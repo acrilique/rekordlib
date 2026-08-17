@@ -14,23 +14,27 @@ const bin = @import("bin");
 /// Size of the three NUL-padded string fields at the start of the file.
 const string_field_len = 32;
 
+/// Length of the three string fields, as recorded in the first header field
+/// (`0x60` in all known files).
+const len_string_fields = 3 * string_field_len;
+
 /// Offset of the `data` section; the checksum starts at `data_offset + len_data`.
-const data_offset = 4 + 3 * string_field_len + 4;
+const data_offset = 4 + len_string_fields + 4;
 
 pub const ParseError = error{ UnexpectedEof, InvalidFormat, UnexpectedValue };
-
-/// Error set of the payload `parse` functions: read errors plus the
-/// rejection of unknown fields with an unexpected value.
-const DataParseError = bin.ReadError || error{UnexpectedValue};
 
 /// Represents a `*SETTING.DAT` file, generic over the payload type `Data`
 /// (`DevSetting` for `DEVSETTING.DAT`, `MySetting` for `MYSETTING.DAT`,
 /// `MySetting2` for `MYSETTING2.DAT`, `DJMMySetting` for `DJMMYSETTING.DAT`).
-/// The payload type determines the expected `len_data`, so parsing with a
+/// The payload's fields are read and written in declaration order; its
+/// serialized size determines the expected `len_data`, so parsing with a
 /// payload type of a different size fails.
 pub fn Setting(comptime Data: type) type {
     return struct {
         const Self = @This();
+
+        /// Serialized size of the data section, derived from `Data`'s fields.
+        const data_len = bin.serializedLen(Data);
 
         /// Name of the brand, NUL-padded ("PIONEER DJ" for `DEVSETTING.DAT`,
         /// "PIONEER" for `MYSETTING.DAT`).
@@ -50,13 +54,14 @@ pub fn Setting(comptime Data: type) type {
         pub fn parse(buf: []const u8) ParseError!Self {
             var c = bin.Cursor.init(buf);
             const len_stringdata = try c.takeInt(u32);
-            if (len_stringdata != 0x60) return error.InvalidFormat;
+            if (len_stringdata != len_string_fields) return error.InvalidFormat;
             const brand = (try c.takeArray(string_field_len)).*;
             const software = (try c.takeArray(string_field_len)).*;
             const version = (try c.takeArray(string_field_len)).*;
             const len_data = try c.takeInt(u32);
-            if (len_data != Data.serialized_len) return error.InvalidFormat;
-            const data = try Data.parse(&c);
+            if (len_data != data_len) return error.InvalidFormat;
+            const data = try bin.takeStruct(&c, Data);
+            try validateConstantFields(Data, data);
             _ = try c.takeInt(u16);
             const unknown = try c.takeInt(u16);
             if (unknown != 0) return error.UnexpectedValue;
@@ -71,12 +76,12 @@ pub fn Setting(comptime Data: type) type {
         }
 
         pub fn writeTo(s: *const Self, e: *bin.Emitter) bin.WriteError!void {
-            try e.putInt(u32, 0x60);
+            try e.putInt(u32, len_string_fields);
             try e.putBytes(&s.brand);
             try e.putBytes(&s.software);
             try e.putBytes(&s.version);
-            try e.putInt(u32, Data.serialized_len);
-            try s.data.writeTo(e);
+            try e.putInt(u32, data_len);
+            try bin.putStruct(e, &s.data);
             const checksum_at = e.pos();
             try e.putInt(u16, 0);
             try e.putInt(u16, s.unknown);
@@ -100,7 +105,7 @@ pub fn Setting(comptime Data: type) type {
                 .brand = stringField(Data.default_brand),
                 .software = stringField("rekordbox"),
                 .version = stringField(Data.default_version),
-                .data = Data.default(),
+                .data = .{},
                 .unknown = 0,
             };
         }
@@ -122,27 +127,40 @@ pub fn Setting(comptime Data: type) type {
     };
 }
 
-/// Payload of a `DEVSETTING.DAT` file.
-pub const DevSetting = struct {
-    /// Unknown field, `78 56 34 12 01 00 00 00 01` in all known files. Other
-    /// values are rejected on parse; the stored value is written verbatim.
-    unknown1: [9]u8,
-    /// "Type of the overview Waveform" setting.
-    overview_waveform_type: OverviewWaveformType,
-    /// "Waveform color" setting.
-    waveform_color: WaveformColor,
-    /// Unknown field, `0x01` in all known files. Other values are rejected
-    /// on parse; the stored value is written verbatim.
-    unknown2: u8,
-    /// "Key display format" setting.
-    key_display_format: KeyDisplayFormat,
-    /// "Waveform Current Position" setting.
-    waveform_current_position: WaveformCurrentPosition,
-    /// Unknown field, zero in all known files. Nonzero values are rejected
-    /// on parse; the stored value is written verbatim.
-    unknown3: [18]u8,
+/// Checks the payload fields listed in `T.constant_fields` against their
+/// default values, which they must hold in all known files. Fields not
+/// listed are accepted and written verbatim.
+fn validateConstantFields(comptime T: type, value: T) error{UnexpectedValue}!void {
+    if (!@hasDecl(T, "constant_fields")) return;
+    const defaults = T{};
+    inline for (T.constant_fields) |field| {
+        const name = @tagName(field);
+        if (!@hasField(T, name))
+            @compileError("constant_fields of " ++ @typeName(T) ++ " reference unknown field '" ++ name ++ "'");
+        switch (@typeInfo(@TypeOf(@field(value, name)))) {
+            .array => if (!std.mem.eql(u8, &@field(value, name), &@field(defaults, name))) return error.UnexpectedValue,
+            else => if (@field(value, name) != @field(defaults, name)) return error.UnexpectedValue,
+        }
+    }
+}
 
-    pub const serialized_len = 32;
+/// Payload of a `DEVSETTING.DAT` file. Fields are read and written in
+/// declaration order; the default values are those written by Rekordbox 6.6.1.
+pub const DevSetting = struct {
+    /// Unknown field, `78 56 34 12 01 00 00 00 01` in all known files.
+    unknown1: [9]u8 = .{ 0x78, 0x56, 0x34, 0x12, 0x01, 0x00, 0x00, 0x00, 0x01 },
+    /// "Type of the overview Waveform" setting.
+    overview_waveform_type: OverviewWaveformType = .half_waveform,
+    /// "Waveform color" setting.
+    waveform_color: WaveformColor = .blue,
+    /// Unknown field, `0x01` in all known files.
+    unknown2: u8 = 0x01,
+    /// "Key display format" setting.
+    key_display_format: KeyDisplayFormat = .classic,
+    /// "Waveform Current Position" setting.
+    waveform_current_position: WaveformCurrentPosition = .center,
+    /// Unknown field, zero in all known files.
+    unknown3: [18]u8 = @splat(0),
 
     /// The checksum covers just the data section (see `Setting.writeTo`).
     pub const checksum_covers_data_only = true;
@@ -153,115 +171,71 @@ pub const DevSetting = struct {
     /// Version string found in `DEVSETTING.DAT` files written by Rekordbox.
     pub const default_version = "6.6.1";
 
-    pub fn parse(c: *bin.Cursor) DataParseError!DevSetting {
-        const unknown1 = (try c.takeArray(9)).*;
-        const overview_waveform_type: OverviewWaveformType = @enumFromInt(try c.takeInt(u8));
-        const waveform_color: WaveformColor = @enumFromInt(try c.takeInt(u8));
-        const unknown2 = try c.takeInt(u8);
-        const key_display_format: KeyDisplayFormat = @enumFromInt(try c.takeInt(u8));
-        const waveform_current_position: WaveformCurrentPosition = @enumFromInt(try c.takeInt(u8));
-        const unknown3 = (try c.takeArray(18)).*;
-        if (!std.mem.eql(u8, &unknown1, &.{ 0x78, 0x56, 0x34, 0x12, 0x01, 0x00, 0x00, 0x00, 0x01 })) return error.UnexpectedValue;
-        if (unknown2 != 0x01) return error.UnexpectedValue;
-        if (!std.mem.allEqual(u8, &unknown3, 0)) return error.UnexpectedValue;
-        return .{
-            .unknown1 = unknown1,
-            .overview_waveform_type = overview_waveform_type,
-            .waveform_color = waveform_color,
-            .unknown2 = unknown2,
-            .key_display_format = key_display_format,
-            .waveform_current_position = waveform_current_position,
-            .unknown3 = unknown3,
-        };
-    }
-
-    pub fn writeTo(d: *const DevSetting, e: *bin.Emitter) bin.WriteError!void {
-        try e.putBytes(&d.unknown1);
-        try e.putInt(u8, @intFromEnum(d.overview_waveform_type));
-        try e.putInt(u8, @intFromEnum(d.waveform_color));
-        try e.putInt(u8, d.unknown2);
-        try e.putInt(u8, @intFromEnum(d.key_display_format));
-        try e.putInt(u8, @intFromEnum(d.waveform_current_position));
-        try e.putBytes(&d.unknown3);
-    }
-
-    /// Default values as found in Rekordbox 6.6.1.
-    pub fn default() DevSetting {
-        return .{
-            .unknown1 = .{ 0x78, 0x56, 0x34, 0x12, 0x01, 0x00, 0x00, 0x00, 0x01 },
-            .overview_waveform_type = .half_waveform,
-            .waveform_color = .blue,
-            .unknown2 = 0x01,
-            .key_display_format = .classic,
-            .waveform_current_position = .center,
-            .unknown3 = @splat(0),
-        };
-    }
+    /// Unknown fields that must hold their default value in all known files;
+    /// other values are rejected on parse. Unknown fields not listed here are
+    /// kept verbatim.
+    pub const constant_fields = .{ .unknown1, .unknown2, .unknown3 };
 };
 
-/// Payload of a `MYSETTING.DAT` file.
+/// Payload of a `MYSETTING.DAT` file. Fields are read and written in
+/// declaration order; the default values are those written by Rekordbox 6.6.1.
 pub const MySetting = struct {
     /// Unknown field (fixtures carry `78 56 34 12 02 00 00 00`), kept verbatim.
-    unknown1: [8]u8,
+    unknown1: [8]u8 = .{ 0x78, 0x56, 0x34, 0x12, 0x02, 0x00, 0x00, 0x00 },
     /// "ON AIR DISPLAY" setting.
-    on_air_display: OnAirDisplay,
+    on_air_display: OnAirDisplay = .on,
     /// "LCD BRIGHTNESS" setting.
-    lcd_brightness: LcdBrightness,
+    lcd_brightness: LcdBrightness = .three,
     /// "QUANTIZE" setting.
-    quantize: Quantize,
+    quantize: Quantize = .on,
     /// "AUTO CUE LEVEL" setting.
-    auto_cue_level: AutoCueLevel,
+    auto_cue_level: AutoCueLevel = .memory,
     /// "LANGUAGE" setting.
-    language: Language,
+    language: Language = .english,
     /// Unknown field (apparently always `0x01`), kept verbatim.
-    unknown2: u8,
+    unknown2: u8 = 0x01,
     /// "JOG RING BRIGHTNESS" setting.
-    jog_ring_brightness: JogRingBrightness,
+    jog_ring_brightness: JogRingBrightness = .bright,
     /// "JOG RING INDICATOR" setting.
-    jog_ring_indicator: JogRingIndicator,
+    jog_ring_indicator: JogRingIndicator = .on,
     /// "SLIP FLASHING" setting.
-    slip_flashing: SlipFlashing,
+    slip_flashing: SlipFlashing = .on,
     /// Unknown field (fixtures carry `01 01 01`), kept verbatim.
-    unknown3: [3]u8,
+    unknown3: [3]u8 = .{ 0x01, 0x01, 0x01 },
     /// "DISC SLOT ILLUMINATION" setting.
-    disc_slot_illumination: DiscSlotIllumination,
+    disc_slot_illumination: DiscSlotIllumination = .bright,
     /// "EJECT/LOAD LOCK" setting.
-    eject_lock: EjectLock,
+    eject_lock: EjectLock = .unlock,
     /// "SYNC" setting.
-    sync: Sync,
+    sync: Sync = .off,
     /// "PLAY MODE / AUTO PLAY MODE" setting.
-    play_mode: PlayMode,
+    play_mode: PlayMode = .single,
     /// "QUANTIZE BEAT VALUE" setting.
-    quantize_beat_value: QuantizeBeatValue,
+    quantize_beat_value: QuantizeBeatValue = .full_beat,
     /// "HOT CUE AUTO LOAD" setting.
-    hotcue_autoload: HotCueAutoLoad,
+    hotcue_autoload: HotCueAutoLoad = .on,
     /// "HOT CUE COLOR" setting.
-    hotcue_color: HotCueColor,
-    /// Unknown field, zero in all known files. Nonzero values are rejected
-    /// on parse; the stored value is written verbatim.
-    unknown4: u16,
+    hotcue_color: HotCueColor = .off,
+    /// Unknown field, zero in all known files.
+    unknown4: u16 = 0,
     /// "NEEDLE LOCK" setting.
-    needle_lock: NeedleLock,
-    /// Unknown field, zero in all known files. Nonzero values are rejected
-    /// on parse; the stored value is written verbatim.
-    unknown5: u16,
+    needle_lock: NeedleLock = .lock,
+    /// Unknown field, zero in all known files.
+    unknown5: u16 = 0,
     /// "TIME MODE" setting.
-    time_mode: TimeMode,
+    time_mode: TimeMode = .remain,
     /// "JOG MODE" setting.
-    jog_mode: JogMode,
+    jog_mode: JogMode = .vinyl,
     /// "AUTO CUE" setting.
-    auto_cue: AutoCue,
+    auto_cue: AutoCue = .on,
     /// "MASTER TEMPO" setting.
-    master_tempo: MasterTempo,
+    master_tempo: MasterTempo = .off,
     /// "TEMPO RANGE" setting.
-    tempo_range: TempoRange,
+    tempo_range: TempoRange = .ten_percent,
     /// "PHASE METER" setting.
-    phase_meter: PhaseMeter,
-    /// Unknown field, zero in all known files. Nonzero values are rejected
-    /// on parse; the stored value is written verbatim.
-    unknown6: u16,
-
-    pub const serialized_len = 40;
+    phase_meter: PhaseMeter = .type1,
+    /// Unknown field, zero in all known files.
+    unknown6: u16 = 0,
 
     /// The checksum covers just the data section (see `Setting.writeTo`).
     pub const checksum_covers_data_only = true;
@@ -272,162 +246,35 @@ pub const MySetting = struct {
     /// Version string found in `MYSETTING.DAT` files written by Rekordbox 6.6.1.
     pub const default_version = "0.001";
 
-    pub fn parse(c: *bin.Cursor) DataParseError!MySetting {
-        const unknown1 = (try c.takeArray(8)).*;
-        const on_air_display: OnAirDisplay = @enumFromInt(try c.takeInt(u8));
-        const lcd_brightness: LcdBrightness = @enumFromInt(try c.takeInt(u8));
-        const quantize: Quantize = @enumFromInt(try c.takeInt(u8));
-        const auto_cue_level: AutoCueLevel = @enumFromInt(try c.takeInt(u8));
-        const language: Language = @enumFromInt(try c.takeInt(u8));
-        const unknown2 = try c.takeInt(u8);
-        const jog_ring_brightness: JogRingBrightness = @enumFromInt(try c.takeInt(u8));
-        const jog_ring_indicator: JogRingIndicator = @enumFromInt(try c.takeInt(u8));
-        const slip_flashing: SlipFlashing = @enumFromInt(try c.takeInt(u8));
-        const unknown3 = (try c.takeArray(3)).*;
-        const disc_slot_illumination: DiscSlotIllumination = @enumFromInt(try c.takeInt(u8));
-        const eject_lock: EjectLock = @enumFromInt(try c.takeInt(u8));
-        const sync: Sync = @enumFromInt(try c.takeInt(u8));
-        const play_mode: PlayMode = @enumFromInt(try c.takeInt(u8));
-        const quantize_beat_value: QuantizeBeatValue = @enumFromInt(try c.takeInt(u8));
-        const hotcue_autoload: HotCueAutoLoad = @enumFromInt(try c.takeInt(u8));
-        const hotcue_color: HotCueColor = @enumFromInt(try c.takeInt(u8));
-        const unknown4 = try c.takeInt(u16);
-        const needle_lock: NeedleLock = @enumFromInt(try c.takeInt(u8));
-        const unknown5 = try c.takeInt(u16);
-        const time_mode: TimeMode = @enumFromInt(try c.takeInt(u8));
-        const jog_mode: JogMode = @enumFromInt(try c.takeInt(u8));
-        const auto_cue: AutoCue = @enumFromInt(try c.takeInt(u8));
-        const master_tempo: MasterTempo = @enumFromInt(try c.takeInt(u8));
-        const tempo_range: TempoRange = @enumFromInt(try c.takeInt(u8));
-        const phase_meter: PhaseMeter = @enumFromInt(try c.takeInt(u8));
-        const unknown6 = try c.takeInt(u16);
-        if (unknown4 != 0) return error.UnexpectedValue;
-        if (unknown5 != 0) return error.UnexpectedValue;
-        if (unknown6 != 0) return error.UnexpectedValue;
-        return .{
-            .unknown1 = unknown1,
-            .on_air_display = on_air_display,
-            .lcd_brightness = lcd_brightness,
-            .quantize = quantize,
-            .auto_cue_level = auto_cue_level,
-            .language = language,
-            .unknown2 = unknown2,
-            .jog_ring_brightness = jog_ring_brightness,
-            .jog_ring_indicator = jog_ring_indicator,
-            .slip_flashing = slip_flashing,
-            .unknown3 = unknown3,
-            .disc_slot_illumination = disc_slot_illumination,
-            .eject_lock = eject_lock,
-            .sync = sync,
-            .play_mode = play_mode,
-            .quantize_beat_value = quantize_beat_value,
-            .hotcue_autoload = hotcue_autoload,
-            .hotcue_color = hotcue_color,
-            .unknown4 = unknown4,
-            .needle_lock = needle_lock,
-            .unknown5 = unknown5,
-            .time_mode = time_mode,
-            .jog_mode = jog_mode,
-            .auto_cue = auto_cue,
-            .master_tempo = master_tempo,
-            .tempo_range = tempo_range,
-            .phase_meter = phase_meter,
-            .unknown6 = unknown6,
-        };
-    }
-
-    pub fn writeTo(m: *const MySetting, e: *bin.Emitter) bin.WriteError!void {
-        try e.putBytes(&m.unknown1);
-        try e.putInt(u8, @intFromEnum(m.on_air_display));
-        try e.putInt(u8, @intFromEnum(m.lcd_brightness));
-        try e.putInt(u8, @intFromEnum(m.quantize));
-        try e.putInt(u8, @intFromEnum(m.auto_cue_level));
-        try e.putInt(u8, @intFromEnum(m.language));
-        try e.putInt(u8, m.unknown2);
-        try e.putInt(u8, @intFromEnum(m.jog_ring_brightness));
-        try e.putInt(u8, @intFromEnum(m.jog_ring_indicator));
-        try e.putInt(u8, @intFromEnum(m.slip_flashing));
-        try e.putBytes(&m.unknown3);
-        try e.putInt(u8, @intFromEnum(m.disc_slot_illumination));
-        try e.putInt(u8, @intFromEnum(m.eject_lock));
-        try e.putInt(u8, @intFromEnum(m.sync));
-        try e.putInt(u8, @intFromEnum(m.play_mode));
-        try e.putInt(u8, @intFromEnum(m.quantize_beat_value));
-        try e.putInt(u8, @intFromEnum(m.hotcue_autoload));
-        try e.putInt(u8, @intFromEnum(m.hotcue_color));
-        try e.putInt(u16, m.unknown4);
-        try e.putInt(u8, @intFromEnum(m.needle_lock));
-        try e.putInt(u16, m.unknown5);
-        try e.putInt(u8, @intFromEnum(m.time_mode));
-        try e.putInt(u8, @intFromEnum(m.jog_mode));
-        try e.putInt(u8, @intFromEnum(m.auto_cue));
-        try e.putInt(u8, @intFromEnum(m.master_tempo));
-        try e.putInt(u8, @intFromEnum(m.tempo_range));
-        try e.putInt(u8, @intFromEnum(m.phase_meter));
-        try e.putInt(u16, m.unknown6);
-    }
-
-    /// Default values as found in Rekordbox 6.6.1.
-    pub fn default() MySetting {
-        return .{
-            .unknown1 = .{ 0x78, 0x56, 0x34, 0x12, 0x02, 0x00, 0x00, 0x00 },
-            .on_air_display = .on,
-            .lcd_brightness = .three,
-            .quantize = .on,
-            .auto_cue_level = .memory,
-            .language = .english,
-            .unknown2 = 0x01,
-            .jog_ring_brightness = .bright,
-            .jog_ring_indicator = .on,
-            .slip_flashing = .on,
-            .unknown3 = .{ 0x01, 0x01, 0x01 },
-            .disc_slot_illumination = .bright,
-            .eject_lock = .unlock,
-            .sync = .off,
-            .play_mode = .single,
-            .quantize_beat_value = .full_beat,
-            .hotcue_autoload = .on,
-            .hotcue_color = .off,
-            .unknown4 = 0,
-            .needle_lock = .lock,
-            .unknown5 = 0,
-            .time_mode = .remain,
-            .jog_mode = .vinyl,
-            .auto_cue = .on,
-            .master_tempo = .off,
-            .tempo_range = .ten_percent,
-            .phase_meter = .type1,
-            .unknown6 = 0,
-        };
-    }
+    /// Unknown fields that must hold their default value in all known files;
+    /// other values are rejected on parse. Unknown fields not listed here are
+    /// kept verbatim.
+    pub const constant_fields = .{ .unknown4, .unknown5, .unknown6 };
 };
 
-/// Payload of a `MYSETTING2.DAT` file.
+/// Payload of a `MYSETTING2.DAT` file. Fields are read and written in
+/// declaration order; the default values are those written by Rekordbox 6.6.1.
 pub const MySetting2 = struct {
     /// "VINYL SPEED ADJUST" setting.
-    vinyl_speed_adjust: VinylSpeedAdjust,
+    vinyl_speed_adjust: VinylSpeedAdjust = .touch,
     /// "JOG DISPLAY MODE" setting.
-    jog_display_mode: JogDisplayMode,
+    jog_display_mode: JogDisplayMode = .auto,
     /// "PAD/BUTTON BRIGHTNESS" setting.
-    pad_button_brightness: PadButtonBrightness,
+    pad_button_brightness: PadButtonBrightness = .three,
     /// "JOG LCD BRIGHTNESS" setting.
-    jog_lcd_brightness: JogLcdBrightness,
+    jog_lcd_brightness: JogLcdBrightness = .three,
     /// "WAVEFORM DIVISIONS" setting.
-    waveform_divisions: WaveformDivisions,
-    /// Unknown field, zero in all known files. Nonzero values are rejected
-    /// on parse; the stored value is written verbatim.
-    unknown1: [5]u8,
+    waveform_divisions: WaveformDivisions = .phrase,
+    /// Unknown field, zero in all known files.
+    unknown1: [5]u8 = @splat(0),
     /// "WAVEFORM / PHASE METER" setting.
-    waveform: Waveform,
+    waveform: Waveform = .waveform,
     /// Unknown field (apparently always `0x81`), kept verbatim.
-    unknown2: u8,
+    unknown2: u8 = 0x81,
     /// "BEAT JUMP BEAT VALUE" setting.
-    beat_jump_beat_value: BeatJumpBeatValue,
-    /// Unknown field, zero in all known files. Nonzero values are rejected
-    /// on parse; the stored value is written verbatim.
-    unknown3: [27]u8,
-
-    pub const serialized_len = 40;
+    beat_jump_beat_value: BeatJumpBeatValue = .sixteen_beat,
+    /// Unknown field, zero in all known files.
+    unknown3: [27]u8 = @splat(0),
 
     /// The checksum covers just the data section (see `Setting.writeTo`).
     pub const checksum_covers_data_only = true;
@@ -438,100 +285,46 @@ pub const MySetting2 = struct {
     /// Version string found in `MYSETTING2.DAT` files written by Rekordbox 6.6.1.
     pub const default_version = "0.001";
 
-    pub fn parse(c: *bin.Cursor) DataParseError!MySetting2 {
-        const vinyl_speed_adjust: VinylSpeedAdjust = @enumFromInt(try c.takeInt(u8));
-        const jog_display_mode: JogDisplayMode = @enumFromInt(try c.takeInt(u8));
-        const pad_button_brightness: PadButtonBrightness = @enumFromInt(try c.takeInt(u8));
-        const jog_lcd_brightness: JogLcdBrightness = @enumFromInt(try c.takeInt(u8));
-        const waveform_divisions: WaveformDivisions = @enumFromInt(try c.takeInt(u8));
-        const unknown1 = (try c.takeArray(5)).*;
-        const waveform: Waveform = @enumFromInt(try c.takeInt(u8));
-        const unknown2 = try c.takeInt(u8);
-        const beat_jump_beat_value: BeatJumpBeatValue = @enumFromInt(try c.takeInt(u8));
-        const unknown3 = (try c.takeArray(27)).*;
-        if (!std.mem.allEqual(u8, &unknown1, 0)) return error.UnexpectedValue;
-        if (!std.mem.allEqual(u8, &unknown3, 0)) return error.UnexpectedValue;
-        return .{
-            .vinyl_speed_adjust = vinyl_speed_adjust,
-            .jog_display_mode = jog_display_mode,
-            .pad_button_brightness = pad_button_brightness,
-            .jog_lcd_brightness = jog_lcd_brightness,
-            .waveform_divisions = waveform_divisions,
-            .unknown1 = unknown1,
-            .waveform = waveform,
-            .unknown2 = unknown2,
-            .beat_jump_beat_value = beat_jump_beat_value,
-            .unknown3 = unknown3,
-        };
-    }
-
-    pub fn writeTo(m: *const MySetting2, e: *bin.Emitter) bin.WriteError!void {
-        try e.putInt(u8, @intFromEnum(m.vinyl_speed_adjust));
-        try e.putInt(u8, @intFromEnum(m.jog_display_mode));
-        try e.putInt(u8, @intFromEnum(m.pad_button_brightness));
-        try e.putInt(u8, @intFromEnum(m.jog_lcd_brightness));
-        try e.putInt(u8, @intFromEnum(m.waveform_divisions));
-        try e.putBytes(&m.unknown1);
-        try e.putInt(u8, @intFromEnum(m.waveform));
-        try e.putInt(u8, m.unknown2);
-        try e.putInt(u8, @intFromEnum(m.beat_jump_beat_value));
-        try e.putBytes(&m.unknown3);
-    }
-
-    /// Default values as found in Rekordbox 6.6.1.
-    pub fn default() MySetting2 {
-        return .{
-            .vinyl_speed_adjust = .touch,
-            .jog_display_mode = .auto,
-            .pad_button_brightness = .three,
-            .jog_lcd_brightness = .three,
-            .waveform_divisions = .phrase,
-            .unknown1 = @splat(0),
-            .waveform = .waveform,
-            .unknown2 = 0x81,
-            .beat_jump_beat_value = .sixteen_beat,
-            .unknown3 = @splat(0),
-        };
-    }
+    /// Unknown fields that must hold their default value in all known files;
+    /// other values are rejected on parse. Unknown fields not listed here are
+    /// kept verbatim.
+    pub const constant_fields = .{ .unknown1, .unknown3 };
 };
 
-/// Payload of a `DJMMYSETTING.DAT` file. Unlike the other settings files, the
-/// checksum covers the whole file, not just the data section.
+/// Payload of a `DJMMYSETTING.DAT` file. Fields are read and written in
+/// declaration order; the default values are those written by Rekordbox 6.6.1.
 pub const DJMMySetting = struct {
     /// Unknown field (fixtures carry `78 56 34 12 01 00 00 00 20 00 00 00`),
     /// kept verbatim.
-    unknown1: [12]u8,
+    unknown1: [12]u8 = .{ 0x78, 0x56, 0x34, 0x12, 0x01, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00 },
     /// "CH FADER CURVE" setting.
-    channel_fader_curve: ChannelFaderCurve,
+    channel_fader_curve: ChannelFaderCurve = .linear,
     /// "CROSSFADER CURVE" setting.
-    crossfader_curve: CrossfaderCurve,
+    crossfader_curve: CrossfaderCurve = .fast_cut,
     /// "HEADPHONES PRE EQ" setting.
-    headphones_pre_eq: HeadphonesPreEq,
+    headphones_pre_eq: HeadphonesPreEq = .post_eq,
     /// "HEADPHONES MONO SPLIT" setting.
-    headphones_mono_split: HeadphonesMonoSplit,
+    headphones_mono_split: HeadphonesMonoSplit = .stereo,
     /// "BEAT FX QUANTIZE" setting.
-    beat_fx_quantize: BeatFxQuantize,
+    beat_fx_quantize: BeatFxQuantize = .on,
     /// "MIC LOW CUT" setting.
-    mic_low_cut: MicLowCut,
+    mic_low_cut: MicLowCut = .on,
     /// "TALK OVER MODE" setting.
-    talk_over_mode: TalkOverMode,
+    talk_over_mode: TalkOverMode = .advanced,
     /// "TALK OVER LEVEL" setting.
-    talk_over_level: TalkOverLevel,
+    talk_over_level: TalkOverLevel = .minus_18_db,
     /// "MIDI CH" setting.
-    midi_channel: MidiChannel,
+    midi_channel: MidiChannel = .one,
     /// "MIDI BUTTON TYPE" setting.
-    midi_button_type: MidiButtonType,
+    midi_button_type: MidiButtonType = .toggle,
     /// "BRIGHTNESS > DISPLAY" setting.
-    display_brightness: MixerDisplayBrightness,
+    display_brightness: MixerDisplayBrightness = .five,
     /// "BRIGHTNESS > INDICATOR" setting.
-    indicator_brightness: MixerIndicatorBrightness,
+    indicator_brightness: MixerIndicatorBrightness = .three,
     /// "CH FADER CURVE (LONG FADER)" setting.
-    channel_fader_curve_long_fader: ChannelFaderCurveLongFader,
-    /// Unknown field, zero in all known files. Nonzero values are rejected
-    /// on parse; the stored value is written verbatim.
-    unknown2: [27]u8,
-
-    pub const serialized_len = 52;
+    channel_fader_curve_long_fader: ChannelFaderCurveLongFader = .exponential,
+    /// Unknown field, zero in all known files.
+    unknown2: [27]u8 = @splat(0),
 
     /// Unlike the other settings files, the checksum covers the whole file
     /// (see `Setting.writeTo`).
@@ -543,80 +336,10 @@ pub const DJMMySetting = struct {
     /// Version string found in `DJMMYSETTING.DAT` files written by Rekordbox 6.6.1.
     pub const default_version = "1.000";
 
-    pub fn parse(c: *bin.Cursor) DataParseError!DJMMySetting {
-        const unknown1 = (try c.takeArray(12)).*;
-        const channel_fader_curve: ChannelFaderCurve = @enumFromInt(try c.takeInt(u8));
-        const crossfader_curve: CrossfaderCurve = @enumFromInt(try c.takeInt(u8));
-        const headphones_pre_eq: HeadphonesPreEq = @enumFromInt(try c.takeInt(u8));
-        const headphones_mono_split: HeadphonesMonoSplit = @enumFromInt(try c.takeInt(u8));
-        const beat_fx_quantize: BeatFxQuantize = @enumFromInt(try c.takeInt(u8));
-        const mic_low_cut: MicLowCut = @enumFromInt(try c.takeInt(u8));
-        const talk_over_mode: TalkOverMode = @enumFromInt(try c.takeInt(u8));
-        const talk_over_level: TalkOverLevel = @enumFromInt(try c.takeInt(u8));
-        const midi_channel: MidiChannel = @enumFromInt(try c.takeInt(u8));
-        const midi_button_type: MidiButtonType = @enumFromInt(try c.takeInt(u8));
-        const display_brightness: MixerDisplayBrightness = @enumFromInt(try c.takeInt(u8));
-        const indicator_brightness: MixerIndicatorBrightness = @enumFromInt(try c.takeInt(u8));
-        const channel_fader_curve_long_fader: ChannelFaderCurveLongFader = @enumFromInt(try c.takeInt(u8));
-        const unknown2 = (try c.takeArray(27)).*;
-        if (!std.mem.allEqual(u8, &unknown2, 0)) return error.UnexpectedValue;
-        return .{
-            .unknown1 = unknown1,
-            .channel_fader_curve = channel_fader_curve,
-            .crossfader_curve = crossfader_curve,
-            .headphones_pre_eq = headphones_pre_eq,
-            .headphones_mono_split = headphones_mono_split,
-            .beat_fx_quantize = beat_fx_quantize,
-            .mic_low_cut = mic_low_cut,
-            .talk_over_mode = talk_over_mode,
-            .talk_over_level = talk_over_level,
-            .midi_channel = midi_channel,
-            .midi_button_type = midi_button_type,
-            .display_brightness = display_brightness,
-            .indicator_brightness = indicator_brightness,
-            .channel_fader_curve_long_fader = channel_fader_curve_long_fader,
-            .unknown2 = unknown2,
-        };
-    }
-
-    pub fn writeTo(d: *const DJMMySetting, e: *bin.Emitter) bin.WriteError!void {
-        try e.putBytes(&d.unknown1);
-        try e.putInt(u8, @intFromEnum(d.channel_fader_curve));
-        try e.putInt(u8, @intFromEnum(d.crossfader_curve));
-        try e.putInt(u8, @intFromEnum(d.headphones_pre_eq));
-        try e.putInt(u8, @intFromEnum(d.headphones_mono_split));
-        try e.putInt(u8, @intFromEnum(d.beat_fx_quantize));
-        try e.putInt(u8, @intFromEnum(d.mic_low_cut));
-        try e.putInt(u8, @intFromEnum(d.talk_over_mode));
-        try e.putInt(u8, @intFromEnum(d.talk_over_level));
-        try e.putInt(u8, @intFromEnum(d.midi_channel));
-        try e.putInt(u8, @intFromEnum(d.midi_button_type));
-        try e.putInt(u8, @intFromEnum(d.display_brightness));
-        try e.putInt(u8, @intFromEnum(d.indicator_brightness));
-        try e.putInt(u8, @intFromEnum(d.channel_fader_curve_long_fader));
-        try e.putBytes(&d.unknown2);
-    }
-
-    /// Default values as found in Rekordbox 6.6.1.
-    pub fn default() DJMMySetting {
-        return .{
-            .unknown1 = .{ 0x78, 0x56, 0x34, 0x12, 0x01, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00 },
-            .channel_fader_curve = .linear,
-            .crossfader_curve = .fast_cut,
-            .headphones_pre_eq = .post_eq,
-            .headphones_mono_split = .stereo,
-            .beat_fx_quantize = .on,
-            .mic_low_cut = .on,
-            .talk_over_mode = .advanced,
-            .talk_over_level = .minus_18_db,
-            .midi_channel = .one,
-            .midi_button_type = .toggle,
-            .display_brightness = .five,
-            .indicator_brightness = .three,
-            .channel_fader_curve_long_fader = .exponential,
-            .unknown2 = @splat(0),
-        };
-    }
+    /// Unknown fields that must hold their default value in all known files;
+    /// other values are rejected on parse. Unknown fields not listed here are
+    /// kept verbatim.
+    pub const constant_fields = .{.unknown2};
 };
 
 /// "Type of the overview Waveform" setting. Found on the "General" page in the

@@ -120,6 +120,67 @@ pub const Emitter = struct {
     }
 };
 
+/// Reads the fields of `T` in declaration order. Supported field types are
+/// integers, `[N]u8` arrays, and non-exhaustive enums (so that unknown enum
+/// values roundtrip verbatim instead of tripping a safety check).
+pub fn takeStruct(c: *Cursor, comptime T: type) ReadError!T {
+    var out: T = undefined;
+    inline for (@typeInfo(T).@"struct".fields) |field| {
+        switch (@typeInfo(field.type)) {
+            .int => @field(out, field.name) = try c.takeInt(field.type),
+            .@"enum" => |e| {
+                if (e.is_exhaustive) @compileError("takeStruct: enum fields must be non-exhaustive, `" ++ @typeName(field.type) ++ "` is not");
+                @field(out, field.name) = @enumFromInt(try c.takeInt(e.tag_type));
+            },
+            .array => |a| {
+                if (a.child != u8) @compileError("takeStruct: array fields must be `[N]u8`, `" ++ @typeName(field.type) ++ "` is not");
+                @field(out, field.name) = (try c.takeArray(a.len)).*;
+            },
+            else => @compileError("takeStruct: unsupported field type `" ++ @typeName(field.type) ++ "`"),
+        }
+    }
+    return out;
+}
+
+/// Writes the fields of `value` in declaration order, the mirror image of
+/// `takeStruct`. `value` may be passed by value or as a pointer.
+pub fn putStruct(e: *Emitter, value: anytype) WriteError!void {
+    const T = switch (@typeInfo(@TypeOf(value))) {
+        .pointer => |p| p.child,
+        else => @TypeOf(value),
+    };
+    inline for (@typeInfo(T).@"struct".fields) |field| {
+        switch (@typeInfo(field.type)) {
+            .int => try e.putInt(field.type, @field(value, field.name)),
+            .@"enum" => |en| try e.putInt(en.tag_type, @intFromEnum(@field(value, field.name))),
+            .array => |a| {
+                if (a.child != u8) @compileError("putStruct: array fields must be `[N]u8`, `" ++ @typeName(field.type) ++ "` is not");
+                try e.putBytes(&@field(value, field.name));
+            },
+            else => @compileError("putStruct: unsupported field type `" ++ @typeName(field.type) ++ "`"),
+        }
+    }
+}
+
+/// Number of bytes `takeStruct`/`putStruct` read/write for `T`.
+pub fn serializedLen(comptime T: type) usize {
+    return comptime blk: {
+        var len: usize = 0;
+        for (@typeInfo(T).@"struct".fields) |field| {
+            switch (@typeInfo(field.type)) {
+                .int => len += @sizeOf(field.type),
+                .@"enum" => |en| len += @sizeOf(en.tag_type),
+                .array => |a| {
+                    if (a.child != u8) @compileError("serializedLen: array fields must be `[N]u8`, `" ++ @typeName(field.type) ++ "` is not");
+                    len += a.len;
+                },
+                else => @compileError("serializedLen: unsupported field type `" ++ @typeName(field.type) ++ "`"),
+            }
+        }
+        break :blk len;
+    };
+}
+
 const testing = std.testing;
 
 test "cursor little-endian reads and position" {
@@ -193,4 +254,30 @@ test "emitter toOwnedSlice" {
     const out = try e.toOwnedSlice();
     defer testing.allocator.free(out);
     try testing.expectEqualSlices(u8, &.{7}, out);
+}
+
+test "takeStruct, putStruct and serializedLen roundtrip" {
+    const Sample = struct {
+        magic: [3]u8 = .{ 1, 2, 3 },
+        kind: enum(u8) { a = 1, b = 2, _ } = .a,
+        count: u16 = 0x1234,
+    };
+
+    try testing.expectEqual(@as(usize, 6), serializedLen(Sample));
+    var e = Emitter.init(testing.allocator);
+    defer e.deinit();
+    try putStruct(&e, Sample{ .kind = @enumFromInt(0x7F) });
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 0x7F, 0x34, 0x12 }, e.written());
+
+    var c = Cursor.init(e.written());
+    const s = try takeStruct(&c, Sample);
+    try testing.expect(c.atEnd());
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, &s.magic);
+    try testing.expectEqual(@as(u8, 0x7F), @intFromEnum(s.kind));
+    try testing.expectEqual(@as(u16, 0x1234), s.count);
+
+    var e2 = Emitter.init(testing.allocator);
+    defer e2.deinit();
+    try putStruct(&e2, &s);
+    try testing.expectEqualSlices(u8, e.written(), e2.written());
 }
