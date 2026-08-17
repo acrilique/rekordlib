@@ -85,10 +85,11 @@ pub fn Setting(comptime Data: type) type {
             const checksum_at = e.pos();
             try e.putInt(u16, 0);
             try e.putInt(u16, s.unknown);
-            // The checksum covers just the data section, except in
-            // `DJMMYSETTING.DAT` where it covers the whole file.
+            // The checksum is CRC-16/XMODEM; it covers just the data
+            // section, except in `DJMMYSETTING.DAT` where it covers the
+            // whole file.
             const checksum_start = if (Data.checksum_covers_data_only) data_offset else 0;
-            const crc = crc16Xmodem(e.written()[checksum_start..checksum_at]);
+            const crc = std.hash.crc.Crc16Xmodem.hash(e.written()[checksum_start..checksum_at]);
             e.patchIntAt(checksum_at, u16, crc);
         }
 
@@ -962,24 +963,7 @@ fn fieldString(field: []const u8) []const u8 {
     return field[0..end];
 }
 
-/// CRC-16/XMODEM (poly 0x1021, init 0x0000, no reflection, no final xor).
-/// <https://reveng.sourceforge.io/crc-catalogue/all.htm#crc.cat.crc-16-xmodem>
-fn crc16Xmodem(data: []const u8) u16 {
-    var crc: u16 = 0;
-    for (data) |byte| {
-        crc ^= @as(u16, byte) << 8;
-        for (0..8) |_| {
-            crc = if (crc & 0x8000 != 0) (crc << 1) ^ 0x1021 else crc << 1;
-        }
-    }
-    return crc;
-}
-
 const testing = std.testing;
-
-test "crc16-xmodem known answer" {
-    try testing.expectEqual(@as(u16, 0x31C3), crc16Xmodem("123456789"));
-}
 
 /// Checks that the default `Setting(Data)` value roundtrips: the expected
 /// file length derived from the format constants, struct equality after
