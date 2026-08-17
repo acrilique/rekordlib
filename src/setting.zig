@@ -7,10 +7,6 @@
 //! The files are found in the `PIONEER` directory of a USB device export.
 //!
 //! Ported from rekordcrate's `src/setting.rs`
-//!
-//!
-//! Unknown fields and unknown enum values are stored on parse and written back
-//! verbatim, so a parsed file always re-serializes byte-identically.
 
 const std = @import("std");
 const bin = @import("bin");
@@ -21,7 +17,11 @@ const string_field_len = 32;
 /// Offset of the `data` section; the checksum starts at `data_offset + len_data`.
 const data_offset = 4 + 3 * string_field_len + 4;
 
-pub const ParseError = error{ UnexpectedEof, InvalidFormat };
+pub const ParseError = error{ UnexpectedEof, InvalidFormat, UnexpectedValue };
+
+/// Error set of the payload `parse` functions: read errors plus the
+/// rejection of unknown fields with an unexpected value.
+const DataParseError = bin.ReadError || error{UnexpectedValue};
 
 /// Represents a `*SETTING.DAT` file, generic over the payload type `Data`
 /// (`DevSetting` for `DEVSETTING.DAT`, `MySetting` for `MYSETTING.DAT`,
@@ -41,7 +41,8 @@ pub fn Setting(comptime Data: type) type {
         version: [string_field_len]u8,
         /// The actual settings data.
         data: Data,
-        /// Trailing unknown field (apparently always zero), kept verbatim.
+        /// Trailing unknown field, zero in all known files. Nonzero values
+        /// are rejected on parse; the stored value is written verbatim.
         unknown: u16,
 
         /// Parse a `*SETTING.DAT` image. The checksum is not verified; it is
@@ -58,6 +59,7 @@ pub fn Setting(comptime Data: type) type {
             const data = try Data.parse(&c);
             _ = try c.takeInt(u16);
             const unknown = try c.takeInt(u16);
+            if (unknown != 0) return error.UnexpectedValue;
             if (!c.atEnd()) return error.InvalidFormat;
             return .{
                 .brand = brand,
@@ -122,20 +124,22 @@ pub fn Setting(comptime Data: type) type {
 
 /// Payload of a `DEVSETTING.DAT` file.
 pub const DevSetting = struct {
-    /// Unknown field (fixtures carry `78 56 34 12 01 00 00 00 01`), kept
-    /// verbatim.
+    /// Unknown field, `78 56 34 12 01 00 00 00 01` in all known files. Other
+    /// values are rejected on parse; the stored value is written verbatim.
     unknown1: [9]u8,
     /// "Type of the overview Waveform" setting.
     overview_waveform_type: OverviewWaveformType,
     /// "Waveform color" setting.
     waveform_color: WaveformColor,
-    /// Unknown field (apparently always `0x01`), kept verbatim.
+    /// Unknown field, `0x01` in all known files. Other values are rejected
+    /// on parse; the stored value is written verbatim.
     unknown2: u8,
     /// "Key display format" setting.
     key_display_format: KeyDisplayFormat,
     /// "Waveform Current Position" setting.
     waveform_current_position: WaveformCurrentPosition,
-    /// Unknown field (apparently always zero), kept verbatim.
+    /// Unknown field, zero in all known files. Nonzero values are rejected
+    /// on parse; the stored value is written verbatim.
     unknown3: [18]u8,
 
     pub const serialized_len = 32;
@@ -149,15 +153,25 @@ pub const DevSetting = struct {
     /// Version string found in `DEVSETTING.DAT` files written by Rekordbox.
     pub const default_version = "6.6.1";
 
-    pub fn parse(c: *bin.Cursor) bin.ReadError!DevSetting {
+    pub fn parse(c: *bin.Cursor) DataParseError!DevSetting {
+        const unknown1 = (try c.takeArray(9)).*;
+        const overview_waveform_type: OverviewWaveformType = @enumFromInt(try c.takeInt(u8));
+        const waveform_color: WaveformColor = @enumFromInt(try c.takeInt(u8));
+        const unknown2 = try c.takeInt(u8);
+        const key_display_format: KeyDisplayFormat = @enumFromInt(try c.takeInt(u8));
+        const waveform_current_position: WaveformCurrentPosition = @enumFromInt(try c.takeInt(u8));
+        const unknown3 = (try c.takeArray(18)).*;
+        if (!std.mem.eql(u8, &unknown1, &.{ 0x78, 0x56, 0x34, 0x12, 0x01, 0x00, 0x00, 0x00, 0x01 })) return error.UnexpectedValue;
+        if (unknown2 != 0x01) return error.UnexpectedValue;
+        if (!std.mem.allEqual(u8, &unknown3, 0)) return error.UnexpectedValue;
         return .{
-            .unknown1 = (try c.takeArray(9)).*,
-            .overview_waveform_type = @enumFromInt(try c.takeInt(u8)),
-            .waveform_color = @enumFromInt(try c.takeInt(u8)),
-            .unknown2 = try c.takeInt(u8),
-            .key_display_format = @enumFromInt(try c.takeInt(u8)),
-            .waveform_current_position = @enumFromInt(try c.takeInt(u8)),
-            .unknown3 = (try c.takeArray(18)).*,
+            .unknown1 = unknown1,
+            .overview_waveform_type = overview_waveform_type,
+            .waveform_color = waveform_color,
+            .unknown2 = unknown2,
+            .key_display_format = key_display_format,
+            .waveform_current_position = waveform_current_position,
+            .unknown3 = unknown3,
         };
     }
 
@@ -223,11 +237,13 @@ pub const MySetting = struct {
     hotcue_autoload: HotCueAutoLoad,
     /// "HOT CUE COLOR" setting.
     hotcue_color: HotCueColor,
-    /// Unknown field (apparently always zero), kept verbatim.
+    /// Unknown field, zero in all known files. Nonzero values are rejected
+    /// on parse; the stored value is written verbatim.
     unknown4: u16,
     /// "NEEDLE LOCK" setting.
     needle_lock: NeedleLock,
-    /// Unknown field (apparently always zero), kept verbatim.
+    /// Unknown field, zero in all known files. Nonzero values are rejected
+    /// on parse; the stored value is written verbatim.
     unknown5: u16,
     /// "TIME MODE" setting.
     time_mode: TimeMode,
@@ -241,7 +257,8 @@ pub const MySetting = struct {
     tempo_range: TempoRange,
     /// "PHASE METER" setting.
     phase_meter: PhaseMeter,
-    /// Unknown field (apparently always zero), kept verbatim.
+    /// Unknown field, zero in all known files. Nonzero values are rejected
+    /// on parse; the stored value is written verbatim.
     unknown6: u16,
 
     pub const serialized_len = 40;
@@ -255,36 +272,67 @@ pub const MySetting = struct {
     /// Version string found in `MYSETTING.DAT` files written by Rekordbox 6.6.1.
     pub const default_version = "0.001";
 
-    pub fn parse(c: *bin.Cursor) bin.ReadError!MySetting {
+    pub fn parse(c: *bin.Cursor) DataParseError!MySetting {
+        const unknown1 = (try c.takeArray(8)).*;
+        const on_air_display: OnAirDisplay = @enumFromInt(try c.takeInt(u8));
+        const lcd_brightness: LcdBrightness = @enumFromInt(try c.takeInt(u8));
+        const quantize: Quantize = @enumFromInt(try c.takeInt(u8));
+        const auto_cue_level: AutoCueLevel = @enumFromInt(try c.takeInt(u8));
+        const language: Language = @enumFromInt(try c.takeInt(u8));
+        const unknown2 = try c.takeInt(u8);
+        const jog_ring_brightness: JogRingBrightness = @enumFromInt(try c.takeInt(u8));
+        const jog_ring_indicator: JogRingIndicator = @enumFromInt(try c.takeInt(u8));
+        const slip_flashing: SlipFlashing = @enumFromInt(try c.takeInt(u8));
+        const unknown3 = (try c.takeArray(3)).*;
+        const disc_slot_illumination: DiscSlotIllumination = @enumFromInt(try c.takeInt(u8));
+        const eject_lock: EjectLock = @enumFromInt(try c.takeInt(u8));
+        const sync: Sync = @enumFromInt(try c.takeInt(u8));
+        const play_mode: PlayMode = @enumFromInt(try c.takeInt(u8));
+        const quantize_beat_value: QuantizeBeatValue = @enumFromInt(try c.takeInt(u8));
+        const hotcue_autoload: HotCueAutoLoad = @enumFromInt(try c.takeInt(u8));
+        const hotcue_color: HotCueColor = @enumFromInt(try c.takeInt(u8));
+        const unknown4 = try c.takeInt(u16);
+        const needle_lock: NeedleLock = @enumFromInt(try c.takeInt(u8));
+        const unknown5 = try c.takeInt(u16);
+        const time_mode: TimeMode = @enumFromInt(try c.takeInt(u8));
+        const jog_mode: JogMode = @enumFromInt(try c.takeInt(u8));
+        const auto_cue: AutoCue = @enumFromInt(try c.takeInt(u8));
+        const master_tempo: MasterTempo = @enumFromInt(try c.takeInt(u8));
+        const tempo_range: TempoRange = @enumFromInt(try c.takeInt(u8));
+        const phase_meter: PhaseMeter = @enumFromInt(try c.takeInt(u8));
+        const unknown6 = try c.takeInt(u16);
+        if (unknown4 != 0) return error.UnexpectedValue;
+        if (unknown5 != 0) return error.UnexpectedValue;
+        if (unknown6 != 0) return error.UnexpectedValue;
         return .{
-            .unknown1 = (try c.takeArray(8)).*,
-            .on_air_display = @enumFromInt(try c.takeInt(u8)),
-            .lcd_brightness = @enumFromInt(try c.takeInt(u8)),
-            .quantize = @enumFromInt(try c.takeInt(u8)),
-            .auto_cue_level = @enumFromInt(try c.takeInt(u8)),
-            .language = @enumFromInt(try c.takeInt(u8)),
-            .unknown2 = try c.takeInt(u8),
-            .jog_ring_brightness = @enumFromInt(try c.takeInt(u8)),
-            .jog_ring_indicator = @enumFromInt(try c.takeInt(u8)),
-            .slip_flashing = @enumFromInt(try c.takeInt(u8)),
-            .unknown3 = (try c.takeArray(3)).*,
-            .disc_slot_illumination = @enumFromInt(try c.takeInt(u8)),
-            .eject_lock = @enumFromInt(try c.takeInt(u8)),
-            .sync = @enumFromInt(try c.takeInt(u8)),
-            .play_mode = @enumFromInt(try c.takeInt(u8)),
-            .quantize_beat_value = @enumFromInt(try c.takeInt(u8)),
-            .hotcue_autoload = @enumFromInt(try c.takeInt(u8)),
-            .hotcue_color = @enumFromInt(try c.takeInt(u8)),
-            .unknown4 = try c.takeInt(u16),
-            .needle_lock = @enumFromInt(try c.takeInt(u8)),
-            .unknown5 = try c.takeInt(u16),
-            .time_mode = @enumFromInt(try c.takeInt(u8)),
-            .jog_mode = @enumFromInt(try c.takeInt(u8)),
-            .auto_cue = @enumFromInt(try c.takeInt(u8)),
-            .master_tempo = @enumFromInt(try c.takeInt(u8)),
-            .tempo_range = @enumFromInt(try c.takeInt(u8)),
-            .phase_meter = @enumFromInt(try c.takeInt(u8)),
-            .unknown6 = try c.takeInt(u16),
+            .unknown1 = unknown1,
+            .on_air_display = on_air_display,
+            .lcd_brightness = lcd_brightness,
+            .quantize = quantize,
+            .auto_cue_level = auto_cue_level,
+            .language = language,
+            .unknown2 = unknown2,
+            .jog_ring_brightness = jog_ring_brightness,
+            .jog_ring_indicator = jog_ring_indicator,
+            .slip_flashing = slip_flashing,
+            .unknown3 = unknown3,
+            .disc_slot_illumination = disc_slot_illumination,
+            .eject_lock = eject_lock,
+            .sync = sync,
+            .play_mode = play_mode,
+            .quantize_beat_value = quantize_beat_value,
+            .hotcue_autoload = hotcue_autoload,
+            .hotcue_color = hotcue_color,
+            .unknown4 = unknown4,
+            .needle_lock = needle_lock,
+            .unknown5 = unknown5,
+            .time_mode = time_mode,
+            .jog_mode = jog_mode,
+            .auto_cue = auto_cue,
+            .master_tempo = master_tempo,
+            .tempo_range = tempo_range,
+            .phase_meter = phase_meter,
+            .unknown6 = unknown6,
         };
     }
 
@@ -366,7 +414,8 @@ pub const MySetting2 = struct {
     jog_lcd_brightness: JogLcdBrightness,
     /// "WAVEFORM DIVISIONS" setting.
     waveform_divisions: WaveformDivisions,
-    /// Unknown field (apparently always zero), kept verbatim.
+    /// Unknown field, zero in all known files. Nonzero values are rejected
+    /// on parse; the stored value is written verbatim.
     unknown1: [5]u8,
     /// "WAVEFORM / PHASE METER" setting.
     waveform: Waveform,
@@ -374,7 +423,8 @@ pub const MySetting2 = struct {
     unknown2: u8,
     /// "BEAT JUMP BEAT VALUE" setting.
     beat_jump_beat_value: BeatJumpBeatValue,
-    /// Unknown field (apparently always zero), kept verbatim.
+    /// Unknown field, zero in all known files. Nonzero values are rejected
+    /// on parse; the stored value is written verbatim.
     unknown3: [27]u8,
 
     pub const serialized_len = 40;
@@ -388,18 +438,30 @@ pub const MySetting2 = struct {
     /// Version string found in `MYSETTING2.DAT` files written by Rekordbox 6.6.1.
     pub const default_version = "0.001";
 
-    pub fn parse(c: *bin.Cursor) bin.ReadError!MySetting2 {
+    pub fn parse(c: *bin.Cursor) DataParseError!MySetting2 {
+        const vinyl_speed_adjust: VinylSpeedAdjust = @enumFromInt(try c.takeInt(u8));
+        const jog_display_mode: JogDisplayMode = @enumFromInt(try c.takeInt(u8));
+        const pad_button_brightness: PadButtonBrightness = @enumFromInt(try c.takeInt(u8));
+        const jog_lcd_brightness: JogLcdBrightness = @enumFromInt(try c.takeInt(u8));
+        const waveform_divisions: WaveformDivisions = @enumFromInt(try c.takeInt(u8));
+        const unknown1 = (try c.takeArray(5)).*;
+        const waveform: Waveform = @enumFromInt(try c.takeInt(u8));
+        const unknown2 = try c.takeInt(u8);
+        const beat_jump_beat_value: BeatJumpBeatValue = @enumFromInt(try c.takeInt(u8));
+        const unknown3 = (try c.takeArray(27)).*;
+        if (!std.mem.allEqual(u8, &unknown1, 0)) return error.UnexpectedValue;
+        if (!std.mem.allEqual(u8, &unknown3, 0)) return error.UnexpectedValue;
         return .{
-            .vinyl_speed_adjust = @enumFromInt(try c.takeInt(u8)),
-            .jog_display_mode = @enumFromInt(try c.takeInt(u8)),
-            .pad_button_brightness = @enumFromInt(try c.takeInt(u8)),
-            .jog_lcd_brightness = @enumFromInt(try c.takeInt(u8)),
-            .waveform_divisions = @enumFromInt(try c.takeInt(u8)),
-            .unknown1 = (try c.takeArray(5)).*,
-            .waveform = @enumFromInt(try c.takeInt(u8)),
-            .unknown2 = try c.takeInt(u8),
-            .beat_jump_beat_value = @enumFromInt(try c.takeInt(u8)),
-            .unknown3 = (try c.takeArray(27)).*,
+            .vinyl_speed_adjust = vinyl_speed_adjust,
+            .jog_display_mode = jog_display_mode,
+            .pad_button_brightness = pad_button_brightness,
+            .jog_lcd_brightness = jog_lcd_brightness,
+            .waveform_divisions = waveform_divisions,
+            .unknown1 = unknown1,
+            .waveform = waveform,
+            .unknown2 = unknown2,
+            .beat_jump_beat_value = beat_jump_beat_value,
+            .unknown3 = unknown3,
         };
     }
 
@@ -465,7 +527,8 @@ pub const DJMMySetting = struct {
     indicator_brightness: MixerIndicatorBrightness,
     /// "CH FADER CURVE (LONG FADER)" setting.
     channel_fader_curve_long_fader: ChannelFaderCurveLongFader,
-    /// Unknown field (apparently always zero), kept verbatim.
+    /// Unknown field, zero in all known files. Nonzero values are rejected
+    /// on parse; the stored value is written verbatim.
     unknown2: [27]u8,
 
     pub const serialized_len = 52;
@@ -480,23 +543,39 @@ pub const DJMMySetting = struct {
     /// Version string found in `DJMMYSETTING.DAT` files written by Rekordbox 6.6.1.
     pub const default_version = "1.000";
 
-    pub fn parse(c: *bin.Cursor) bin.ReadError!DJMMySetting {
+    pub fn parse(c: *bin.Cursor) DataParseError!DJMMySetting {
+        const unknown1 = (try c.takeArray(12)).*;
+        const channel_fader_curve: ChannelFaderCurve = @enumFromInt(try c.takeInt(u8));
+        const crossfader_curve: CrossfaderCurve = @enumFromInt(try c.takeInt(u8));
+        const headphones_pre_eq: HeadphonesPreEq = @enumFromInt(try c.takeInt(u8));
+        const headphones_mono_split: HeadphonesMonoSplit = @enumFromInt(try c.takeInt(u8));
+        const beat_fx_quantize: BeatFxQuantize = @enumFromInt(try c.takeInt(u8));
+        const mic_low_cut: MicLowCut = @enumFromInt(try c.takeInt(u8));
+        const talk_over_mode: TalkOverMode = @enumFromInt(try c.takeInt(u8));
+        const talk_over_level: TalkOverLevel = @enumFromInt(try c.takeInt(u8));
+        const midi_channel: MidiChannel = @enumFromInt(try c.takeInt(u8));
+        const midi_button_type: MidiButtonType = @enumFromInt(try c.takeInt(u8));
+        const display_brightness: MixerDisplayBrightness = @enumFromInt(try c.takeInt(u8));
+        const indicator_brightness: MixerIndicatorBrightness = @enumFromInt(try c.takeInt(u8));
+        const channel_fader_curve_long_fader: ChannelFaderCurveLongFader = @enumFromInt(try c.takeInt(u8));
+        const unknown2 = (try c.takeArray(27)).*;
+        if (!std.mem.allEqual(u8, &unknown2, 0)) return error.UnexpectedValue;
         return .{
-            .unknown1 = (try c.takeArray(12)).*,
-            .channel_fader_curve = @enumFromInt(try c.takeInt(u8)),
-            .crossfader_curve = @enumFromInt(try c.takeInt(u8)),
-            .headphones_pre_eq = @enumFromInt(try c.takeInt(u8)),
-            .headphones_mono_split = @enumFromInt(try c.takeInt(u8)),
-            .beat_fx_quantize = @enumFromInt(try c.takeInt(u8)),
-            .mic_low_cut = @enumFromInt(try c.takeInt(u8)),
-            .talk_over_mode = @enumFromInt(try c.takeInt(u8)),
-            .talk_over_level = @enumFromInt(try c.takeInt(u8)),
-            .midi_channel = @enumFromInt(try c.takeInt(u8)),
-            .midi_button_type = @enumFromInt(try c.takeInt(u8)),
-            .display_brightness = @enumFromInt(try c.takeInt(u8)),
-            .indicator_brightness = @enumFromInt(try c.takeInt(u8)),
-            .channel_fader_curve_long_fader = @enumFromInt(try c.takeInt(u8)),
-            .unknown2 = (try c.takeArray(27)).*,
+            .unknown1 = unknown1,
+            .channel_fader_curve = channel_fader_curve,
+            .crossfader_curve = crossfader_curve,
+            .headphones_pre_eq = headphones_pre_eq,
+            .headphones_mono_split = headphones_mono_split,
+            .beat_fx_quantize = beat_fx_quantize,
+            .mic_low_cut = mic_low_cut,
+            .talk_over_mode = talk_over_mode,
+            .talk_over_level = talk_over_level,
+            .midi_channel = midi_channel,
+            .midi_button_type = midi_button_type,
+            .display_brightness = display_brightness,
+            .indicator_brightness = indicator_brightness,
+            .channel_fader_curve_long_fader = channel_fader_curve_long_fader,
+            .unknown2 = unknown2,
         };
     }
 
@@ -1205,13 +1284,9 @@ test "mysetting default roundtrip" {
     try testing.expectEqualStrings("0.001", parsed.versionString());
 }
 
-test "devsetting unknown fields and enum values roundtrip verbatim" {
+test "devsetting unknown enum values roundtrip verbatim" {
     var s = Setting(DevSetting).default();
-    s.data.unknown1 = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
-    s.data.unknown2 = 0xAA;
-    s.data.unknown3 = [_]u8{0x5A} ** 18;
     s.data.key_display_format = @enumFromInt(0x7F);
-    s.unknown = 0xBEEF;
 
     const out = try s.serialize(testing.allocator);
     defer testing.allocator.free(out);
@@ -1228,12 +1303,8 @@ test "mysetting unknown fields and enum values roundtrip verbatim" {
     s.data.unknown1 = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
     s.data.unknown2 = 0xAA;
     s.data.unknown3 = .{ 0x5A, 0xA5, 0x5A };
-    s.data.unknown4 = 0xDEAD;
-    s.data.unknown5 = 0xBEEF;
-    s.data.unknown6 = 0xCAFE;
     s.data.language = @enumFromInt(0x7F);
     s.data.tempo_range = @enumFromInt(0x00);
-    s.unknown = 0xBEEF;
 
     const out = try s.serialize(testing.allocator);
     defer testing.allocator.free(out);
@@ -1273,11 +1344,8 @@ test "djmmysetting default roundtrip" {
 
 test "mysetting2 unknown fields and enum values roundtrip verbatim" {
     var s = Setting(MySetting2).default();
-    s.data.unknown1 = .{ 1, 2, 3, 4, 5 };
     s.data.unknown2 = 0xAA;
-    s.data.unknown3 = [_]u8{0x5A} ** 27;
     s.data.waveform = @enumFromInt(0x7F);
-    s.unknown = 0xBEEF;
 
     const out = try s.serialize(testing.allocator);
     defer testing.allocator.free(out);
@@ -1292,9 +1360,7 @@ test "mysetting2 unknown fields and enum values roundtrip verbatim" {
 test "djmmysetting unknown fields and enum values roundtrip verbatim" {
     var s = Setting(DJMMySetting).default();
     s.data.unknown1 = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
-    s.data.unknown2 = [_]u8{0x5A} ** 27;
     s.data.midi_channel = @enumFromInt(0x7F);
-    s.unknown = 0xBEEF;
 
     const out = try s.serialize(testing.allocator);
     defer testing.allocator.free(out);
@@ -1334,6 +1400,61 @@ test "setting type mismatch is rejected" {
     const out = try Setting(MySetting).default().serialize(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectError(error.InvalidFormat, Setting(DevSetting).parse(out));
+}
+
+/// Serializes a setting and checks that parsing it back fails with
+/// `error.UnexpectedValue`.
+fn expectUnexpectedValue(s: anytype) !void {
+    const out = try s.serialize(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectError(error.UnexpectedValue, Setting(@TypeOf(s.data)).parse(out));
+}
+
+test "unexpected values in constant unknown fields are rejected" {
+    // The trailing `unknown` field is asserted for every file type.
+    var dev = Setting(DevSetting).default();
+    dev.unknown = 1;
+    try expectUnexpectedValue(dev);
+
+    // DevSetting: unknown1, unknown2, unknown3.
+    dev = Setting(DevSetting).default();
+    dev.data.unknown1[0] = 0x00;
+    try expectUnexpectedValue(dev);
+
+    dev = Setting(DevSetting).default();
+    dev.data.unknown2 = 0x02;
+    try expectUnexpectedValue(dev);
+
+    dev = Setting(DevSetting).default();
+    dev.data.unknown3[17] = 0x01;
+    try expectUnexpectedValue(dev);
+
+    // MySetting: unknown4, unknown5, unknown6.
+    var my = Setting(MySetting).default();
+    my.data.unknown4 = 0x0001;
+    try expectUnexpectedValue(my);
+
+    my = Setting(MySetting).default();
+    my.data.unknown5 = 0x8000;
+    try expectUnexpectedValue(my);
+
+    my = Setting(MySetting).default();
+    my.data.unknown6 = 0xFFFF;
+    try expectUnexpectedValue(my);
+
+    // MySetting2: unknown1, unknown3.
+    var my2 = Setting(MySetting2).default();
+    my2.data.unknown1[0] = 0x01;
+    try expectUnexpectedValue(my2);
+
+    my2 = Setting(MySetting2).default();
+    my2.data.unknown3[26] = 0xFF;
+    try expectUnexpectedValue(my2);
+
+    // DJMMySetting: unknown2.
+    var djm = Setting(DJMMySetting).default();
+    djm.data.unknown2[13] = 0x01;
+    try expectUnexpectedValue(djm);
 }
 
 test "DEVSETTING.DAT fixtures roundtrip byte-identical" {
