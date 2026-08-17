@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lib);
 
     const mod_tests = b.addTest(.{
-        .root_module = lib.root_module,
+        .root_module = bin,
     });
 
     const run_mod_tests = b.addRunArtifact(mod_tests);
