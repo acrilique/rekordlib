@@ -981,44 +981,83 @@ test "crc16-xmodem known answer" {
     try testing.expectEqual(@as(u16, 0x31C3), crc16Xmodem("123456789"));
 }
 
-test "devsetting default roundtrip" {
-    const s = Setting(DevSetting).default();
+/// Checks that the default `Setting(Data)` value roundtrips: the expected
+/// file length derived from the format constants, struct equality after
+/// parse, and the expected brand/software/version strings.
+fn expectDefaultRoundtrip(comptime Data: type) !void {
+    const s = Setting(Data).default();
     const out = try s.serialize(testing.allocator);
     defer testing.allocator.free(out);
-    try testing.expectEqual(@as(usize, 140), out.len);
+    try testing.expectEqual(data_offset + bin.serializedLen(Data) + 4, out.len);
 
-    const parsed = try Setting(DevSetting).parse(out);
+    const parsed = try Setting(Data).parse(out);
     try testing.expectEqual(s, parsed);
-    try testing.expectEqualStrings("PIONEER DJ", parsed.brandString());
+    try testing.expectEqualStrings(Data.default_brand, parsed.brandString());
     try testing.expectEqualStrings("rekordbox", parsed.softwareString());
-    try testing.expectEqualStrings("6.6.1", parsed.versionString());
+    try testing.expectEqualStrings(Data.default_version, parsed.versionString());
 }
 
-test "mysetting default roundtrip" {
-    const s = Setting(MySetting).default();
+/// Checks that `s` parses back equal and serializes to the same bytes, so
+/// unknown field and enum values survive verbatim.
+fn expectRoundtripVerbatim(s: anytype) !void {
     const out = try s.serialize(testing.allocator);
     defer testing.allocator.free(out);
-    try testing.expectEqual(@as(usize, 148), out.len);
-
-    const parsed = try Setting(MySetting).parse(out);
-    try testing.expectEqual(s, parsed);
-    try testing.expectEqualStrings("PIONEER", parsed.brandString());
-    try testing.expectEqualStrings("rekordbox", parsed.softwareString());
-    try testing.expectEqualStrings("0.001", parsed.versionString());
-}
-
-test "devsetting unknown enum values roundtrip verbatim" {
-    var s = Setting(DevSetting).default();
-    s.data.key_display_format = @enumFromInt(0x7F);
-
-    const out = try s.serialize(testing.allocator);
-    defer testing.allocator.free(out);
-    const parsed = try Setting(DevSetting).parse(out);
+    const parsed = try Setting(@TypeOf(s.data)).parse(out);
     try testing.expectEqual(s, parsed);
 
     const out2 = try parsed.serialize(testing.allocator);
     defer testing.allocator.free(out2);
     try testing.expectEqualSlices(u8, out, out2);
+}
+
+/// Parses every `testdata` fixture named `basename` and checks that it
+/// re-serializes byte-identical, with at least `min_count` files found.
+fn expectFixturesRoundtrip(comptime Data: type, comptime basename: []const u8, min_count: usize) !void {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, "testdata", .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(alloc);
+    defer walker.deinit();
+
+    var count: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.eql(u8, entry.basename, basename)) continue;
+
+        const input = try dir.readFileAlloc(io, entry.path, alloc, std.Io.Limit.limited(1 << 20));
+        defer alloc.free(input);
+        const parsed = try Setting(Data).parse(input);
+        const output = try parsed.serialize(alloc);
+        defer alloc.free(output);
+        if (!std.mem.eql(u8, input, output)) std.debug.print("mismatching fixture: {s}\n", .{entry.path});
+        try testing.expectEqualSlices(u8, input, output);
+        count += 1;
+    }
+
+    try testing.expect(count >= min_count);
+}
+
+/// Serializes a setting and checks that parsing it back fails with
+/// `error.UnexpectedValue`.
+fn expectUnexpectedValue(s: anytype) !void {
+    const out = try s.serialize(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectError(error.UnexpectedValue, Setting(@TypeOf(s.data)).parse(out));
+}
+
+test "devsetting default roundtrip" {
+    try expectDefaultRoundtrip(DevSetting);
+}
+
+test "mysetting default roundtrip" {
+    try expectDefaultRoundtrip(MySetting);
+}
+
+test "devsetting unknown enum values roundtrip verbatim" {
+    var s = Setting(DevSetting).default();
+    s.data.key_display_format = @enumFromInt(0x7F);
+    try expectRoundtripVerbatim(s);
 }
 
 test "mysetting unknown fields and enum values roundtrip verbatim" {
@@ -1028,71 +1067,29 @@ test "mysetting unknown fields and enum values roundtrip verbatim" {
     s.data.unknown3 = .{ 0x5A, 0xA5, 0x5A };
     s.data.language = @enumFromInt(0x7F);
     s.data.tempo_range = @enumFromInt(0x00);
-
-    const out = try s.serialize(testing.allocator);
-    defer testing.allocator.free(out);
-    const parsed = try Setting(MySetting).parse(out);
-    try testing.expectEqual(s, parsed);
-
-    const out2 = try parsed.serialize(testing.allocator);
-    defer testing.allocator.free(out2);
-    try testing.expectEqualSlices(u8, out, out2);
+    try expectRoundtripVerbatim(s);
 }
 
 test "mysetting2 default roundtrip" {
-    const s = Setting(MySetting2).default();
-    const out = try s.serialize(testing.allocator);
-    defer testing.allocator.free(out);
-    try testing.expectEqual(@as(usize, 148), out.len);
-
-    const parsed = try Setting(MySetting2).parse(out);
-    try testing.expectEqual(s, parsed);
-    try testing.expectEqualStrings("PIONEER", parsed.brandString());
-    try testing.expectEqualStrings("rekordbox", parsed.softwareString());
-    try testing.expectEqualStrings("0.001", parsed.versionString());
+    try expectDefaultRoundtrip(MySetting2);
 }
 
 test "djmmysetting default roundtrip" {
-    const s = Setting(DJMMySetting).default();
-    const out = try s.serialize(testing.allocator);
-    defer testing.allocator.free(out);
-    try testing.expectEqual(@as(usize, 160), out.len);
-
-    const parsed = try Setting(DJMMySetting).parse(out);
-    try testing.expectEqual(s, parsed);
-    try testing.expectEqualStrings("PioneerDJ", parsed.brandString());
-    try testing.expectEqualStrings("rekordbox", parsed.softwareString());
-    try testing.expectEqualStrings("1.000", parsed.versionString());
+    try expectDefaultRoundtrip(DJMMySetting);
 }
 
 test "mysetting2 unknown fields and enum values roundtrip verbatim" {
     var s = Setting(MySetting2).default();
     s.data.unknown2 = 0xAA;
     s.data.waveform = @enumFromInt(0x7F);
-
-    const out = try s.serialize(testing.allocator);
-    defer testing.allocator.free(out);
-    const parsed = try Setting(MySetting2).parse(out);
-    try testing.expectEqual(s, parsed);
-
-    const out2 = try parsed.serialize(testing.allocator);
-    defer testing.allocator.free(out2);
-    try testing.expectEqualSlices(u8, out, out2);
+    try expectRoundtripVerbatim(s);
 }
 
 test "djmmysetting unknown fields and enum values roundtrip verbatim" {
     var s = Setting(DJMMySetting).default();
     s.data.unknown1 = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
     s.data.midi_channel = @enumFromInt(0x7F);
-
-    const out = try s.serialize(testing.allocator);
-    defer testing.allocator.free(out);
-    const parsed = try Setting(DJMMySetting).parse(out);
-    try testing.expectEqual(s, parsed);
-
-    const out2 = try parsed.serialize(testing.allocator);
-    defer testing.allocator.free(out2);
-    try testing.expectEqualSlices(u8, out, out2);
+    try expectRoundtripVerbatim(s);
 }
 
 test "parse rejects invalid structure" {
@@ -1123,14 +1120,6 @@ test "setting type mismatch is rejected" {
     const out = try Setting(MySetting).default().serialize(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectError(error.InvalidFormat, Setting(DevSetting).parse(out));
-}
-
-/// Serializes a setting and checks that parsing it back fails with
-/// `error.UnexpectedValue`.
-fn expectUnexpectedValue(s: anytype) !void {
-    const out = try s.serialize(testing.allocator);
-    defer testing.allocator.free(out);
-    try testing.expectError(error.UnexpectedValue, Setting(@TypeOf(s.data)).parse(out));
 }
 
 test "unexpected values in constant unknown fields are rejected" {
@@ -1181,105 +1170,21 @@ test "unexpected values in constant unknown fields are rejected" {
 }
 
 test "DEVSETTING.DAT fixtures roundtrip byte-identical" {
-    const alloc = testing.allocator;
-    const io = testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "testdata", .{ .iterate = true });
-    defer dir.close(io);
-    var walker = try dir.walk(alloc);
-    defer walker.deinit();
-
-    var count: usize = 0;
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.eql(u8, entry.basename, "DEVSETTING.DAT")) continue;
-
-        const input = try dir.readFileAlloc(io, entry.path, alloc, std.Io.Limit.limited(1 << 20));
-        defer alloc.free(input);
-        const parsed = try Setting(DevSetting).parse(input);
-        const output = try parsed.serialize(alloc);
-        defer alloc.free(output);
-        try testing.expectEqualSlices(u8, input, output);
-        count += 1;
-    }
-
     // Five devsetting fixtures plus two complete device exports.
-    try testing.expect(count >= 7);
+    try expectFixturesRoundtrip(DevSetting, "DEVSETTING.DAT", 7);
 }
 
 test "MYSETTING.DAT fixtures roundtrip byte-identical" {
-    const alloc = testing.allocator;
-    const io = testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "testdata", .{ .iterate = true });
-    defer dir.close(io);
-    var walker = try dir.walk(alloc);
-    defer walker.deinit();
-
-    var count: usize = 0;
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.eql(u8, entry.basename, "MYSETTING.DAT")) continue;
-
-        const input = try dir.readFileAlloc(io, entry.path, alloc, std.Io.Limit.limited(1 << 20));
-        defer alloc.free(input);
-        const parsed = try Setting(MySetting).parse(input);
-        const output = try parsed.serialize(alloc);
-        defer alloc.free(output);
-        try testing.expectEqualSlices(u8, input, output);
-        count += 1;
-    }
-
     // Thirty-two mysetting fixtures plus two complete device exports.
-    try testing.expect(count >= 34);
+    try expectFixturesRoundtrip(MySetting, "MYSETTING.DAT", 34);
 }
 
 test "MYSETTING2.DAT fixtures roundtrip byte-identical" {
-    const alloc = testing.allocator;
-    const io = testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "testdata", .{ .iterate = true });
-    defer dir.close(io);
-    var walker = try dir.walk(alloc);
-    defer walker.deinit();
-
-    var count: usize = 0;
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.eql(u8, entry.basename, "MYSETTING2.DAT")) continue;
-
-        const input = try dir.readFileAlloc(io, entry.path, alloc, std.Io.Limit.limited(1 << 20));
-        defer alloc.free(input);
-        const parsed = try Setting(MySetting2).parse(input);
-        const output = try parsed.serialize(alloc);
-        defer alloc.free(output);
-        try testing.expectEqualSlices(u8, input, output);
-        count += 1;
-    }
-
     // Fourteen mysetting2 fixtures plus two complete device exports.
-    try testing.expect(count >= 16);
+    try expectFixturesRoundtrip(MySetting2, "MYSETTING2.DAT", 16);
 }
 
 test "DJMMYSETTING.DAT fixtures roundtrip byte-identical" {
-    const alloc = testing.allocator;
-    const io = testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "testdata", .{ .iterate = true });
-    defer dir.close(io);
-    var walker = try dir.walk(alloc);
-    defer walker.deinit();
-
-    var count: usize = 0;
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.eql(u8, entry.basename, "DJMMYSETTING.DAT")) continue;
-
-        const input = try dir.readFileAlloc(io, entry.path, alloc, std.Io.Limit.limited(1 << 20));
-        defer alloc.free(input);
-        const parsed = try Setting(DJMMySetting).parse(input);
-        const output = try parsed.serialize(alloc);
-        defer alloc.free(output);
-        try testing.expectEqualSlices(u8, input, output);
-        count += 1;
-    }
-
     // Twenty-three djmmysetting fixtures plus two complete device exports.
-    try testing.expect(count >= 25);
+    try expectFixturesRoundtrip(DJMMySetting, "DJMMYSETTING.DAT", 25);
 }
