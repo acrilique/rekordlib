@@ -21,7 +21,7 @@ const len_string_fields = 3 * string_field_len;
 /// Offset of the `data` section; the checksum starts at `data_offset + len_data`.
 const data_offset = 4 + len_string_fields + 4;
 
-pub const ParseError = error{ UnexpectedEof, InvalidFormat, UnexpectedValue };
+pub const ParseError = error{ UnexpectedEof, InvalidFormat, UnexpectedValue, OutOfMemory };
 
 /// Represents a `*SETTING.DAT` file, generic over the payload type `Data`
 /// (`DevSetting` for `DEVSETTING.DAT`, `MySetting` for `MYSETTING.DAT`,
@@ -53,17 +53,17 @@ pub fn Setting(comptime Data: type) type {
         /// recalculated on write.
         pub fn parse(buf: []const u8) ParseError!Self {
             var c = bin.Cursor.init(buf);
-            const len_stringdata = try c.takeInt(u32);
+            const len_stringdata = try c.takeInt(u32, .little);
             if (len_stringdata != len_string_fields) return error.InvalidFormat;
             const brand = (try c.takeArray(string_field_len)).*;
             const software = (try c.takeArray(string_field_len)).*;
             const version = (try c.takeArray(string_field_len)).*;
-            const len_data = try c.takeInt(u32);
+            const len_data = try c.takeInt(u32, .little);
             if (len_data != data_len) return error.InvalidFormat;
-            const data = try bin.takeStruct(&c, Data);
+            const data = try bin.takeStruct(&c, Data, .little);
             try validateConstantFields(Data, data);
-            _ = try c.takeInt(u16);
-            const unknown = try c.takeInt(u16);
+            _ = try c.takeInt(u16, .little);
+            const unknown = try c.takeInt(u16, .little);
             if (unknown != 0) return error.UnexpectedValue;
             if (!c.atEnd()) return error.InvalidFormat;
             return .{
@@ -76,21 +76,21 @@ pub fn Setting(comptime Data: type) type {
         }
 
         pub fn writeTo(s: *const Self, e: *bin.Emitter) bin.WriteError!void {
-            try e.putInt(u32, len_string_fields);
+            try e.putInt(u32, len_string_fields, .little);
             try e.putBytes(&s.brand);
             try e.putBytes(&s.software);
             try e.putBytes(&s.version);
-            try e.putInt(u32, data_len);
-            try bin.putStruct(e, &s.data);
+            try e.putInt(u32, data_len, .little);
+            try bin.putStruct(e, &s.data, .little);
             const checksum_at = e.pos();
-            try e.putInt(u16, 0);
-            try e.putInt(u16, s.unknown);
+            try e.putInt(u16, 0, .little);
+            try e.putInt(u16, s.unknown, .little);
             // The checksum is CRC-16/XMODEM; it covers just the data
             // section, except in `DJMMYSETTING.DAT` where it covers the
             // whole file.
             const checksum_start = if (Data.checksum_covers_data_only) data_offset else 0;
             const crc = std.hash.crc.Crc16Xmodem.hash(e.written()[checksum_start..checksum_at]);
-            e.patchIntAt(checksum_at, u16, crc);
+            e.patchIntAt(checksum_at, u16, crc, .little);
         }
 
         pub fn serialize(s: *const Self, alloc: std.mem.Allocator) bin.WriteError![]u8 {
