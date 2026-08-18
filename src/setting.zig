@@ -21,7 +21,7 @@ const len_string_fields = 3 * string_field_len;
 /// Offset of the `data` section; the checksum starts at `data_offset + len_data`.
 const data_offset = 4 + len_string_fields + 4;
 
-pub const ParseError = error{ UnexpectedEof, InvalidFormat, UnexpectedValue, OutOfMemory };
+pub const ParseError = error{ UnexpectedEof, InvalidFormat, UnexpectedValue, OutOfMemory, ChecksumMismatch };
 
 /// Represents a `*SETTING.DAT` file, generic over the payload type `Data`
 /// (`DevSetting` for `DEVSETTING.DAT`, `MySetting` for `MYSETTING.DAT`,
@@ -49,7 +49,8 @@ pub fn Setting(comptime Data: type) type {
         /// other value, so it is always zero in parsed instances.
         unknown: u16,
 
-        /// Parse a `*SETTING.DAT` image. The checksum is not verified; it is
+        /// Parse a `*SETTING.DAT` image. The checksum is verified and a
+        /// mismatch is reported as `error.ChecksumMismatch`; it is
         /// recalculated on write.
         pub fn parse(buf: []const u8) ParseError!Self {
             var c = bin.Cursor.init(buf);
@@ -62,10 +63,16 @@ pub fn Setting(comptime Data: type) type {
             if (len_data != data_len) return error.InvalidFormat;
             const data = try bin.takeStruct(&c, Data, .little);
             try bin.validateConstantFields(Data, data);
-            _ = try c.takeInt(u16, .little);
+            const checksum = try c.takeInt(u16, .little);
             const unknown = try c.takeInt(u16, .little);
             if (unknown != 0) return error.UnexpectedValue;
             if (!c.atEnd()) return error.InvalidFormat;
+            // The checksum covers the same range as in `writeTo`: just the
+            // data section, except in `DJMMYSETTING.DAT` where it covers the
+            // whole file.
+            const checksum_start = if (Data.checksum_covers_data_only) data_offset else 0;
+            const expected = std.hash.crc.Crc16Xmodem.hash(buf[checksum_start .. data_offset + data_len]);
+            if (checksum != expected) return error.ChecksumMismatch;
             return .{
                 .brand = brand,
                 .software = software,
@@ -1103,6 +1110,42 @@ test "writeTo appends correctly after foreign bytes" {
     const plain = try Setting(DJMMySetting).default().serialize(testing.allocator);
     defer testing.allocator.free(plain);
     try testing.expectEqualSlices(u8, plain, e.written()[prefix.len..]);
+}
+
+test "parse verifies the checksum" {
+    const out = try Setting(DevSetting).default().serialize(testing.allocator);
+    defer testing.allocator.free(out);
+
+    // A corrupted checksum field is rejected. It sits right before the
+    // trailing `unknown` field, at data_offset + data_len.
+    const bad_checksum = try testing.allocator.dupe(u8, out);
+    defer testing.allocator.free(bad_checksum);
+    bad_checksum[136] ^= 0xFF;
+    try testing.expectError(error.ChecksumMismatch, Setting(DevSetting).parse(bad_checksum));
+
+    // Corruption inside the covered data section is caught even though the
+    // structure still parses: enum fields accept any value, and this byte is
+    // `overview_waveform_type` (data_offset + 9).
+    const bad_data = try testing.allocator.dupe(u8, out);
+    defer testing.allocator.free(bad_data);
+    bad_data[113] = 0x55;
+    try testing.expectError(error.ChecksumMismatch, Setting(DevSetting).parse(bad_data));
+
+    // The same flip in the brand string (offset 5) is outside DEVSETTING's
+    // data-only coverage, so the file still parses.
+    const bad_brand = try testing.allocator.dupe(u8, out);
+    defer testing.allocator.free(bad_brand);
+    bad_brand[5] ^= 0xFF;
+    _ = try Setting(DevSetting).parse(bad_brand);
+
+    // DJMMYSETTING's checksum covers the whole file, so the brand flip is
+    // caught there.
+    const djm = try Setting(DJMMySetting).default().serialize(testing.allocator);
+    defer testing.allocator.free(djm);
+    const bad_djm = try testing.allocator.dupe(u8, djm);
+    defer testing.allocator.free(bad_djm);
+    bad_djm[5] ^= 0xFF;
+    try testing.expectError(error.ChecksumMismatch, Setting(DJMMySetting).parse(bad_djm));
 }
 
 test "unexpected values in constant unknown fields are rejected" {
