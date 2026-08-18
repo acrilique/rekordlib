@@ -76,6 +76,7 @@ pub fn Setting(comptime Data: type) type {
         }
 
         pub fn writeTo(s: *const Self, e: *bin.Emitter) bin.WriteError!void {
+            const start = e.pos();
             try e.putInt(u32, len_string_fields, .little);
             try e.putBytes(&s.brand);
             try e.putBytes(&s.software);
@@ -87,8 +88,10 @@ pub fn Setting(comptime Data: type) type {
             try e.putInt(u16, s.unknown, .little);
             // The checksum is CRC-16/XMODEM; it covers just the data
             // section, except in `DJMMYSETTING.DAT` where it covers the
-            // whole file.
-            const checksum_start = if (Data.checksum_covers_data_only) data_offset else 0;
+            // whole file. Both ranges are relative to where this setting
+            // starts in the emitter, so appending to a non-empty emitter
+            // works too.
+            const checksum_start = start + if (Data.checksum_covers_data_only) data_offset else 0;
             const crc = std.hash.crc.Crc16Xmodem.hash(e.written()[checksum_start..checksum_at]);
             e.patchIntAt(checksum_at, u16, crc, .little);
         }
@@ -1087,6 +1090,20 @@ test "setting type mismatch is rejected" {
     const out = try Setting(MySetting).default().serialize(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectError(error.InvalidFormat, Setting(DevSetting).parse(out));
+}
+
+test "writeTo appends correctly after foreign bytes" {
+    // DJMMySetting exercises the whole-file checksum range, which must be
+    // relative to where the setting starts, not to the emitter start.
+    const prefix = [_]u8{ 0xAA, 0xBB, 0xCC };
+    var e = bin.Emitter.init(testing.allocator);
+    defer e.deinit();
+    try e.putBytes(&prefix);
+    try Setting(DJMMySetting).default().writeTo(&e);
+
+    const plain = try Setting(DJMMySetting).default().serialize(testing.allocator);
+    defer testing.allocator.free(plain);
+    try testing.expectEqualSlices(u8, plain, e.written()[prefix.len..]);
 }
 
 test "unexpected values in constant unknown fields are rejected" {
