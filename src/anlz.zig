@@ -247,8 +247,11 @@ pub const CueList = struct {
     list_type: CueListType = .memory_cues,
     /// Unknown field, zero in all known files.
     unknown: u16 = 0,
-    /// Unknown field, `0xFFFFFFFF` in known files with no cues.
-    memory_count: u32 = 0,
+    /// Entry count of a non-empty memory cue list; the `0xFFFFFFFF`
+    /// sentinel in hot cue lists and empty lists. Validated on parse and
+    /// derived on write, so the count stays consistent when `cues` is
+    /// edited.
+    memory_count: u32 = 0xFFFF_FFFF,
     /// Cues of this list. The `len_cues` count is recomputed from this slice
     /// on write.
     cues: []Cue = &.{},
@@ -259,6 +262,8 @@ pub const CueList = struct {
         const unknown = try c.takeInt(u16, .big);
         const len_cues = try c.takeInt(u16, .big);
         const memory_count = try c.takeInt(u32, .big);
+        const expected_count: u64 = if (list_type == .memory_cues and len_cues > 0) len_cues else 0xFFFF_FFFF;
+        if (memory_count != expected_count) return error.UnexpectedValue;
         const cues = try alloc.alloc(Cue, len_cues);
         for (cues) |*cue| cue.* = try Cue.parse(c);
         return .{
@@ -273,7 +278,11 @@ pub const CueList = struct {
         try e.putInt(u32, @intFromEnum(cl.list_type), .big);
         try e.putInt(u16, cl.unknown, .big);
         try e.putInt(u16, try narrow(u16, cl.cues.len), .big);
-        try e.putInt(u32, cl.memory_count, .big);
+        const memory_count: u32 = if (cl.list_type == .memory_cues and cl.cues.len > 0)
+            try narrow(u32, cl.cues.len)
+        else
+            0xFFFF_FFFF;
+        try e.putInt(u32, memory_count, .big);
         for (cl.cues) |*cue| try cue.writeTo(e);
     }
 };
@@ -1744,6 +1753,34 @@ test "writing more cues than the u16 len_cues field holds fails" {
     try testing.expectError(error.Overflow, buildFile(alloc, &file_header_data, &sections));
 }
 
+test "cue list memory_count is derived and validated" {
+    const alloc = testing.allocator;
+    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+    var cues = [_]Cue{.{ .time = 1000 }};
+    const sections = [_]Content{
+        .{ .cue_list = .{ .list_type = .memory_cues, .cues = &cues } },
+    };
+    const out = try buildFile(alloc, &file_header_data, &sections);
+    defer alloc.free(out);
+    _ = try expectRoundtripBytes(alloc, out);
+
+    var parsed = try Anlz.parse(alloc, out);
+    defer parsed.deinit();
+    // A non-empty memory list derives the entry count; a hot list derives
+    // (and parses) the `0xFFFFFFFF` sentinel instead, whatever value the
+    // struct field happens to hold.
+    try testing.expectEqual(@as(u32, 1), parsed.sections[0].cue_list.memory_count);
+
+    // A stored count that disagrees with the list type and length is
+    // rejected on parse: the field sits at file offset 12 (`PMAI`) + 16
+    // (header_data) + 12 (section header) + 8 (list_type, unknown,
+    // len_cues).
+    const bad = try alloc.dupe(u8, out);
+    defer alloc.free(bad);
+    std.mem.writeInt(u32, bad[48..52], 5, .big);
+    try testing.expectError(error.UnexpectedValue, Anlz.parse(alloc, bad));
+}
+
 test "waveform sections roundtrip with checks" {
     const alloc = testing.allocator;
     const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
@@ -1927,8 +1964,10 @@ test "mutating fixture cue list entries re-parses" {
     defer parsed.deinit();
     const arena = parsed.arena.allocator();
 
-    // The fixture's hot cue list is empty; `len_cues` is derived on write.
+    // The fixture's hot cue list is empty; `len_cues` is derived on write,
+    // and `memory_count` keeps the hot-cue sentinel.
     const list = &parsed.findSection(.cue_list).?.cue_list;
+    try testing.expectEqual(CueListType.hot_cues, list.list_type);
     try testing.expectEqual(@as(usize, 0), list.cues.len);
 
     // Add two cues: the file grows by one wire entry each.
@@ -1944,7 +1983,9 @@ test "mutating fixture cue list entries re-parses" {
 
     var reparsed = try Anlz.parse(alloc, grown);
     defer reparsed.deinit();
-    try testing.expectEqualSlices(Cue, cues, reparsed.findSection(.cue_list).?.cue_list.cues);
+    const grown_list = reparsed.findSection(.cue_list).?.cue_list;
+    try testing.expectEqualSlices(Cue, cues, grown_list.cues);
+    try testing.expectEqual(@as(u32, 0xFFFF_FFFF), grown_list.memory_count);
 
     // Modify the first cue: the file size stays, the entry changes.
     cues[0].time += 500;
