@@ -128,14 +128,25 @@ pub const BeatGrid = struct {
     /// slice on write.
     beats: []Beat = &.{},
 
+    /// Kind of the section this content serializes as.
+    const kind: Kind = .beat_grid;
+    /// Fixed size of the section header: the 12-byte prefix plus the
+    /// preamble fields.
+    const header_size: u32 = 24;
+
     fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!BeatGrid {
-        if (header.size != 24) return error.UnexpectedValue;
+        if (header.size != header_size) return error.UnexpectedValue;
         const unknown1 = try c.takeInt(u32, .big);
         const unknown2 = try c.takeInt(u32, .big);
         const len_beats = try c.takeInt(u32, .big);
         if (@as(u64, len_beats) * bin.serializedLen(Beat) != header.content_size()) return error.InvalidFormat;
         const beats = try bin.takeStructSlice(alloc, c, Beat, .big, len_beats);
         return .{ .unknown1 = unknown1, .unknown2 = unknown2, .beats = beats };
+    }
+
+    /// Bytes of section content beyond the fixed header.
+    fn contentLen(bg: *const BeatGrid) usize {
+        return bin.serializedLen(Beat) * bg.beats.len;
     }
 
     fn writeTo(bg: *const BeatGrid, e: *bin.Emitter) WriteError!void {
@@ -278,8 +289,14 @@ pub const CueList = struct {
     /// byte-identical.
     entry_header_size: u32 = 16,
 
+    /// Kind of the section this content serializes as.
+    const kind: Kind = .cue_list;
+    /// Fixed size of the section header: the 12-byte prefix plus the
+    /// preamble fields.
+    const header_size: u32 = 24;
+
     fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!CueList {
-        if (header.size != 24) return error.UnexpectedValue;
+        if (header.size != header_size) return error.UnexpectedValue;
         const list_type: CueListType = @enumFromInt(try c.takeInt(u32, .big));
         const unknown = try c.takeInt(u16, .big);
         const len_cues = try c.takeInt(u16, .big);
@@ -295,6 +312,11 @@ pub const CueList = struct {
             .cues = cues,
             .entry_header_size = entry_header_size orelse 16,
         };
+    }
+
+    /// Bytes of section content beyond the fixed header.
+    fn contentLen(cl: *const CueList) usize {
+        return Cue.wire_len * cl.cues.len;
     }
 
     fn writeTo(cl: *const CueList, e: *bin.Emitter) WriteError!void {
@@ -544,13 +566,19 @@ pub const ExtendedCueList = struct {
     /// on write.
     cues: []ExtendedCue = &.{},
 
+    /// Kind of the section this content serializes as.
+    const kind: Kind = .extended_cue_list;
+    /// Fixed size of the section header: the 12-byte prefix plus the
+    /// preamble fields.
+    const header_size: u32 = 20;
+
     /// Unknown fields that must hold their default value in all known files;
     /// other values are rejected on parse (rekordcrate asserts `unknown` is
     /// zero on read).
     pub const constant_fields = .{.unknown};
 
     fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!ExtendedCueList {
-        if (header.size != 20) return error.UnexpectedValue;
+        if (header.size != header_size) return error.UnexpectedValue;
         const list_type: CueListType = @enumFromInt(try c.takeInt(u32, .big));
         const len_cues = try c.takeInt(u16, .big);
         const unknown = try c.takeInt(u16, .big);
@@ -558,6 +586,13 @@ pub const ExtendedCueList = struct {
         const cues = try alloc.alloc(ExtendedCue, len_cues);
         for (cues) |*cue| cue.* = try ExtendedCue.parse(c, alloc);
         return .{ .list_type = list_type, .unknown = unknown, .cues = cues };
+    }
+
+    /// Bytes of section content beyond the fixed header.
+    fn contentLen(cl: *const ExtendedCueList) usize {
+        var len: usize = 0;
+        for (cl.cues) |*cue| len += cue.wireLen();
+        return len;
     }
 
     fn writeTo(cl: *const ExtendedCueList, e: *bin.Emitter) WriteError!void {
@@ -574,11 +609,23 @@ pub const Path = struct {
     /// must equal the section's `content_size`.
     path: LenPrefixedWideString = .{},
 
-    fn parse(c: *bin.Cursor, header: Header) ParseError!Path {
-        if (header.size != 16) return error.UnexpectedValue;
+    /// Kind of the section this content serializes as.
+    const kind: Kind = .path;
+    /// Fixed size of the section header: the 12-byte prefix plus the
+    /// preamble fields.
+    const header_size: u32 = 16;
+
+    fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!Path {
+        _ = alloc;
+        if (header.size != header_size) return error.UnexpectedValue;
         const p = try bin.takeStruct(c, Path, .big);
         if (p.path.raw.len != header.content_size()) return error.InvalidFormat;
         return p;
+    }
+
+    /// Bytes of section content beyond the fixed header.
+    fn contentLen(p: *const Path) usize {
+        return p.path.byte_len();
     }
 
     fn writeTo(p: *const Path, e: *bin.Emitter) WriteError!void {
@@ -593,11 +640,22 @@ pub const Vbr = struct {
     /// Unknown data blob, the raw section content.
     data: []const u8 = &.{},
 
+    /// Kind of the section this content serializes as.
+    const kind: Kind = .vbr;
+    /// Fixed size of the section header: the 12-byte prefix plus the
+    /// preamble fields.
+    const header_size: u32 = 16;
+
     fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!Vbr {
-        if (header.size != 16) return error.UnexpectedValue;
+        if (header.size != header_size) return error.UnexpectedValue;
         const unknown1 = try c.takeInt(u32, .big);
         const data = try alloc.dupe(u8, try c.takeBytes(header.content_size()));
         return .{ .unknown1 = unknown1, .data = data };
+    }
+
+    /// Bytes of section content beyond the fixed header.
+    fn contentLen(v: *const Vbr) usize {
+        return v.data.len;
     }
 
     fn writeTo(v: *const Vbr, e: *bin.Emitter) WriteError!void {
@@ -674,6 +732,8 @@ pub const Waveform3BandColumn = struct {
 
 /// Comptime shape of a waveform section, as consumed by `WaveformSection`.
 const WaveformSpec = struct {
+    /// Kind of the generated section.
+    kind: Kind,
     /// Type of a single waveform column.
     column: type,
     /// Value of the `len_entry_bytes` preamble field, the wire size of one
@@ -704,6 +764,8 @@ fn WaveformSection(comptime spec: WaveformSpec) type {
     return struct {
         const Self = @This();
 
+        /// Kind of the section this content serializes as.
+        const kind: Kind = spec.kind;
         /// Fixed size of the section header: the 12-byte prefix plus the
         /// preamble fields.
         const header_size: u32 = 12 + 4 + (if (spec.entry_bytes != null) 4 else 0) + (if (spec.unknown != null) 4 else 0);
@@ -735,7 +797,7 @@ fn WaveformSection(comptime spec: WaveformSpec) type {
             };
         }
 
-        /// Bytes of column data this section serializes.
+        /// Bytes of section content beyond the fixed header.
         fn contentLen(w: *const Self) usize {
             return bin.serializedLen(Column) * w.data.len;
         }
@@ -751,6 +813,7 @@ fn WaveformSection(comptime spec: WaveformSpec) type {
 
 /// Fixed-width monochrome preview of the track waveform.
 pub const WaveformPreview = WaveformSection(.{
+    .kind = .waveform_preview,
     .column = WaveformPreviewColumn,
     .unknown = 0x0001_0000,
 });
@@ -758,6 +821,7 @@ pub const WaveformPreview = WaveformSection(.{
 /// Smaller version of the fixed-width monochrome preview of the track
 /// waveform (for the CDJ-900).
 pub const TinyWaveformPreview = WaveformSection(.{
+    .kind = .tiny_waveform_preview,
     .column = TinyWaveformPreviewColumn,
     .unknown = 0x0001_0000,
 });
@@ -766,6 +830,7 @@ pub const TinyWaveformPreview = WaveformSection(.{
 /// files. Each entry represents one half-frame of audio data, so there are
 /// 150 entries per second of track audio.
 pub const WaveformDetail = WaveformSection(.{
+    .kind = .waveform_detail,
     .column = WaveformPreviewColumn,
     .entry_bytes = 1,
     .unknown = 0x0096_0000,
@@ -774,6 +839,7 @@ pub const WaveformDetail = WaveformSection(.{
 
 /// Fixed-width colored preview of the track waveform, in `.EXT` files.
 pub const WaveformColorPreview = WaveformSection(.{
+    .kind = .waveform_color_preview,
     .column = WaveformColorPreviewColumn,
     .entry_bytes = 6,
     .unknown = 0,
@@ -783,6 +849,7 @@ pub const WaveformColorPreview = WaveformSection(.{
 /// files. Each entry represents one half-frame of audio data, so there are
 /// 150 entries per second of track audio.
 pub const WaveformColorDetail = WaveformSection(.{
+    .kind = .waveform_color_detail,
     .column = WaveformColorDetailColumn,
     .entry_bytes = 2,
     .unknown = 0x0096_0305,
@@ -790,6 +857,7 @@ pub const WaveformColorDetail = WaveformSection(.{
 
 /// Fixed-width 3-band preview of the track waveform, in `.2EX` files.
 pub const Waveform3BandPreview = WaveformSection(.{
+    .kind = .waveform_3band_preview,
     .column = Waveform3BandColumn,
     .entry_bytes = 3,
 });
@@ -798,6 +866,7 @@ pub const Waveform3BandPreview = WaveformSection(.{
 /// files. Each entry represents one half-frame of audio data, so there are
 /// 150 entries per second of track audio.
 pub const Waveform3BandDetail = WaveformSection(.{
+    .kind = .waveform_3band_detail,
     .column = Waveform3BandColumn,
     .entry_bytes = 3,
     .unknown = 0x0096_0000,
@@ -969,8 +1038,14 @@ pub const SongStructure = struct {
     /// Song structure data.
     data: SongStructureData = .{},
 
+    /// Kind of the section this content serializes as.
+    const kind: Kind = .song_structure;
+    /// Fixed size of the section header: the 12-byte prefix plus the
+    /// preamble fields.
+    const header_size: u32 = 32;
+
     fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!SongStructure {
-        if (header.size != 32) return error.UnexpectedValue;
+        if (header.size != header_size) return error.UnexpectedValue;
         const len_entry_bytes = try c.takeInt(u32, .big);
         if (len_entry_bytes != bin.serializedLen(Phrase)) return error.UnexpectedValue;
         const len_entries = try c.takeInt(u16, .big);
@@ -986,15 +1061,20 @@ pub const SongStructure = struct {
         return .{ .is_encrypted = is_encrypted, .data = data };
     }
 
-    fn writeTo(ss: *const SongStructure, e: *bin.Emitter, alloc: std.mem.Allocator) WriteError!void {
+    /// Bytes of section content beyond the fixed header.
+    fn contentLen(ss: *const SongStructure) usize {
+        return bin.serializedLen(Phrase) * ss.data.phrases.len;
+    }
+
+    fn writeTo(ss: *const SongStructure, e: *bin.Emitter) WriteError!void {
         const len_entries: u16 = try narrow(u16, ss.data.phrases.len);
         try e.putInt(u32, @intCast(bin.serializedLen(Phrase)), .big);
         try e.putInt(u16, len_entries, .big);
-        var data_out = bin.Emitter.init(alloc);
+        var data_out = bin.Emitter.init(e.alloc);
         defer data_out.deinit();
         try ss.data.writeTo(&data_out);
         const bytes = try data_out.toOwnedSlice();
-        defer alloc.free(bytes);
+        defer e.alloc.free(bytes);
         if (ss.is_encrypted) xor.apply(bytes, &getKey(len_entries));
         try e.putBytes(bytes);
     }
@@ -1062,159 +1142,67 @@ pub const Content = union(enum) {
 /// Parses the content of one section from `c` (positioned right after the
 /// section's 12-byte header). The section's bytes are bounded to its
 /// declared `total_size` and must be consumed exactly; a mismatch is
-/// reported as `InvalidFormat`.
+/// reported as `InvalidFormat`. Each content type parses the `kind` it
+/// declares; the entry kinds (`file`, `cue`, `extended_cue`) only appear
+/// nested inside cue lists, so a stray one matches no type and is kept
+/// verbatim, like any unknown tag.
 fn parseContent(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!Content {
     if (header.size < 12 or header.total_size < header.size) return error.InvalidFormat;
     const region = try c.takeBytes(header.total_size - 12);
     var sub = bin.Cursor.initAlloc(alloc, region);
-    const content: Content = switch (header.kind) {
-        .beat_grid => .{ .beat_grid = try BeatGrid.parse(&sub, alloc, header) },
-        .cue_list => .{ .cue_list = try CueList.parse(&sub, alloc, header) },
-        .extended_cue_list => .{ .extended_cue_list = try ExtendedCueList.parse(&sub, alloc, header) },
-        .path => .{ .path = try Path.parse(&sub, header) },
-        .vbr => .{ .vbr = try Vbr.parse(&sub, alloc, header) },
-        .waveform_preview => .{ .waveform_preview = try WaveformPreview.parse(&sub, alloc, header) },
-        .tiny_waveform_preview => .{ .tiny_waveform_preview = try TinyWaveformPreview.parse(&sub, alloc, header) },
-        .waveform_detail => .{ .waveform_detail = try WaveformDetail.parse(&sub, alloc, header) },
-        .waveform_color_preview => .{ .waveform_color_preview = try WaveformColorPreview.parse(&sub, alloc, header) },
-        .waveform_color_detail => .{ .waveform_color_detail = try WaveformColorDetail.parse(&sub, alloc, header) },
-        .waveform_3band_preview => .{ .waveform_3band_preview = try Waveform3BandPreview.parse(&sub, alloc, header) },
-        .waveform_3band_detail => .{ .waveform_3band_detail = try Waveform3BandDetail.parse(&sub, alloc, header) },
-        .song_structure => .{ .song_structure = try SongStructure.parse(&sub, alloc, header) },
-        // Entry kinds only appear nested inside cue lists; a stray `file`
-        // header or cue section at the top level is kept verbatim, like any
-        // unknown tag.
-        .file, .cue, .extended_cue, _ => .{ .unknown = try Unknown.parse(&sub, alloc, header) },
-    };
+    const content: Content = inline for (std.meta.fields(Content)) |field| {
+        const T = field.type;
+        if (T == Unknown) continue;
+        if (T.kind == header.kind) break @unionInit(Content, field.name, try T.parse(&sub, alloc, header));
+    } else .{ .unknown = try Unknown.parse(&sub, alloc, header) };
     if (!sub.atEnd()) return error.InvalidFormat;
     return content;
 }
 
-/// The kind a section's content serializes as: every known content maps to
-/// its kind, unknown content keeps the kind it was parsed with.
+/// The kind a section's content serializes as: every content type declares
+/// its `kind` (unknown content keeps the kind it was parsed with).
 fn sectionKind(content: *const Content) Kind {
     return switch (content.*) {
-        .beat_grid => .beat_grid,
-        .cue_list => .cue_list,
-        .extended_cue_list => .extended_cue_list,
-        .path => .path,
-        .vbr => .vbr,
-        .waveform_preview => .waveform_preview,
-        .tiny_waveform_preview => .tiny_waveform_preview,
-        .waveform_detail => .waveform_detail,
-        .waveform_color_preview => .waveform_color_preview,
-        .waveform_color_detail => .waveform_color_detail,
-        .waveform_3band_preview => .waveform_3band_preview,
-        .waveform_3band_detail => .waveform_3band_detail,
-        .song_structure => .song_structure,
         .unknown => |u| u.kind,
+        inline else => |x| @TypeOf(x).kind,
     };
 }
 
-/// Derives the wire header of `content`: the kind and the canonical header
-/// `size` are fixed per section type (and follow the blob lengths, for
-/// unknown sections), while `total_size` follows from the content lengths.
-/// Deriving headers from the data rather than storing parsed values keeps
-/// files consistent when parsed content is modified.
+/// Derives the wire header of `content`: every section type declares its
+/// `kind` and canonical `header_size` and provides a `contentLen` method,
+/// so the header follows from the content; unknown sections keep their
+/// parsed kind and follow the blob lengths. Deriving headers from the data
+/// rather than storing parsed values keeps files consistent when parsed
+/// content is modified.
 fn sectionHeader(content: Content) WriteError!Header {
     return switch (content) {
-        .beat_grid => |x| .{
-            .kind = .beat_grid,
-            .size = 24,
-            .total_size = try narrow(u32, 24 + bin.serializedLen(Beat) * x.beats.len),
-        },
-        .cue_list => |x| .{
-            .kind = .cue_list,
-            .size = 24,
-            .total_size = try narrow(u32, 24 + Cue.wire_len * x.cues.len),
-        },
-        .extended_cue_list => |x| .{
-            .kind = .extended_cue_list,
-            .size = 20,
-            .total_size = blk: {
-                var len: usize = 20;
-                for (x.cues) |*cue| len += cue.wireLen();
-                break :blk try narrow(u32, len);
-            },
-        },
-        .path => |x| .{ .kind = .path, .size = 16, .total_size = 16 + x.path.byte_len() },
-        .vbr => |x| .{ .kind = .vbr, .size = 16, .total_size = try narrow(u32, 16 + x.data.len) },
-        .waveform_preview => |x| .{
-            .kind = .waveform_preview,
-            .size = WaveformPreview.header_size,
-            .total_size = try narrow(u32, WaveformPreview.header_size + x.contentLen()),
-        },
-        .tiny_waveform_preview => |x| .{
-            .kind = .tiny_waveform_preview,
-            .size = TinyWaveformPreview.header_size,
-            .total_size = try narrow(u32, TinyWaveformPreview.header_size + x.contentLen()),
-        },
-        .waveform_detail => |x| .{
-            .kind = .waveform_detail,
-            .size = WaveformDetail.header_size,
-            .total_size = try narrow(u32, WaveformDetail.header_size + x.contentLen()),
-        },
-        .waveform_color_preview => |x| .{
-            .kind = .waveform_color_preview,
-            .size = WaveformColorPreview.header_size,
-            .total_size = try narrow(u32, WaveformColorPreview.header_size + x.contentLen()),
-        },
-        .waveform_color_detail => |x| .{
-            .kind = .waveform_color_detail,
-            .size = WaveformColorDetail.header_size,
-            .total_size = try narrow(u32, WaveformColorDetail.header_size + x.contentLen()),
-        },
-        .waveform_3band_preview => |x| .{
-            .kind = .waveform_3band_preview,
-            .size = Waveform3BandPreview.header_size,
-            .total_size = try narrow(u32, Waveform3BandPreview.header_size + x.contentLen()),
-        },
-        .waveform_3band_detail => |x| .{
-            .kind = .waveform_3band_detail,
-            .size = Waveform3BandDetail.header_size,
-            .total_size = try narrow(u32, Waveform3BandDetail.header_size + x.contentLen()),
-        },
-        .song_structure => |x| .{
-            .kind = .song_structure,
-            .size = 32,
-            .total_size = try narrow(u32, 32 + bin.serializedLen(Phrase) * x.data.phrases.len),
-        },
         .unknown => |x| .{
             .kind = x.kind,
             .size = try narrow(u32, 12 + x.header_data.len),
             .total_size = try narrow(u32, 12 + x.header_data.len + x.content_data.len),
         },
+        inline else => |x| blk: {
+            const T = @TypeOf(x);
+            break :blk .{
+                .kind = T.kind,
+                .size = T.header_size,
+                .total_size = try narrow(u32, T.header_size + x.contentLen()),
+            };
+        },
     };
 }
 
 /// Writes one section: its derived header followed by the content.
-fn writeSection(content: Content, e: *bin.Emitter, alloc: std.mem.Allocator) WriteError!void {
+fn writeSection(content: Content, e: *bin.Emitter) WriteError!void {
     try bin.putStruct(e, try sectionHeader(content), .big);
-    try writeContent(content, e, alloc);
-}
-
-fn writeContent(content: Content, e: *bin.Emitter, alloc: std.mem.Allocator) WriteError!void {
     switch (content) {
-        .beat_grid => |x| try x.writeTo(e),
-        .cue_list => |x| try x.writeTo(e),
-        .extended_cue_list => |x| try x.writeTo(e),
-        .path => |x| try x.writeTo(e),
-        .vbr => |x| try x.writeTo(e),
-        .waveform_preview => |x| try x.writeTo(e),
-        .tiny_waveform_preview => |x| try x.writeTo(e),
-        .waveform_detail => |x| try x.writeTo(e),
-        .waveform_color_preview => |x| try x.writeTo(e),
-        .waveform_color_detail => |x| try x.writeTo(e),
-        .waveform_3band_preview => |x| try x.writeTo(e),
-        .waveform_3band_detail => |x| try x.writeTo(e),
-        .song_structure => |x| try x.writeTo(e, alloc),
-        .unknown => |x| try x.writeTo(e),
+        inline else => |x| try x.writeTo(e),
     }
 }
 
 /// Writes a whole file: the `PMAI` header with sizes derived from the
 /// content, `header_data`, and the sections.
-fn writeFile(e: *bin.Emitter, alloc: std.mem.Allocator, header_data: []const u8, sections: []const Content) WriteError!void {
+fn writeFile(e: *bin.Emitter, header_data: []const u8, sections: []const Content) WriteError!void {
     var total: usize = 12 + header_data.len;
     for (sections) |content| total += (try sectionHeader(content)).total_size;
     try bin.putStruct(e, Header{
@@ -1223,7 +1211,7 @@ fn writeFile(e: *bin.Emitter, alloc: std.mem.Allocator, header_data: []const u8,
         .total_size = try narrow(u32, total),
     }, .big);
     try e.putBytes(header_data);
-    for (sections) |content| try writeSection(content, e, alloc);
+    for (sections) |content| try writeSection(content, e);
 }
 
 /// Serializes a whole file into an owned ANLZ image; the caller owns the
@@ -1231,7 +1219,7 @@ fn writeFile(e: *bin.Emitter, alloc: std.mem.Allocator, header_data: []const u8,
 fn serializeFile(alloc: std.mem.Allocator, header_data: []const u8, sections: []const Content) WriteError![]u8 {
     var e = bin.Emitter.init(alloc);
     defer e.deinit();
-    try writeFile(&e, alloc, header_data, sections);
+    try writeFile(&e, header_data, sections);
     return e.toOwnedSlice();
 }
 
