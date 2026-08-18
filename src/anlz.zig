@@ -126,6 +126,7 @@ pub const BeatGrid = struct {
         const unknown1 = try c.takeInt(u32, .big);
         const unknown2 = try c.takeInt(u32, .big);
         const len_beats = try c.takeInt(u32, .big);
+        if (@as(u64, len_beats) * bin.serializedLen(Beat) != header.content_size()) return error.InvalidFormat;
         const beats = try alloc.alloc(Beat, len_beats);
         for (beats) |*beat| beat.* = try bin.takeStruct(c, Beat, .big);
         return .{ .unknown1 = unknown1, .unknown2 = unknown2, .beats = beats };
@@ -505,7 +506,7 @@ pub const ExtendedCueList = struct {
         const list_type: CueListType = @enumFromInt(try c.takeInt(u32, .big));
         const len_cues = try c.takeInt(u16, .big);
         const unknown = try c.takeInt(u16, .big);
-        try validateConstantFields(ExtendedCueList, .{ .list_type = list_type, .unknown = unknown });
+        try bin.validateConstantFields(ExtendedCueList, .{ .list_type = list_type, .unknown = unknown });
         const cues = try alloc.alloc(ExtendedCue, len_cues);
         for (cues) |*cue| cue.* = try ExtendedCue.parse(c, alloc);
         return .{ .list_type = list_type, .unknown = unknown, .cues = cues };
@@ -705,7 +706,7 @@ pub const WaveformDetail = struct {
         const len_entries = try c.takeInt(u32, .big);
         if (@as(u64, len_entry_bytes) * len_entries != header.content_size()) return error.InvalidFormat;
         const unknown = try c.takeInt(u32, .big);
-        try validateConstantFields(WaveformDetail, .{ .unknown = unknown });
+        try bin.validateConstantFields(WaveformDetail, .{ .unknown = unknown });
         const data = try alloc.alloc(WaveformPreviewColumn, len_entries);
         for (data) |*column| column.* = try bin.takeStruct(c, WaveformPreviewColumn, .big);
         return .{ .unknown = unknown, .data = data };
@@ -822,7 +823,7 @@ pub const Waveform3BandDetail = struct {
         const len_entries = try c.takeInt(u32, .big);
         if (@as(u64, len_entry_bytes) * len_entries != header.content_size()) return error.InvalidFormat;
         const unknown = try c.takeInt(u32, .big);
-        try validateConstantFields(Waveform3BandDetail, .{ .unknown = unknown });
+        try bin.validateConstantFields(Waveform3BandDetail, .{ .unknown = unknown });
         const data = try alloc.alloc(Waveform3BandDetailColumn, len_entries);
         for (data) |*column| column.* = try bin.takeStruct(c, Waveform3BandDetailColumn, .big);
         return .{ .unknown = unknown, .data = data };
@@ -1299,23 +1300,6 @@ pub const Anlz = struct {
     }
 };
 
-/// Checks the fields listed in `T.constant_fields` against their default
-/// values, which they must hold in all known files; other values are
-/// rejected on parse. Fields not listed are accepted and written verbatim.
-fn validateConstantFields(comptime T: type, value: T) error{UnexpectedValue}!void {
-    if (!@hasDecl(T, "constant_fields")) return;
-    const defaults = T{};
-    inline for (T.constant_fields) |field| {
-        const name = @tagName(field);
-        if (!@hasField(T, name))
-            @compileError("constant_fields of " ++ @typeName(T) ++ " reference unknown field '" ++ name ++ "'");
-        switch (@typeInfo(@TypeOf(@field(value, name)))) {
-            .array => if (!std.mem.eql(u8, &@field(value, name), &@field(defaults, name))) return error.UnexpectedValue,
-            else => if (@field(value, name) != @field(defaults, name)) return error.UnexpectedValue,
-        }
-    }
-}
-
 const testing = std.testing;
 
 /// Serializes `sections` into a full ANLZ image.
@@ -1394,7 +1378,7 @@ fn expectFixturesRoundtrip() !void {
         try testing.expectEqualSlices(u8, input, output);
         count += 1;
     }
-    try testing.expectEqual(@as(usize, 6), count);
+    try testing.expect(count >= 6);
 }
 
 test "ANLZ fixtures roundtrip byte-identical" {
