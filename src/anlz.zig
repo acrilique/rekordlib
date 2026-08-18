@@ -1139,6 +1139,25 @@ pub const Content = union(enum) {
     unknown: Unknown,
 };
 
+// Content types must declare pairwise distinct `kind`s: `parseContent`
+// dispatches on first match, so a duplicate would silently parse one
+// type's bytes as another while `sectionHeader` still writes the kind and
+// sizes of the type that declared it.
+comptime {
+    const fields = std.meta.fields(Content);
+    for (fields, 0..) |a, i| {
+        if (a.type == Unknown) continue;
+        for (fields[i + 1 ..]) |b| {
+            if (b.type == Unknown) continue;
+            if (a.type.kind == b.type.kind)
+                @compileError(
+                    "content types " ++ @typeName(a.type) ++ " and " ++
+                        @typeName(b.type) ++ " declare the same section kind",
+                );
+        }
+    }
+}
+
 /// Parses the content of one section from `c` (positioned right after the
 /// section's 12-byte header). The section's bytes are bounded to its
 /// declared `total_size` and must be consumed exactly; a mismatch is
