@@ -1125,6 +1125,27 @@ fn parseContent(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseE
     return content;
 }
 
+/// The kind a section's content serializes as: every known content maps to
+/// its kind, unknown content keeps the kind it was parsed with.
+fn sectionKind(content: *const Content) Kind {
+    return switch (content.*) {
+        .beat_grid => .beat_grid,
+        .cue_list => .cue_list,
+        .extended_cue_list => .extended_cue_list,
+        .path => .path,
+        .vbr => .vbr,
+        .waveform_preview => .waveform_preview,
+        .tiny_waveform_preview => .tiny_waveform_preview,
+        .waveform_detail => .waveform_detail,
+        .waveform_color_preview => .waveform_color_preview,
+        .waveform_color_detail => .waveform_color_detail,
+        .waveform_3band_preview => .waveform_3band_preview,
+        .waveform_3band_detail => .waveform_3band_detail,
+        .song_structure => .song_structure,
+        .unknown => |u| u.kind,
+    };
+}
+
 /// Derives the wire header of `content`: the kind and the canonical header
 /// `size` are fixed per section type (and follow the blob lengths, for
 /// unknown sections), while `total_size` follows from the content lengths.
@@ -1299,6 +1320,16 @@ pub const Anlz = struct {
         try writeFile(&e, alloc, m.header_data, m.sections);
         return e.toOwnedSlice();
     }
+
+    /// Returns the first section of the given kind, or null if the file
+    /// contains none. The pointer reaches into this instance, so mutations
+    /// through it are picked up by `serialize`.
+    pub fn findSection(m: *const Anlz, kind: Kind) ?*Content {
+        for (m.sections) |*section| {
+            if (sectionKind(section) == kind) return section;
+        }
+        return null;
+    }
 };
 
 const testing = std.testing;
@@ -1384,6 +1415,62 @@ fn expectFixturesRoundtrip() !void {
 
 test "ANLZ fixtures roundtrip byte-identical" {
     try expectFixturesRoundtrip();
+}
+
+/// Reads a fixture from `testdata`.
+fn readFixture(alloc: std.mem.Allocator, sub_path: []const u8) ![]u8 {
+    const io = testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, "testdata", .{});
+    defer dir.close(io);
+    return dir.readFileAlloc(io, sub_path, alloc, std.Io.Limit.limited(1 << 20));
+}
+
+/// Path of the P053 `.DAT` fixture, relative to `testdata`.
+const p053_dat = "complete_export/demo_tracks/PIONEER/USBANLZ/P053/0001D21F/ANLZ0000.DAT";
+
+/// Path of the P053 `.EXT` fixture, relative to `testdata`.
+const p053_ext = "complete_export/demo_tracks/PIONEER/USBANLZ/P053/0001D21F/ANLZ0000.EXT";
+
+test "empty file roundtrips" {
+    // Port of rekordcrate's anlz_new_empty_roundtrips: a file built from no
+    // sections serializes, re-parses, and stays empty.
+    const alloc = testing.allocator;
+    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+    const out = try buildFile(alloc, &file_header_data, &.{});
+    defer alloc.free(out);
+    try testing.expectEqual(@as(usize, 28), out.len);
+
+    var parsed = try Anlz.parse(alloc, out);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 0), parsed.sections.len);
+
+    const again = try parsed.serialize(alloc);
+    defer alloc.free(again);
+    try testing.expectEqualSlices(u8, out, again);
+    // The `PMAI` file header is derived on write.
+    try testing.expectEqual(@as(u32, @intFromEnum(Kind.file)), std.mem.readInt(u32, again[0..4], .big));
+}
+
+test "derived headers roundtrip through content size" {
+    // Port of rekordcrate's header_for_section_roundtrips_through_content_size:
+    // the derived header of a section without preamble is `size` 12 and
+    // `total_size` 12 + content, which the size accessors invert.
+    const content = [_]u8{0} ** 100;
+    const plain = sectionHeader(.{ .unknown = .{
+        .kind = @enumFromInt(fourcc("PQT2")),
+        .content_data = &content,
+    } });
+    try testing.expectEqual(@as(u32, 12), plain.size);
+    try testing.expectEqual(@as(u32, 112), plain.total_size);
+    try testing.expectEqual(@as(u32, 100), plain.content_size());
+    try testing.expectEqual(@as(u32, 0), plain.remaining_size());
+
+    // A section with a 4-byte preamble keeps it in `remaining_size`.
+    const vbr = sectionHeader(.{ .vbr = .{ .data = &content } });
+    try testing.expectEqual(@as(u32, 16), vbr.size);
+    try testing.expectEqual(@as(u32, 116), vbr.total_size);
+    try testing.expectEqual(@as(u32, 100), vbr.content_size());
+    try testing.expectEqual(@as(u32, 4), vbr.remaining_size());
 }
 
 test "unknown section kinds roundtrip verbatim" {
@@ -1777,6 +1864,220 @@ test "mutating parsed data re-serializes consistently" {
     const text = try reparsed.sections[1].extended_cue_list.cues[0].comment.utf8(alloc);
     defer alloc.free(text);
     try testing.expectEqualStrings("Breakdown", text);
+}
+
+test "mutating fixture beat grid tempo re-parses" {
+    const alloc = testing.allocator;
+    const input = try readFixture(alloc, p053_dat);
+    defer alloc.free(input);
+    var parsed = try Anlz.parse(alloc, input);
+    defer parsed.deinit();
+
+    const grid = &parsed.findSection(.beat_grid).?.beat_grid;
+    try testing.expectEqual(@as(usize, 257), grid.beats.len);
+    for (grid.beats) |*beat| beat.tempo += 1;
+
+    const modified = try parsed.serialize(alloc);
+    defer alloc.free(modified);
+    // Same beat count, same file size, different bytes.
+    try testing.expectEqual(input.len, modified.len);
+    try testing.expect(!std.mem.eql(u8, input, modified));
+
+    var reparsed = try Anlz.parse(alloc, modified);
+    defer reparsed.deinit();
+    const beats = reparsed.findSection(.beat_grid).?.beat_grid.beats;
+    try testing.expectEqualSlices(Beat, grid.beats, beats);
+    try testing.expectEqual(@as(u16, 12001), beats[0].tempo);
+}
+
+test "mutating fixture cue list entries re-parses" {
+    const alloc = testing.allocator;
+    const input = try readFixture(alloc, p053_dat);
+    defer alloc.free(input);
+    var parsed = try Anlz.parse(alloc, input);
+    defer parsed.deinit();
+    const arena = parsed.arena.allocator();
+
+    // The fixture's hot cue list is empty; `len_cues` is derived on write.
+    const list = &parsed.findSection(.cue_list).?.cue_list;
+    try testing.expectEqual(@as(usize, 0), list.cues.len);
+
+    // Add two cues: the file grows by one wire entry each.
+    const cues = try arena.alloc(Cue, 2);
+    cues[0] = .{ .hot_cue = 1, .time = 0x0004_62F7 };
+    cues[1] = .{ .hot_cue = 2, .cue_type = .loop, .time = 1000, .loop_time = 2000 };
+    list.cues = cues;
+
+    const grown = try parsed.serialize(alloc);
+    defer alloc.free(grown);
+    try testing.expectEqual(input.len + 2 * Cue.wire_len, grown.len);
+    try expectRoundtripBytes(alloc, grown);
+
+    var reparsed = try Anlz.parse(alloc, grown);
+    defer reparsed.deinit();
+    try testing.expectEqualSlices(Cue, cues, reparsed.findSection(.cue_list).?.cue_list.cues);
+
+    // Modify the first cue: the file size stays, the entry changes.
+    cues[0].time += 500;
+    const tweaked = try parsed.serialize(alloc);
+    defer alloc.free(tweaked);
+    try testing.expectEqual(grown.len, tweaked.len);
+
+    var reparsed2 = try Anlz.parse(alloc, tweaked);
+    defer reparsed2.deinit();
+    const tweaked_cues = reparsed2.findSection(.cue_list).?.cue_list.cues;
+    try testing.expectEqualSlices(Cue, cues, tweaked_cues);
+    try testing.expectEqual(@as(u32, 0x0004_62F7 + 500), tweaked_cues[0].time);
+
+    // Remove one cue, then the other: the derived count shrinks the file
+    // back to the original bytes.
+    list.cues = cues[0..1];
+    const shrunk = try parsed.serialize(alloc);
+    defer alloc.free(shrunk);
+    try testing.expectEqual(input.len + Cue.wire_len, shrunk.len);
+
+    var reparsed3 = try Anlz.parse(alloc, shrunk);
+    defer reparsed3.deinit();
+    try testing.expectEqualSlices(Cue, cues[0..1], reparsed3.findSection(.cue_list).?.cue_list.cues);
+
+    list.cues = &.{};
+    const restored = try parsed.serialize(alloc);
+    defer alloc.free(restored);
+    try testing.expectEqualSlices(u8, input, restored);
+}
+
+test "mutating fixture extended cue comment re-parses" {
+    const alloc = testing.allocator;
+    const input = try readFixture(alloc, p053_ext);
+    defer alloc.free(input);
+    var parsed = try Anlz.parse(alloc, input);
+    defer parsed.deinit();
+    const arena = parsed.arena.allocator();
+
+    const list = &parsed.findSection(.extended_cue_list).?.extended_cue_list;
+    try testing.expectEqual(@as(usize, 0), list.cues.len);
+
+    // Add a cue whose comment grows the entry beyond its 68 fixed bytes.
+    const cues = try arena.alloc(ExtendedCue, 1);
+    cues[0] = .{
+        .hot_cue = 1,
+        .time = 0x0004_62F7,
+        .comment = try LenPrefixedWideString.fromUtf8(arena, "Break"),
+    };
+    list.cues = cues;
+
+    const grown = try parsed.serialize(alloc);
+    defer alloc.free(grown);
+    // 68 fixed bytes plus the 12 comment bytes ("Break" + NUL, UTF-16BE).
+    try testing.expectEqual(input.len + 68 + 12, grown.len);
+    try expectRoundtripBytes(alloc, grown);
+
+    var reparsed = try Anlz.parse(alloc, grown);
+    defer reparsed.deinit();
+    const grown_list = reparsed.findSection(.extended_cue_list).?.extended_cue_list;
+    try testing.expectEqual(@as(usize, 1), grown_list.cues.len);
+    const text = try grown_list.cues[0].comment.utf8(alloc);
+    defer alloc.free(text);
+    try testing.expectEqualStrings("Break", text);
+
+    // Growing the comment text grows the entry byte for byte.
+    cues[0].comment = try LenPrefixedWideString.fromUtf8(arena, "Breakdown!");
+    const longer = try parsed.serialize(alloc);
+    defer alloc.free(longer);
+    try testing.expectEqual(grown.len + 10, longer.len);
+
+    // Clearing the comment shrinks the cue back to its fixed size.
+    cues[0].comment = .{};
+    const cleared = try parsed.serialize(alloc);
+    defer alloc.free(cleared);
+    try testing.expectEqual(input.len + 68, cleared.len);
+    try expectRoundtripBytes(alloc, cleared);
+
+    var reparsed2 = try Anlz.parse(alloc, cleared);
+    defer reparsed2.deinit();
+    const cleared_cue = &reparsed2.findSection(.extended_cue_list).?.extended_cue_list.cues[0];
+    try testing.expectEqual(@as(usize, 0), cleared_cue.comment.raw.len);
+    const empty_text = try cleared_cue.comment.utf8(alloc);
+    defer alloc.free(empty_text);
+    try testing.expectEqualStrings("", empty_text);
+}
+
+test "mutating fixture path re-parses" {
+    const alloc = testing.allocator;
+    const input = try readFixture(alloc, p053_dat);
+    defer alloc.free(input);
+    var parsed = try Anlz.parse(alloc, input);
+    defer parsed.deinit();
+
+    const section = parsed.findSection(.path).?;
+    const original = try section.path.path.utf8(alloc);
+    defer alloc.free(original);
+    try testing.expectEqualStrings("/Contents/Loopmasters/UnknownAlbum/Demo Track 2.mp3", original);
+    const old_len = section.path.path.byte_len();
+
+    section.path.path = try LenPrefixedWideString.fromUtf8(parsed.arena.allocator(), "/Contents/mutated.mp3");
+    const new_len = section.path.path.byte_len();
+    try testing.expect(new_len < old_len);
+
+    const modified = try parsed.serialize(alloc);
+    defer alloc.free(modified);
+    try testing.expectEqual(input.len - old_len + new_len, modified.len);
+    try expectRoundtripBytes(alloc, modified);
+
+    var reparsed = try Anlz.parse(alloc, modified);
+    defer reparsed.deinit();
+    const text = try reparsed.findSection(.path).?.path.path.utf8(alloc);
+    defer alloc.free(text);
+    try testing.expectEqualStrings("/Contents/mutated.mp3", text);
+}
+
+test "mutating fixture song structure re-encrypts" {
+    const alloc = testing.allocator;
+    const input = try readFixture(alloc, p053_ext);
+    defer alloc.free(input);
+    var parsed = try Anlz.parse(alloc, input);
+    defer parsed.deinit();
+    const arena = parsed.arena.allocator();
+
+    const ss = &parsed.findSection(.song_structure).?.song_structure;
+    try testing.expect(ss.is_encrypted);
+    try testing.expectEqual(Mood.mid, ss.data.mood);
+    try testing.expectEqual(@as(usize, 11), ss.data.phrases.len);
+
+    // Same-length mutations: the output must be re-obfuscated with the key
+    // so that it decodes again on re-parse.
+    ss.data.mood = .low;
+    ss.data.phrases[0].beat += 1;
+    const modified = try parsed.serialize(alloc);
+    defer alloc.free(modified);
+    try testing.expectEqual(input.len, modified.len);
+    try testing.expect(!std.mem.eql(u8, input, modified));
+
+    var reparsed = try Anlz.parse(alloc, modified);
+    defer reparsed.deinit();
+    const ss2 = &reparsed.findSection(.song_structure).?.song_structure;
+    try testing.expect(ss2.is_encrypted);
+    try testing.expectEqual(Mood.low, ss2.data.mood);
+    try testing.expectEqualSlices(Phrase, ss.data.phrases, ss2.data.phrases);
+
+    // Growing the phrase list changes the entry count, and with it the XOR
+    // key; the re-obfuscated section must decode with the new key.
+    const phrases = try arena.alloc(Phrase, ss.data.phrases.len + 1);
+    @memcpy(phrases[0 .. phrases.len - 1], ss.data.phrases);
+    phrases[phrases.len - 1] = .{ .index = 12, .beat = ss.data.phrases[ss.data.phrases.len - 1].beat + 16 };
+    ss.data.phrases = phrases;
+
+    const grown = try parsed.serialize(alloc);
+    defer alloc.free(grown);
+    try testing.expectEqual(modified.len + bin.serializedLen(Phrase), grown.len);
+    try expectRoundtripBytes(alloc, grown);
+
+    var reparsed2 = try Anlz.parse(alloc, grown);
+    defer reparsed2.deinit();
+    const ss3 = &reparsed2.findSection(.song_structure).?.song_structure;
+    try testing.expect(ss3.is_encrypted);
+    try testing.expectEqual(Mood.low, ss3.data.mood);
+    try testing.expectEqualSlices(Phrase, phrases, ss3.data.phrases);
 }
 
 test "length-prefixed wide strings roundtrip" {
