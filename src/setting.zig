@@ -984,32 +984,18 @@ fn expectRoundtripVerbatim(s: anytype) !void {
     try testing.expectEqualSlices(u8, out, out2);
 }
 
-/// Parses every `testdata` fixture named `basename` and checks that it
-/// re-serializes byte-identical, with at least `min_count` files found.
-fn expectFixturesRoundtrip(comptime Data: type, comptime basename: []const u8, min_count: usize) !void {
-    const alloc = testing.allocator;
-    const io = testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "testdata", .{ .iterate = true });
-    defer dir.close(io);
-    var walker = try dir.walk(alloc);
-    defer walker.deinit();
+const testutil = @import("testutil");
 
-    var count: usize = 0;
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.eql(u8, entry.basename, basename)) continue;
-
-        const input = try dir.readFileAlloc(io, entry.path, alloc, std.Io.Limit.limited(1 << 20));
-        defer alloc.free(input);
-        const parsed = try Setting(Data).parse(input);
-        const output = try parsed.serialize(alloc);
-        defer alloc.free(output);
-        if (!std.mem.eql(u8, input, output)) std.debug.print("mismatching fixture: {s}\n", .{entry.path});
-        try testing.expectEqualSlices(u8, input, output);
-        count += 1;
-    }
-
-    try testing.expect(count >= min_count);
+/// Checks the `testdata` fixtures named `basename` with `Setting(Data)`,
+/// through the shared `testutil.expectFixturesRoundtrip`.
+fn expectSettingFixturesRoundtrip(comptime Data: type, comptime basename: []const u8, min_count: usize) !void {
+    const Roundtrip = struct {
+        fn run(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+            const parsed = try Setting(Data).parse(input);
+            return parsed.serialize(alloc);
+        }
+    };
+    try testutil.expectFixturesRoundtrip(Roundtrip.run, basename, min_count);
 }
 
 /// Serializes a setting and checks that parsing it back fails with
@@ -1191,21 +1177,21 @@ test "unexpected values in constant unknown fields are rejected" {
 }
 
 test "DEVSETTING.DAT fixtures roundtrip byte-identical" {
-    // Five devsetting fixtures plus two complete device exports.
-    try expectFixturesRoundtrip(DevSetting, "DEVSETTING.DAT", 7);
+    // Five devsetting fixtures plus three complete device exports.
+    try expectSettingFixturesRoundtrip(DevSetting, "DEVSETTING.DAT", 8);
 }
 
 test "MYSETTING.DAT fixtures roundtrip byte-identical" {
-    // Thirty-two mysetting fixtures plus two complete device exports.
-    try expectFixturesRoundtrip(MySetting, "MYSETTING.DAT", 34);
+    // Thirty-two mysetting fixtures plus three complete device exports.
+    try expectSettingFixturesRoundtrip(MySetting, "MYSETTING.DAT", 35);
 }
 
 test "MYSETTING2.DAT fixtures roundtrip byte-identical" {
-    // Fourteen mysetting2 fixtures plus two complete device exports.
-    try expectFixturesRoundtrip(MySetting2, "MYSETTING2.DAT", 16);
+    // Fourteen mysetting2 fixtures plus three complete device exports.
+    try expectSettingFixturesRoundtrip(MySetting2, "MYSETTING2.DAT", 17);
 }
 
 test "DJMMYSETTING.DAT fixtures roundtrip byte-identical" {
-    // Twenty-three djmmysetting fixtures plus two complete device exports.
-    try expectFixturesRoundtrip(DJMMySetting, "DJMMYSETTING.DAT", 25);
+    // Twenty-three djmmysetting fixtures plus three complete device exports.
+    try expectSettingFixturesRoundtrip(DJMMySetting, "DJMMYSETTING.DAT", 26);
 }

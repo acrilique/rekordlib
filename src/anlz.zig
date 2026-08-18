@@ -1428,39 +1428,19 @@ fn expectRoundtripBytes(alloc: std.mem.Allocator, input: []const u8) !void {
     try testing.expectEqualSlices(u8, input, output);
 }
 
-/// Parses every `testdata` fixture whose basename starts with `ANLZ0000.`
-/// and checks that it re-serializes byte-identical.
-fn expectFixturesRoundtrip() !void {
-    const alloc = testing.allocator;
-    const io = testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "testdata", .{ .iterate = true });
-    defer dir.close(io);
-    var walker = try dir.walk(alloc);
-    defer walker.deinit();
+const testutil = @import("testutil");
 
-    var count: usize = 0;
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.startsWith(u8, entry.basename, "ANLZ0000.")) continue;
-
-        const input = try dir.readFileAlloc(io, entry.path, alloc, std.Io.Limit.limited(1 << 20));
-        defer alloc.free(input);
-        var parsed = Anlz.parse(alloc, input) catch |err| {
-            std.debug.print("failing fixture: {s} ({t})\n", .{ entry.path, err });
-            return err;
-        };
-        defer parsed.deinit();
-        const output = try parsed.serialize(alloc);
-        defer alloc.free(output);
-        if (!std.mem.eql(u8, input, output)) std.debug.print("mismatching fixture: {s}\n", .{entry.path});
-        try testing.expectEqualSlices(u8, input, output);
-        count += 1;
-    }
-    try testing.expect(count >= 6);
+/// Parses `input` and re-serializes it, for `testutil.expectFixturesRoundtrip`.
+fn roundtripAnlz(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+    var parsed = try Anlz.parse(alloc, input);
+    defer parsed.deinit();
+    return parsed.serialize(alloc);
 }
 
 test "ANLZ fixtures roundtrip byte-identical" {
-    try expectFixturesRoundtrip();
+    // Four tracks times the three extensions, across two complete device
+    // exports.
+    try testutil.expectFixturesRoundtrip(roundtripAnlz, "ANLZ0000.", 12);
 }
 
 /// Reads a fixture from `testdata`.

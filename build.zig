@@ -10,12 +10,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const testutil = b.addModule("testutil", .{
+        .root_source_file = b.path("src/testutil.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const setting = b.addModule("setting", .{
         .root_source_file = b.path("src/setting.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "bin", .module = bin },
+            .{ .name = "testutil", .module = testutil },
         },
     });
 
@@ -32,6 +39,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "bin", .module = bin },
             .{ .name = "xor", .module = xor },
+            .{ .name = "testutil", .module = testutil },
         },
     });
 
