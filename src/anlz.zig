@@ -562,8 +562,7 @@ pub const Path = struct {
     /// must equal the section's `content_size`.
     path: LenPrefixedWideString = .{},
 
-    fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!Path {
-        _ = alloc;
+    fn parse(c: *bin.Cursor, header: Header) ParseError!Path {
         if (header.size != 16) return error.UnexpectedValue;
         const p = try bin.takeStruct(c, Path, .big);
         if (p.path.raw.len != header.content_size()) return error.InvalidFormat;
@@ -1141,7 +1140,7 @@ fn parseContent(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseE
         .beat_grid => .{ .beat_grid = try BeatGrid.parse(&sub, alloc, header) },
         .cue_list => .{ .cue_list = try CueList.parse(&sub, alloc, header) },
         .extended_cue_list => .{ .extended_cue_list = try ExtendedCueList.parse(&sub, alloc, header) },
-        .path => .{ .path = try Path.parse(&sub, alloc, header) },
+        .path => .{ .path = try Path.parse(&sub, header) },
         .vbr => .{ .vbr = try Vbr.parse(&sub, alloc, header) },
         .waveform_preview => .{ .waveform_preview = try WaveformPreview.parse(&sub, alloc, header) },
         .tiny_waveform_preview => .{ .tiny_waveform_preview = try TinyWaveformPreview.parse(&sub, alloc, header) },
