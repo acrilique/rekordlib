@@ -300,6 +300,7 @@ pub const LenPrefixedWideString = struct {
 
     /// Decodes the payload (minus trailing NULs) into UTF-8.
     pub fn utf8(s: *const LenPrefixedWideString, alloc: std.mem.Allocator) ![]u8 {
+        if (s.raw.len % 2 != 0) return error.UnexpectedValue;
         const units = try alloc.alloc(u16, s.raw.len / 2);
         defer alloc.free(units);
         for (units, 0..) |*unit, i| {
@@ -1806,6 +1807,11 @@ test "length-prefixed wide strings roundtrip" {
     const text = try again.utf8(alloc);
     defer alloc.free(text);
     try testing.expectEqualStrings("Ära", text);
+}
+
+test "length-prefixed wide string rejects odd payload lengths" {
+    const odd = LenPrefixedWideString{ .raw = &.{ 0, 'A', 0 } };
+    try testing.expectError(error.UnexpectedValue, odd.utf8(testing.allocator));
 }
 
 test "length-prefixed wide string through the struct walker" {
