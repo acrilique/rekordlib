@@ -17,6 +17,20 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const xor = b.addModule("xor", .{
+        .root_source_file = b.path("src/xor.zig"),
+        .target = target,
+    });
+
+    const anlz = b.addModule("anlz", .{
+        .root_source_file = b.path("src/anlz.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "bin", .module = bin },
+            .{ .name = "xor", .module = xor },
+        },
+    });
+
     const lib = b.addLibrary(.{
         .name = "rekordlib",
         .root_module = b.createModule(.{
@@ -26,6 +40,8 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "bin", .module = bin },
                 .{ .name = "setting", .module = setting },
+                .{ .name = "xor", .module = xor },
+                .{ .name = "anlz", .module = anlz },
             },
         }),
     });
@@ -40,9 +56,21 @@ pub fn build(b: *std.Build) void {
         .root_module = setting,
     });
 
+    const xor_tests = b.addTest(.{
+        .root_module = xor,
+    });
+
+    const anlz_tests = b.addTest(.{
+        .root_module = anlz,
+    });
+
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const run_setting_tests = b.addRunArtifact(setting_tests);
+    const run_xor_tests = b.addRunArtifact(xor_tests);
+    const run_anlz_tests = b.addRunArtifact(anlz_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_setting_tests.step);
+    test_step.dependOn(&run_xor_tests.step);
+    test_step.dependOn(&run_anlz_tests.step);
 }
