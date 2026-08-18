@@ -134,8 +134,7 @@ pub const BeatGrid = struct {
         const unknown2 = try c.takeInt(u32, .big);
         const len_beats = try c.takeInt(u32, .big);
         if (@as(u64, len_beats) * bin.serializedLen(Beat) != header.content_size()) return error.InvalidFormat;
-        const beats = try alloc.alloc(Beat, len_beats);
-        for (beats) |*beat| beat.* = try bin.takeStruct(c, Beat, .big);
+        const beats = try bin.takeStructSlice(alloc, c, Beat, .big, len_beats);
         return .{ .unknown1 = unknown1, .unknown2 = unknown2, .beats = beats };
     }
 
@@ -251,6 +250,13 @@ pub const Cue = struct {
     }
 };
 
+/// Entry count that a `CueList.memory_count` field must hold: the number of
+/// cues in a non-empty memory cue list, the `0xFFFFFFFF` sentinel in hot cue
+/// lists and empty lists.
+fn derivedMemoryCount(list_type: CueListType, len_cues: usize) usize {
+    return if (list_type == .memory_cues and len_cues > 0) len_cues else 0xFFFF_FFFF;
+}
+
 /// List of cue points or loops (either hot cues or memory cues).
 pub const CueList = struct {
     /// The types of cues (memory or hot) that this list contains.
@@ -278,8 +284,7 @@ pub const CueList = struct {
         const unknown = try c.takeInt(u16, .big);
         const len_cues = try c.takeInt(u16, .big);
         const memory_count = try c.takeInt(u32, .big);
-        const expected_count: u64 = if (list_type == .memory_cues and len_cues > 0) len_cues else 0xFFFF_FFFF;
-        if (memory_count != expected_count) return error.UnexpectedValue;
+        if (memory_count != derivedMemoryCount(list_type, len_cues)) return error.UnexpectedValue;
         const cues = try alloc.alloc(Cue, len_cues);
         var entry_header_size: ?u32 = null;
         for (cues) |*cue| cue.* = try Cue.parse(c, &entry_header_size);
@@ -296,11 +301,7 @@ pub const CueList = struct {
         try e.putInt(u32, @intFromEnum(cl.list_type), .big);
         try e.putInt(u16, cl.unknown, .big);
         try e.putInt(u16, try narrow(u16, cl.cues.len), .big);
-        const memory_count: u32 = if (cl.list_type == .memory_cues and cl.cues.len > 0)
-            try narrow(u32, cl.cues.len)
-        else
-            0xFFFF_FFFF;
-        try e.putInt(u32, memory_count, .big);
+        try e.putInt(u32, try narrow(u32, derivedMemoryCount(cl.list_type, cl.cues.len)), .big);
         for (cl.cues) |*cue| try cue.writeTo(e, cl.entry_header_size);
     }
 };
@@ -693,8 +694,7 @@ pub const WaveformPreview = struct {
         const len_preview = try c.takeInt(u32, .big);
         const unknown = try c.takeInt(u32, .big);
         if (len_preview != header.content_size()) return error.InvalidFormat;
-        const data = try alloc.alloc(WaveformPreviewColumn, len_preview);
-        for (data) |*column| column.* = try bin.takeStruct(c, WaveformPreviewColumn, .big);
+        const data = try bin.takeStructSlice(alloc, c, WaveformPreviewColumn, .big, len_preview);
         return .{ .unknown = unknown, .data = data };
     }
 
@@ -719,8 +719,7 @@ pub const TinyWaveformPreview = struct {
         const len_preview = try c.takeInt(u32, .big);
         const unknown = try c.takeInt(u32, .big);
         if (len_preview != header.content_size()) return error.InvalidFormat;
-        const data = try alloc.alloc(TinyWaveformPreviewColumn, len_preview);
-        for (data) |*column| column.* = try bin.takeStruct(c, TinyWaveformPreviewColumn, .big);
+        const data = try bin.takeStructSlice(alloc, c, TinyWaveformPreviewColumn, .big, len_preview);
         return .{ .unknown = unknown, .data = data };
     }
 
@@ -753,8 +752,7 @@ pub const WaveformDetail = struct {
         if (@as(u64, len_entry_bytes) * len_entries != header.content_size()) return error.InvalidFormat;
         const unknown = try c.takeInt(u32, .big);
         try bin.validateConstantFields(WaveformDetail, .{ .unknown = unknown });
-        const data = try alloc.alloc(WaveformPreviewColumn, len_entries);
-        for (data) |*column| column.* = try bin.takeStruct(c, WaveformPreviewColumn, .big);
+        const data = try bin.takeStructSlice(alloc, c, WaveformPreviewColumn, .big, len_entries);
         return .{ .unknown = unknown, .data = data };
     }
 
@@ -781,8 +779,7 @@ pub const WaveformColorPreview = struct {
         const len_entries = try c.takeInt(u32, .big);
         if (@as(u64, len_entry_bytes) * len_entries != header.content_size()) return error.InvalidFormat;
         const unknown = try c.takeInt(u32, .big);
-        const data = try alloc.alloc(WaveformColorPreviewColumn, len_entries);
-        for (data) |*column| column.* = try bin.takeStruct(c, WaveformColorPreviewColumn, .big);
+        const data = try bin.takeStructSlice(alloc, c, WaveformColorPreviewColumn, .big, len_entries);
         return .{ .unknown = unknown, .data = data };
     }
 
@@ -811,8 +808,7 @@ pub const WaveformColorDetail = struct {
         const len_entries = try c.takeInt(u32, .big);
         if (@as(u64, len_entry_bytes) * len_entries != header.content_size()) return error.InvalidFormat;
         const unknown = try c.takeInt(u32, .big);
-        const data = try alloc.alloc(WaveformColorDetailColumn, len_entries);
-        for (data) |*column| column.* = try bin.takeStruct(c, WaveformColorDetailColumn, .big);
+        const data = try bin.takeStructSlice(alloc, c, WaveformColorDetailColumn, .big, len_entries);
         return .{ .unknown = unknown, .data = data };
     }
 
@@ -836,8 +832,7 @@ pub const Waveform3BandPreview = struct {
         if (len_entry_bytes != 3) return error.UnexpectedValue;
         const len_entries = try c.takeInt(u32, .big);
         if (@as(u64, len_entry_bytes) * len_entries != header.content_size()) return error.InvalidFormat;
-        const data = try alloc.alloc(Waveform3BandPreviewColumn, len_entries);
-        for (data) |*column| column.* = try bin.takeStruct(c, Waveform3BandPreviewColumn, .big);
+        const data = try bin.takeStructSlice(alloc, c, Waveform3BandPreviewColumn, .big, len_entries);
         return .{ .data = data };
     }
 
@@ -870,8 +865,7 @@ pub const Waveform3BandDetail = struct {
         if (@as(u64, len_entry_bytes) * len_entries != header.content_size()) return error.InvalidFormat;
         const unknown = try c.takeInt(u32, .big);
         try bin.validateConstantFields(Waveform3BandDetail, .{ .unknown = unknown });
-        const data = try alloc.alloc(Waveform3BandDetailColumn, len_entries);
-        for (data) |*column| column.* = try bin.takeStruct(c, Waveform3BandDetailColumn, .big);
+        const data = try bin.takeStructSlice(alloc, c, Waveform3BandDetailColumn, .big, len_entries);
         return .{ .unknown = unknown, .data = data };
     }
 
@@ -996,8 +990,7 @@ pub const SongStructureData = struct {
 
     fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, len_entries: u16) ParseError!SongStructureData {
         var out = try bin.takeStruct(c, SongStructureData, .big);
-        out.phrases = try alloc.alloc(Phrase, len_entries);
-        for (out.phrases) |*phrase| phrase.* = try bin.takeStruct(c, Phrase, .big);
+        out.phrases = try bin.takeStructSlice(alloc, c, Phrase, .big, len_entries);
         return out;
     }
 
@@ -1052,7 +1045,7 @@ pub const SongStructure = struct {
     fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!SongStructure {
         if (header.size != 32) return error.UnexpectedValue;
         const len_entry_bytes = try c.takeInt(u32, .big);
-        if (len_entry_bytes != 24) return error.UnexpectedValue;
+        if (len_entry_bytes != bin.serializedLen(Phrase)) return error.UnexpectedValue;
         const len_entries = try c.takeInt(u16, .big);
         if (@as(u64, len_entry_bytes) * len_entries != header.content_size()) return error.InvalidFormat;
         // The data span starts at `mood`, inside the section preamble, and
@@ -1068,7 +1061,7 @@ pub const SongStructure = struct {
 
     fn writeTo(ss: *const SongStructure, e: *bin.Emitter, alloc: std.mem.Allocator) WriteError!void {
         const len_entries: u16 = try narrow(u16, ss.data.phrases.len);
-        try e.putInt(u32, 24, .big);
+        try e.putInt(u32, @intCast(bin.serializedLen(Phrase)), .big);
         try e.putInt(u16, len_entries, .big);
         var data_out = bin.Emitter.init(alloc);
         defer data_out.deinit();
@@ -1306,6 +1299,15 @@ fn writeFile(e: *bin.Emitter, alloc: std.mem.Allocator, header_data: []const u8,
     for (sections) |content| try writeSection(content, e, alloc);
 }
 
+/// Serializes a whole file into an owned ANLZ image; the caller owns the
+/// returned bytes.
+fn serializeFile(alloc: std.mem.Allocator, header_data: []const u8, sections: []const Content) WriteError![]u8 {
+    var e = bin.Emitter.init(alloc);
+    defer e.deinit();
+    try writeFile(&e, alloc, header_data, sections);
+    return e.toOwnedSlice();
+}
+
 /// Represents a whole `ANLZ0000.{DAT,EXT,2EX}` file.
 pub const Anlz = struct {
     /// Arena that owns every variable-size value reachable from this
@@ -1361,10 +1363,7 @@ pub const Anlz = struct {
     /// serialize byte-identical and modified files stay well-formed. A count
     /// or size that does not fit its wire field fails with `error.Overflow`.
     pub fn serialize(m: *const Anlz, alloc: std.mem.Allocator) WriteError![]u8 {
-        var e = bin.Emitter.init(alloc);
-        defer e.deinit();
-        try writeFile(&e, alloc, m.header_data, m.sections);
-        return e.toOwnedSlice();
+        return serializeFile(alloc, m.header_data, m.sections);
     }
 
     /// Returns the first section of the given kind, or null if the file
@@ -1380,13 +1379,9 @@ pub const Anlz = struct {
 
 const testing = std.testing;
 
-/// Serializes `sections` into a full ANLZ image.
-fn buildFile(alloc: std.mem.Allocator, header_data: []const u8, sections: []const Content) WriteError![]u8 {
-    var e = bin.Emitter.init(alloc);
-    defer e.deinit();
-    try writeFile(&e, alloc, header_data, sections);
-    return e.toOwnedSlice();
-}
+/// File header preamble shared by the hand-built test files (16 bytes, as in
+/// all known files).
+const test_file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
 
 /// Serializes raw section bytes (already including their headers) into a
 /// full ANLZ image.
@@ -1421,9 +1416,7 @@ fn buildRawSection(alloc: std.mem.Allocator, kind: Kind, preamble: []const u8, c
 
 /// Parses `input` and checks that it re-serializes byte-identical.
 fn expectRoundtripBytes(alloc: std.mem.Allocator, input: []const u8) !void {
-    var parsed = try Anlz.parse(alloc, input);
-    defer parsed.deinit();
-    const output = try parsed.serialize(alloc);
+    const output = try roundtripAnlz(alloc, input);
     defer alloc.free(output);
     try testing.expectEqualSlices(u8, input, output);
 }
@@ -1461,8 +1454,7 @@ test "empty file roundtrips" {
     // Port of rekordcrate's anlz_new_empty_roundtrips: a file built from no
     // sections serializes, re-parses, and stays empty.
     const alloc = testing.allocator;
-    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
-    const out = try buildFile(alloc, &file_header_data, &.{});
+    const out = try serializeFile(alloc, &test_file_header_data, &.{});
     defer alloc.free(out);
     try testing.expectEqual(@as(usize, 28), out.len);
 
@@ -1501,7 +1493,6 @@ test "derived headers roundtrip through content size" {
 
 test "unknown section kinds roundtrip verbatim" {
     const alloc = testing.allocator;
-    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
     const path_raw = [6]u8{ 0x00, '/', 0x00, 'a', 0x00, 0x00 };
     var unknown_content = [6]u8{ 1, 2, 3, 4, 5, 6 };
     const sections = [_]Content{
@@ -1509,7 +1500,7 @@ test "unknown section kinds roundtrip verbatim" {
         .{ .path = .{ .path = .{ .raw = &path_raw } } },
     };
 
-    const out = try buildFile(alloc, &file_header_data, &sections);
+    const out = try serializeFile(alloc, &test_file_header_data, &sections);
     defer alloc.free(out);
     try testing.expectEqual(@as(usize, 28 + 20 + 22), out.len);
     try expectRoundtripBytes(alloc, out);
@@ -1526,7 +1517,7 @@ test "unknown section kinds roundtrip verbatim" {
     // Mutating the unknown section's raw bytes changes the output with the
     // input while still roundtripping.
     unknown_content[3] ^= 0xFF;
-    const out3 = try buildFile(alloc, &file_header_data, &sections);
+    const out3 = try serializeFile(alloc, &test_file_header_data, &sections);
     defer alloc.free(out3);
     try expectRoundtripBytes(alloc, out3);
     try testing.expect(!std.mem.eql(u8, out, out3));
@@ -1534,11 +1525,10 @@ test "unknown section kinds roundtrip verbatim" {
 
 test "parse rejects malformed files" {
     const alloc = testing.allocator;
-    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
     const sections = [_]Content{
         .{ .vbr = .{ .unknown1 = 7, .data = &.{ 0x11, 0x22 } } },
     };
-    const out = try buildFile(alloc, &file_header_data, &sections);
+    const out = try serializeFile(alloc, &test_file_header_data, &sections);
     defer alloc.free(out);
     _ = try expectRoundtripBytes(alloc, out);
 
@@ -1566,7 +1556,6 @@ test "parse rejects malformed files" {
 
 test "parse rejects sections with inconsistent sizes" {
     const alloc = testing.allocator;
-    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
 
     // Path whose stored length does not match the section content size:
     // prefix says 6 bytes, the section reserves 14.
@@ -1574,7 +1563,7 @@ test "parse rejects sections with inconsistent sizes" {
     std.mem.writeInt(u32, path_preamble[0..4], 6, .big);
     const path_section = try buildRawSection(alloc, .path, &path_preamble, &([_]u8{0} ** 14));
     defer alloc.free(path_section);
-    const path_file = try buildRawFile(alloc, &file_header_data, path_section);
+    const path_file = try buildRawFile(alloc, &test_file_header_data, path_section);
     defer alloc.free(path_file);
     try testing.expectError(error.InvalidFormat, Anlz.parse(alloc, path_file));
 
@@ -1584,7 +1573,7 @@ test "parse rejects sections with inconsistent sizes" {
     std.mem.writeInt(u16, ext_preamble[6..8], 1, .big);
     const ext_body = try buildRawSection(alloc, .extended_cue_list, &ext_preamble, &.{});
     defer alloc.free(ext_body);
-    const ext_file = try buildRawFile(alloc, &file_header_data, ext_body);
+    const ext_file = try buildRawFile(alloc, &test_file_header_data, ext_body);
     defer alloc.free(ext_file);
     try testing.expectError(error.UnexpectedValue, Anlz.parse(alloc, ext_file));
 
@@ -1595,7 +1584,7 @@ test "parse rejects sections with inconsistent sizes" {
     std.mem.writeInt(u16, pssi_preamble[6..8], 1, .big); // unencrypted mood
     const pssi_body = try buildRawSection(alloc, .song_structure, &pssi_preamble, &([_]u8{0} ** 24));
     defer alloc.free(pssi_body);
-    const pssi_file = try buildRawFile(alloc, &file_header_data, pssi_body);
+    const pssi_file = try buildRawFile(alloc, &test_file_header_data, pssi_body);
     defer alloc.free(pssi_file);
     try testing.expectError(error.UnexpectedValue, Anlz.parse(alloc, pssi_file));
 
@@ -1604,7 +1593,7 @@ test "parse rejects sections with inconsistent sizes" {
     std.mem.writeInt(u32, pwv3_preamble[0..4], 2, .big);
     const pwv3_body = try buildRawSection(alloc, .waveform_detail, &pwv3_preamble, &.{});
     defer alloc.free(pwv3_body);
-    const pwv3_file = try buildRawFile(alloc, &file_header_data, pwv3_body);
+    const pwv3_file = try buildRawFile(alloc, &test_file_header_data, pwv3_body);
     defer alloc.free(pwv3_file);
     try testing.expectError(error.UnexpectedValue, Anlz.parse(alloc, pwv3_file));
 
@@ -1615,21 +1604,20 @@ test "parse rejects sections with inconsistent sizes" {
     std.mem.writeInt(u16, pssi_preamble2[6..8], 1, .big);
     const pssi_body2 = try buildRawSection(alloc, .song_structure, &pssi_preamble2, &([_]u8{0} ** 24));
     defer alloc.free(pssi_body2);
-    const pssi_file2 = try buildRawFile(alloc, &file_header_data, pssi_body2);
+    const pssi_file2 = try buildRawFile(alloc, &test_file_header_data, pssi_body2);
     defer alloc.free(pssi_file2);
     try testing.expectError(error.InvalidFormat, Anlz.parse(alloc, pssi_file2));
 }
 
 test "parse rejects non-canonical header sizes" {
     const alloc = testing.allocator;
-    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
 
     // Beat grid whose header size is 20 instead of the canonical 24; the
     // total size is consistent, so only the size check catches it.
     const beat_grid = try buildRawSection(alloc, .beat_grid, &([_]u8{0} ** 12), &.{});
     defer alloc.free(beat_grid);
     std.mem.writeInt(u32, beat_grid[4..8], 20, .big);
-    const grid_file = try buildRawFile(alloc, &file_header_data, beat_grid);
+    const grid_file = try buildRawFile(alloc, &test_file_header_data, beat_grid);
     defer alloc.free(grid_file);
     try testing.expectError(error.UnexpectedValue, Anlz.parse(alloc, grid_file));
 
@@ -1642,7 +1630,7 @@ test "parse rejects non-canonical header sizes" {
     std.mem.writeInt(u32, entry[8..12], 57, .big);
     const cue_list = try buildRawSection(alloc, .cue_list, &preamble, &entry);
     defer alloc.free(cue_list);
-    const list_file = try buildRawFile(alloc, &file_header_data, cue_list);
+    const list_file = try buildRawFile(alloc, &test_file_header_data, cue_list);
     defer alloc.free(list_file);
     try testing.expectError(error.UnexpectedValue, Anlz.parse(alloc, list_file));
 }
@@ -1669,7 +1657,6 @@ test "song structure encryption detection" {
 
 test "song structure roundtrips encrypted and plain" {
     const alloc = testing.allocator;
-    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
     var phrases = [_]Phrase{
         .{ .index = 1, .beat = 1, .kind = 1, .beat2 = 16, .fill = 1, .beat_fill = 14 },
         .{ .index = 2, .beat = 17, .kind = 2, .beat2 = 32 },
@@ -1686,7 +1673,7 @@ test "song structure roundtrips encrypted and plain" {
         const sections = [_]Content{.{
             .song_structure = .{ .is_encrypted = is_encrypted, .data = data },
         }};
-        const out = try buildFile(alloc, &file_header_data, &sections);
+        const out = try serializeFile(alloc, &test_file_header_data, &sections);
         defer alloc.free(out);
 
         var parsed = try Anlz.parse(alloc, out);
@@ -1710,7 +1697,6 @@ test "beat grid and cue list with entries roundtrip" {
     try testing.expectEqual(@as(u32, 56), Cue.wire_len);
     try testing.expectEqual(@as(usize, 24), bin.serializedLen(Phrase));
     const alloc = testing.allocator;
-    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
     var beats = [_]Beat{
         .{ .beat_number = 1, .tempo = 12800, .time = 0 },
         .{ .beat_number = 2, .tempo = 12800, .time = 468 },
@@ -1725,7 +1711,7 @@ test "beat grid and cue list with entries roundtrip" {
         .{ .cue_list = .{ .list_type = .hot_cues, .memory_count = 0xFFFF_FFFF, .cues = &cues } },
     };
 
-    const out = try buildFile(alloc, &file_header_data, &sections);
+    const out = try serializeFile(alloc, &test_file_header_data, &sections);
     defer alloc.free(out);
     _ = try expectRoundtripBytes(alloc, out);
 
@@ -1743,7 +1729,6 @@ test "beat grid and cue list with entries roundtrip" {
 
 test "writing more cues than the u16 len_cues field holds fails" {
     const alloc = testing.allocator;
-    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
     const cues = try alloc.alloc(Cue, 65536);
     defer alloc.free(cues);
     for (cues) |*cue| cue.* = .{};
@@ -1752,24 +1737,23 @@ test "writing more cues than the u16 len_cues field holds fails" {
         .{ .cue_list = .{ .list_type = .hot_cues, .memory_count = 0xFFFF_FFFF, .cues = cues[0..65535] } },
     };
     // The largest count that fits `len_cues` (u16) still roundtrips.
-    const max = try buildFile(alloc, &file_header_data, &sections);
+    const max = try serializeFile(alloc, &test_file_header_data, &sections);
     defer alloc.free(max);
     try expectRoundtripBytes(alloc, max);
 
     // One cue more must fail instead of truncating the count against the
     // derived `total_size`.
     sections[0].cue_list.cues = cues;
-    try testing.expectError(error.Overflow, buildFile(alloc, &file_header_data, &sections));
+    try testing.expectError(error.Overflow, serializeFile(alloc, &test_file_header_data, &sections));
 }
 
 test "cue list memory_count is derived and validated" {
     const alloc = testing.allocator;
-    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
     var cues = [_]Cue{.{ .time = 1000 }};
     const sections = [_]Content{
         .{ .cue_list = .{ .list_type = .memory_cues, .cues = &cues } },
     };
-    const out = try buildFile(alloc, &file_header_data, &sections);
+    const out = try serializeFile(alloc, &test_file_header_data, &sections);
     defer alloc.free(out);
     _ = try expectRoundtripBytes(alloc, out);
 
@@ -1792,7 +1776,6 @@ test "cue list memory_count is derived and validated" {
 
 test "cue entries with newer 28-byte entry headers roundtrip" {
     const alloc = testing.allocator;
-    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
     var cues = [_]Cue{
         .{ .hot_cue = 1, .time = 0x0003_CA3B },
         .{ .hot_cue = 2, .time = 0x0000_011E },
@@ -1800,7 +1783,7 @@ test "cue entries with newer 28-byte entry headers roundtrip" {
     const sections = [_]Content{
         .{ .cue_list = .{ .list_type = .hot_cues, .cues = &cues, .entry_header_size = 28 } },
     };
-    const out = try buildFile(alloc, &file_header_data, &sections);
+    const out = try serializeFile(alloc, &test_file_header_data, &sections);
     defer alloc.free(out);
     _ = try expectRoundtripBytes(alloc, out);
 
@@ -1821,7 +1804,6 @@ test "cue entries with newer 28-byte entry headers roundtrip" {
 
 test "waveform sections roundtrip with checks" {
     const alloc = testing.allocator;
-    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
     var preview = [_]WaveformPreviewColumn{
         .{ .height = 0b10101, .whiteness = 0b110 },
         .{ .height = 31, .whiteness = 7 },
@@ -1842,7 +1824,7 @@ test "waveform sections roundtrip with checks" {
         .{ .waveform_3band_detail = .{ .data = &band_detail } },
     };
 
-    const out = try buildFile(alloc, &file_header_data, &sections);
+    const out = try serializeFile(alloc, &test_file_header_data, &sections);
     defer alloc.free(out);
     _ = try expectRoundtripBytes(alloc, out);
 
@@ -1899,7 +1881,6 @@ test "extended cue with empty comment roundtrips" {
 
 test "extended cue list with commented cue roundtrips" {
     const alloc = testing.allocator;
-    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
     const comment = try LenPrefixedWideString.fromUtf8(alloc, "Break");
     defer alloc.free(comment.raw);
     var cues = [_]ExtendedCue{
@@ -1909,7 +1890,7 @@ test "extended cue list with commented cue roundtrips" {
         .extended_cue_list = .{ .list_type = .hot_cues, .cues = &cues },
     }};
 
-    const out = try buildFile(alloc, &file_header_data, &sections);
+    const out = try serializeFile(alloc, &test_file_header_data, &sections);
     defer alloc.free(out);
     _ = try expectRoundtripBytes(alloc, out);
 
@@ -1924,7 +1905,6 @@ test "extended cue list with commented cue roundtrips" {
 
 test "mutating parsed data re-serializes consistently" {
     const alloc = testing.allocator;
-    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
     var beats = [_]Beat{
         .{ .beat_number = 1, .tempo = 12800, .time = 0 },
         .{ .beat_number = 2, .tempo = 12800, .time = 468 },
@@ -1938,7 +1918,7 @@ test "mutating parsed data re-serializes consistently" {
         .{ .beat_grid = .{ .beats = &beats } },
         .{ .extended_cue_list = .{ .list_type = .hot_cues, .cues = &cues } },
     };
-    const out = try buildFile(alloc, &file_header_data, &sections);
+    const out = try serializeFile(alloc, &test_file_header_data, &sections);
     defer alloc.free(out);
 
     var parsed = try Anlz.parse(alloc, out);

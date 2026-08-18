@@ -258,6 +258,17 @@ pub fn putStruct(e: *Emitter, value: anytype, comptime endian: std.builtin.Endia
     }
 }
 
+/// Reads `n` elements of `T` in declaration order at `endian` (see
+/// `takeStruct` for the supported field types), allocating the returned
+/// slice with `alloc`; the caller owns it. The partial slice is freed if any
+/// element fails to read.
+pub fn takeStructSlice(alloc: std.mem.Allocator, c: *Cursor, comptime T: type, comptime endian: std.builtin.Endian, n: usize) ReadError![]T {
+    const out = try alloc.alloc(T, n);
+    errdefer alloc.free(out);
+    for (out) |*item| item.* = try takeStruct(c, T, endian);
+    return out;
+}
+
 /// Number of bytes `takeStruct`/`putStruct` read/write for `T`. Structs with
 /// slice fields (variable length) or codec fields (data-dependent length)
 /// have no fixed size and fail to compile.
@@ -559,6 +570,29 @@ test "validateConstantFields" {
     try testing.expectError(error.UnexpectedValue, validateConstantFields(Sample, .{ .magic = 0x1234, .blob = .{ 1, 3 } }));
     // Types without the declaration pass untouched.
     try validateConstantFields(struct { spare: u8 = 0 }, .{ .spare = 7 });
+}
+
+test "takeStructSlice reads a run of structs" {
+    const Sample = struct {
+        tag: u8 = 0,
+        value: u16 = 0,
+    };
+    var e = Emitter.init(testing.allocator);
+    defer e.deinit();
+    try putStruct(&e, Sample{ .tag = 1, .value = 0x0203 }, .big);
+    try putStruct(&e, Sample{ .tag = 4, .value = 0x0506 }, .big);
+
+    var c = Cursor.init(e.written());
+    const items = try takeStructSlice(testing.allocator, &c, Sample, .big, 2);
+    defer testing.allocator.free(items);
+    try testing.expect(c.atEnd());
+    try testing.expectEqual(@as(u8, 1), items[0].tag);
+    try testing.expectEqual(@as(u16, 0x0203), items[0].value);
+    try testing.expectEqual(@as(u8, 4), items[1].tag);
+
+    // A truncated run fails without leaking the partial slice.
+    var short = Cursor.init(e.written()[0..2]);
+    try testing.expectError(ReadError.UnexpectedEof, takeStructSlice(testing.allocator, &short, Sample, .big, 2));
 }
 
 test "takeStruct/putStruct skip slice fields" {

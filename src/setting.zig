@@ -49,6 +49,13 @@ pub fn Setting(comptime Data: type) type {
         /// other value, so it is always zero in parsed instances.
         unknown: u16,
 
+        /// Offset where the checksummed range begins, relative to the start
+        /// of the setting: the data section, except in `DJMMYSETTING.DAT`
+        /// where it covers the whole file.
+        fn checksumOffset() usize {
+            return if (Data.checksum_covers_data_only) data_offset else 0;
+        }
+
         /// Parse a `*SETTING.DAT` image. The checksum is verified and a
         /// mismatch is reported as `error.ChecksumMismatch`; it is
         /// recalculated on write.
@@ -67,11 +74,7 @@ pub fn Setting(comptime Data: type) type {
             const unknown = try c.takeInt(u16, .little);
             if (unknown != 0) return error.UnexpectedValue;
             if (!c.atEnd()) return error.InvalidFormat;
-            // The checksum covers the same range as in `writeTo`: just the
-            // data section, except in `DJMMYSETTING.DAT` where it covers the
-            // whole file.
-            const checksum_start = if (Data.checksum_covers_data_only) data_offset else 0;
-            const expected = std.hash.crc.Crc16Xmodem.hash(buf[checksum_start .. data_offset + data_len]);
+            const expected = std.hash.crc.Crc16Xmodem.hash(buf[checksumOffset() .. data_offset + data_len]);
             if (checksum != expected) return error.ChecksumMismatch;
             return .{
                 .brand = brand,
@@ -93,13 +96,9 @@ pub fn Setting(comptime Data: type) type {
             const checksum_at = e.pos();
             try e.putInt(u16, 0, .little);
             try e.putInt(u16, s.unknown, .little);
-            // The checksum is CRC-16/XMODEM; it covers just the data
-            // section, except in `DJMMYSETTING.DAT` where it covers the
-            // whole file. Both ranges are relative to where this setting
-            // starts in the emitter, so appending to a non-empty emitter
-            // works too.
-            const checksum_start = start + if (Data.checksum_covers_data_only) data_offset else 0;
-            const crc = std.hash.crc.Crc16Xmodem.hash(e.written()[checksum_start..checksum_at]);
+            // The range is relative to where this setting starts in the
+            // emitter, so appending to a non-empty emitter works too.
+            const crc = std.hash.crc.Crc16Xmodem.hash(e.written()[start + checksumOffset() .. checksum_at]);
             e.patchIntAt(checksum_at, u16, crc, .little);
         }
 
