@@ -310,7 +310,9 @@ pub const DJMMySetting = struct {
     indicator_brightness: MixerIndicatorBrightness = .three,
     /// "CH FADER CURVE (LONG FADER)" setting.
     channel_fader_curve_long_fader: ChannelFaderCurveLongFader = .exponential,
-    /// Unknown field, zero in all known files.
+    /// Unknown field, zero in older files; newer exports carry five
+    /// setting-like bytes (`0x80`-range values, not yet modeled) at its
+    /// start. Kept verbatim.
     unknown2: [27]u8 = @splat(0),
 
     /// Unlike the other settings files, the checksum covers the whole file
@@ -322,11 +324,6 @@ pub const DJMMySetting = struct {
 
     /// Version string found in `DJMMYSETTING.DAT` files written by Rekordbox 6.6.1.
     pub const default_version = "1.000";
-
-    /// Unknown fields that must hold their default value in all known files;
-    /// other values are rejected on parse. Unknown fields not listed here are
-    /// kept verbatim.
-    pub const constant_fields = .{.unknown2};
 };
 
 /// "Type of the overview Waveform" setting. Found on the "General" page in the
@@ -1059,6 +1056,8 @@ test "djmmysetting unknown fields and enum values roundtrip verbatim" {
     var s = Setting(DJMMySetting).default();
     s.data.unknown1 = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
     s.data.midi_channel = @enumFromInt(0x7F);
+    // The five setting-like bytes newer exports carry in `unknown2`.
+    s.data.unknown2[0..5].* = .{ 0x80, 0x82, 0x84, 0x81, 0x81 };
     try expectRoundtripVerbatim(s);
 }
 
@@ -1146,11 +1145,6 @@ test "unexpected values in constant unknown fields are rejected" {
     my2 = Setting(MySetting2).default();
     my2.data.unknown3[26] = 0xFF;
     try expectUnexpectedValue(my2);
-
-    // DJMMySetting: unknown2.
-    var djm = Setting(DJMMySetting).default();
-    djm.data.unknown2[13] = 0x01;
-    try expectUnexpectedValue(djm);
 }
 
 test "DEVSETTING.DAT fixtures roundtrip byte-identical" {

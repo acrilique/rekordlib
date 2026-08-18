@@ -189,10 +189,12 @@ pub const ColorIndex = enum(u8) {
 };
 
 /// A memory or hot cue (or loop), a single entry of a cue list. Preceded on
-/// the wire by a nested 16-byte entry header (tag `PCPT`, total entry
-/// length `wire_len`), which is derived on write and validated on parse;
-/// the remaining fields are serialized in one pass through
-/// `bin.takeStruct`/`bin.putStruct`.
+/// the wire by a nested 12-byte entry header (tag `PCPT`, total entry
+/// length `wire_len`); its `size` field is `16` in older files and `28` in
+/// files written by newer Rekordbox versions, with an identical entry body
+/// either way (the containing `CueList` carries the style, since a virtual
+/// field here would be serialized by `bin.putStruct`). The remaining
+/// fields are serialized in one pass through `bin.takeStruct`/`bin.putStruct`.
 pub const Cue = struct {
     /// Hot cue number (0 = not a hot cue, 1 = A, 2 = B, ...).
     hot_cue: u32 = 0,
@@ -228,15 +230,22 @@ pub const Cue = struct {
     /// Length of a serialized entry, its nested header included.
     const wire_len = 12 + bin.serializedLen(Cue);
 
-    fn parse(c: *bin.Cursor) ParseError!Cue {
+    /// Parses one entry. `header_size` learns the nested header's `size`
+    /// style from the first entry; later entries must share it.
+    fn parse(c: *bin.Cursor, header_size: *?u32) ParseError!Cue {
         const header = try bin.takeStruct(c, Header, .big);
-        if (header.kind != .cue or header.size != 16 or header.total_size != wire_len)
-            return error.UnexpectedValue;
+        if (header.kind != .cue or header.total_size != wire_len) return error.UnexpectedValue;
+        if (header.size != 16 and header.size != 28) return error.UnexpectedValue;
+        if (header_size.*) |size| {
+            if (size != header.size) return error.UnexpectedValue;
+        } else {
+            header_size.* = header.size;
+        }
         return bin.takeStruct(c, Cue, .big);
     }
 
-    fn writeTo(cue: *const Cue, e: *bin.Emitter) WriteError!void {
-        try bin.putStruct(e, Header{ .kind = .cue, .size = 16, .total_size = wire_len }, .big);
+    fn writeTo(cue: *const Cue, e: *bin.Emitter, header_size: u32) WriteError!void {
+        try bin.putStruct(e, Header{ .kind = .cue, .size = header_size, .total_size = wire_len }, .big);
         try bin.putStruct(e, cue, .big);
     }
 };
@@ -255,6 +264,12 @@ pub const CueList = struct {
     /// Cues of this list. The `len_cues` count is recomputed from this slice
     /// on write.
     cues: []Cue = &.{},
+    /// The `size` recorded in the nested `PCPT` entry headers: `16` in older
+    /// files, `28` in files written by newer Rekordbox versions (the entry
+    /// body is identical either way). A virtual field, not present in the
+    /// file outside the entries; stored verbatim so files roundtrip
+    /// byte-identical.
+    entry_header_size: u32 = 16,
 
     fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!CueList {
         if (header.size != 24) return error.UnexpectedValue;
@@ -265,12 +280,14 @@ pub const CueList = struct {
         const expected_count: u64 = if (list_type == .memory_cues and len_cues > 0) len_cues else 0xFFFF_FFFF;
         if (memory_count != expected_count) return error.UnexpectedValue;
         const cues = try alloc.alloc(Cue, len_cues);
-        for (cues) |*cue| cue.* = try Cue.parse(c);
+        var entry_header_size: ?u32 = null;
+        for (cues) |*cue| cue.* = try Cue.parse(c, &entry_header_size);
         return .{
             .list_type = list_type,
             .unknown = unknown,
             .memory_count = memory_count,
             .cues = cues,
+            .entry_header_size = entry_header_size orelse 16,
         };
     }
 
@@ -283,7 +300,7 @@ pub const CueList = struct {
         else
             0xFFFF_FFFF;
         try e.putInt(u32, memory_count, .big);
-        for (cl.cues) |*cue| try cue.writeTo(e);
+        for (cl.cues) |*cue| try cue.writeTo(e, cl.entry_header_size);
     }
 };
 
@@ -1778,6 +1795,35 @@ test "cue list memory_count is derived and validated" {
     const bad = try alloc.dupe(u8, out);
     defer alloc.free(bad);
     std.mem.writeInt(u32, bad[48..52], 5, .big);
+    try testing.expectError(error.UnexpectedValue, Anlz.parse(alloc, bad));
+}
+
+test "cue entries with newer 28-byte entry headers roundtrip" {
+    const alloc = testing.allocator;
+    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+    var cues = [_]Cue{
+        .{ .hot_cue = 1, .time = 0x0003_CA3B },
+        .{ .hot_cue = 2, .time = 0x0000_011E },
+    };
+    const sections = [_]Content{
+        .{ .cue_list = .{ .list_type = .hot_cues, .cues = &cues, .entry_header_size = 28 } },
+    };
+    const out = try buildFile(alloc, &file_header_data, &sections);
+    defer alloc.free(out);
+    _ = try expectRoundtripBytes(alloc, out);
+
+    var parsed = try Anlz.parse(alloc, out);
+    defer parsed.deinit();
+    const list = parsed.sections[0].cue_list;
+    try testing.expectEqual(@as(u32, 28), list.entry_header_size);
+    try testing.expectEqualSlices(Cue, &cues, list.cues);
+
+    // Entries must share the style: patch the second entry's header size
+    // (at 12 + 16 + 12 for the file and section headers, + 12 preamble, +
+    // one 56-byte entry, + 4 for the entry tag) from 28 back to 16.
+    const bad = try alloc.dupe(u8, out);
+    defer alloc.free(bad);
+    std.mem.writeInt(u32, bad[112..116], 16, .big);
     try testing.expectError(error.UnexpectedValue, Anlz.parse(alloc, bad));
 }
 
