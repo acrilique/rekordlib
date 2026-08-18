@@ -120,10 +120,10 @@ pub const Beat = struct {
 
 /// All beats in the track.
 pub const BeatGrid = struct {
-    /// Unknown field, zero in all known files.
+    /// Unknown field, zero in all known files (stored verbatim).
     unknown1: u32 = 0,
-    /// Unknown field, `0x00800000` in all known files.
-    unknown2: u32 = 0x0080_0000,
+    /// Unknown field, `0x00080000` in all known files (stored verbatim).
+    unknown2: u32 = 0x0008_0000,
     /// Beats of this beatgrid. The `len_beats` count is recomputed from this
     /// slice on write.
     beats: []Beat = &.{},
@@ -200,17 +200,18 @@ pub const Cue = struct {
     hot_cue: u32 = 0,
     /// Loop status: `4` if this cue is an active loop, `0` otherwise.
     status: u32 = 0,
-    /// Unknown field, `0x00100000` in all known files.
-    unknown1: u32 = 0x0010_0000,
+    /// Unknown field, `0x00010000` in all known files (stored verbatim).
+    unknown1: u32 = 0x0001_0000,
     /// Somehow used for sorting cues (`0xFFFF` for the first cue).
     order_first: u16 = 0xFFFF,
     /// Somehow used for sorting cues (`0xFFFF` for the last cue).
     order_last: u16 = 0xFFFF,
     /// Type of this cue (`loop` if this cue is a loop).
     cue_type: CueType = .point,
-    /// Unknown field, zero in all known files.
+    /// Unknown field, zero in all known files (stored verbatim).
     unknown2: u8 = 0,
-    /// Unknown field, `0x03E8` (= decimal 1000) in all known files.
+    /// Unknown field, `0x03E8` (= decimal 1000) in all known files (stored
+    /// verbatim).
     unknown3: u16 = 0x03E8,
     /// Time in milliseconds after which this cue would occur (at normal
     /// playback speed).
@@ -254,7 +255,7 @@ pub const Cue = struct {
 pub const CueList = struct {
     /// The types of cues (memory or hot) that this list contains.
     list_type: CueListType = .memory_cues,
-    /// Unknown field, zero in all known files.
+    /// Unknown field, zero in all known files (stored verbatim).
     unknown: u16 = 0,
     /// Entry count of a non-empty memory cue list; the `0xFFFFFFFF`
     /// sentinel in hot cue lists and empty lists. Validated on parse and
@@ -385,9 +386,10 @@ pub const ExtendedCue = struct {
     hot_cue: u32 = 0,
     /// Type of this cue (`loop` if this cue is a loop).
     cue_type: CueType = .point,
-    /// Unknown field, zero in all known files.
+    /// Unknown field, zero in all known files (stored verbatim).
     unknown1: u8 = 0,
-    /// Unknown field, `0x03E8` (= decimal 1000) in all known files.
+    /// Unknown field, `0x03E8` (= decimal 1000) in all known files (stored
+    /// verbatim).
     unknown2: u16 = 0x03E8,
     /// Time in milliseconds after which this cue would occur (at normal
     /// playback speed).
@@ -398,7 +400,7 @@ pub const ExtendedCue = struct {
     /// Color assigned to this cue. Only used by memory cues; hot cues use a
     /// different value (see `hot_cue_color_index`).
     color: ColorIndex = .none,
-    /// Unknown field, `1` in all known files.
+    /// Unknown field, `1` in all known files (stored verbatim).
     unknown3: u8 = 1,
     /// Unknown field.
     unknown4: u16 = 0,
@@ -485,7 +487,7 @@ pub const ExtendedCue = struct {
     hot_cue_color_rgb: [3]u8 = .{ 0, 0, 0 },
     /// Unknown field.
     unknown6: u32 = 0,
-    /// Unknown field, `0x00C17000` in all known files.
+    /// Unknown field, `0x00C17000` in all known files (stored verbatim).
     unknown7: u32 = 0x00C1_7000,
     /// Unknown field.
     unknown8: u32 = 0,
@@ -670,7 +672,7 @@ pub const Waveform3BandDetailColumn = struct {
 
 /// Fixed-width monochrome preview of the track waveform.
 pub const WaveformPreview = struct {
-    /// Unknown field, `0x00010000` in all known files.
+    /// Unknown field, `0x00010000` in all known files (stored verbatim).
     unknown: u32 = 0x0001_0000,
     /// Waveform preview column data; `len_preview` is recomputed from this
     /// slice on write.
@@ -696,7 +698,7 @@ pub const WaveformPreview = struct {
 /// Smaller version of the fixed-width monochrome preview of the track
 /// waveform (for the CDJ-900).
 pub const TinyWaveformPreview = struct {
-    /// Unknown field, `0x00010000` in all known files.
+    /// Unknown field, `0x00010000` in all known files (stored verbatim).
     unknown: u32 = 0x0001_0000,
     /// Waveform preview column data; `len_preview` is recomputed from this
     /// slice on write.
@@ -1746,7 +1748,7 @@ test "beat grid and cue list with entries roundtrip" {
     try testing.expectEqual(@as(usize, 2), list.cues.len);
     try testing.expectEqual(CueType.loop, list.cues[1].cue_type);
     try testing.expectEqual(@as(u32, 2000), list.cues[1].loop_time);
-    try testing.expectEqual(@as(u32, 0x0010_0000), list.cues[1].unknown1);
+    try testing.expectEqual(@as(u32, 0x0001_0000), list.cues[1].unknown1);
 }
 
 test "writing more cues than the u16 len_cues field holds fails" {
