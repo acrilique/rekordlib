@@ -661,8 +661,9 @@ pub const WaveformColorDetailColumn = packed struct(u16) {
     red: u3 = 0,
 };
 
-/// Single column of a `waveform_3band_preview` section.
-pub const Waveform3BandPreviewColumn = struct {
+/// Single column of a `waveform_3band_preview` or `waveform_3band_detail`
+/// section.
+pub const Waveform3BandColumn = struct {
     /// Sound energy in the mid of the frequency range.
     energy_mid_third_freq: u8 = 0,
     /// Sound energy in the top of the frequency range.
@@ -671,211 +672,137 @@ pub const Waveform3BandPreviewColumn = struct {
     energy_bottom_third_freq: u8 = 0,
 };
 
-/// Single column of a `waveform_3band_detail` section.
-pub const Waveform3BandDetailColumn = struct {
-    /// Sound energy in the mid of the frequency range.
-    energy_mid_third_freq: u8 = 0,
-    /// Sound energy in the top of the frequency range.
-    energy_top_third_freq: u8 = 0,
-    /// Sound energy in the bottom third of the frequency range.
-    energy_bottom_third_freq: u8 = 0,
+/// Comptime shape of a waveform section, as consumed by `WaveformSection`.
+const WaveformSpec = struct {
+    /// Type of a single waveform column.
+    column: type,
+    /// Value of the `len_entry_bytes` preamble field, the wire size of one
+    /// column. `null` for the two oldest preview sections, whose preamble
+    /// carries only the column count (their columns are one byte each).
+    entry_bytes: ?u32 = null,
+    /// Default value of the trailing unknown preamble field. `null` if the
+    /// section has no such field.
+    unknown: ?u32 = null,
+    /// Whether the unknown preamble field must hold its default value in all
+    /// known files; other values are rejected on parse (rekordcrate asserts
+    /// on read). Otherwise the field is stored verbatim.
+    constant_unknown: bool = false,
 };
+
+/// Generates one of the waveform section types: the preamble described by
+/// `spec`, followed by a run of `spec.column` entries. The waveform kinds
+/// differ only in their column type and preamble shape; all parse and write
+/// logic is shared here.
+fn WaveformSection(comptime spec: WaveformSpec) type {
+    const Column = spec.column;
+    if (spec.entry_bytes) |entry_bytes| {
+        if (entry_bytes != bin.serializedLen(Column))
+            @compileError("WaveformSection: entry_bytes must match the serialized length of column");
+    } else if (bin.serializedLen(Column) != 1) {
+        @compileError("WaveformSection: sections without entry_bytes need one-byte columns");
+    }
+    return struct {
+        const Self = @This();
+
+        /// Fixed size of the section header: the 12-byte prefix plus the
+        /// preamble fields.
+        const header_size: u32 = 12 + 4 + (if (spec.entry_bytes != null) 4 else 0) + (if (spec.unknown != null) 4 else 0);
+
+        /// Unknown preamble field, stored verbatim (see the section alias
+        /// for the value found in known files). Virtual when the spec has no
+        /// such field: it stays at its default and is never serialized.
+        unknown: u32 = spec.unknown orelse 0,
+        /// Waveform column data; the entry count is recomputed from this
+        /// slice on write.
+        data: []Column = &.{},
+
+        fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!Self {
+            if (header.size != header_size) return error.UnexpectedValue;
+            if (spec.entry_bytes) |entry_bytes| {
+                const len_entry_bytes = try c.takeInt(u32, .big);
+                if (len_entry_bytes != entry_bytes) return error.UnexpectedValue;
+            }
+            const len_entries = try c.takeInt(u32, .big);
+            const column_bytes: u64 = spec.entry_bytes orelse 1;
+            if (column_bytes * len_entries != header.content_size()) return error.InvalidFormat;
+            const unknown: u32 = if (spec.unknown != null) try c.takeInt(u32, .big) else 0;
+            if (spec.unknown) |default| {
+                if (spec.constant_unknown and unknown != default) return error.UnexpectedValue;
+            }
+            return .{
+                .unknown = unknown,
+                .data = try bin.takeStructSlice(alloc, c, Column, .big, len_entries),
+            };
+        }
+
+        /// Bytes of column data this section serializes.
+        fn contentLen(w: *const Self) usize {
+            return bin.serializedLen(Column) * w.data.len;
+        }
+
+        fn writeTo(w: *const Self, e: *bin.Emitter) WriteError!void {
+            if (spec.entry_bytes) |entry_bytes| try e.putInt(u32, entry_bytes, .big);
+            try e.putInt(u32, try narrow(u32, w.data.len), .big);
+            if (spec.unknown != null) try e.putInt(u32, w.unknown, .big);
+            for (w.data) |*column| try bin.putStruct(e, column, .big);
+        }
+    };
+}
 
 /// Fixed-width monochrome preview of the track waveform.
-pub const WaveformPreview = struct {
-    /// Unknown field, `0x00010000` in all known files (stored verbatim).
-    unknown: u32 = 0x0001_0000,
-    /// Waveform preview column data; `len_preview` is recomputed from this
-    /// slice on write.
-    data: []WaveformPreviewColumn = &.{},
-
-    fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!WaveformPreview {
-        if (header.size != 20) return error.UnexpectedValue;
-        const len_preview = try c.takeInt(u32, .big);
-        const unknown = try c.takeInt(u32, .big);
-        if (len_preview != header.content_size()) return error.InvalidFormat;
-        const data = try bin.takeStructSlice(alloc, c, WaveformPreviewColumn, .big, len_preview);
-        return .{ .unknown = unknown, .data = data };
-    }
-
-    fn writeTo(w: *const WaveformPreview, e: *bin.Emitter) WriteError!void {
-        try e.putInt(u32, try narrow(u32, w.data.len), .big);
-        try e.putInt(u32, w.unknown, .big);
-        for (w.data) |*column| try bin.putStruct(e, column, .big);
-    }
-};
+pub const WaveformPreview = WaveformSection(.{
+    .column = WaveformPreviewColumn,
+    .unknown = 0x0001_0000,
+});
 
 /// Smaller version of the fixed-width monochrome preview of the track
 /// waveform (for the CDJ-900).
-pub const TinyWaveformPreview = struct {
-    /// Unknown field, `0x00010000` in all known files (stored verbatim).
-    unknown: u32 = 0x0001_0000,
-    /// Waveform preview column data; `len_preview` is recomputed from this
-    /// slice on write.
-    data: []TinyWaveformPreviewColumn = &.{},
-
-    fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!TinyWaveformPreview {
-        if (header.size != 20) return error.UnexpectedValue;
-        const len_preview = try c.takeInt(u32, .big);
-        const unknown = try c.takeInt(u32, .big);
-        if (len_preview != header.content_size()) return error.InvalidFormat;
-        const data = try bin.takeStructSlice(alloc, c, TinyWaveformPreviewColumn, .big, len_preview);
-        return .{ .unknown = unknown, .data = data };
-    }
-
-    fn writeTo(w: *const TinyWaveformPreview, e: *bin.Emitter) WriteError!void {
-        try e.putInt(u32, try narrow(u32, w.data.len), .big);
-        try e.putInt(u32, w.unknown, .big);
-        for (w.data) |*column| try bin.putStruct(e, column, .big);
-    }
-};
+pub const TinyWaveformPreview = WaveformSection(.{
+    .column = TinyWaveformPreviewColumn,
+    .unknown = 0x0001_0000,
+});
 
 /// Variable-width large monochrome version of the track waveform, in `.EXT`
 /// files. Each entry represents one half-frame of audio data, so there are
 /// 150 entries per second of track audio.
-pub const WaveformDetail = struct {
-    /// Unknown field, `0x00960000` in all known files.
-    unknown: u32 = 0x0096_0000,
-    /// Waveform detail column data; `len_entries` is recomputed from this
-    /// slice on write.
-    data: []WaveformPreviewColumn = &.{},
-
-    /// Unknown fields that must hold their default value in all known files;
-    /// other values are rejected on parse (rekordcrate asserts on read).
-    pub const constant_fields = .{.unknown};
-
-    fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!WaveformDetail {
-        if (header.size != 24) return error.UnexpectedValue;
-        const len_entry_bytes = try c.takeInt(u32, .big);
-        if (len_entry_bytes != 1) return error.UnexpectedValue;
-        const len_entries = try c.takeInt(u32, .big);
-        if (@as(u64, len_entry_bytes) * len_entries != header.content_size()) return error.InvalidFormat;
-        const unknown = try c.takeInt(u32, .big);
-        try bin.validateConstantFields(WaveformDetail, .{ .unknown = unknown });
-        const data = try bin.takeStructSlice(alloc, c, WaveformPreviewColumn, .big, len_entries);
-        return .{ .unknown = unknown, .data = data };
-    }
-
-    fn writeTo(w: *const WaveformDetail, e: *bin.Emitter) WriteError!void {
-        try e.putInt(u32, 1, .big);
-        try e.putInt(u32, try narrow(u32, w.data.len), .big);
-        try e.putInt(u32, w.unknown, .big);
-        for (w.data) |*column| try bin.putStruct(e, column, .big);
-    }
-};
+pub const WaveformDetail = WaveformSection(.{
+    .column = WaveformPreviewColumn,
+    .entry_bytes = 1,
+    .unknown = 0x0096_0000,
+    .constant_unknown = true,
+});
 
 /// Fixed-width colored preview of the track waveform, in `.EXT` files.
-pub const WaveformColorPreview = struct {
-    /// Unknown field, zero in all known files (stored verbatim).
-    unknown: u32 = 0,
-    /// Waveform preview column data; `len_entries` is recomputed from this
-    /// slice on write.
-    data: []WaveformColorPreviewColumn = &.{},
-
-    fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!WaveformColorPreview {
-        if (header.size != 24) return error.UnexpectedValue;
-        const len_entry_bytes = try c.takeInt(u32, .big);
-        if (len_entry_bytes != 6) return error.UnexpectedValue;
-        const len_entries = try c.takeInt(u32, .big);
-        if (@as(u64, len_entry_bytes) * len_entries != header.content_size()) return error.InvalidFormat;
-        const unknown = try c.takeInt(u32, .big);
-        const data = try bin.takeStructSlice(alloc, c, WaveformColorPreviewColumn, .big, len_entries);
-        return .{ .unknown = unknown, .data = data };
-    }
-
-    fn writeTo(w: *const WaveformColorPreview, e: *bin.Emitter) WriteError!void {
-        try e.putInt(u32, 6, .big);
-        try e.putInt(u32, try narrow(u32, w.data.len), .big);
-        try e.putInt(u32, w.unknown, .big);
-        for (w.data) |*column| try bin.putStruct(e, column, .big);
-    }
-};
+pub const WaveformColorPreview = WaveformSection(.{
+    .column = WaveformColorPreviewColumn,
+    .entry_bytes = 6,
+    .unknown = 0,
+});
 
 /// Variable-width large colored version of the track waveform, in `.EXT`
 /// files. Each entry represents one half-frame of audio data, so there are
 /// 150 entries per second of track audio.
-pub const WaveformColorDetail = struct {
-    /// Unknown field, `0x00960305` in all known files (stored verbatim).
-    unknown: u32 = 0x0096_0305,
-    /// Waveform detail column data; `len_entries` is recomputed from this
-    /// slice on write.
-    data: []WaveformColorDetailColumn = &.{},
-
-    fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!WaveformColorDetail {
-        if (header.size != 24) return error.UnexpectedValue;
-        const len_entry_bytes = try c.takeInt(u32, .big);
-        if (len_entry_bytes != 2) return error.UnexpectedValue;
-        const len_entries = try c.takeInt(u32, .big);
-        if (@as(u64, len_entry_bytes) * len_entries != header.content_size()) return error.InvalidFormat;
-        const unknown = try c.takeInt(u32, .big);
-        const data = try bin.takeStructSlice(alloc, c, WaveformColorDetailColumn, .big, len_entries);
-        return .{ .unknown = unknown, .data = data };
-    }
-
-    fn writeTo(w: *const WaveformColorDetail, e: *bin.Emitter) WriteError!void {
-        try e.putInt(u32, 2, .big);
-        try e.putInt(u32, try narrow(u32, w.data.len), .big);
-        try e.putInt(u32, w.unknown, .big);
-        for (w.data) |*column| try bin.putStruct(e, column, .big);
-    }
-};
+pub const WaveformColorDetail = WaveformSection(.{
+    .column = WaveformColorDetailColumn,
+    .entry_bytes = 2,
+    .unknown = 0x0096_0305,
+});
 
 /// Fixed-width 3-band preview of the track waveform, in `.2EX` files.
-pub const Waveform3BandPreview = struct {
-    /// Waveform preview column data; `len_entries` is recomputed from this
-    /// slice on write.
-    data: []Waveform3BandPreviewColumn = &.{},
-
-    fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!Waveform3BandPreview {
-        if (header.size != 20) return error.UnexpectedValue;
-        const len_entry_bytes = try c.takeInt(u32, .big);
-        if (len_entry_bytes != 3) return error.UnexpectedValue;
-        const len_entries = try c.takeInt(u32, .big);
-        if (@as(u64, len_entry_bytes) * len_entries != header.content_size()) return error.InvalidFormat;
-        const data = try bin.takeStructSlice(alloc, c, Waveform3BandPreviewColumn, .big, len_entries);
-        return .{ .data = data };
-    }
-
-    fn writeTo(w: *const Waveform3BandPreview, e: *bin.Emitter) WriteError!void {
-        try e.putInt(u32, 3, .big);
-        try e.putInt(u32, try narrow(u32, w.data.len), .big);
-        for (w.data) |*column| try bin.putStruct(e, column, .big);
-    }
-};
+pub const Waveform3BandPreview = WaveformSection(.{
+    .column = Waveform3BandColumn,
+    .entry_bytes = 3,
+});
 
 /// Variable-width large 3-band version of the track waveform, in `.2EX`
 /// files. Each entry represents one half-frame of audio data, so there are
 /// 150 entries per second of track audio.
-pub const Waveform3BandDetail = struct {
-    /// Unknown field, `0x00960000` in all known files.
-    unknown: u32 = 0x0096_0000,
-    /// Waveform detail column data; `len_entries` is recomputed from this
-    /// slice on write.
-    data: []Waveform3BandDetailColumn = &.{},
-
-    /// Unknown fields that must hold their default value in all known files;
-    /// other values are rejected on parse (rekordcrate asserts on read).
-    pub const constant_fields = .{.unknown};
-
-    fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!Waveform3BandDetail {
-        if (header.size != 24) return error.UnexpectedValue;
-        const len_entry_bytes = try c.takeInt(u32, .big);
-        if (len_entry_bytes != 3) return error.UnexpectedValue;
-        const len_entries = try c.takeInt(u32, .big);
-        if (@as(u64, len_entry_bytes) * len_entries != header.content_size()) return error.InvalidFormat;
-        const unknown = try c.takeInt(u32, .big);
-        try bin.validateConstantFields(Waveform3BandDetail, .{ .unknown = unknown });
-        const data = try bin.takeStructSlice(alloc, c, Waveform3BandDetailColumn, .big, len_entries);
-        return .{ .unknown = unknown, .data = data };
-    }
-
-    fn writeTo(w: *const Waveform3BandDetail, e: *bin.Emitter) WriteError!void {
-        try e.putInt(u32, 3, .big);
-        try e.putInt(u32, try narrow(u32, w.data.len), .big);
-        try e.putInt(u32, w.unknown, .big);
-        for (w.data) |*column| try bin.putStruct(e, column, .big);
-    }
-};
+pub const Waveform3BandDetail = WaveformSection(.{
+    .column = Waveform3BandColumn,
+    .entry_bytes = 3,
+    .unknown = 0x0096_0000,
+    .constant_unknown = true,
+});
 
 /// Music classification used for Lighting mode, based on rhythm, tempo,
 /// kick drum, and sound density.
@@ -1214,38 +1141,38 @@ fn sectionHeader(content: Content) WriteError!Header {
         .vbr => |x| .{ .kind = .vbr, .size = 16, .total_size = try narrow(u32, 16 + x.data.len) },
         .waveform_preview => |x| .{
             .kind = .waveform_preview,
-            .size = 20,
-            .total_size = try narrow(u32, 20 + bin.serializedLen(WaveformPreviewColumn) * x.data.len),
+            .size = WaveformPreview.header_size,
+            .total_size = try narrow(u32, WaveformPreview.header_size + x.contentLen()),
         },
         .tiny_waveform_preview => |x| .{
             .kind = .tiny_waveform_preview,
-            .size = 20,
-            .total_size = try narrow(u32, 20 + bin.serializedLen(TinyWaveformPreviewColumn) * x.data.len),
+            .size = TinyWaveformPreview.header_size,
+            .total_size = try narrow(u32, TinyWaveformPreview.header_size + x.contentLen()),
         },
         .waveform_detail => |x| .{
             .kind = .waveform_detail,
-            .size = 24,
-            .total_size = try narrow(u32, 24 + bin.serializedLen(WaveformPreviewColumn) * x.data.len),
+            .size = WaveformDetail.header_size,
+            .total_size = try narrow(u32, WaveformDetail.header_size + x.contentLen()),
         },
         .waveform_color_preview => |x| .{
             .kind = .waveform_color_preview,
-            .size = 24,
-            .total_size = try narrow(u32, 24 + bin.serializedLen(WaveformColorPreviewColumn) * x.data.len),
+            .size = WaveformColorPreview.header_size,
+            .total_size = try narrow(u32, WaveformColorPreview.header_size + x.contentLen()),
         },
         .waveform_color_detail => |x| .{
             .kind = .waveform_color_detail,
-            .size = 24,
-            .total_size = try narrow(u32, 24 + bin.serializedLen(WaveformColorDetailColumn) * x.data.len),
+            .size = WaveformColorDetail.header_size,
+            .total_size = try narrow(u32, WaveformColorDetail.header_size + x.contentLen()),
         },
         .waveform_3band_preview => |x| .{
             .kind = .waveform_3band_preview,
-            .size = 20,
-            .total_size = try narrow(u32, 20 + bin.serializedLen(Waveform3BandPreviewColumn) * x.data.len),
+            .size = Waveform3BandPreview.header_size,
+            .total_size = try narrow(u32, Waveform3BandPreview.header_size + x.contentLen()),
         },
         .waveform_3band_detail => |x| .{
             .kind = .waveform_3band_detail,
-            .size = 24,
-            .total_size = try narrow(u32, 24 + bin.serializedLen(Waveform3BandDetailColumn) * x.data.len),
+            .size = Waveform3BandDetail.header_size,
+            .total_size = try narrow(u32, Waveform3BandDetail.header_size + x.contentLen()),
         },
         .song_structure => |x| .{
             .kind = .song_structure,
@@ -1597,6 +1524,17 @@ test "parse rejects sections with inconsistent sizes" {
     defer alloc.free(pwv3_file);
     try testing.expectError(error.UnexpectedValue, Anlz.parse(alloc, pwv3_file));
 
+    // Waveform detail whose unknown preamble field is not the constant found
+    // in all known files.
+    var pwv3_preamble2 = [_]u8{0} ** 12;
+    std.mem.writeInt(u32, pwv3_preamble2[0..4], 1, .big);
+    std.mem.writeInt(u32, pwv3_preamble2[8..12], 1, .big);
+    const pwv3_body2 = try buildRawSection(alloc, .waveform_detail, &pwv3_preamble2, &.{});
+    defer alloc.free(pwv3_body2);
+    const pwv3_file2 = try buildRawFile(alloc, &test_file_header_data, pwv3_body2);
+    defer alloc.free(pwv3_file2);
+    try testing.expectError(error.UnexpectedValue, Anlz.parse(alloc, pwv3_file2));
+
     // Song structure whose phrase count does not match the content size.
     var pssi_preamble2 = [_]u8{0} ** 20;
     std.mem.writeInt(u32, pssi_preamble2[0..4], 24, .big);
@@ -1813,8 +1751,8 @@ test "waveform sections roundtrip with checks" {
         .{ .unknown1 = 1, .unknown2 = 2, .energy_bottom_half_freq = 3, .energy_bottom_third_freq = 4, .energy_mid_third_freq = 5, .energy_top_third_freq = 6 },
     };
     var color_detail = [_]WaveformColorDetailColumn{.{ .red = 5, .green = 3, .blue = 7, .height = 31, .unknown = 1 }};
-    var band_preview = [_]Waveform3BandPreviewColumn{.{ .energy_mid_third_freq = 1, .energy_top_third_freq = 2, .energy_bottom_third_freq = 3 }};
-    var band_detail = [_]Waveform3BandDetailColumn{.{ .energy_mid_third_freq = 4, .energy_top_third_freq = 5, .energy_bottom_third_freq = 6 }};
+    var band_preview = [_]Waveform3BandColumn{.{ .energy_mid_third_freq = 1, .energy_top_third_freq = 2, .energy_bottom_third_freq = 3 }};
+    var band_detail = [_]Waveform3BandColumn{.{ .energy_mid_third_freq = 4, .energy_top_third_freq = 5, .energy_bottom_third_freq = 6 }};
     const sections = [_]Content{
         .{ .waveform_preview = .{ .data = &preview } },
         .{ .tiny_waveform_preview = .{ .data = &tiny } },
@@ -1841,8 +1779,8 @@ test "waveform sections roundtrip with checks" {
     try testing.expectEqual(@as(u5, 31), cd.height);
     try testing.expectEqual(@as(u2, 1), cd.unknown);
     try testing.expectEqualSlices(WaveformColorPreviewColumn, &color_preview, parsed.sections[2].waveform_color_preview.data);
-    try testing.expectEqualSlices(Waveform3BandPreviewColumn, &band_preview, parsed.sections[4].waveform_3band_preview.data);
-    try testing.expectEqualSlices(Waveform3BandDetailColumn, &band_detail, parsed.sections[5].waveform_3band_detail.data);
+    try testing.expectEqualSlices(Waveform3BandColumn, &band_preview, parsed.sections[4].waveform_3band_preview.data);
+    try testing.expectEqualSlices(Waveform3BandColumn, &band_detail, parsed.sections[5].waveform_3band_detail.data);
 }
 
 test "extended cue with empty comment roundtrips" {
