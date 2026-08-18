@@ -499,11 +499,22 @@ pub const ExtendedCue = struct {
     /// `total_size - 68 - comment byte_len` bytes.
     trailing: []const u8 = &.{},
 
+    /// Fixed size of a serialized entry: the 12-byte nested `PCP2` header
+    /// plus 56 bytes of fields, the comment's 4-byte length prefix included
+    /// (its payload and the trailing bytes are variable).
+    const fixed_wire_len = 68;
+
+    /// Length of a serialized entry, its nested header, comment payload,
+    /// and trailing bytes included.
+    fn wireLen(cue: *const ExtendedCue) usize {
+        return fixed_wire_len + cue.comment.raw.len + cue.trailing.len;
+    }
+
     fn parse(c: *bin.Cursor, alloc: std.mem.Allocator) ParseError!ExtendedCue {
         const header = try bin.takeStruct(c, Header, .big);
         if (header.kind != .extended_cue or header.size != 16) return error.UnexpectedValue;
         var cue = try bin.takeStruct(c, ExtendedCue, .big);
-        const fixed_len: usize = 68 + cue.comment.raw.len;
+        const fixed_len: usize = fixed_wire_len + cue.comment.raw.len;
         if (header.total_size < fixed_len) return error.InvalidFormat;
         cue.trailing = try alloc.dupe(u8, try c.takeBytes(@as(usize, header.total_size) - fixed_len));
         return cue;
@@ -513,7 +524,7 @@ pub const ExtendedCue = struct {
         try bin.putStruct(e, Header{
             .kind = .extended_cue,
             .size = 16,
-            .total_size = try narrow(u32, 68 + cue.comment.raw.len + cue.trailing.len),
+            .total_size = try narrow(u32, cue.wireLen()),
         }, .big);
         try bin.putStruct(e, cue, .big);
         try e.putBytes(cue.trailing);
@@ -1202,7 +1213,7 @@ fn sectionHeader(content: Content) WriteError!Header {
             .size = 20,
             .total_size = blk: {
                 var len: usize = 20;
-                for (x.cues) |*cue| len += 68 + cue.comment.raw.len + cue.trailing.len;
+                for (x.cues) |*cue| len += cue.wireLen();
                 break :blk try narrow(u32, len);
             },
         },
