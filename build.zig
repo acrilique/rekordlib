@@ -7,11 +7,13 @@ pub fn build(b: *std.Build) void {
     const bin = b.addModule("bin", .{
         .root_source_file = b.path("src/bin.zig"),
         .target = target,
+        .optimize = optimize,
     });
 
     const setting = b.addModule("setting", .{
         .root_source_file = b.path("src/setting.zig"),
         .target = target,
+        .optimize = optimize,
         .imports = &.{
             .{ .name = "bin", .module = bin },
         },
@@ -20,11 +22,13 @@ pub fn build(b: *std.Build) void {
     const xor = b.addModule("xor", .{
         .root_source_file = b.path("src/xor.zig"),
         .target = target,
+        .optimize = optimize,
     });
 
     const anlz = b.addModule("anlz", .{
         .root_source_file = b.path("src/anlz.zig"),
         .target = target,
+        .optimize = optimize,
         .imports = &.{
             .{ .name = "bin", .module = bin },
             .{ .name = "xor", .module = xor },
