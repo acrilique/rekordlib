@@ -1219,18 +1219,20 @@ fn writeSection(content: Content, e: *bin.Emitter) WriteError!void {
     }
 }
 
-/// Writes a whole file: the `PMAI` header with sizes derived from the
-/// content, `header_data`, and the sections.
+/// Writes a whole file: the `PMAI` header, `header_data`, and the sections,
+/// with every size derived from the content. The file header's `total_size`
+/// is patched in after the sections, since only then is it known.
 fn writeFile(e: *bin.Emitter, header_data: []const u8, sections: []const Content) WriteError!void {
-    var total: usize = 12 + header_data.len;
-    for (sections) |content| total += (try sectionHeader(content)).total_size;
+    const file_start = e.pos();
     try bin.putStruct(e, Header{
         .kind = .file,
         .size = try narrow(u32, 12 + header_data.len),
-        .total_size = try narrow(u32, total),
+        .total_size = 0,
     }, .big);
     try e.putBytes(header_data);
     for (sections) |content| try writeSection(content, e);
+    // `total_size` sits eight bytes into the header, behind `kind` and `size`.
+    e.patchIntAt(file_start + 8, u32, try narrow(u32, e.pos() - file_start), .big);
 }
 
 /// Serializes a whole file into an owned ANLZ image; the caller owns the
