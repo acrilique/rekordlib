@@ -25,6 +25,13 @@ const xor = @import("xor");
 
 pub const ParseError = error{ UnexpectedEof, OutOfMemory, InvalidFormat, UnexpectedValue };
 
+pub const WriteError = bin.WriteError || error{Overflow};
+
+/// Narrows `n` to `T`, failing with `Overflow` instead of truncating.
+fn narrow(comptime T: type, n: usize) WriteError!T {
+    return std.math.cast(T, n) orelse error.Overflow;
+}
+
 /// Packs a four character code into a big-endian u32 tag.
 fn fourcc(comptime tag: *const [4]u8) u32 {
     return (@as(u32, tag[0]) << 24) | (@as(u32, tag[1]) << 16) | (@as(u32, tag[2]) << 8) | tag[3];
@@ -132,10 +139,10 @@ pub const BeatGrid = struct {
         return .{ .unknown1 = unknown1, .unknown2 = unknown2, .beats = beats };
     }
 
-    fn writeTo(bg: *const BeatGrid, e: *bin.Emitter) bin.WriteError!void {
+    fn writeTo(bg: *const BeatGrid, e: *bin.Emitter) WriteError!void {
         try e.putInt(u32, bg.unknown1, .big);
         try e.putInt(u32, bg.unknown2, .big);
-        try e.putInt(u32, @intCast(bg.beats.len), .big);
+        try e.putInt(u32, try narrow(u32, bg.beats.len), .big);
         for (bg.beats) |*beat| try bin.putStruct(e, beat, .big);
     }
 };
@@ -228,7 +235,7 @@ pub const Cue = struct {
         return bin.takeStruct(c, Cue, .big);
     }
 
-    fn writeTo(cue: *const Cue, e: *bin.Emitter) bin.WriteError!void {
+    fn writeTo(cue: *const Cue, e: *bin.Emitter) WriteError!void {
         try bin.putStruct(e, Header{ .kind = .cue, .size = 16, .total_size = wire_len }, .big);
         try bin.putStruct(e, cue, .big);
     }
@@ -262,10 +269,10 @@ pub const CueList = struct {
         };
     }
 
-    fn writeTo(cl: *const CueList, e: *bin.Emitter) bin.WriteError!void {
+    fn writeTo(cl: *const CueList, e: *bin.Emitter) WriteError!void {
         try e.putInt(u32, @intFromEnum(cl.list_type), .big);
         try e.putInt(u16, cl.unknown, .big);
-        try e.putInt(u16, @intCast(cl.cues.len), .big);
+        try e.putInt(u16, try narrow(u16, cl.cues.len), .big);
         try e.putInt(u32, cl.memory_count, .big);
         for (cl.cues) |*cue| try cue.writeTo(e);
     }
@@ -474,11 +481,11 @@ pub const ExtendedCue = struct {
         return cue;
     }
 
-    fn writeTo(cue: *const ExtendedCue, e: *bin.Emitter) bin.WriteError!void {
+    fn writeTo(cue: *const ExtendedCue, e: *bin.Emitter) WriteError!void {
         try bin.putStruct(e, Header{
             .kind = .extended_cue,
             .size = 16,
-            .total_size = @intCast(68 + cue.comment.raw.len + cue.trailing.len),
+            .total_size = try narrow(u32, 68 + cue.comment.raw.len + cue.trailing.len),
         }, .big);
         try bin.putStruct(e, cue, .big);
         try e.putBytes(cue.trailing);
@@ -513,9 +520,9 @@ pub const ExtendedCueList = struct {
         return .{ .list_type = list_type, .unknown = unknown, .cues = cues };
     }
 
-    fn writeTo(cl: *const ExtendedCueList, e: *bin.Emitter) bin.WriteError!void {
+    fn writeTo(cl: *const ExtendedCueList, e: *bin.Emitter) WriteError!void {
         try e.putInt(u32, @intFromEnum(cl.list_type), .big);
-        try e.putInt(u16, @intCast(cl.cues.len), .big);
+        try e.putInt(u16, try narrow(u16, cl.cues.len), .big);
         try e.putInt(u16, cl.unknown, .big);
         for (cl.cues) |*cue| try cue.writeTo(e);
     }
@@ -535,7 +542,7 @@ pub const Path = struct {
         return p;
     }
 
-    fn writeTo(p: *const Path, e: *bin.Emitter) bin.WriteError!void {
+    fn writeTo(p: *const Path, e: *bin.Emitter) WriteError!void {
         try bin.putStruct(e, p, .big);
     }
 };
@@ -554,7 +561,7 @@ pub const Vbr = struct {
         return .{ .unknown1 = unknown1, .data = data };
     }
 
-    fn writeTo(v: *const Vbr, e: *bin.Emitter) bin.WriteError!void {
+    fn writeTo(v: *const Vbr, e: *bin.Emitter) WriteError!void {
         try e.putInt(u32, v.unknown1, .big);
         try e.putBytes(v.data);
     }
@@ -653,8 +660,8 @@ pub const WaveformPreview = struct {
         return .{ .unknown = unknown, .data = data };
     }
 
-    fn writeTo(w: *const WaveformPreview, e: *bin.Emitter) bin.WriteError!void {
-        try e.putInt(u32, @intCast(w.data.len), .big);
+    fn writeTo(w: *const WaveformPreview, e: *bin.Emitter) WriteError!void {
+        try e.putInt(u32, try narrow(u32, w.data.len), .big);
         try e.putInt(u32, w.unknown, .big);
         for (w.data) |*column| try bin.putStruct(e, column, .big);
     }
@@ -679,8 +686,8 @@ pub const TinyWaveformPreview = struct {
         return .{ .unknown = unknown, .data = data };
     }
 
-    fn writeTo(w: *const TinyWaveformPreview, e: *bin.Emitter) bin.WriteError!void {
-        try e.putInt(u32, @intCast(w.data.len), .big);
+    fn writeTo(w: *const TinyWaveformPreview, e: *bin.Emitter) WriteError!void {
+        try e.putInt(u32, try narrow(u32, w.data.len), .big);
         try e.putInt(u32, w.unknown, .big);
         for (w.data) |*column| try bin.putStruct(e, column, .big);
     }
@@ -713,9 +720,9 @@ pub const WaveformDetail = struct {
         return .{ .unknown = unknown, .data = data };
     }
 
-    fn writeTo(w: *const WaveformDetail, e: *bin.Emitter) bin.WriteError!void {
+    fn writeTo(w: *const WaveformDetail, e: *bin.Emitter) WriteError!void {
         try e.putInt(u32, 1, .big);
-        try e.putInt(u32, @intCast(w.data.len), .big);
+        try e.putInt(u32, try narrow(u32, w.data.len), .big);
         try e.putInt(u32, w.unknown, .big);
         for (w.data) |*column| try bin.putStruct(e, column, .big);
     }
@@ -741,9 +748,9 @@ pub const WaveformColorPreview = struct {
         return .{ .unknown = unknown, .data = data };
     }
 
-    fn writeTo(w: *const WaveformColorPreview, e: *bin.Emitter) bin.WriteError!void {
+    fn writeTo(w: *const WaveformColorPreview, e: *bin.Emitter) WriteError!void {
         try e.putInt(u32, 6, .big);
-        try e.putInt(u32, @intCast(w.data.len), .big);
+        try e.putInt(u32, try narrow(u32, w.data.len), .big);
         try e.putInt(u32, w.unknown, .big);
         for (w.data) |*column| try bin.putStruct(e, column, .big);
     }
@@ -771,9 +778,9 @@ pub const WaveformColorDetail = struct {
         return .{ .unknown = unknown, .data = data };
     }
 
-    fn writeTo(w: *const WaveformColorDetail, e: *bin.Emitter) bin.WriteError!void {
+    fn writeTo(w: *const WaveformColorDetail, e: *bin.Emitter) WriteError!void {
         try e.putInt(u32, 2, .big);
-        try e.putInt(u32, @intCast(w.data.len), .big);
+        try e.putInt(u32, try narrow(u32, w.data.len), .big);
         try e.putInt(u32, w.unknown, .big);
         for (w.data) |*column| try bin.putStruct(e, column, .big);
     }
@@ -796,9 +803,9 @@ pub const Waveform3BandPreview = struct {
         return .{ .data = data };
     }
 
-    fn writeTo(w: *const Waveform3BandPreview, e: *bin.Emitter) bin.WriteError!void {
+    fn writeTo(w: *const Waveform3BandPreview, e: *bin.Emitter) WriteError!void {
         try e.putInt(u32, 3, .big);
-        try e.putInt(u32, @intCast(w.data.len), .big);
+        try e.putInt(u32, try narrow(u32, w.data.len), .big);
         for (w.data) |*column| try bin.putStruct(e, column, .big);
     }
 };
@@ -830,9 +837,9 @@ pub const Waveform3BandDetail = struct {
         return .{ .unknown = unknown, .data = data };
     }
 
-    fn writeTo(w: *const Waveform3BandDetail, e: *bin.Emitter) bin.WriteError!void {
+    fn writeTo(w: *const Waveform3BandDetail, e: *bin.Emitter) WriteError!void {
         try e.putInt(u32, 3, .big);
-        try e.putInt(u32, @intCast(w.data.len), .big);
+        try e.putInt(u32, try narrow(u32, w.data.len), .big);
         try e.putInt(u32, w.unknown, .big);
         for (w.data) |*column| try bin.putStruct(e, column, .big);
     }
@@ -956,7 +963,7 @@ pub const SongStructureData = struct {
         return out;
     }
 
-    fn writeTo(d: *const SongStructureData, e: *bin.Emitter) bin.WriteError!void {
+    fn writeTo(d: *const SongStructureData, e: *bin.Emitter) WriteError!void {
         try bin.putStruct(e, d, .big);
         for (d.phrases) |*phrase| try bin.putStruct(e, phrase, .big);
     }
@@ -1021,8 +1028,8 @@ pub const SongStructure = struct {
         return .{ .is_encrypted = is_encrypted, .data = data };
     }
 
-    fn writeTo(ss: *const SongStructure, e: *bin.Emitter, alloc: std.mem.Allocator) bin.WriteError!void {
-        const len_entries: u16 = @intCast(ss.data.phrases.len);
+    fn writeTo(ss: *const SongStructure, e: *bin.Emitter, alloc: std.mem.Allocator) WriteError!void {
+        const len_entries: u16 = try narrow(u16, ss.data.phrases.len);
         try e.putInt(u32, 24, .big);
         try e.putInt(u16, len_entries, .big);
         var data_out = bin.Emitter.init(alloc);
@@ -1056,7 +1063,7 @@ pub const Unknown = struct {
         return .{ .kind = header.kind, .header_data = header_data, .content_data = content_data };
     }
 
-    fn writeTo(u: *const Unknown, e: *bin.Emitter) bin.WriteError!void {
+    fn writeTo(u: *const Unknown, e: *bin.Emitter) WriteError!void {
         try e.putBytes(u.header_data);
         try e.putBytes(u.content_data);
     }
@@ -1151,17 +1158,17 @@ fn sectionKind(content: *const Content) Kind {
 /// unknown sections), while `total_size` follows from the content lengths.
 /// Deriving headers from the data rather than storing parsed values keeps
 /// files consistent when parsed content is modified.
-fn sectionHeader(content: Content) Header {
+fn sectionHeader(content: Content) WriteError!Header {
     return switch (content) {
         .beat_grid => |x| .{
             .kind = .beat_grid,
             .size = 24,
-            .total_size = @intCast(24 + bin.serializedLen(Beat) * x.beats.len),
+            .total_size = try narrow(u32, 24 + bin.serializedLen(Beat) * x.beats.len),
         },
         .cue_list => |x| .{
             .kind = .cue_list,
             .size = 24,
-            .total_size = @intCast(24 + Cue.wire_len * x.cues.len),
+            .total_size = try narrow(u32, 24 + Cue.wire_len * x.cues.len),
         },
         .extended_cue_list => |x| .{
             .kind = .extended_cue_list,
@@ -1169,66 +1176,66 @@ fn sectionHeader(content: Content) Header {
             .total_size = blk: {
                 var len: usize = 20;
                 for (x.cues) |*cue| len += 68 + cue.comment.raw.len + cue.trailing.len;
-                break :blk @intCast(len);
+                break :blk try narrow(u32, len);
             },
         },
         .path => |x| .{ .kind = .path, .size = 16, .total_size = 16 + x.path.byte_len() },
-        .vbr => |x| .{ .kind = .vbr, .size = 16, .total_size = @intCast(16 + x.data.len) },
+        .vbr => |x| .{ .kind = .vbr, .size = 16, .total_size = try narrow(u32, 16 + x.data.len) },
         .waveform_preview => |x| .{
             .kind = .waveform_preview,
             .size = 20,
-            .total_size = @intCast(20 + bin.serializedLen(WaveformPreviewColumn) * x.data.len),
+            .total_size = try narrow(u32, 20 + bin.serializedLen(WaveformPreviewColumn) * x.data.len),
         },
         .tiny_waveform_preview => |x| .{
             .kind = .tiny_waveform_preview,
             .size = 20,
-            .total_size = @intCast(20 + bin.serializedLen(TinyWaveformPreviewColumn) * x.data.len),
+            .total_size = try narrow(u32, 20 + bin.serializedLen(TinyWaveformPreviewColumn) * x.data.len),
         },
         .waveform_detail => |x| .{
             .kind = .waveform_detail,
             .size = 24,
-            .total_size = @intCast(24 + bin.serializedLen(WaveformPreviewColumn) * x.data.len),
+            .total_size = try narrow(u32, 24 + bin.serializedLen(WaveformPreviewColumn) * x.data.len),
         },
         .waveform_color_preview => |x| .{
             .kind = .waveform_color_preview,
             .size = 24,
-            .total_size = @intCast(24 + bin.serializedLen(WaveformColorPreviewColumn) * x.data.len),
+            .total_size = try narrow(u32, 24 + bin.serializedLen(WaveformColorPreviewColumn) * x.data.len),
         },
         .waveform_color_detail => |x| .{
             .kind = .waveform_color_detail,
             .size = 24,
-            .total_size = @intCast(24 + bin.serializedLen(WaveformColorDetailColumn) * x.data.len),
+            .total_size = try narrow(u32, 24 + bin.serializedLen(WaveformColorDetailColumn) * x.data.len),
         },
         .waveform_3band_preview => |x| .{
             .kind = .waveform_3band_preview,
             .size = 20,
-            .total_size = @intCast(20 + bin.serializedLen(Waveform3BandPreviewColumn) * x.data.len),
+            .total_size = try narrow(u32, 20 + bin.serializedLen(Waveform3BandPreviewColumn) * x.data.len),
         },
         .waveform_3band_detail => |x| .{
             .kind = .waveform_3band_detail,
             .size = 24,
-            .total_size = @intCast(24 + bin.serializedLen(Waveform3BandDetailColumn) * x.data.len),
+            .total_size = try narrow(u32, 24 + bin.serializedLen(Waveform3BandDetailColumn) * x.data.len),
         },
         .song_structure => |x| .{
             .kind = .song_structure,
             .size = 32,
-            .total_size = @intCast(32 + bin.serializedLen(Phrase) * x.data.phrases.len),
+            .total_size = try narrow(u32, 32 + bin.serializedLen(Phrase) * x.data.phrases.len),
         },
         .unknown => |x| .{
             .kind = x.kind,
-            .size = @intCast(12 + x.header_data.len),
-            .total_size = @intCast(12 + x.header_data.len + x.content_data.len),
+            .size = try narrow(u32, 12 + x.header_data.len),
+            .total_size = try narrow(u32, 12 + x.header_data.len + x.content_data.len),
         },
     };
 }
 
 /// Writes one section: its derived header followed by the content.
-fn writeSection(content: Content, e: *bin.Emitter, alloc: std.mem.Allocator) bin.WriteError!void {
-    try bin.putStruct(e, sectionHeader(content), .big);
+fn writeSection(content: Content, e: *bin.Emitter, alloc: std.mem.Allocator) WriteError!void {
+    try bin.putStruct(e, try sectionHeader(content), .big);
     try writeContent(content, e, alloc);
 }
 
-fn writeContent(content: Content, e: *bin.Emitter, alloc: std.mem.Allocator) bin.WriteError!void {
+fn writeContent(content: Content, e: *bin.Emitter, alloc: std.mem.Allocator) WriteError!void {
     switch (content) {
         .beat_grid => |x| try x.writeTo(e),
         .cue_list => |x| try x.writeTo(e),
@@ -1249,13 +1256,13 @@ fn writeContent(content: Content, e: *bin.Emitter, alloc: std.mem.Allocator) bin
 
 /// Writes a whole file: the `PMAI` header with sizes derived from the
 /// content, `header_data`, and the sections.
-fn writeFile(e: *bin.Emitter, alloc: std.mem.Allocator, header_data: []const u8, sections: []const Content) bin.WriteError!void {
+fn writeFile(e: *bin.Emitter, alloc: std.mem.Allocator, header_data: []const u8, sections: []const Content) WriteError!void {
     var total: usize = 12 + header_data.len;
-    for (sections) |content| total += sectionHeader(content).total_size;
+    for (sections) |content| total += (try sectionHeader(content)).total_size;
     try bin.putStruct(e, Header{
         .kind = .file,
-        .size = @intCast(12 + header_data.len),
-        .total_size = @intCast(total),
+        .size = try narrow(u32, 12 + header_data.len),
+        .total_size = try narrow(u32, total),
     }, .big);
     try e.putBytes(header_data);
     for (sections) |content| try writeSection(content, e, alloc);
@@ -1313,8 +1320,9 @@ pub const Anlz = struct {
 
     /// Serializes the file; the caller owns the returned bytes. All header
     /// sizes and count fields are derived from the data, so parsed files
-    /// serialize byte-identical and modified files stay well-formed.
-    pub fn serialize(m: *const Anlz, alloc: std.mem.Allocator) bin.WriteError![]u8 {
+    /// serialize byte-identical and modified files stay well-formed. A count
+    /// or size that does not fit its wire field fails with `error.Overflow`.
+    pub fn serialize(m: *const Anlz, alloc: std.mem.Allocator) WriteError![]u8 {
         var e = bin.Emitter.init(alloc);
         defer e.deinit();
         try writeFile(&e, alloc, m.header_data, m.sections);
@@ -1335,7 +1343,7 @@ pub const Anlz = struct {
 const testing = std.testing;
 
 /// Serializes `sections` into a full ANLZ image.
-fn buildFile(alloc: std.mem.Allocator, header_data: []const u8, sections: []const Content) bin.WriteError![]u8 {
+fn buildFile(alloc: std.mem.Allocator, header_data: []const u8, sections: []const Content) WriteError![]u8 {
     var e = bin.Emitter.init(alloc);
     defer e.deinit();
     try writeFile(&e, alloc, header_data, sections);
@@ -1456,7 +1464,7 @@ test "derived headers roundtrip through content size" {
     // the derived header of a section without preamble is `size` 12 and
     // `total_size` 12 + content, which the size accessors invert.
     const content = [_]u8{0} ** 100;
-    const plain = sectionHeader(.{ .unknown = .{
+    const plain = try sectionHeader(.{ .unknown = .{
         .kind = @enumFromInt(fourcc("PQT2")),
         .content_data = &content,
     } });
@@ -1466,7 +1474,7 @@ test "derived headers roundtrip through content size" {
     try testing.expectEqual(@as(u32, 0), plain.remaining_size());
 
     // A section with a 4-byte preamble keeps it in `remaining_size`.
-    const vbr = sectionHeader(.{ .vbr = .{ .data = &content } });
+    const vbr = try sectionHeader(.{ .vbr = .{ .data = &content } });
     try testing.expectEqual(@as(u32, 16), vbr.size);
     try testing.expectEqual(@as(u32, 116), vbr.total_size);
     try testing.expectEqual(@as(u32, 100), vbr.content_size());
@@ -1713,6 +1721,27 @@ test "beat grid and cue list with entries roundtrip" {
     try testing.expectEqual(CueType.loop, list.cues[1].cue_type);
     try testing.expectEqual(@as(u32, 2000), list.cues[1].loop_time);
     try testing.expectEqual(@as(u32, 0x0010_0000), list.cues[1].unknown1);
+}
+
+test "writing more cues than the u16 len_cues field holds fails" {
+    const alloc = testing.allocator;
+    const file_header_data = [16]u8{ 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+    const cues = try alloc.alloc(Cue, 65536);
+    defer alloc.free(cues);
+    for (cues) |*cue| cue.* = .{};
+
+    var sections = [_]Content{
+        .{ .cue_list = .{ .list_type = .hot_cues, .memory_count = 0xFFFF_FFFF, .cues = cues[0..65535] } },
+    };
+    // The largest count that fits `len_cues` (u16) still roundtrips.
+    const max = try buildFile(alloc, &file_header_data, &sections);
+    defer alloc.free(max);
+    try expectRoundtripBytes(alloc, max);
+
+    // One cue more must fail instead of truncating the count against the
+    // derived `total_size`.
+    sections[0].cue_list.cues = cues;
+    try testing.expectError(error.Overflow, buildFile(alloc, &file_header_data, &sections));
 }
 
 test "waveform sections roundtrip with checks" {
