@@ -295,6 +295,26 @@ pub fn serializedLen(comptime T: type) usize {
     };
 }
 
+/// Checks the fields listed in `T.constant_fields` (an anonymous struct
+/// listing field names, e.g. `.{ .magic, .checksum }`) against their default
+/// values, which they must hold in all known files; other values are
+/// rejected with `error.UnexpectedValue`. Fields not listed are accepted and
+/// written verbatim. A `T` without a `constant_fields` declaration passes
+/// as-is.
+pub fn validateConstantFields(comptime T: type, value: T) error{UnexpectedValue}!void {
+    if (!@hasDecl(T, "constant_fields")) return;
+    const defaults = T{};
+    inline for (T.constant_fields) |field| {
+        const name = @tagName(field);
+        if (!@hasField(T, name))
+            @compileError("constant_fields of " ++ @typeName(T) ++ " reference unknown field '" ++ name ++ "'");
+        switch (@typeInfo(@TypeOf(@field(value, name)))) {
+            .array => if (!std.mem.eql(u8, &@field(value, name), &@field(defaults, name))) return error.UnexpectedValue,
+            else => if (@field(value, name) != @field(defaults, name)) return error.UnexpectedValue,
+        }
+    }
+}
+
 const testing = std.testing;
 
 /// Test-only custom codec: a little-endian u8 byte-count prefix followed by
@@ -520,6 +540,25 @@ test "takeStruct/putStruct delegate to custom codecs" {
     // A codec that needs memory fails without a cursor allocator.
     var bare = Cursor.init(e.written());
     try testing.expectError(ReadError.OutOfMemory, takeStruct(&bare, Sample, .little));
+}
+
+test "validateConstantFields" {
+    const Sample = struct {
+        magic: u32 = 0x1234,
+        blob: [2]u8 = .{ 1, 2 },
+        spare: u8 = 0,
+
+        pub const constant_fields = .{ .magic, .blob };
+    };
+
+    // Listed fields at their defaults pass, regardless of unlisted fields.
+    try validateConstantFields(Sample, Sample{});
+    try validateConstantFields(Sample, .{ .magic = 0x1234, .blob = .{ 1, 2 }, .spare = 0xFF });
+    // Scalar and array deviations are rejected.
+    try testing.expectError(error.UnexpectedValue, validateConstantFields(Sample, .{ .magic = 1, .blob = .{ 1, 2 } }));
+    try testing.expectError(error.UnexpectedValue, validateConstantFields(Sample, .{ .magic = 0x1234, .blob = .{ 1, 3 } }));
+    // Types without the declaration pass untouched.
+    try validateConstantFields(struct { spare: u8 = 0 }, .{ .spare = 7 });
 }
 
 test "takeStruct/putStruct skip slice fields" {

@@ -45,8 +45,8 @@ pub fn Setting(comptime Data: type) type {
         version: [string_field_len]u8,
         /// The actual settings data.
         data: Data,
-        /// Trailing unknown field, zero in all known files. Nonzero values
-        /// are rejected on parse; the stored value is written verbatim.
+        /// Trailing unknown field, zero in all known files; parsing rejects any
+        /// other value, so it is always zero in parsed instances.
         unknown: u16,
 
         /// Parse a `*SETTING.DAT` image. The checksum is not verified; it is
@@ -61,7 +61,7 @@ pub fn Setting(comptime Data: type) type {
             const len_data = try c.takeInt(u32, .little);
             if (len_data != data_len) return error.InvalidFormat;
             const data = try bin.takeStruct(&c, Data, .little);
-            try validateConstantFields(Data, data);
+            try bin.validateConstantFields(Data, data);
             _ = try c.takeInt(u16, .little);
             const unknown = try c.takeInt(u16, .little);
             if (unknown != 0) return error.UnexpectedValue;
@@ -126,23 +126,6 @@ pub fn Setting(comptime Data: type) type {
             return fieldString(&s.version);
         }
     };
-}
-
-/// Checks the payload fields listed in `T.constant_fields` against their
-/// default values, which they must hold in all known files. Fields not
-/// listed are accepted and written verbatim.
-fn validateConstantFields(comptime T: type, value: T) error{UnexpectedValue}!void {
-    if (!@hasDecl(T, "constant_fields")) return;
-    const defaults = T{};
-    inline for (T.constant_fields) |field| {
-        const name = @tagName(field);
-        if (!@hasField(T, name))
-            @compileError("constant_fields of " ++ @typeName(T) ++ " reference unknown field '" ++ name ++ "'");
-        switch (@typeInfo(@TypeOf(@field(value, name)))) {
-            .array => if (!std.mem.eql(u8, &@field(value, name), &@field(defaults, name))) return error.UnexpectedValue,
-            else => if (@field(value, name) != @field(defaults, name)) return error.UnexpectedValue,
-        }
-    }
 }
 
 /// Payload of a `DEVSETTING.DAT` file. Fields are read and written in
