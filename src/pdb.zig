@@ -444,7 +444,7 @@ pub fn Offsets(comptime n: usize) type {
 /// The inner type `T` combines the items into one value and must declare:
 ///
 /// * `offset_count`: how many items (and offsets) it comprises
-/// * `OffsetItem`: the item type, holding the `decode`/`encode`/
+/// * `OffsetItem`: the item type, holding the `decode`/`encode`/`deinit`/
 ///   `heapBytesRequired`/`requiredAlignment`/`eql` protocol of
 ///   `DeviceSQLString` (the alignment matters to calculated offsets)
 /// * `offsetItems(T) [n]OffsetItem`, a borrowing view, and
@@ -490,16 +490,26 @@ pub fn OffsetArrayContainer(comptime T: type) type {
             }
             const base = start - array_offset;
             var items: [n]Item = undefined;
-            // `inline for` so zero-item containers can use `void` items:
-            // the body referencing `Item.decode` is never analyzed.
-            inline for (values, &items) |offset, *item| {
-                const pos = base + @as(usize, offset);
-                if (pos > c.buf.len) return error.UnexpectedEof;
-                var sub_cursor = bin.Cursor{
-                    .buf = c.buf[pos..],
-                    .alloc = c.alloc,
-                };
-                item.* = try Item.decode(&sub_cursor);
+            // The comptime guard lets zero-item containers use `void`
+            // items, whose type has no `decode`; items decoded before a
+            // failure are freed, so a partially decoded container (a row
+            // rejected mid-parse) never leaks.
+            if (Item != void) {
+                const alloc = c.alloc orelse return bin.ReadError.OutOfMemory;
+                var decoded: usize = 0;
+                errdefer {
+                    for (items[0..decoded]) |*item| item.deinit(alloc);
+                }
+                for (values, &items) |offset, *item| {
+                    const pos = base + @as(usize, offset);
+                    if (pos > c.buf.len) return error.UnexpectedEof;
+                    var sub_cursor = bin.Cursor{
+                        .buf = c.buf[pos..],
+                        .alloc = c.alloc,
+                    };
+                    item.* = try Item.decode(&sub_cursor);
+                    decoded += 1;
+                }
             }
             return .{
                 .offsets = .{ .provided = .{ .size = size, .values = values } },
@@ -573,6 +583,15 @@ pub fn OffsetArrayContainer(comptime T: type) type {
 
         pub fn eql(a: Self, b: Self) bool {
             return a.offsets.eql(b.offsets) and a.inner.eql(b.inner);
+        }
+
+        /// Frees the items, which must have been allocated with `alloc`
+        /// (by `decode` or by building the inner value); containers
+        /// deinit-ed with the same allocator.
+        pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
+            if (Item == void) return;
+            var items = T.offsetItems(self.inner);
+            for (&items) |*item| item.deinit(alloc);
         }
     };
 }
@@ -1919,6 +1938,11 @@ const TestU8Item = struct {
         return 1;
     }
 
+    pub fn deinit(item: *TestU8Item, alloc: std.mem.Allocator) void {
+        _ = item;
+        _ = alloc;
+    }
+
     pub fn eql(a: TestU8Item, b: TestU8Item) bool {
         return a.value == b.value;
     }
@@ -1944,6 +1968,11 @@ const TestBytes4Item = struct {
     pub fn requiredAlignment(item: TestBytes4Item) u16 {
         _ = item;
         return 1;
+    }
+
+    pub fn deinit(item: *TestBytes4Item, alloc: std.mem.Allocator) void {
+        _ = item;
+        _ = alloc;
     }
 
     pub fn eql(a: TestBytes4Item, b: TestBytes4Item) bool {
@@ -2248,6 +2277,28 @@ test "offset array decode rejects malformed input" {
         error.UnexpectedValue,
         OffsetArrayContainer(Single).decode(&c, 2, .u8),
     );
+}
+
+test "offset array decode failure frees already decoded items" {
+    const alloc = testing.allocator;
+    // Offsets {3, 8}: the first item is "foo"; the second points one byte
+    // past the buffer, so decoding fails after the first item allocated.
+    const bytes = [_]u8{ 0x03, 0x03, 0x08, 0x07, 'f', 'o', 'o', 0x01 };
+    var c = bin.Cursor.initAlloc(alloc, &bytes);
+    try testing.expectError(
+        error.UnexpectedEof,
+        OffsetArrayContainer(TestStringPair).decode(&c, 0, .u8),
+    );
+}
+
+test "offset array container deinit frees its items" {
+    const alloc = testing.allocator;
+    // Offsets {3, 7}: the first item is "foo", the second the empty
+    // string.
+    const bytes = [_]u8{ 0x03, 0x03, 0x07, 0x07, 'f', 'o', 'o', 0x03 };
+    var c = bin.Cursor.initAlloc(alloc, &bytes);
+    var container = try OffsetArrayContainer(TestStringPair).decode(&c, 0, .u8);
+    container.deinit(alloc);
 }
 
 test "offset array encode validates provided offsets" {
