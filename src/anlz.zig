@@ -666,20 +666,21 @@ pub const Vbr = struct {
 
 /// Single column of a `waveform_preview`/`waveform_detail` section.
 ///
-/// The wire byte packs the height into the five most significant bits and
-/// the whiteness into the three least significant bits; because Zig packs
+/// The wire byte packs the height into the five least significant bits and
+/// the whiteness into the three most significant bits; because Zig packs
 /// struct fields starting at the least significant bit, the fields are
-/// declared in reverse bit order.
+/// declared in wire bit order.
 pub const WaveformPreviewColumn = packed struct(u8) {
-    /// Shade of white.
-    whiteness: u3 = 0,
     /// Height of the column in pixels.
     height: u5 = 0,
+    /// Shade of white.
+    whiteness: u3 = 0,
 };
 
 /// Single column of a `tiny_waveform_preview` section. The wire byte packs
-/// the height into the four most significant bits (see
-/// `WaveformPreviewColumn` for the field order).
+/// the height into the four least significant bits (see
+/// `WaveformPreviewColumn` for the field order); the upper four bits are
+/// unused.
 pub const TinyWaveformPreviewColumn = packed struct(u8) {
     /// Height of the column in pixels.
     height: u4 = 0,
@@ -1778,8 +1779,8 @@ test "waveform sections roundtrip with checks" {
     var parsed = try Anlz.parse(alloc, out);
     defer parsed.deinit();
     // The packed bitfields land in the expected wire bits: height in the
-    // five most significant bits, whiteness below.
-    try testing.expectEqualSlices(u8, &.{ 0b10101_110, 0b11111_111 }, std.mem.sliceAsBytes(parsed.sections[0].waveform_preview.data));
+    // five least significant bits, whiteness above.
+    try testing.expectEqualSlices(u8, &.{ 0b110_10101, 0b11111_111 }, std.mem.sliceAsBytes(parsed.sections[0].waveform_preview.data));
     try testing.expectEqualSlices(u8, &.{0b0011_1001}, std.mem.sliceAsBytes(parsed.sections[1].tiny_waveform_preview.data));
     const cd = parsed.sections[3].waveform_color_detail.data[0];
     try testing.expectEqual(@as(u3, 5), cd.red);
