@@ -49,6 +49,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "bin", .module = bin },
+            .{ .name = "testutil", .module = testutil },
         },
     });
 

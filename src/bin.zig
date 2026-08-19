@@ -69,7 +69,7 @@ pub const Cursor = struct {
     }
 
     pub fn takeInt(c: *Cursor, comptime T: type, comptime endian: std.builtin.Endian) ReadError!T {
-        return std.mem.readInt(T, try c.takeArray(@sizeOf(T)), endian);
+        return std.mem.readInt(T, try c.takeArray(intBytes(T)), endian);
     }
 
     pub fn takeFloat(c: *Cursor, comptime T: type, comptime endian: std.builtin.Endian) ReadError!T {
@@ -107,7 +107,7 @@ pub const Emitter = struct {
     }
 
     pub fn putInt(e: *Emitter, comptime T: type, value: T, comptime endian: std.builtin.Endian) WriteError!void {
-        var bytes: [@sizeOf(T)]u8 = undefined;
+        var bytes: [intBytes(T)]u8 = undefined;
         std.mem.writeInt(T, &bytes, value, endian);
         try e.list.appendSlice(e.alloc, &bytes);
     }
@@ -150,15 +150,23 @@ fn PackedBacking(comptime T: type) type {
     return switch (@bitSizeOf(T)) {
         8 => u8,
         16 => u16,
+        24 => u24,
         32 => u32,
         64 => u64,
-        else => @compileError("bin: packed struct fields must be backed by u8/u16/u32/u64, `" ++ @typeName(T) ++ "` is not"),
+        else => @compileError("bin: packed struct fields must be backed by u8/u16/u24/u32/u64, `" ++ @typeName(T) ++ "` is not"),
     };
 }
 
 fn isPackedStruct(comptime T: type) bool {
     const ti = @typeInfo(T);
     return ti == .@"struct" and ti.@"struct".layout == .@"packed";
+}
+
+/// Serialized byte count of an integer, its bit size in whole bytes — for
+/// non-power-of-two ints like `u24` this is smaller than the ABI
+/// `@sizeOf`, which includes padding.
+fn intBytes(comptime T: type) usize {
+    return @divExact(@bitSizeOf(T), 8);
 }
 
 /// Reads the fields of `T` in declaration order, at `endian`. Supported field
@@ -280,7 +288,7 @@ pub fn takeStructSlice(alloc: std.mem.Allocator, c: *Cursor, comptime T: type, c
 /// have no fixed size and fail to compile.
 pub fn serializedLen(comptime T: type) usize {
     return comptime blk: {
-        if (isPackedStruct(T)) break :blk @sizeOf(PackedBacking(T));
+        if (isPackedStruct(T)) break :blk intBytes(PackedBacking(T));
         var len: usize = 0;
         for (@typeInfo(T).@"struct".fields) |field| {
             if (hasCodec(field.type))
@@ -295,7 +303,7 @@ pub fn serializedLen(comptime T: type) usize {
                 },
                 .@"struct" => |s| {
                     if (s.layout == .@"packed") {
-                        len += @sizeOf(PackedBacking(field.type));
+                        len += intBytes(PackedBacking(field.type));
                     } else {
                         len += serializedLen(field.type);
                     }
@@ -544,6 +552,25 @@ test "takeStruct/putStruct walk packed structs, first field in the low bits" {
     defer e2.deinit();
     try putStruct(&e2, bits, .big);
     try testing.expectEqualSlices(u8, e.written()[1..], e2.written());
+}
+
+test "takeStruct/putStruct walk u24-backed packed structs" {
+    const Bits = packed struct(u24) {
+        low: u13 = 0,
+        high: u11 = 0,
+    };
+
+    try testing.expectEqual(@as(usize, 3), serializedLen(Bits));
+    var e = Emitter.init(testing.allocator);
+    defer e.deinit();
+    try putStruct(&e, Bits{ .low = 22, .high = 22 }, .little);
+    try testing.expectEqualSlices(u8, &.{ 0x16, 0xC0, 0x02 }, e.written());
+
+    var c = Cursor.init(e.written());
+    const s = try takeStruct(&c, Bits, .little);
+    try testing.expect(c.atEnd());
+    try testing.expectEqual(@as(u13, 22), s.low);
+    try testing.expectEqual(@as(u11, 22), s.high);
 }
 
 test "takeStruct/putStruct delegate to custom codecs" {

@@ -5,11 +5,13 @@
 //! Parser and writer for the rekordbox `export.pdb` database (DeviceSQL).
 //!
 //! Currently contains `DeviceSQLString`, the string type used by all row
-//! types, and the offset arrays that locate strings and other tail data
-//! within rows; pages, rows, and tables are not implemented yet.
+//! types; the offset arrays that locate strings and other tail data
+//! within rows; and the page headers with index pages. Data pages, rows,
+//! tables, and the whole-file database are not implemented yet.
 //!
-//! Initially ported from rekordcrate's `src/pdb/string.rs` and
-//! `src/pdb/offset_array.rs`
+//! Initially ported from rekordcrate's `src/pdb/string.rs`,
+//! `src/pdb/offset_array.rs`, `src/pdb/bitfields.rs`, and the page and
+//! index-page parts of `src/pdb/mod.rs`
 //!
 //! - <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/exports.html#devicesql-strings>
 
@@ -571,6 +573,219 @@ pub fn OffsetArrayContainer(comptime T: type) type {
             return a.offsets.eql(b.offsets) and a.inner.eql(b.inner);
         }
     };
+}
+
+/// The type of rows a page holds, as stored in page headers and table
+/// entries: the wire constants of `export.pdb` tables. In `exportExt.pdb`
+/// databases values 3 and 4 carry the ext meanings (tags, track tags)
+/// instead of albums and labels; distinguishing the two arrives with the
+/// ext row support. Unknown values roundtrip verbatim.
+pub const PageType = enum(u32) {
+    /// Track metadata: title, artist, genre, artwork ID, playing time, etc.
+    tracks = 0,
+    /// Musical genres, for reference by tracks and searching.
+    genres = 1,
+    /// Artists, for reference by tracks and searching.
+    artists = 2,
+    /// Albums, for reference by tracks and searching.
+    albums = 3,
+    /// Music labels, for reference by tracks and searching.
+    labels = 4,
+    /// Musical keys, for reference by tracks, searching, and key matching.
+    keys = 5,
+    /// Color labels, for reference by tracks and searching.
+    colors = 6,
+    /// The hierarchical tree structure of playlists and folders grouping
+    /// them.
+    playlist_tree = 7,
+    /// Links from tracks to playlists, in the right order.
+    playlist_entries = 8,
+    /// History playlists, recorded every time the device is mounted by a
+    /// player.
+    history_playlists = 11,
+    /// Links from tracks to history playlists, in the right order.
+    history_entries = 12,
+    /// Album artwork images.
+    artwork = 13,
+    /// Metadata categories by which tracks can be browsed.
+    columns = 16,
+    /// The active menus on the CDJ.
+    menu = 17,
+    /// Synchronization of the USB with rekordbox or a device.
+    history = 19,
+    _,
+};
+
+/// Packed field in the page header containing the number of used row
+/// offsets in the page (13 bits) and the number of valid rows (11 bits).
+/// The first field occupies the low bits, matching `modular_bitfield`'s
+/// LSB-first layout.
+pub const PackedRowCounts = packed struct(u24) {
+    num_rows: u13 = 0,
+    num_rows_valid: u11 = 0,
+};
+
+/// Page flags stored in the page header, LSB-first: the first declared
+/// field is bit 0, so the declaration order reads backwards compared to
+/// typical bit notation. The default value is the typical data page
+/// (`0x24`); index pages set `is_index_page` (`0x64`).
+pub const PageFlags = packed struct(u8) {
+    /// Unknown flag that appears to never be set.
+    unknown0: bool = false,
+    /// Unknown flag that appears to never be set.
+    unknown1: bool = false,
+    /// Unknown flag that appears to always be set.
+    unknown2: bool = true,
+    /// Unknown flag that appears to never be set.
+    unknown3: bool = false,
+    /// Set when the page contains a deleted row.
+    contains_deleted: bool = false,
+    /// Unknown flag that appears to always be set.
+    unknown5: bool = true,
+    /// Determines if the page is an index page.
+    is_index_page: bool = false,
+    /// Unknown flag that appears to never be set.
+    unknown7: bool = false,
+};
+
+/// The header of a table page (0x20 bytes), shared by data and index
+/// pages.
+pub const PageHeader = struct {
+    /// Magic signature for pages: always zero.
+    magic: u32 = 0,
+    /// Index of the page; should match the index used for lookup and can
+    /// be used to verify that the correct page was loaded.
+    page_index: u32 = 0,
+    /// Type of information that the rows of this page contain; should
+    /// match the page type of the table this page belongs to.
+    page_type: PageType = .tracks,
+    /// Index of the next page with the same page type; if this page is
+    /// the last of that type, the stored index points past the end of the
+    /// file.
+    next_page: u32 = 0,
+    /// Unknown field; appears to be a number between 1 and ~2500.
+    unknown1: u32 = 0,
+    /// Unknown field; appears to always be zero.
+    unknown2: u32 = 0,
+    /// Number of used row offsets and valid rows, packed.
+    packed_row_counts: PackedRowCounts = .{},
+    /// Page flags.
+    page_flags: PageFlags = .{},
+    /// Free space in bytes in the data section of the page, excluding the
+    /// row offsets in the page footer.
+    free_size: u16 = 0,
+    /// Used space in bytes in the data section of the page.
+    used_size: u16 = 0,
+
+    pub const constant_fields = .{ .magic, .unknown2 };
+};
+
+/// An entry in an index page: bits 31-3 hold a page index pointing at a
+/// data page with the same page type as the index page, bits 2-0 hold
+/// index flags of unknown meaning. Valid page indexes are below
+/// `0x03FF_FFFF`; that bound is checked when entries are followed, not on
+/// parse.
+pub const IndexEntry = packed struct(u32) {
+    index_flags: u3 = 0,
+    page_index: u29 = 0,
+
+    /// The empty-slot sentinel `0x1FFF_FFF8`.
+    pub const empty: IndexEntry = @bitCast(@as(u32, 0x1FFF_FFF8));
+
+    pub fn isEmpty(entry: IndexEntry) bool {
+        return @as(u32, @bitCast(entry)) == @as(u32, @bitCast(empty));
+    }
+};
+
+/// The header of the index-containing part of a page (28 bytes). Defaults
+/// describe an empty index page.
+pub const IndexPageHeader = struct {
+    /// Unknown field, usually `0x1fff` or `0x0001`.
+    unknown_a: u16 = 0x1FFF,
+    /// Unknown field, usually `0x1fff` or `0x0000`.
+    unknown_b: u16 = 0x1FFF,
+    /// Magic value `0x03ec`.
+    magic: u16 = 0x03EC,
+    /// Offset where the next index entry will be written, from the
+    /// beginning of the entries array. Sometimes differs from
+    /// `num_entries` for unknown reasons.
+    next_offset: u16 = 0,
+    /// Redundant copy of the page index.
+    page_index: u32 = 0,
+    /// Redundant copy of the next page index.
+    next_page: u32 = 0,
+    /// Magic value `0x0000_0000_03ff_ffff`.
+    magic2: u64 = 0x0000_0000_03FF_FFFF,
+    /// Number of index entries in this page; re-derived from `entries`
+    /// when the content is written.
+    num_entries: u16 = 0,
+    /// Points to the first empty index entry, or `0x1fff` if none. In
+    /// real databases this is either equal to `num_entries`, `0x1fff`
+    /// (assumed to mean the same), or smaller, indicating the first
+    /// empty slot.
+    first_empty: u16 = 0x1FFF,
+
+    pub const constant_fields = .{ .magic, .magic2 };
+};
+
+/// Decoding error of an index page: `UnexpectedValue` is a wrong header
+/// magic.
+pub const IndexPageDecodeError = bin.ReadError || error{UnexpectedValue};
+
+/// Encoding error of an index page: `UnexpectedValue` is a page too small
+/// for its header and trailing zeros, or more entries than it holds.
+pub const IndexPageEncodeError = bin.WriteError || error{UnexpectedValue};
+
+/// Zeros terminating every index page.
+const index_page_zero_tail = 20;
+
+/// The content of an index page: a header followed by the index entries
+/// pointing at the table's data pages. Serializing writes the entries,
+/// pads with empty entries up to the page's capacity, and terminates with
+/// 20 zero bytes; parsing reads only the real entries.
+pub const IndexPageContent = struct {
+    header: IndexPageHeader = .{},
+    entries: []IndexEntry = &.{},
+
+    /// Reads the header (validating its magics) and exactly
+    /// `num_entries` entries; the padding entries and trailing zeros are
+    /// not read.
+    pub fn decode(c: *bin.Cursor, alloc: std.mem.Allocator) IndexPageDecodeError!IndexPageContent {
+        const header = try bin.takeStruct(c, IndexPageHeader, .little);
+        try bin.validateConstantFields(IndexPageHeader, header);
+        const entries = try bin.takeStructSlice(alloc, c, IndexEntry, .little, header.num_entries);
+        return .{ .header = header, .entries = entries };
+    }
+
+    /// Writes the header with `num_entries` derived from `entries`, the
+    /// entries, `totalEntries(page_size) - entries.len` empty entries,
+    /// and the trailing zeros.
+    pub fn encode(self: *const IndexPageContent, e: *bin.Emitter, page_size: usize) IndexPageEncodeError!void {
+        if (self.entries.len > std.math.maxInt(u16)) return error.UnexpectedValue;
+        const capacity = try totalEntries(page_size);
+        if (self.entries.len > capacity) return error.UnexpectedValue;
+
+        var header = self.header;
+        header.num_entries = @intCast(self.entries.len);
+        try bin.putStruct(e, header, .little);
+        for (self.entries) |entry| try bin.putStruct(e, entry, .little);
+        for (self.entries.len..capacity) |_| try bin.putStruct(e, IndexEntry.empty, .little);
+        try e.pad(index_page_zero_tail);
+    }
+
+    pub fn deinit(content: *IndexPageContent, alloc: std.mem.Allocator) void {
+        alloc.free(content.entries);
+        content.entries = &.{};
+    }
+};
+
+/// Number of entries a page of `page_size` bytes holds besides the page
+/// header, the index page header, and the trailing zeros.
+fn totalEntries(page_size: usize) error{UnexpectedValue}!usize {
+    const fixed = bin.serializedLen(PageHeader) +
+        bin.serializedLen(IndexPageHeader) + index_page_zero_tail;
+    if (page_size < fixed) return error.UnexpectedValue;
+    return (page_size - fixed) / bin.serializedLen(IndexEntry);
 }
 
 const testing = std.testing;
@@ -1287,4 +1502,284 @@ test "offset array encode validates provided offsets" {
         error.UnexpectedValue,
         near.encode(&empty, 1, .u8),
     );
+}
+
+// Page and index page tests, ported from rekordcrate's `bitfields.rs` and
+// the `index_page` test of `test_roundtrip.rs`.
+
+test "page flags wire values" {
+    // The typical data page: unknown2 and unknown5 set.
+    try testing.expectEqual(@as(u8, 0x24), @as(u8, @bitCast(PageFlags{})));
+    // An index page additionally sets is_index_page.
+    try testing.expectEqual(
+        @as(u8, 0x64),
+        @as(u8, @bitCast(PageFlags{ .is_index_page = true })),
+    );
+    // A data page containing a deleted row.
+    try testing.expectEqual(
+        @as(u8, 0x34),
+        @as(u8, @bitCast(PageFlags{ .contains_deleted = true })),
+    );
+
+    // Fields read back from a wire value.
+    const parsed: PageFlags = @bitCast(@as(u8, 0x34));
+    try testing.expect(parsed.unknown2 and parsed.unknown5 and parsed.contains_deleted);
+    try testing.expect(!parsed.unknown0 and !parsed.is_index_page);
+}
+
+test "packed row counts occupy the low 13 and high 11 bits" {
+    var e = bin.Emitter.init(testing.allocator);
+    defer e.deinit();
+    try bin.putStruct(&e, PackedRowCounts{ .num_rows = 22, .num_rows_valid = 22 }, .little);
+    try testing.expectEqualSlices(u8, &.{ 0x16, 0xC0, 0x02 }, e.written());
+    try bin.putStruct(&e, PackedRowCounts{ .num_rows = 5, .num_rows_valid = 7 }, .little);
+    try testing.expectEqualSlices(u8, &.{ 0x05, 0xE0, 0x00 }, e.written()[3..]);
+
+    var c = bin.Cursor.init(e.written()[0..3]);
+    try testing.expectEqual(
+        PackedRowCounts{ .num_rows = 22, .num_rows_valid = 22 },
+        try bin.takeStruct(&c, PackedRowCounts, .little),
+    );
+    try testing.expect(c.atEnd());
+}
+
+test "page header roundtrips and validates its constants" {
+    const header: PageHeader = .{
+        .page_index = 1,
+        .page_type = .tracks,
+        .next_page = 2,
+        .unknown1 = 29871,
+        .page_flags = .{ .is_index_page = true },
+    };
+    try testing.expectEqual(@as(usize, 0x20), bin.serializedLen(PageHeader));
+
+    var e = bin.Emitter.init(testing.allocator);
+    defer e.deinit();
+    try bin.putStruct(&e, header, .little);
+    try testing.expectEqualSlices(u8, &.{
+        0x00, 0x00, 0x00, 0x00, // magic
+        0x01, 0x00, 0x00, 0x00, // page_index
+        0x00, 0x00, 0x00, 0x00, // page_type = tracks
+        0x02, 0x00, 0x00, 0x00, // next_page
+        0xAF, 0x74, 0x00, 0x00, // unknown1
+        0x00, 0x00, 0x00, 0x00, // unknown2
+        0x00, 0x00, 0x00, // packed_row_counts
+        0x64, // page_flags
+        0x00, 0x00, // free_size
+        0x00, 0x00, // used_size
+    }, e.written());
+
+    var c = bin.Cursor.init(e.written());
+    try testing.expectEqual(header, try bin.takeStruct(&c, PageHeader, .little));
+    try testing.expect(c.atEnd());
+    try bin.validateConstantFields(PageHeader, header);
+
+    // Unknown page types roundtrip verbatim.
+    var page_type_bytes = [_]u8{0} ** 0x20;
+    page_type_bytes[8] = 0x63;
+    var c2 = bin.Cursor.init(&page_type_bytes);
+    const exotic = try bin.takeStruct(&c2, PageHeader, .little);
+    try testing.expectEqual(@as(u32, 0x63), @intFromEnum(exotic.page_type));
+
+    // A nonzero magic or unknown2 is rejected.
+    try testing.expectError(
+        error.UnexpectedValue,
+        bin.validateConstantFields(PageHeader, .{ .magic = 1 }),
+    );
+    try testing.expectError(
+        error.UnexpectedValue,
+        bin.validateConstantFields(PageHeader, .{ .unknown2 = 1 }),
+    );
+}
+
+test "index entries pack page index and flags" {
+    const entry = IndexEntry{ .page_index = 604 };
+    var e = bin.Emitter.init(testing.allocator);
+    defer e.deinit();
+    try bin.putStruct(&e, entry, .little);
+    // Bits 31-3 hold the page index: 604 << 3.
+    try testing.expectEqualSlices(u8, &.{ 0xE0, 0x12, 0x00, 0x00 }, e.written());
+
+    var c = bin.Cursor.init(e.written());
+    try testing.expectEqual(entry, try bin.takeStruct(&c, IndexEntry, .little));
+    try testing.expect(c.atEnd());
+
+    // The empty sentinel and its recognition.
+    try testing.expectEqual(@as(u32, 0x1FFF_FFF8), @as(u32, @bitCast(IndexEntry.empty)));
+    try testing.expect(IndexEntry.empty.isEmpty());
+    try testing.expect(!entry.isEmpty());
+
+    var c2 = bin.Cursor.init(&.{ 0xF8, 0xFF, 0xFF, 0x1F });
+    try testing.expect((try bin.takeStruct(&c2, IndexEntry, .little)).isEmpty());
+}
+
+test "index page header roundtrips and validates its magics" {
+    const header: IndexPageHeader = .{
+        .unknown_a = 2,
+        .unknown_b = 179,
+        .next_offset = 272,
+        .page_index = 1,
+        .next_page = 2,
+        .num_entries = 272,
+    };
+    try testing.expectEqual(@as(usize, 28), bin.serializedLen(IndexPageHeader));
+
+    var e = bin.Emitter.init(testing.allocator);
+    defer e.deinit();
+    try bin.putStruct(&e, header, .little);
+    try testing.expectEqualSlices(u8, &.{
+        0x02, 0x00, // unknown_a
+        0xB3, 0x00, // unknown_b
+        0xEC, 0x03, // magic
+        0x10, 0x01, // next_offset
+        0x01, 0x00, 0x00, 0x00, // page_index
+        0x02, 0x00, 0x00, 0x00, // next_page
+        0xFF, 0xFF, 0xFF, 0x03, 0x00, 0x00, 0x00, 0x00, // magic2
+        0x10, 0x01, // num_entries
+        0xFF, 0x1F, // first_empty
+    }, e.written());
+
+    var c = bin.Cursor.init(e.written());
+    try testing.expectEqual(header, try bin.takeStruct(&c, IndexPageHeader, .little));
+    try testing.expect(c.atEnd());
+
+    try testing.expectError(
+        error.UnexpectedValue,
+        bin.validateConstantFields(IndexPageHeader, .{ .magic = 0 }),
+    );
+    try testing.expectError(
+        error.UnexpectedValue,
+        bin.validateConstantFields(IndexPageHeader, .{ .magic2 = 0 }),
+    );
+}
+
+test "index page content pads to capacity with empty entries and zeros" {
+    const alloc = testing.allocator;
+    const content = IndexPageContent{ .header = .{ .page_index = 1, .next_page = 2 } };
+
+    var e = bin.Emitter.init(alloc);
+    defer e.deinit();
+    try content.encode(&e, 4096);
+    // The content fills the page behind a 0x20-byte page header: a
+    // 28-byte index header, 1004 entries, and 20 trailing zeros.
+    try testing.expectEqual(@as(usize, 4096 - 0x20), e.written().len);
+
+    var c = bin.Cursor.initAlloc(alloc, e.written());
+    var parsed = try IndexPageContent.decode(&c, alloc);
+    defer parsed.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), parsed.entries.len);
+    try testing.expectEqual(@as(u16, 0), parsed.header.num_entries);
+    try testing.expectEqual(content.header, parsed.header);
+    for (0..1004) |_| {
+        try testing.expect((try bin.takeStruct(&c, IndexEntry, .little)).isEmpty());
+    }
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 20), try c.takeBytes(20));
+    try testing.expect(c.atEnd());
+}
+
+test "index page content rejects malformed input" {
+    const alloc = testing.allocator;
+
+    // A header claiming two entries when only one is on the wire.
+    var e = bin.Emitter.init(alloc);
+    defer e.deinit();
+    try bin.putStruct(&e, IndexPageHeader{ .num_entries = 2 }, .little);
+    try bin.putStruct(&e, IndexEntry{ .page_index = 7 }, .little);
+    var c = bin.Cursor.initAlloc(alloc, e.written());
+    try testing.expectError(error.UnexpectedEof, IndexPageContent.decode(&c, alloc));
+
+    // A wrong 0x03ec magic.
+    var e2 = bin.Emitter.init(alloc);
+    defer e2.deinit();
+    try bin.putStruct(&e2, IndexPageHeader{ .magic = 0 }, .little);
+    var c2 = bin.Cursor.initAlloc(alloc, e2.written());
+    try testing.expectError(error.UnexpectedValue, IndexPageContent.decode(&c2, alloc));
+
+    // More entries than the page holds, and a page too small for the
+    // fixed parts.
+    const many = try alloc.alloc(IndexEntry, 1005);
+    defer alloc.free(many);
+    for (many) |*entry| entry.* = .{};
+    const big = IndexPageContent{ .entries = many };
+    var e3 = bin.Emitter.init(alloc);
+    defer e3.deinit();
+    try testing.expectError(error.UnexpectedValue, big.encode(&e3, 4096));
+    var e4 = bin.Emitter.init(alloc);
+    defer e4.deinit();
+    try testing.expectError(error.UnexpectedValue, big.encode(&e4, 0x20));
+}
+
+test "index page fixture parses with known field values" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, "testdata/pdb/unit_tests", .{});
+    defer dir.close(io);
+    const bytes = try dir.readFileAlloc(io, "index_page.bin", alloc, .limited(1 << 16));
+    defer alloc.free(bytes);
+
+    var c = bin.Cursor.initAlloc(alloc, bytes);
+    const header = try bin.takeStruct(&c, PageHeader, .little);
+    try bin.validateConstantFields(PageHeader, header);
+    try testing.expectEqual(@as(u32, 1), header.page_index);
+    try testing.expectEqual(PageType.tracks, header.page_type);
+    try testing.expectEqual(@as(u32, 2), header.next_page);
+    try testing.expectEqual(@as(u32, 29871), header.unknown1);
+    try testing.expectEqual(PackedRowCounts{}, header.packed_row_counts);
+    try testing.expect(header.page_flags.is_index_page);
+    try testing.expect(!header.page_flags.contains_deleted);
+    try testing.expectEqual(@as(u16, 0), header.free_size);
+    try testing.expectEqual(@as(u16, 0), header.used_size);
+
+    var content = try IndexPageContent.decode(&c, alloc);
+    defer content.deinit(alloc);
+    const h = content.header;
+    try testing.expectEqual(@as(u16, 2), h.unknown_a);
+    try testing.expectEqual(@as(u16, 179), h.unknown_b);
+    try testing.expectEqual(@as(u16, 272), h.next_offset);
+    try testing.expectEqual(@as(u32, 1), h.page_index);
+    try testing.expectEqual(@as(u32, 2), h.next_page);
+    try testing.expectEqual(@as(u16, 272), h.num_entries);
+    try testing.expectEqual(@as(u16, 8191), h.first_empty);
+
+    // The first entries point at pages 604, 371, 441; exactly two entries
+    // carry nonzero flags (page 603 with flags 5 and 3, the latter last).
+    try testing.expectEqual(@as(usize, 272), content.entries.len);
+    try testing.expectEqual(@as(u29, 604), content.entries[0].page_index);
+    try testing.expectEqual(@as(u29, 371), content.entries[1].page_index);
+    try testing.expectEqual(@as(u29, 441), content.entries[2].page_index);
+    var flagged: usize = 0;
+    for (content.entries) |entry| {
+        if (entry.index_flags != 0) {
+            try testing.expectEqual(@as(u29, 603), entry.page_index);
+            flagged += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), flagged);
+    const last = content.entries[content.entries.len - 1];
+    try testing.expectEqual(@as(u29, 603), last.page_index);
+    try testing.expectEqual(@as(u3, 3), last.index_flags);
+}
+
+const testutil = @import("testutil");
+
+/// Parses `input` — a whole index page, including the page header — and
+/// re-serializes it, for `testutil.expectFixturesRoundtrip`. The page
+/// size is the fixture length; data pages are not implemented yet.
+fn roundtripIndexPage(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+    var c = bin.Cursor.initAlloc(alloc, input);
+    const header = try bin.takeStruct(&c, PageHeader, .little);
+    try bin.validateConstantFields(PageHeader, header);
+    if (!header.page_flags.is_index_page) return error.NotImplemented;
+    var content = try IndexPageContent.decode(&c, alloc);
+    defer content.deinit(alloc);
+
+    var e = bin.Emitter.init(alloc);
+    defer e.deinit();
+    try bin.putStruct(&e, header, .little);
+    try content.encode(&e, input.len);
+    return e.toOwnedSlice();
+}
+
+test "index page fixture roundtrips byte-identical" {
+    try testutil.expectFixturesRoundtrip(roundtripIndexPage, "index_page", 1);
 }
