@@ -855,9 +855,13 @@ pub const RowDecodeError = bin.ReadError || error{ InvalidFormat, UnexpectedValu
 /// with `num_rows_valid`.
 pub const DataPageDecodeError = RowDecodeError;
 
-/// Encoding error of a data page: `UnexpectedValue` is row groups not
-/// fitting the page.
-pub const DataPageEncodeError = bin.WriteError || error{UnexpectedValue};
+/// Encoding error of a row: the trailing offset array's errors, the only
+/// fallible part of a row write (see `OffsetArrayEncodeError`).
+pub const RowEncodeError = OffsetArrayEncodeError;
+
+/// Encoding error of a data page: row encoding errors; row groups not
+/// fitting the page fail with `UnexpectedValue`.
+pub const DataPageEncodeError = RowEncodeError;
 
 /// Magic value between a History row's `num_tracks` and `date` fields;
 /// always zero.
@@ -1311,15 +1315,249 @@ pub const Menu = struct {
     }
 };
 
+/// Fixed-field sizes of the rows with trailing offset arrays: their
+/// offsets are relative to the row start, this many bytes back from the
+/// array.
+const artist_fixed_len: usize = 8;
+const album_fixed_len: usize = 20;
+
+/// The single name string at the end of Artist and Album rows, located by
+/// the row's offset array.
+pub const TrailingName = struct {
+    /// The name at the end of the row.
+    name: DeviceSQLString = DeviceSQLString.empty(),
+
+    pub const offset_count = 1;
+    pub const OffsetItem = DeviceSQLString;
+
+    pub fn offsetItems(inner: TrailingName) [offset_count]DeviceSQLString {
+        return .{inner.name};
+    }
+
+    pub fn fromOffsetItems(items: [offset_count]DeviceSQLString) TrailingName {
+        return .{ .name = items[0] };
+    }
+
+    pub fn eql(a: TrailingName, b: TrailingName) bool {
+        return a.name.eql(b.name);
+    }
+};
+
+/// Contains the artist name and ID.
+pub const Artist = struct {
+    /// Selects the offset width of the trailing offset array; observed
+    /// values are `0x60` (u8 offsets) and `0x64` (u16).
+    subtype: u16 = 0x60,
+    /// Unknown field, called `index_shift` by flesniak; appears to always
+    /// be `0x20 * row index`.
+    index_shift: u16 = 0,
+    /// ID of this row.
+    id: u32 = 0,
+    /// The offsets and the name at the end of the row.
+    offsets: OffsetArrayContainer(TrailingName) = .{},
+
+    pub const page_type: PageType = .artists;
+
+    pub fn decode(c: *bin.Cursor) RowDecodeError!Artist {
+        const subtype = try c.takeInt(u16, .little);
+        const index_shift = try c.takeInt(u16, .little);
+        const id = try c.takeInt(u32, .little);
+        return .{
+            .subtype = subtype,
+            .index_shift = index_shift,
+            .id = id,
+            .offsets = try OffsetArrayContainer(TrailingName).decode(
+                c,
+                artist_fixed_len,
+                OffsetSize.fromSubtype(subtype),
+            ),
+        };
+    }
+
+    pub fn encode(self: *const Artist, e: *bin.Emitter) RowEncodeError!void {
+        try e.putInt(u16, self.subtype, .little);
+        try e.putInt(u16, self.index_shift, .little);
+        try e.putInt(u32, self.id, .little);
+        try self.offsets.encode(
+            e,
+            artist_fixed_len,
+            OffsetSize.fromSubtype(self.subtype),
+        );
+    }
+
+    pub fn heapBytesRequired(self: *const Artist) u16 {
+        return @intCast(artist_fixed_len + @as(u32, self.offsets.heapBytesRequired(
+            OffsetSize.fromSubtype(self.subtype),
+        )));
+    }
+
+    pub fn eql(a: Artist, b: Artist) bool {
+        return a.subtype == b.subtype and a.index_shift == b.index_shift and
+            a.id == b.id and a.offsets.eql(b.offsets);
+    }
+
+    pub fn deinit(self: *Artist, alloc: std.mem.Allocator) void {
+        self.offsets.deinit(alloc);
+    }
+};
+
+/// Contains the album name, the ID of its artist, and its own ID.
+pub const Album = struct {
+    /// Selects the offset width of the trailing offset array; the usual
+    /// value is `0x0080` (u8 offsets).
+    subtype: u16 = 0x0080,
+    /// Unknown field, called `index_shift` by flesniak; appears to always
+    /// be `0x20 * row index`.
+    index_shift: u16 = 0,
+    /// Unknown field.
+    unknown2: u32 = 0,
+    /// ID of the artist row associated with this row.
+    artist_id: u32 = 0,
+    /// ID of this row.
+    id: u32 = 0,
+    /// Unknown field.
+    unknown3: u32 = 0,
+    /// The offsets and the name at the end of the row.
+    offsets: OffsetArrayContainer(TrailingName) = .{},
+
+    pub const page_type: PageType = .albums;
+
+    pub fn decode(c: *bin.Cursor) RowDecodeError!Album {
+        const subtype = try c.takeInt(u16, .little);
+        const index_shift = try c.takeInt(u16, .little);
+        const unknown2 = try c.takeInt(u32, .little);
+        const artist_id = try c.takeInt(u32, .little);
+        const id = try c.takeInt(u32, .little);
+        const unknown3 = try c.takeInt(u32, .little);
+        return .{
+            .subtype = subtype,
+            .index_shift = index_shift,
+            .unknown2 = unknown2,
+            .artist_id = artist_id,
+            .id = id,
+            .unknown3 = unknown3,
+            .offsets = try OffsetArrayContainer(TrailingName).decode(
+                c,
+                album_fixed_len,
+                OffsetSize.fromSubtype(subtype),
+            ),
+        };
+    }
+
+    pub fn encode(self: *const Album, e: *bin.Emitter) RowEncodeError!void {
+        try e.putInt(u16, self.subtype, .little);
+        try e.putInt(u16, self.index_shift, .little);
+        try e.putInt(u32, self.unknown2, .little);
+        try e.putInt(u32, self.artist_id, .little);
+        try e.putInt(u32, self.id, .little);
+        try e.putInt(u32, self.unknown3, .little);
+        try self.offsets.encode(
+            e,
+            album_fixed_len,
+            OffsetSize.fromSubtype(self.subtype),
+        );
+    }
+
+    pub fn heapBytesRequired(self: *const Album) u16 {
+        return @intCast(album_fixed_len + @as(u32, self.offsets.heapBytesRequired(
+            OffsetSize.fromSubtype(self.subtype),
+        )));
+    }
+
+    pub fn eql(a: Album, b: Album) bool {
+        return a.subtype == b.subtype and a.index_shift == b.index_shift and
+            a.unknown2 == b.unknown2 and a.artist_id == b.artist_id and
+            a.id == b.id and a.unknown3 == b.unknown3 and
+            a.offsets.eql(b.offsets);
+    }
+
+    pub fn deinit(self: *Album, alloc: std.mem.Allocator) void {
+        self.offsets.deinit(alloc);
+    }
+};
+
+/// A node in the playlist tree: a folder grouping other nodes or a leaf
+/// playlist.
+pub const PlaylistTreeNode = struct {
+    /// ID of the parent row (which must be a folder); nodes parented to
+    /// `PlaylistTreeNodeId.root` (0) sit at the top level.
+    parent_id: u32 = 0,
+    /// Unknown field.
+    unknown: u32 = 0,
+    /// Sort order indicator.
+    sort_order: u32 = 0,
+    /// ID of this row.
+    id: u32 = 0,
+    /// Non-zero when the node is a folder, zero when it is a leaf
+    /// playlist. The name is rekordcrate's, whose doc comment inverts the
+    /// meaning ("non-zero if it's a leaf"); its code and the fixtures
+    /// agree that non-zero means folder — its `is_folder()` accessor, its
+    /// writer rejecting leaf parents, and the fixture rows named
+    /// "folder*" carrying 1.
+    node_is_folder: u32 = 0,
+    /// Name of this node, as shown when navigating the menu.
+    name: DeviceSQLString = DeviceSQLString.empty(),
+
+    pub const page_type: PageType = .playlist_tree;
+
+    /// Whether the node is a folder (grouping other nodes) rather than a
+    /// leaf playlist.
+    pub fn isFolder(self: *const PlaylistTreeNode) bool {
+        return self.node_is_folder > 0;
+    }
+
+    pub fn decode(c: *bin.Cursor) RowDecodeError!PlaylistTreeNode {
+        const parent_id = try c.takeInt(u32, .little);
+        const unknown = try c.takeInt(u32, .little);
+        const sort_order = try c.takeInt(u32, .little);
+        const id = try c.takeInt(u32, .little);
+        const node_is_folder = try c.takeInt(u32, .little);
+        return .{
+            .parent_id = parent_id,
+            .unknown = unknown,
+            .sort_order = sort_order,
+            .id = id,
+            .node_is_folder = node_is_folder,
+            .name = try DeviceSQLString.decode(c),
+        };
+    }
+
+    pub fn encode(self: *const PlaylistTreeNode, e: *bin.Emitter) bin.WriteError!void {
+        try e.putInt(u32, self.parent_id, .little);
+        try e.putInt(u32, self.unknown, .little);
+        try e.putInt(u32, self.sort_order, .little);
+        try e.putInt(u32, self.id, .little);
+        try e.putInt(u32, self.node_is_folder, .little);
+        try self.name.encode(e);
+    }
+
+    pub fn heapBytesRequired(self: *const PlaylistTreeNode) u16 {
+        return @intCast(20 + @as(u32, self.name.heapBytesRequired()));
+    }
+
+    pub fn eql(a: PlaylistTreeNode, b: PlaylistTreeNode) bool {
+        return a.parent_id == b.parent_id and a.unknown == b.unknown and
+            a.sort_order == b.sort_order and a.id == b.id and
+            a.node_is_folder == b.node_is_folder and a.name.eql(b.name);
+    }
+
+    pub fn deinit(self: *PlaylistTreeNode, alloc: std.mem.Allocator) void {
+        self.name.deinit(alloc);
+    }
+};
+
 /// A table row. Each variant declares its `page_type`, which selects it
-/// in `decode`; page types without a wired row (and unknown page type
-/// values) fail with `error.NotImplemented` until their rows land.
+/// in `decode`; unknown page type values fail with `error.NotImplemented`
+/// until the ext rows land.
 pub const Row = union(enum) {
     genre: Genre,
     label: Label,
     key: Key,
     color: Color,
     artwork: Artwork,
+    artist: Artist,
+    album: Album,
+    playlist_tree_node: PlaylistTreeNode,
     history_playlist: HistoryPlaylist,
     history_entry: HistoryEntry,
     playlist_entry: PlaylistEntry,
@@ -1337,7 +1575,7 @@ pub const Row = union(enum) {
     }
 
     /// Writes the row, the inverse of the per-type `decode`.
-    pub fn encode(self: Row, e: *bin.Emitter) bin.WriteError!void {
+    pub fn encode(self: Row, e: *bin.Emitter) RowEncodeError!void {
         return switch (self) {
             inline else => |row| try row.encode(e),
         };
@@ -2649,20 +2887,36 @@ test "data page fixtures roundtrip byte-identical" {
         try testutil.expectFixturesRoundtrip(roundtripPage, prefix, 1);
 }
 
+test "artist, album, and playlist tree page fixtures roundtrip byte-identical" {
+    const prefixes = [_][]const u8{
+        "artists", "artist_page_long", "albums", "playlist_tree",
+    };
+    inline for (prefixes) |prefix|
+        try testutil.expectFixturesRoundtrip(roundtripPage, prefix, 1);
+}
+
 // Data page and simple row tests, ported from the row tests of
 // rekordcrate's `test_roundtrip.rs` and the page semantics of
 // `mod.rs`.
 
 /// Mirrors the row tests of rekordcrate's `test_roundtrip`: parses
-/// `bytes` expecting `expected` and full consumption, re-encodes
-/// `expected` expecting `bytes` back, and checks `heapBytesRequired`
-/// against the serialized length. `expected` must not own memory, since
-/// it is never deinit-ed; strings in it are borrowed from the caller.
-fn expectRowRoundtrip(comptime T: type, bytes: []const u8, expected: T) !void {
+/// `bytes` expecting `expected`, re-encodes `expected` expecting `bytes`
+/// back, and checks `heapBytesRequired` against the serialized length.
+/// `expected` must not own memory, since it is never deinit-ed; strings
+/// in it are borrowed from the caller. `end_pos` is the cursor position
+/// the parse must end at — the buffer end for rows whose strings are
+/// inline, directly after the offsets for rows with a trailing offset
+/// array (whose items are read via sub-cursors at their offsets).
+fn expectRowRoundtrip(
+    comptime T: type,
+    bytes: []const u8,
+    expected: T,
+    end_pos: ?usize,
+) !void {
     var c = bin.Cursor.initAlloc(testing.allocator, bytes);
     var parsed = try T.decode(&c);
     defer parsed.deinit(testing.allocator);
-    try testing.expect(c.atEnd());
+    try testing.expectEqual(end_pos orelse bytes.len, c.pos);
     try testing.expect(expected.eql(parsed));
 
     var e = bin.Emitter.init(testing.allocator);
@@ -2683,6 +2937,7 @@ test "label row roundtrips" {
         Label,
         &.{ 1, 0, 0, 0, 25, 76, 111, 111, 112, 109, 97, 115, 116, 101, 114, 115 },
         .{ .id = 1, .name = name },
+        null,
     );
 }
 
@@ -2693,6 +2948,7 @@ test "key row roundtrips" {
         Key,
         &.{ 1, 0, 0, 0, 1, 0, 0, 0, 7, 68, 109 },
         .{ .id = 1, .id2 = 1, .name = name },
+        null,
     );
 }
 
@@ -2703,6 +2959,7 @@ test "color row roundtrips" {
         Color,
         &.{ 0, 0, 0, 0, 1, 1, 0, 0, 11, 80, 105, 110, 107 },
         .{ .unknown2 = 1, .color = .pink, .name = name },
+        null,
     );
 }
 
@@ -2711,6 +2968,7 @@ test "playlist entry row roundtrips" {
         PlaylistEntry,
         &.{ 1, 0, 0, 0, 1, 0, 0, 0, 6, 0, 0, 0 },
         .{ .entry_index = 1, .track_id = 1, .playlist_id = 6 },
+        null,
     );
 }
 
@@ -2727,6 +2985,7 @@ test "column entry row wraps its name in interlinear annotation anchors" {
             0x00, 0x4e, 0x00, 0x52, 0x00, 0x45, 0x00, 0xfb, 0xff,
         },
         .{ .id = 1, .unknown0 = 128, .column_name = name },
+        null,
     );
 }
 
@@ -2741,7 +3000,96 @@ test "menu row roundtrips" {
             .visibility = .visible,
             .sort_order = 1,
         },
+        null,
     );
+}
+
+test "artist row roundtrips" {
+    var name = try DeviceSQLString.fromUtf8(testing.allocator, "Loopmasters");
+    defer name.deinit(testing.allocator);
+    try expectRowRoundtrip(
+        Artist,
+        &.{
+            96,  0, 0, 0, 1, 0, 0, 0, 3, 10, 25, 76, 111, 111, 112, 109, 97, 115, 116, 101, 114,
+            115,
+        },
+        .{
+            .subtype = 0x60,
+            .id = 1,
+            .offsets = .{
+                .offsets = .{ .provided = .{ .size = .u8, .values = .{10} } },
+                .inner = .{ .name = name },
+            },
+        },
+        10,
+    );
+}
+
+test "album rows roundtrip" {
+    const alloc = testing.allocator;
+    {
+        var name = try DeviceSQLString.fromUtf8(alloc, "GOOD LUCK");
+        defer name.deinit(alloc);
+        try expectRowRoundtrip(
+            Album,
+            &.{
+                0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x16, 0x15, 0x47, 0x4f, 0x4f,
+                0x44, 0x20, 0x4c, 0x55, 0x43, 0x4b,
+            },
+            .{
+                .subtype = 0x80,
+                .artist_id = 2,
+                .id = 2,
+                .offsets = .{
+                    .offsets = .{ .provided = .{ .size = .u8, .values = .{0x16} } },
+                    .inner = .{ .name = name },
+                },
+            },
+            22,
+        );
+    }
+    {
+        var name = try DeviceSQLString.fromUtf8(alloc, "Techno Rave 2023");
+        defer name.deinit(alloc);
+        try expectRowRoundtrip(
+            Album,
+            &.{
+                0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x16, 0x23, 0x54, 0x65, 0x63,
+                0x68, 0x6e, 0x6f, 0x20, 0x52, 0x61, 0x76, 0x65, 0x20, 0x32, 0x30, 0x32, 0x33,
+            },
+            .{
+                .subtype = 0x80,
+                .artist_id = 0,
+                .id = 3,
+                .offsets = .{
+                    .offsets = .{ .provided = .{ .size = .u8, .values = .{0x16} } },
+                    .inner = .{ .name = name },
+                },
+            },
+            22,
+        );
+    }
+}
+
+test "playlist tree node row roundtrips" {
+    var name = try DeviceSQLString.fromUtf8(
+        testing.allocator,
+        "current set 2021 reduced",
+    );
+    defer name.deinit(testing.allocator);
+    try expectRowRoundtrip(
+        PlaylistTreeNode,
+        &.{
+            0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    1,    0,    0,    0,    1,    0,    0,    0,    0x33, 0x63, 0x75, 0x72,
+            0x72, 0x65, 0x6e, 0x74, 0x20, 0x73, 0x65, 0x74, 0x20, 0x32, 0x30, 0x32, 0x31, 0x20, 0x72, 0x65, 0x64, 0x75, 0x63, 0x65, 0x64,
+        },
+        .{ .id = 1, .node_is_folder = 1, .name = name },
+        null,
+    );
+    try testing.expect((PlaylistTreeNode{ .node_is_folder = 1 }).isFolder());
+    try testing.expect(!(PlaylistTreeNode{}).isFolder());
 }
 
 test "history row roundtrips" {
@@ -2765,6 +3113,7 @@ test "history row roundtrips" {
             .version = version,
             .label = DeviceSQLString.empty(),
         },
+        null,
     );
 }
 
@@ -2791,6 +3140,7 @@ test "history row with label roundtrips" {
             .version = version,
             .label = label,
         },
+        null,
     );
 }
 
