@@ -5,7 +5,7 @@
 //! Parser and writer for the rekordbox `export.pdb` database (DeviceSQL).
 //!
 //! Currently contains `DeviceSQLString`, the string type used by all row
-//! types; pages, rows, and tables follow in later steps of the roadmap.
+//! types; pages, rows, and tables are not implemented yet.
 //!
 //! Initially ported from rekordcrate's `src/pdb/string.rs`
 //!
@@ -14,18 +14,15 @@
 const std = @import("std");
 const bin = @import("bin");
 
-/// Error of decoding a string from bytes, beyond running out of input or
-/// memory: the bytes do not follow the DeviceSQL string format.
+/// Decoding error; `InvalidFormat` means the bytes do not follow the
+/// DeviceSQL string format.
 pub const DecodeError = bin.ReadError || error{InvalidFormat};
 
 /// Longest content that fits the short form: the header
 /// `((len + 1) << 1) | 1` must fit a `u8`.
 const max_short_len: usize = (std.math.maxInt(u8) >> 1) - 1;
 
-/// Longest string `fromUtf8` accepts, in UTF-8 bytes. As in rekordcrate the
-/// limit applies to the UTF-8 length, not the encoded length: a UCS-2LE
-/// body is never longer than its UTF-8 input (a 4-byte UTF-8 character
-/// becomes two code units), so it always fits the long form's `u16` length.
+/// Longest string `fromUtf8` accepts, in UTF-8 bytes, as in rekordcrate.
 const max_len: usize = std.math.maxInt(i16);
 
 /// Bytes a long-form header occupies: flags byte, `u16` length, padding.
@@ -38,7 +35,7 @@ const long_flags_ascii: u8 = 0x40;
 const long_flags_isrc_or_ucs2: u8 = 0x90;
 
 /// An immutable DeviceSQL string, as stored in the page heaps of
-/// `export.pdb`. Once constructed there is no way to change it.
+/// `export.pdb`.
 ///
 /// Two forms exist, told apart by the least significant bit of the first
 /// byte:
@@ -88,7 +85,6 @@ pub const DeviceSQLString = union(enum) {
         /// Bytes the body occupies, excluding the 4 long-form header bytes.
         fn byteCount(body: LongBody) u16 {
             return switch (body) {
-                // magic byte plus NUL terminator around the characters
                 .isrc => |chars| @intCast(chars.len + 2),
                 .ascii => |bytes| @intCast(bytes.len),
                 .ucs2le => |units| @intCast(units.len * 2),
@@ -103,16 +99,28 @@ pub const DeviceSQLString = union(enum) {
             };
         }
 
-        fn decode(c: *bin.Cursor, alloc: std.mem.Allocator, flags_byte: u8, len: u16) DecodeError!LongBody {
+        fn decode(
+            c: *bin.Cursor,
+            alloc: std.mem.Allocator,
+            flags_byte: u8,
+            len: u16,
+        ) DecodeError!LongBody {
             switch (flags_byte) {
-                long_flags_ascii => return .{ .ascii = try alloc.dupe(u8, try c.takeBytes(len)) },
+                long_flags_ascii => return .{ .ascii = try alloc.dupe(
+                    u8,
+                    try c.takeBytes(len),
+                ) },
                 long_flags_isrc_or_ucs2 => {
                     if (try decodeIsrc(c, alloc, len)) |body| return body;
                     if (len % 2 != 0) return error.InvalidFormat;
                     const bytes = try c.takeBytes(len);
                     const units = try alloc.alloc(u16, len / 2);
                     for (units, 0..) |*unit, i| {
-                        unit.* = std.mem.readInt(u16, bytes[2 * i ..][0..2], .little);
+                        unit.* = std.mem.readInt(
+                            u16,
+                            bytes[2 * i ..][0..2],
+                            .little,
+                        );
                     }
                     return .{ .ucs2le = units };
                 },
@@ -120,20 +128,21 @@ pub const DeviceSQLString = union(enum) {
             }
         }
 
-        /// Parses an ISRC body: `0x03` magic byte, NUL-terminated ASCII,
-        /// exactly filling `len` bytes. Returns `null` when the body does
-        /// not have that shape, so UCS-2LE gets a chance. ISRC is tried
-        /// first because both body kinds share the `0x90` flags, and a
-        /// flags-`0x90` body of the ISRC shape is an ISRC even when its
-        /// bytes would also read as valid UCS-2LE. Diverging from
-        /// rekordcrate, the exact fill is required so that parsing stays in
-        /// sync with the length field and roundtrips stay byte-identical
-        /// (see `docs/DIVERGENCES.md`).
-        fn decodeIsrc(c: *bin.Cursor, alloc: std.mem.Allocator, len: u16) DecodeError!?LongBody {
+        /// Parses an ISRC body — `0x03` magic byte, NUL-terminated ASCII,
+        /// exactly filling `len` bytes — or returns `null` when the body is
+        /// not of that shape, so UCS-2LE gets a chance. The exact fill is
+        /// required so parsing stays in sync with the length field and
+        /// roundtrips stay byte-identical.
+        fn decodeIsrc(
+            c: *bin.Cursor,
+            alloc: std.mem.Allocator,
+            len: u16,
+        ) DecodeError!?LongBody {
             if (len < 2) return null; // no room for magic byte and NUL
             const body = try c.range(c.pos, c.pos + len);
             if (body[0] != 0x03 or body[len - 1] != 0) return null;
-            if (std.mem.indexOfScalar(u8, body[1 .. len - 1], 0) != null) return null; // the NUL terminator must be the only one
+            if (std.mem.indexOfScalar(u8, body[1 .. len - 1], 0) != null)
+                return null; // the NUL terminator must be the only one
             try c.seekBy(len);
             return .{ .isrc = try alloc.dupe(u8, body[1 .. len - 1]) };
         }
@@ -156,7 +165,10 @@ pub const DeviceSQLString = union(enum) {
     /// Encodes `text`, picking the form the way rekordbox does: short ASCII
     /// while it fits, otherwise the long form, as ASCII when possible and
     /// UCS-2LE for anything else.
-    pub fn fromUtf8(alloc: std.mem.Allocator, text: []const u8) error{ TooLong, InvalidEncoding, OutOfMemory }!DeviceSQLString {
+    pub fn fromUtf8(
+        alloc: std.mem.Allocator,
+        text: []const u8,
+    ) error{ TooLong, InvalidEncoding, OutOfMemory }!DeviceSQLString {
         const only_ascii = allAscii(text);
         if (only_ascii and text.len <= max_short_len) {
             return .{ .short_ascii = try alloc.dupe(u8, text) };
@@ -167,28 +179,45 @@ pub const DeviceSQLString = union(enum) {
         }
         if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidEncoding;
         // InvalidUtf8 is impossible after the validation above.
-        const units = std.unicode.utf8ToUtf16LeAlloc(alloc, text) catch |err| switch (err) {
+        const units = std.unicode.utf8ToUtf16LeAlloc(
+            alloc,
+            text,
+        ) catch |err| switch (err) {
             error.InvalidUtf8 => unreachable,
             error.OutOfMemory => return error.OutOfMemory,
         };
+        // ASCII characters expand from one UTF-8 byte to two UCS-2LE bytes,
+        // so the UTF-8 cap above does not bound the encoded size; a body
+        // that would overflow the `u16` length field is rejected.
+        if (@as(u32, @intCast(units.len)) * 2 +
+            long_header_len > std.math.maxInt(u16))
+        {
+            alloc.free(units);
+            return error.TooLong;
+        }
         return .{ .long = .{ .ucs2le = units } };
     }
 
-    /// Creates the strange long-form encoding Pioneer uses for strings
-    /// containing a track's ISRC (International Standard Recording Code)
-    /// instead of an expected string: flags `0x90` with an ISRC-shaped
-    /// body. An empty `text` becomes the regular empty string; anything
-    /// but 12 ASCII characters is rejected (basic validation from
-    /// <https://isrc.ifpi.org/downloads/ISRC_Bulletin-2015-01.pdf>).
-    pub fn fromIsrc(alloc: std.mem.Allocator, text: []const u8) error{ InvalidIsrc, OutOfMemory }!DeviceSQLString {
+    /// Creates the long-form encoding Pioneer uses for a track's ISRC in
+    /// place of a regular string: flags `0x90` with an ISRC-shaped body.
+    /// An empty `text` becomes the regular empty string; anything but 12
+    /// ASCII characters without a NUL byte is rejected (basic validation
+    /// from <https://isrc.ifpi.org/downloads/ISRC_Bulletin-2015-01.pdf>; a
+    /// NUL would make `decode` read the body back as UCS-2LE.
+    pub fn fromIsrc(
+        alloc: std.mem.Allocator,
+        text: []const u8,
+    ) error{ InvalidIsrc, OutOfMemory }!DeviceSQLString {
         if (text.len == 0) return empty();
         if (text.len != 12) return error.InvalidIsrc;
         if (!allAscii(text)) return error.InvalidIsrc;
+        if (std.mem.indexOfScalar(u8, text, 0) != null)
+            return error.InvalidIsrc;
         return .{ .long = .{ .isrc = try alloc.dupe(u8, text) } };
     }
 
-    /// The empty string: short form with no content, the single byte
-    /// `0x03`. Allocates nothing.
+    /// The empty string: the single short-form byte `0x03`. Allocates
+    /// nothing.
     pub fn empty() DeviceSQLString {
         return .{ .short_ascii = &.{} };
     }
@@ -210,19 +239,27 @@ pub const DeviceSQLString = union(enum) {
         }
     }
 
-    /// Extracts the text as UTF-8, strictly: contents that are not valid
-    /// UTF-8 or UTF-16 are rejected instead of being replaced. rekordcrate
-    /// additionally has a lossy `Display`/`ToString` impl; callers that
-    /// want that can produce it from `utf8`'s error.
-    pub fn utf8(s: DeviceSQLString, alloc: std.mem.Allocator) error{ InvalidEncoding, OutOfMemory }![]u8 {
+    /// Extracts the text as UTF-8, strictly: invalid UTF-8 or UTF-16
+    /// contents are rejected instead of being replaced.
+    pub fn utf8(
+        s: DeviceSQLString,
+        alloc: std.mem.Allocator,
+    ) error{ InvalidEncoding, OutOfMemory }![]u8 {
         switch (s) {
             .short_ascii => |content| return dupeUtf8(alloc, content),
             .long => |body| switch (body) {
                 .isrc, .ascii => |chars| return dupeUtf8(alloc, chars),
-                .ucs2le => |units| return std.unicode.utf16LeToUtf8Alloc(alloc, units) catch |err| switch (err) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    error.DanglingSurrogateHalf, error.ExpectedSecondSurrogateHalf, error.UnexpectedSecondSurrogateHalf => error.InvalidEncoding,
-                },
+                .ucs2le => |units| return std.unicode.utf16LeToUtf8Alloc(
+                    alloc,
+                    units,
+                ) catch |err|
+                    switch (err) {
+                        error.OutOfMemory => error.OutOfMemory,
+                        error.DanglingSurrogateHalf,
+                        error.ExpectedSecondSurrogateHalf,
+                        error.UnexpectedSecondSurrogateHalf,
+                        => error.InvalidEncoding,
+                    },
             },
         }
     }
@@ -231,7 +268,9 @@ pub const DeviceSQLString = union(enum) {
     pub fn heapBytesRequired(s: DeviceSQLString) u16 {
         return switch (s) {
             .short_ascii => |content| @intCast(1 + content.len),
-            .long => |body| @intCast(@as(u32, long_header_len) + body.byteCount()),
+            .long => |body| @intCast(
+                @as(u32, long_header_len) + body.byteCount(),
+            ),
         };
     }
 
@@ -250,23 +289,31 @@ pub const DeviceSQLString = union(enum) {
 
     /// Reads a string from `c`, which must have an allocator set (see
     /// `bin.Cursor.initAlloc`). Content bytes are not validated on parse,
-    /// only by `utf8`; structural constants (flag values, the padding byte,
-    /// the ISRC body shape) are. Note the error set is wider than the
-    /// custom-codec contract of `bin.takeStruct`: strings in pdb rows are
-    /// read through dedicated cursors rather than as inline struct fields.
+    /// only by `utf8`; structural constants (flag values, the padding
+    /// byte, the ISRC body shape) are. The error set is wider than the
+    /// custom-codec contract of `bin.takeStruct` (`ReadError!T`): strings
+    /// in pdb rows are read through dedicated cursors rather than as
+    /// inline struct fields.
     pub fn decode(c: *bin.Cursor) DecodeError!DeviceSQLString {
         const alloc = c.alloc orelse return bin.ReadError.OutOfMemory;
         const first = try c.takeInt(u8, .little);
         if (first & 1 != 0) {
-            if (first == 1) return error.InvalidFormat; // content length would be -1
+            if (first == 1)
+                return error.InvalidFormat; // content length would be -1
             const len = (first >> 1) - 1;
             return .{ .short_ascii = try alloc.dupe(u8, try c.takeBytes(len)) };
         }
         const length = try c.takeInt(u16, .little);
         const padding = try c.takeInt(u8, .little);
         if (padding != 0) return error.InvalidFormat;
-        if (length < long_header_len) return error.InvalidFormat; // shorter than its own header
-        const body = try LongBody.decode(c, alloc, first, length - long_header_len);
+        if (length < long_header_len)
+            return error.InvalidFormat; // shorter than its own header
+        const body = try LongBody.decode(
+            c,
+            alloc,
+            first,
+            length - long_header_len,
+        );
         return .{ .long = body };
     }
 
@@ -274,12 +321,20 @@ pub const DeviceSQLString = union(enum) {
     pub fn encode(s: DeviceSQLString, e: *bin.Emitter) bin.WriteError!void {
         switch (s) {
             .short_ascii => |content| {
-                try e.putInt(u8, @intCast(((content.len + 1) << 1) | 1), .little);
+                try e.putInt(
+                    u8,
+                    @intCast(((content.len + 1) << 1) | 1),
+                    .little,
+                );
                 try e.putBytes(content);
             },
             .long => |body| {
                 try e.putInt(u8, body.flags(), .little);
-                try e.putInt(u16, @intCast(@as(u32, body.byteCount()) + long_header_len), .little);
+                try e.putInt(
+                    u16,
+                    @intCast(@as(u32, body.byteCount()) + long_header_len),
+                    .little,
+                );
                 try e.putInt(u8, 0, .little);
                 try body.encode(e);
             },
@@ -288,12 +343,14 @@ pub const DeviceSQLString = union(enum) {
 };
 
 /// Duplicates `bytes` as a UTF-8 string, rejecting invalid UTF-8.
-fn dupeUtf8(alloc: std.mem.Allocator, bytes: []const u8) error{ InvalidEncoding, OutOfMemory }![]u8 {
+fn dupeUtf8(
+    alloc: std.mem.Allocator,
+    bytes: []const u8,
+) error{ InvalidEncoding, OutOfMemory }![]u8 {
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidEncoding;
     return alloc.dupe(u8, bytes);
 }
 
-/// Returns `true` when every byte of `s` is ASCII.
 fn allAscii(s: []const u8) bool {
     for (s) |ch| if (!std.ascii.isAscii(ch)) return false;
     return true;
@@ -316,7 +373,10 @@ fn expectRoundtrip(bytes: []const u8, expected: DeviceSQLString) !void {
     try expected.encode(&e);
     try testing.expectEqualSlices(u8, bytes, e.written());
 
-    try testing.expectEqual(@as(u16, @intCast(bytes.len)), expected.heapBytesRequired());
+    try testing.expectEqual(
+        @as(u16, @intCast(bytes.len)),
+        expected.heapBytesRequired(),
+    );
 }
 
 /// Builds `text` with `fromUtf8`, roundtrips it against `serialized`, and
@@ -370,7 +430,36 @@ test "non-ascii string roundtrips as ucs2le" {
 
 test "too long string is rejected" {
     const humongous = [_]u8{'A'} ** 65536;
-    try testing.expectError(error.TooLong, DeviceSQLString.fromUtf8(testing.allocator, &humongous));
+    try testing.expectError(
+        error.TooLong,
+        DeviceSQLString.fromUtf8(testing.allocator, &humongous),
+    );
+}
+
+test "mixed charset is rejected once its encoded body outgrows u16" {
+    const alloc = testing.allocator;
+
+    // 32765 ASCII chars plus one 2-byte char pass the UTF-8 cap (32767
+    // bytes) but encode to 32766 units — 65532 body bytes plus the 4
+    // header bytes overflow u16.
+    var text: [32767]u8 = undefined;
+    @memset(&text, 'a');
+    text[32765] = 0xC3; // "é", two UTF-8 bytes
+    text[32766] = 0xA9;
+    try testing.expectError(
+        error.TooLong,
+        DeviceSQLString.fromUtf8(alloc, &text),
+    );
+
+    // One ASCII char less the encoded form fits exactly: 32765 units,
+    // 65530 body bytes, 65534 with the header.
+    var max_mixed = try DeviceSQLString.fromUtf8(alloc, text[1..]);
+    defer max_mixed.deinit(alloc);
+    try testing.expect(std.meta.activeTag(max_mixed.long) == .ucs2le);
+    try testing.expectEqual(
+        @as(u16, std.math.maxInt(u16) - 1),
+        max_mixed.heapBytesRequired(),
+    );
 }
 
 test "isrc strings roundtrip" {
@@ -387,8 +476,19 @@ test "isrc strings roundtrip" {
     try expectRoundtrip(&.{0x03}, empty_isrc);
 
     // Anything but 12 ASCII characters is rejected.
-    try testing.expectError(error.InvalidIsrc, DeviceSQLString.fromIsrc(testing.allocator, "non-conforming garbage"));
-    try testing.expectError(error.InvalidIsrc, DeviceSQLString.fromIsrc(testing.allocator, "ÉBCDEFGHIJK"));
+    try testing.expectError(
+        error.InvalidIsrc,
+        DeviceSQLString.fromIsrc(testing.allocator, "non-conforming garbage"),
+    );
+    try testing.expectError(
+        error.InvalidIsrc,
+        DeviceSQLString.fromIsrc(testing.allocator, "ÉBCDEFGHIJK"),
+    );
+    // A NUL byte is ASCII but would not survive the roundtrip.
+    try testing.expectError(
+        error.InvalidIsrc,
+        DeviceSQLString.fromIsrc(testing.allocator, "A\x00AAAAAAAAAA"),
+    );
 
     const text = try s.utf8(testing.allocator);
     defer testing.allocator.free(text);
@@ -422,7 +522,40 @@ test "fromUtf8 picks the form by charset and length" {
     @memset(&big, 'a');
     var max = try DeviceSQLString.fromUtf8(alloc, big[0 .. big.len - 1]);
     defer max.deinit(alloc);
-    try testing.expectError(error.TooLong, DeviceSQLString.fromUtf8(alloc, &big));
+    try testing.expectError(
+        error.TooLong,
+        DeviceSQLString.fromUtf8(alloc, &big),
+    );
+
+    // Invalid UTF-8 is rejected without reaching the encoder.
+    try testing.expectError(
+        error.InvalidEncoding,
+        DeviceSQLString.fromUtf8(alloc, &[_]u8{0xFF}),
+    );
+}
+
+test "eql distinguishes different strings" {
+    const alloc = testing.allocator;
+
+    // Same length, different content.
+    var foo = try DeviceSQLString.fromUtf8(alloc, "foo");
+    defer foo.deinit(alloc);
+    var bar = try DeviceSQLString.fromUtf8(alloc, "bar");
+    defer bar.deinit(alloc);
+    try testing.expect(!foo.eql(bar));
+
+    // Different lengths.
+    var fo = try DeviceSQLString.fromUtf8(alloc, "fo");
+    defer fo.deinit(alloc);
+    try testing.expect(!foo.eql(fo));
+
+    // Same content, different form.
+    const long_foo: DeviceSQLString = .{ .long = .{ .ascii = "foo" } };
+    try testing.expect(!foo.eql(long_foo));
+
+    // Same long-form tag, different content.
+    const long_bar: DeviceSQLString = .{ .long = .{ .ascii = "bar" } };
+    try testing.expect(!long_foo.eql(long_bar));
 }
 
 test "flags 0x90 dispatches isrc before ucs2le" {
@@ -525,4 +658,11 @@ test "heap bytes and alignment" {
     defer ucs2.deinit(alloc);
     try testing.expectEqual(@as(u16, 20), ucs2.heapBytesRequired());
     try testing.expectEqual(@as(u16, 4), ucs2.requiredAlignment());
+
+    // Long-form ASCII bodies need no alignment either.
+    const long_ascii_bytes = [_]u8{'a'} ** 127;
+    var long_ascii = try DeviceSQLString.fromUtf8(alloc, &long_ascii_bytes);
+    defer long_ascii.deinit(alloc);
+    try testing.expect(std.meta.activeTag(long_ascii.long) == .ascii);
+    try testing.expectEqual(@as(u16, 1), long_ascii.requiredAlignment());
 }
