@@ -5,9 +5,11 @@
 //! Parser and writer for the rekordbox `export.pdb` database (DeviceSQL).
 //!
 //! Currently contains `DeviceSQLString`, the string type used by all row
-//! types; pages, rows, and tables are not implemented yet.
+//! types, and the offset arrays that locate strings and other tail data
+//! within rows; pages, rows, and tables are not implemented yet.
 //!
-//! Initially ported from rekordcrate's `src/pdb/string.rs`
+//! Initially ported from rekordcrate's `src/pdb/string.rs` and
+//! `src/pdb/offset_array.rs`
 //!
 //! - <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/exports.html#devicesql-strings>
 
@@ -356,6 +358,221 @@ fn allAscii(s: []const u8) bool {
     return true;
 }
 
+/// Magic preceding every offset array: `0x03` as a `u8` before `u8`
+/// offsets, `0x0003` as a `u16` before `u16` offsets.
+const offset_array_magic = 0x03;
+
+/// Decoding error of an offset array container: `InvalidFormat` is a wrong
+/// magic; `UnexpectedValue` is an `array_offset` argument exceeding the
+/// cursor position, which would underflow the base.
+pub const OffsetArrayDecodeError = bin.ReadError || error{ InvalidFormat, UnexpectedValue };
+
+/// Encoding error of an offset array container: `UnexpectedValue` is a
+/// provided-offset width disagreeing with the argument, an offset too large
+/// for its width, or an `array_offset` argument exceeding the emitter
+/// position; `NotImplemented` is the unwired calculated mode.
+pub const OffsetArrayEncodeError = bin.WriteError || error{ UnexpectedValue, NotImplemented };
+
+/// Specifies whether the offsets of an offset array are stored as `u8` or
+/// `u16`; the surrounding row's subtype selects the width (bit `0x04` set
+/// means `u16`, see `fromSubtype`).
+pub const OffsetSize = enum {
+    /// Offsets are stored as `u8`, preceded by the `u8` magic `0x03`.
+    u8,
+    /// Offsets are stored as `u16`, preceded by the `u16` magic `0x0003`.
+    u16,
+
+    /// Bytes one stored offset occupies, magic excluded.
+    fn bytes(size: OffsetSize) usize {
+        return switch (size) {
+            .u8 => 1,
+            .u16 => 2,
+        };
+    }
+
+    /// The offset size a row subtype selects: bit `0x04` not set means
+    /// `u8` offsets, set means `u16`.
+    pub fn fromSubtype(subtype: u16) OffsetSize {
+        return if (subtype & 0x04 == 0) .u8 else .u16;
+    }
+};
+
+/// The offsets of an `OffsetArrayContainer`: either exactly as stored in
+/// the file or computed from the items during serialization. This is
+/// rekordcrate's `MaybeCalculated<OffsetArray<N>>` collapsed into one flag
+/// with the stored width.
+pub fn Offsets(comptime n: usize) type {
+    return union(enum) {
+        const Self = @This();
+
+        /// The offsets as they appear in the file (or as explicitly chosen
+        /// by the caller), written verbatim.
+        provided: struct {
+            /// Width the offsets are stored at; on write it must equal the
+            /// offset size the surrounding row's subtype selects.
+            size: OffsetSize,
+            /// Offset values, relative to the row start.
+            values: [n]u16,
+        },
+
+        /// Offsets are computed from the items during serialization and
+        /// patched back in; writing this mode is not implemented yet.
+        calculated,
+
+        pub fn eql(a: Self, b: Self) bool {
+            if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+            return switch (a) {
+                .provided => |p| p.size == b.provided.size and
+                    std.mem.eql(u16, &p.values, &b.provided.values),
+                .calculated => true,
+            };
+        }
+    };
+}
+
+/// An array of `n` offsets followed by the data at those offsets, the tail
+/// structure rows use to locate strings (and other heap objects) after
+/// their fixed fields: a magic sized by `OffsetSize`, the `n` offsets, and
+/// the items at positions computed from the offsets. Offsets are relative
+/// to the row start, not to the array, which is what the `array_offset`
+/// arguments of `decode` and `encode` compensate for.
+///
+/// The inner type `T` combines the items into one value and must declare:
+///
+/// * `offset_count`: how many items (and offsets) it comprises
+/// * `OffsetItem`: the item type, holding the `decode`/`encode`/
+///   `heapBytesRequired`/`requiredAlignment`/`eql` protocol of
+///   `DeviceSQLString` (the alignment matters to calculated offsets)
+/// * `offsetItems(T) [n]OffsetItem`, a borrowing view, and
+///   `fromOffsetItems([n]OffsetItem) T`, which takes item ownership
+/// * `eql(a: T, b: T) bool`
+pub fn OffsetArrayContainer(comptime T: type) type {
+    const n = T.offset_count;
+    const Item = T.OffsetItem;
+    return struct {
+        const Self = @This();
+
+        /// Number of offsets and items, re-exposed from `T`.
+        pub const offset_count = n;
+
+        /// The offsets; see `Offsets`.
+        offsets: Offsets(n) = .calculated,
+
+        /// The inner value the items combine into.
+        inner: T = .{},
+
+        /// Reads the offsets from `c`, then each item from its own
+        /// sub-cursor at `base + offset`, where `base` is the cursor
+        /// position the array starts at minus `array_offset` — the row
+        /// start. Track passes `0x5C` (its fixed-field size), Artist `8`,
+        /// Album `20`. The cursor is left directly after the offsets;
+        /// items may lie beyond that, and are not required to fill the
+        /// buffer they occupy.
+        pub fn decode(c: *bin.Cursor, array_offset: usize, size: OffsetSize) OffsetArrayDecodeError!Self {
+            const start = c.pos;
+            if (array_offset > start) return error.UnexpectedValue; // base underflow
+            var values: [n]u16 = undefined;
+            switch (size) {
+                .u8 => {
+                    if (try c.takeInt(u8, .little) != offset_array_magic)
+                        return error.InvalidFormat;
+                    for (&values) |*value| value.* = try c.takeInt(u8, .little);
+                },
+                .u16 => {
+                    if (try c.takeInt(u16, .little) != offset_array_magic)
+                        return error.InvalidFormat;
+                    for (&values) |*value| value.* = try c.takeInt(u16, .little);
+                },
+            }
+            const base = start - array_offset;
+            var items: [n]Item = undefined;
+            // `inline for` so zero-item containers can use `void` items:
+            // the body referencing `Item.decode` is never analyzed.
+            inline for (values, &items) |offset, *item| {
+                const pos = base + @as(usize, offset);
+                if (pos > c.buf.len) return error.UnexpectedEof;
+                var sub_cursor = bin.Cursor{
+                    .buf = c.buf[pos..],
+                    .alloc = c.alloc,
+                };
+                item.* = try Item.decode(&sub_cursor);
+            }
+            return .{
+                .offsets = .{ .provided = .{ .size = size, .values = values } },
+                .inner = T.fromOffsetItems(items),
+            };
+        }
+
+        /// Writes the offsets, then each item at `base + offset` (the
+        /// inverse of `decode`, same `array_offset` convention); gaps the
+        /// offsets skip over are zero-filled. Writing with calculated
+        /// offsets is not implemented yet.
+        pub fn encode(
+            self: *const Self,
+            e: *bin.Emitter,
+            array_offset: usize,
+            size: OffsetSize,
+        ) OffsetArrayEncodeError!void {
+            const provided = switch (self.offsets) {
+                .provided => |p| p,
+                .calculated => return error.NotImplemented,
+            };
+            if (provided.size != size) return error.UnexpectedValue;
+            const start = e.pos();
+            if (array_offset > start) return error.UnexpectedValue; // base underflow
+            const base = start - array_offset;
+            switch (size) {
+                .u8 => {
+                    try e.putInt(u8, offset_array_magic, .little);
+                    for (provided.values) |value| {
+                        if (value > std.math.maxInt(u8)) return error.UnexpectedValue;
+                        try e.putInt(u8, @intCast(value), .little);
+                    }
+                },
+                .u16 => {
+                    try e.putInt(u16, offset_array_magic, .little);
+                    for (provided.values) |value| try e.putInt(u16, value, .little);
+                },
+            }
+            // `inline for` so zero-item containers can use `void` items:
+            // the body referencing `Item.encode` is never analyzed.
+            inline for (T.offsetItems(self.inner), provided.values) |item, offset| {
+                var sub_emitter = bin.Emitter.init(e.alloc);
+                defer sub_emitter.deinit();
+                try item.encode(&sub_emitter);
+                try e.putBytesAt(base + @as(usize, offset), sub_emitter.written());
+            }
+        }
+
+        /// Page heap space in bytes the container occupies: the magic and
+        /// offsets plus every item, with each item's start aligned per its
+        /// `requiredAlignment` when the offsets are calculated (provided
+        /// offsets measure the file's actual placement, so gaps between
+        /// items do not count).
+        pub fn heapBytesRequired(self: *const Self, size: OffsetSize) u16 {
+            const calculated = switch (self.offsets) {
+                .calculated => true,
+                .provided => false,
+            };
+            var total: u32 = @intCast((n + 1) * size.bytes());
+            // `inline for` so zero-item containers can use `void` items:
+            // the body referencing the item methods is never analyzed.
+            inline for (T.offsetItems(self.inner)) |item| {
+                if (calculated) {
+                    const alignment: u32 = @max(item.requiredAlignment(), 1);
+                    total = std.mem.alignForward(u32, total, alignment);
+                }
+                total += item.heapBytesRequired();
+            }
+            return @intCast(total);
+        }
+
+        pub fn eql(a: Self, b: Self) bool {
+            return a.offsets.eql(b.offsets) and a.inner.eql(b.inner);
+        }
+    };
+}
+
 const testing = std.testing;
 
 /// Mirrors rekordcrate's `test_roundtrip`: parses `bytes` expecting
@@ -665,4 +882,409 @@ test "heap bytes and alignment" {
     defer long_ascii.deinit(alloc);
     try testing.expect(std.meta.activeTag(long_ascii.long) == .ascii);
     try testing.expectEqual(@as(u16, 1), long_ascii.requiredAlignment());
+}
+
+// Offset array tests, ported from rekordcrate's offset_array.rs test module.
+
+/// Test item holding one little-endian `u8`.
+const TestU8Item = struct {
+    value: u8 = 0,
+
+    pub fn decode(c: *bin.Cursor) bin.ReadError!TestU8Item {
+        return .{ .value = try c.takeInt(u8, .little) };
+    }
+
+    pub fn encode(item: TestU8Item, e: *bin.Emitter) bin.WriteError!void {
+        try e.putInt(u8, item.value, .little);
+    }
+
+    pub fn heapBytesRequired(item: TestU8Item) u16 {
+        _ = item;
+        return 1;
+    }
+
+    pub fn requiredAlignment(item: TestU8Item) u16 {
+        _ = item;
+        return 1;
+    }
+
+    pub fn eql(a: TestU8Item, b: TestU8Item) bool {
+        return a.value == b.value;
+    }
+};
+
+/// Test item holding four raw bytes, as-is on the wire.
+const TestBytes4Item = struct {
+    bytes: [4]u8 = .{ 0, 0, 0, 0 },
+
+    pub fn decode(c: *bin.Cursor) bin.ReadError!TestBytes4Item {
+        return .{ .bytes = (try c.takeArray(4)).* };
+    }
+
+    pub fn encode(item: TestBytes4Item, e: *bin.Emitter) bin.WriteError!void {
+        try e.putBytes(&item.bytes);
+    }
+
+    pub fn heapBytesRequired(item: TestBytes4Item) u16 {
+        _ = item;
+        return 4;
+    }
+
+    pub fn requiredAlignment(item: TestBytes4Item) u16 {
+        _ = item;
+        return 1;
+    }
+
+    pub fn eql(a: TestBytes4Item, b: TestBytes4Item) bool {
+        return std.mem.eql(u8, &a.bytes, &b.bytes);
+    }
+};
+
+/// Single-item inner type, the analogue of rekordcrate's test `SingleTarget`
+/// (and of its `TrailingName`).
+fn TestSingle(comptime Item: type) type {
+    return struct {
+        value: Item = .{},
+
+        pub const offset_count = 1;
+        pub const OffsetItem = Item;
+
+        pub fn offsetItems(inner: @This()) [offset_count]Item {
+            return .{inner.value};
+        }
+
+        pub fn fromOffsetItems(items: [offset_count]Item) @This() {
+            return .{ .value = items[0] };
+        }
+
+        pub fn eql(a: @This(), b: @This()) bool {
+            return a.value.eql(b.value);
+        }
+    };
+}
+
+/// Two-item inner type, the analogue of rekordcrate's test `Multiple`.
+fn TestPair(comptime Item: type) type {
+    return struct {
+        a: Item = .{},
+        b: Item = .{},
+
+        pub const offset_count = 2;
+        pub const OffsetItem = Item;
+
+        pub fn offsetItems(inner: @This()) [offset_count]Item {
+            return .{ inner.a, inner.b };
+        }
+
+        pub fn fromOffsetItems(items: [offset_count]Item) @This() {
+            return .{ .a = items[0], .b = items[1] };
+        }
+
+        pub fn eql(x: @This(), y: @This()) bool {
+            return x.a.eql(y.a) and x.b.eql(y.b);
+        }
+    };
+}
+
+/// Zero-item inner type, the analogue of rekordcrate's `()` implementation
+/// of `OffsetArrayItems<0>`.
+const TestEmpty = struct {
+    pub const offset_count = 0;
+    pub const OffsetItem = void;
+
+    pub fn offsetItems(_: TestEmpty) [offset_count]void {
+        return .{};
+    }
+
+    pub fn fromOffsetItems(_: [offset_count]void) TestEmpty {
+        return .{};
+    }
+
+    pub fn eql(_: TestEmpty, _: TestEmpty) bool {
+        return true;
+    }
+};
+
+/// Two-string inner type for the heap-bytes tests, the analogue of
+/// rekordcrate's `Multiple<DeviceSQLString>` (and a preview of the
+/// `TrailingName`-style row types).
+const TestStringPair = struct {
+    a: DeviceSQLString = DeviceSQLString.empty(),
+    b: DeviceSQLString = DeviceSQLString.empty(),
+
+    pub const offset_count = 2;
+    pub const OffsetItem = DeviceSQLString;
+
+    pub fn offsetItems(inner: TestStringPair) [offset_count]DeviceSQLString {
+        return .{ inner.a, inner.b };
+    }
+
+    pub fn fromOffsetItems(items: [offset_count]DeviceSQLString) TestStringPair {
+        return .{ .a = items[0], .b = items[1] };
+    }
+
+    pub fn eql(x: TestStringPair, y: TestStringPair) bool {
+        return x.a.eql(y.a) and x.b.eql(y.b);
+    }
+};
+
+/// Mirrors rekordcrate's `test_roundtrip_with_args` at `array_offset` 0:
+/// parses `bytes` expecting `expected`, with the cursor landing directly
+/// after the offsets, and re-encodes `expected` expecting `bytes` back.
+/// The items of `expected` must not own memory, since `expected` is never
+/// deinit-ed.
+fn expectOffsetsRoundtrip(bytes: []const u8, expected: anytype, size: OffsetSize) !void {
+    const Container = @TypeOf(expected);
+
+    var c = bin.Cursor.initAlloc(testing.allocator, bytes);
+    const parsed = try Container.decode(&c, 0, size);
+    try testing.expectEqual(
+        @as(usize, (Container.offset_count + 1) * size.bytes()),
+        c.pos,
+    );
+    try testing.expect(expected.eql(parsed));
+
+    var e = bin.Emitter.init(testing.allocator);
+    defer e.deinit();
+    try expected.encode(&e, 0, size);
+    try testing.expectEqualSlices(u8, bytes, e.written());
+}
+
+test "empty offset array roundtrips" {
+    try expectOffsetsRoundtrip(
+        &.{0x03},
+        OffsetArrayContainer(TestEmpty){
+            .offsets = .{ .provided = .{ .size = .u8, .values = .{} } },
+        },
+        .u8,
+    );
+    try expectOffsetsRoundtrip(
+        &.{ 0x03, 0x00 },
+        OffsetArrayContainer(TestEmpty){
+            .offsets = .{ .provided = .{ .size = .u16, .values = .{} } },
+        },
+        .u16,
+    );
+}
+
+test "near u8 offset roundtrips" {
+    try expectOffsetsRoundtrip(
+        &.{ 0x03, 0x02, 42 },
+        OffsetArrayContainer(TestSingle(TestU8Item)){
+            .offsets = .{ .provided = .{ .size = .u8, .values = .{2} } },
+            .inner = .{ .value = .{ .value = 42 } },
+        },
+        .u8,
+    );
+}
+
+test "four-byte buffer item roundtrips" {
+    try expectOffsetsRoundtrip(
+        &.{ 0x03, 0x02, 0xDE, 0xAD, 0xBE, 0xEF },
+        OffsetArrayContainer(TestSingle(TestBytes4Item)){
+            .offsets = .{ .provided = .{ .size = .u8, .values = .{2} } },
+            .inner = .{ .value = .{ .bytes = .{ 0xDE, 0xAD, 0xBE, 0xEF } } },
+        },
+        .u8,
+    );
+}
+
+test "near remote offset roundtrips" {
+    // The item lives three bytes past the offsets; the gap is zero-filled
+    // on write.
+    try expectOffsetsRoundtrip(
+        &.{ 0x03, 0x05, 0x00, 0x00, 0x00, 42 },
+        OffsetArrayContainer(TestSingle(TestU8Item)){
+            .offsets = .{ .provided = .{ .size = .u8, .values = .{5} } },
+            .inner = .{ .value = .{ .value = 42 } },
+        },
+        .u8,
+    );
+}
+
+test "far remote u16 offsets roundtrip" {
+    try expectOffsetsRoundtrip(
+        &.{ 0x03, 0x00, 0x05, 0x00, 0x00, 42 },
+        OffsetArrayContainer(TestSingle(TestU8Item)){
+            .offsets = .{ .provided = .{ .size = .u16, .values = .{5} } },
+            .inner = .{ .value = .{ .value = 42 } },
+        },
+        .u16,
+    );
+}
+
+test "nonzero base offset roundtrips" {
+    // Three padding bytes stand in for the fixed fields of a row: the
+    // array starts at position 3, its offsets are relative to position 0.
+    const Single = TestSingle(TestU8Item);
+    const expected: OffsetArrayContainer(Single) = .{
+        .offsets = .{ .provided = .{ .size = .u8, .values = .{5} } },
+        .inner = .{ .value = .{ .value = 42 } },
+    };
+    const bytes = [_]u8{ 0, 0, 0, 0x03, 0x05, 42 };
+
+    var c = bin.Cursor.initAlloc(testing.allocator, &bytes);
+    try c.seekBy(3);
+    const parsed = try OffsetArrayContainer(Single).decode(&c, 3, .u8);
+    try testing.expect(expected.eql(parsed));
+
+    var e = bin.Emitter.init(testing.allocator);
+    defer e.deinit();
+    try e.pad(3);
+    try expected.encode(&e, 3, .u8);
+    try testing.expectEqualSlices(u8, &bytes, e.written());
+}
+
+test "multiple offsets roundtrip" {
+    try expectOffsetsRoundtrip(
+        &.{ 0x03, 0x03, 0x04, 0xC0, 0xDE },
+        OffsetArrayContainer(TestPair(TestU8Item)){
+            .offsets = .{ .provided = .{ .size = .u8, .values = .{ 3, 4 } } },
+            .inner = .{ .a = .{ .value = 0xC0 }, .b = .{ .value = 0xDE } },
+        },
+        .u8,
+    );
+}
+
+test "switched ordering roundtrips" {
+    // Items live at their offsets in wire order, independent of the inner
+    // type's field order: a's offset points past b's.
+    try expectOffsetsRoundtrip(
+        &.{ 0x03, 0x04, 0x03, 0xDE, 0xC0 },
+        OffsetArrayContainer(TestPair(TestU8Item)){
+            .offsets = .{ .provided = .{ .size = .u8, .values = .{ 4, 3 } } },
+            .inner = .{ .a = .{ .value = 0xC0 }, .b = .{ .value = 0xDE } },
+        },
+        .u8,
+    );
+}
+
+test "offset size comes from the subtype bit 0x04" {
+    // Artist subtypes 0x60/0x64 and Track's 0x24 are the known occupants
+    // of each width; Album's usual 0x0080 stays u8.
+    try testing.expectEqual(OffsetSize.u8, OffsetSize.fromSubtype(0x60));
+    try testing.expectEqual(OffsetSize.u16, OffsetSize.fromSubtype(0x64));
+    try testing.expectEqual(OffsetSize.u16, OffsetSize.fromSubtype(0x24));
+    try testing.expectEqual(OffsetSize.u8, OffsetSize.fromSubtype(0x0080));
+}
+
+test "heapBytesRequired aligns calculated ucs2 items to 4 bytes" {
+    const alloc = testing.allocator;
+
+    var foo = try DeviceSQLString.fromUtf8(alloc, "foo");
+    defer foo.deinit(alloc);
+    var e_acute = try DeviceSQLString.fromUtf8(alloc, "é");
+    defer e_acute.deinit(alloc);
+
+    // Calculated: 3 bytes of magic+offsets, "foo" at 3 (4 bytes), then
+    // "é" aligned from 7 up to 8, adding its 6 bytes — the placement the
+    // oracle's calculated write produces.
+    const calculated: OffsetArrayContainer(TestStringPair) = .{
+        .offsets = .calculated,
+        .inner = .{ .a = foo, .b = e_acute },
+    };
+    try testing.expectEqual(@as(u16, 14), calculated.heapBytesRequired(.u8));
+
+    // Provided: the bytes of the array and the items, gaps not counted.
+    const provided: OffsetArrayContainer(TestStringPair) = .{
+        .offsets = .{ .provided = .{ .size = .u8, .values = .{ 3, 8 } } },
+        .inner = .{ .a = foo, .b = e_acute },
+    };
+    try testing.expectEqual(@as(u16, 13), provided.heapBytesRequired(.u8));
+}
+
+test "offset array decode rejects malformed input" {
+    const Single = TestSingle(TestBytes4Item);
+    const alloc = testing.allocator;
+
+    const invalid = [_]struct { bytes: []const u8, size: OffsetSize }{
+        // u16 width, but the bytes are a u8 magic plus an offset, which
+        // reads as the u16 magic 0x0503.
+        .{ .bytes = &.{ 0x03, 0x05, 0x00, 0x00, 42 }, .size = .u16 },
+        // wrong u8 magic
+        .{ .bytes = &.{ 0x02, 0x01, 42 }, .size = .u8 },
+    };
+    for (invalid) |case| {
+        var c = bin.Cursor.initAlloc(alloc, case.bytes);
+        try testing.expectError(
+            error.InvalidFormat,
+            OffsetArrayContainer(Single).decode(&c, 0, case.size),
+        );
+    }
+
+    const truncated = [_]struct { bytes: []const u8, size: OffsetSize }{
+        // u16 magic cut in half
+        .{ .bytes = &.{0x03}, .size = .u16 },
+        // u8 offsets truncated after the magic
+        .{ .bytes = &.{0x03}, .size = .u8 },
+        // offset pointing past the buffer
+        .{ .bytes = &.{ 0x03, 0x09, 42 }, .size = .u8 },
+        // item truncated mid-decode
+        .{ .bytes = &.{ 0x03, 0x01, 0xDE, 0xAD }, .size = .u8 },
+    };
+    for (truncated) |case| {
+        var c = bin.Cursor.initAlloc(alloc, case.bytes);
+        try testing.expectError(
+            error.UnexpectedEof,
+            OffsetArrayContainer(Single).decode(&c, 0, case.size),
+        );
+    }
+
+    // A base underflowing the cursor position is rejected as well: an
+    // array at position 0 has no row start 2 bytes before it.
+    var c = bin.Cursor.initAlloc(alloc, &.{ 0x03, 0x01, 42 });
+    try testing.expectError(
+        error.UnexpectedValue,
+        OffsetArrayContainer(Single).decode(&c, 2, .u8),
+    );
+}
+
+test "offset array encode validates provided offsets" {
+    const alloc = testing.allocator;
+    const Single = TestSingle(TestU8Item);
+    var e = bin.Emitter.init(alloc);
+    defer e.deinit();
+
+    // Writing with calculated offsets is not wired yet.
+    const calculated: OffsetArrayContainer(Single) = .{
+        .offsets = .calculated,
+        .inner = .{ .value = .{ .value = 42 } },
+    };
+    try testing.expectError(
+        error.NotImplemented,
+        calculated.encode(&e, 0, .u8),
+    );
+
+    // Provided width must match the write argument.
+    const u16_stored: OffsetArrayContainer(Single) = .{
+        .offsets = .{ .provided = .{ .size = .u16, .values = .{2} } },
+        .inner = .{ .value = .{ .value = 42 } },
+    };
+    try testing.expectError(
+        error.UnexpectedValue,
+        u16_stored.encode(&e, 0, .u8),
+    );
+
+    // u8 offsets cannot hold values wider than a byte.
+    const overflowing: OffsetArrayContainer(Single) = .{
+        .offsets = .{ .provided = .{ .size = .u8, .values = .{0x0100} } },
+        .inner = .{ .value = .{ .value = 42 } },
+    };
+    try testing.expectError(
+        error.UnexpectedValue,
+        overflowing.encode(&e, 0, .u8),
+    );
+
+    // The base must not underflow the emitter position: an empty emitter
+    // has no row start 1 byte before it.
+    const near: OffsetArrayContainer(Single) = .{
+        .offsets = .{ .provided = .{ .size = .u8, .values = .{1} } },
+        .inner = .{ .value = .{ .value = 42 } },
+    };
+    var empty = bin.Emitter.init(alloc);
+    defer empty.deinit();
+    try testing.expectError(
+        error.UnexpectedValue,
+        near.encode(&empty, 1, .u8),
+    );
 }

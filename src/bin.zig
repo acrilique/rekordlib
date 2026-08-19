@@ -123,6 +123,12 @@ pub const Emitter = struct {
         @memset(e.list.items[len..], 0);
     }
 
+    pub fn putBytesAt(e: *Emitter, offset: usize, bytes: []const u8) WriteError!void {
+        const end = offset + bytes.len;
+        if (end > e.list.items.len) try e.pad(end - e.list.items.len);
+        @memcpy(e.list.items[offset..end], bytes);
+    }
+
     pub fn patchIntAt(e: *Emitter, offset: usize, comptime T: type, value: T, comptime endian: std.builtin.Endian) void {
         std.debug.assert(offset + @sizeOf(T) <= e.list.items.len);
         std.mem.writeInt(T, e.list.items[offset..][0..@sizeOf(T)], value, endian);
@@ -426,6 +432,18 @@ test "patchIntAt" {
     var c = Cursor.init(e.written());
     try testing.expectEqual(@as(u32, 0x0201_002A), try c.takeInt(u32, .little));
     try testing.expectEqual(@as(u16, 0xFFFF), try c.takeInt(u16, .little));
+}
+
+test "putBytesAt zero-fills gaps and overwrites" {
+    var e = Emitter.init(testing.allocator);
+    defer e.deinit();
+    try e.putBytes(&.{ 1, 2, 3 });
+    // Past the end: the gap becomes zeros.
+    try e.putBytesAt(6, &.{ 7, 8 });
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 0, 0, 0, 7, 8 }, e.written());
+    // Within the written range: existing bytes are replaced.
+    try e.putBytesAt(1, &.{9});
+    try testing.expectEqualSlices(u8, &.{ 1, 9, 3, 0, 0, 0, 7, 8 }, e.written());
 }
 
 test "emitter toOwnedSlice" {
