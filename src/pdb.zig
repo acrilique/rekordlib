@@ -7,13 +7,13 @@
 //! Currently contains `DeviceSQLString`, the string type used by all row
 //! types; the offset arrays that locate strings and other tail data
 //! within rows; the page headers with index pages; and data pages with
-//! the simple row types. The complex row types (artist, album, playlist
-//! tree node, track), ext rows, tables, and the whole-file database are
-//! not implemented yet.
+//! all plain row types, from the simple ones to artist, album, playlist
+//! tree node, and track. The ext rows, tables, and the whole-file
+//! database are not implemented yet.
 //!
 //! Initially ported from rekordcrate's `src/pdb/string.rs`,
 //! `src/pdb/offset_array.rs`, `src/pdb/bitfields.rs`, and the page,
-//! index-page, data-page, and simple-row parts of `src/pdb/mod.rs`
+//! index-page, data-page, and row parts of `src/pdb/mod.rs`
 //!
 //! - <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/exports.html#devicesql-strings>
 
@@ -833,6 +833,25 @@ pub const ColorIndex = enum(u8) {
     _,
 };
 
+/// Audio file formats tracks reference, stored as the Track row's
+/// `file_type` field. Ported from rekordcrate's `util::FileType`; unknown
+/// values roundtrip verbatim.
+pub const FileType = enum(u16) {
+    /// Unknown file type.
+    unknown = 0,
+    /// MP3.
+    mp3 = 1,
+    /// M4A.
+    m4a = 4,
+    /// FLAC.
+    flac = 5,
+    /// WAV.
+    wav = 0x0B,
+    /// AIFF.
+    aiff = 0x0C,
+    _,
+};
+
 /// Visibility state of a menu on the CDJ. Experiments confirmed that
 /// changing a menu from `hidden` to `visible` makes hidden menus (like
 /// Genre) appear, although some menus stay invisible on a CDJ-350 even
@@ -1546,6 +1565,330 @@ pub const PlaylistTreeNode = struct {
     }
 };
 
+/// The string fields of a Track row, stored behind its offset array in
+/// this fixed slot order — the order of the offsets in the file.
+pub const TrackStrings = struct {
+    /// International Standard Recording Code (ISRC), in mangled format.
+    isrc: DeviceSQLString = DeviceSQLString.empty(),
+    /// Lyricist of the track.
+    lyricist: DeviceSQLString = DeviceSQLString.empty(),
+    /// Unknown string field containing a number; appears to increment
+    /// when the track is exported or modified in rekordbox.
+    unknown_string2: DeviceSQLString = DeviceSQLString.empty(),
+    /// Unknown string field containing a number.
+    unknown_string3: DeviceSQLString = DeviceSQLString.empty(),
+    /// Unknown string field.
+    unknown_string4: DeviceSQLString = DeviceSQLString.empty(),
+    /// Track "message", a field in the rekordbox UI.
+    message: DeviceSQLString = DeviceSQLString.empty(),
+    /// "Publish track information" in rekordbox; "ON" or empty. Appears
+    /// related to the Stagehand product for controlling DJ equipment
+    /// remotely.
+    publish_track_information: DeviceSQLString = DeviceSQLString.empty(),
+    /// Whether hotcues should be autoloaded; "ON" or empty.
+    autoload_hotcues: DeviceSQLString = DeviceSQLString.empty(),
+    /// Unknown string field (usually empty).
+    unknown_string5: DeviceSQLString = DeviceSQLString.empty(),
+    /// Unknown string field (usually empty).
+    unknown_string6: DeviceSQLString = DeviceSQLString.empty(),
+    /// Date the track was added to the rekordbox collection (YYYY-MM-DD).
+    date_added: DeviceSQLString = DeviceSQLString.empty(),
+    /// Date the track was released (YYYY-MM-DD).
+    release_date: DeviceSQLString = DeviceSQLString.empty(),
+    /// Name of the remix (if any).
+    mix_name: DeviceSQLString = DeviceSQLString.empty(),
+    /// Unknown string field (usually empty).
+    unknown_string7: DeviceSQLString = DeviceSQLString.empty(),
+    /// File path of the track analysis file.
+    analyze_path: DeviceSQLString = DeviceSQLString.empty(),
+    /// Date the track analysis was performed (YYYY-MM-DD).
+    analyze_date: DeviceSQLString = DeviceSQLString.empty(),
+    /// Track comment.
+    comment: DeviceSQLString = DeviceSQLString.empty(),
+    /// Track title.
+    title: DeviceSQLString = DeviceSQLString.empty(),
+    /// Unknown string field (usually empty).
+    unknown_string8: DeviceSQLString = DeviceSQLString.empty(),
+    /// Name of the file.
+    filename: DeviceSQLString = DeviceSQLString.empty(),
+    /// Path of the file.
+    file_path: DeviceSQLString = DeviceSQLString.empty(),
+
+    pub const offset_count = 21;
+    pub const OffsetItem = DeviceSQLString;
+
+    pub fn offsetItems(inner: TrackStrings) [offset_count]DeviceSQLString {
+        return .{
+            inner.isrc,                      inner.lyricist,
+            inner.unknown_string2,           inner.unknown_string3,
+            inner.unknown_string4,           inner.message,
+            inner.publish_track_information, inner.autoload_hotcues,
+            inner.unknown_string5,           inner.unknown_string6,
+            inner.date_added,                inner.release_date,
+            inner.mix_name,                  inner.unknown_string7,
+            inner.analyze_path,              inner.analyze_date,
+            inner.comment,                   inner.title,
+            inner.unknown_string8,           inner.filename,
+            inner.file_path,
+        };
+    }
+
+    pub fn fromOffsetItems(items: [offset_count]DeviceSQLString) TrackStrings {
+        return .{
+            .isrc = items[0],
+            .lyricist = items[1],
+            .unknown_string2 = items[2],
+            .unknown_string3 = items[3],
+            .unknown_string4 = items[4],
+            .message = items[5],
+            .publish_track_information = items[6],
+            .autoload_hotcues = items[7],
+            .unknown_string5 = items[8],
+            .unknown_string6 = items[9],
+            .date_added = items[10],
+            .release_date = items[11],
+            .mix_name = items[12],
+            .unknown_string7 = items[13],
+            .analyze_path = items[14],
+            .analyze_date = items[15],
+            .comment = items[16],
+            .title = items[17],
+            .unknown_string8 = items[18],
+            .filename = items[19],
+            .file_path = items[20],
+        };
+    }
+
+    pub fn eql(a: TrackStrings, b: TrackStrings) bool {
+        const a_items = a.offsetItems();
+        const b_items = b.offsetItems();
+        for (a_items, b_items) |a_item, b_item| {
+            if (!a_item.eql(b_item)) return false;
+        }
+        return true;
+    }
+};
+
+/// The subtype every observed Track row carries: `0x24`, which selects
+/// `u16` offsets for the trailing offset array (bit `0x04` set).
+const track_subtype: u16 = 0x24;
+
+/// The Track row's fixed-field size, which its offset-array offsets are
+/// relative back past.
+const track_fixed_len: usize = 0x5C;
+
+/// Contains a track: its metadata, foreign-key IDs into the other tables,
+/// and the 21 strings behind the row's trailing offset array (base
+/// `0x5C`, the fixed-field size).
+pub const Track = struct {
+    /// Selects the offset width of the trailing offset array; always
+    /// `0x24` in observed files, see `track_subtype`.
+    subtype: u16 = track_subtype,
+    /// Unknown field, called `index_shift` by flesniak; appears to always
+    /// be `0x20 * row index`.
+    index_shift: u16 = 0,
+    /// Unknown field, called `bitmask` by flesniak; appears to always be
+    /// `0x000c0700`.
+    bitmask: u32 = 0,
+    /// Sample rate in Hz.
+    sample_rate: u32 = 0,
+    /// Composer of this track as artist row ID (non-zero if set).
+    composer_id: u32 = 0,
+    /// File size in bytes.
+    file_size: u32 = 0,
+    /// Unknown field; observed values are effectively random.
+    unknown2: u32 = 0,
+    /// Unknown field; observed values 19048, 64128, 31844 — the same for
+    /// all tracks in a given database.
+    unknown3: u16 = 0,
+    /// Unknown field; observed values 30967, 1511, 9043 — the same for
+    /// all tracks in a given database.
+    unknown4: u16 = 0,
+    /// Artwork row ID for the cover art (non-zero if set).
+    artwork_id: u32 = 0,
+    /// Key row ID for this track (non-zero if set).
+    key_id: u32 = 0,
+    /// Artist row ID of the original performer (non-zero if set).
+    orig_artist_id: u32 = 0,
+    /// Label row ID for this track (non-zero if set).
+    label_id: u32 = 0,
+    /// Artist row ID of the remixer (non-zero if set).
+    remixer_id: u32 = 0,
+    /// Bitrate of the track.
+    bitrate: u32 = 0,
+    /// Track number of the track.
+    track_number: u32 = 0,
+    /// Track tempo in centi-BPM (= 1/100 BPM).
+    tempo: u32 = 0,
+    /// Genre row ID for this track (non-zero if set).
+    genre_id: u32 = 0,
+    /// Album row ID for this track (non-zero if set).
+    album_id: u32 = 0,
+    /// Artist row ID for this track (non-zero if set).
+    artist_id: u32 = 0,
+    /// Row ID of this track.
+    id: u32 = 0,
+    /// Disc number of this track.
+    disc_number: u16 = 0,
+    /// Number of times this track was played.
+    play_count: u16 = 0,
+    /// Year this track was released.
+    year: u16 = 0,
+    /// Bits per sample of the track's audio file.
+    sample_depth: u16 = 0,
+    /// Playback duration of this track in seconds (at normal speed).
+    duration: u16 = 0,
+    /// Unknown field, apparently always `0x29` (41).
+    unknown5: u16 = 0,
+    /// Color row ID for this track (non-zero if set).
+    color: ColorIndex = .none,
+    /// User rating of this track (0 to 5 stars).
+    rating: u8 = 0,
+    /// Format of the file.
+    file_type: FileType = .unknown,
+    /// The offsets and the strings at the end of the row.
+    offsets: OffsetArrayContainer(TrackStrings) = .{},
+
+    pub const page_type: PageType = .tracks;
+
+    pub fn decode(c: *bin.Cursor) RowDecodeError!Track {
+        const subtype = try c.takeInt(u16, .little);
+        const index_shift = try c.takeInt(u16, .little);
+        const bitmask = try c.takeInt(u32, .little);
+        const sample_rate = try c.takeInt(u32, .little);
+        const composer_id = try c.takeInt(u32, .little);
+        const file_size = try c.takeInt(u32, .little);
+        const unknown2 = try c.takeInt(u32, .little);
+        const unknown3 = try c.takeInt(u16, .little);
+        const unknown4 = try c.takeInt(u16, .little);
+        const artwork_id = try c.takeInt(u32, .little);
+        const key_id = try c.takeInt(u32, .little);
+        const orig_artist_id = try c.takeInt(u32, .little);
+        const label_id = try c.takeInt(u32, .little);
+        const remixer_id = try c.takeInt(u32, .little);
+        const bitrate = try c.takeInt(u32, .little);
+        const track_number = try c.takeInt(u32, .little);
+        const tempo = try c.takeInt(u32, .little);
+        const genre_id = try c.takeInt(u32, .little);
+        const album_id = try c.takeInt(u32, .little);
+        const artist_id = try c.takeInt(u32, .little);
+        const id = try c.takeInt(u32, .little);
+        const disc_number = try c.takeInt(u16, .little);
+        const play_count = try c.takeInt(u16, .little);
+        const year = try c.takeInt(u16, .little);
+        const sample_depth = try c.takeInt(u16, .little);
+        const duration = try c.takeInt(u16, .little);
+        const unknown5 = try c.takeInt(u16, .little);
+        const color: ColorIndex = @enumFromInt(try c.takeInt(u8, .little));
+        const rating = try c.takeInt(u8, .little);
+        const file_type: FileType = @enumFromInt(try c.takeInt(u16, .little));
+        return .{
+            .subtype = subtype,
+            .index_shift = index_shift,
+            .bitmask = bitmask,
+            .sample_rate = sample_rate,
+            .composer_id = composer_id,
+            .file_size = file_size,
+            .unknown2 = unknown2,
+            .unknown3 = unknown3,
+            .unknown4 = unknown4,
+            .artwork_id = artwork_id,
+            .key_id = key_id,
+            .orig_artist_id = orig_artist_id,
+            .label_id = label_id,
+            .remixer_id = remixer_id,
+            .bitrate = bitrate,
+            .track_number = track_number,
+            .tempo = tempo,
+            .genre_id = genre_id,
+            .album_id = album_id,
+            .artist_id = artist_id,
+            .id = id,
+            .disc_number = disc_number,
+            .play_count = play_count,
+            .year = year,
+            .sample_depth = sample_depth,
+            .duration = duration,
+            .unknown5 = unknown5,
+            .color = color,
+            .rating = rating,
+            .file_type = file_type,
+            .offsets = try OffsetArrayContainer(TrackStrings).decode(
+                c,
+                track_fixed_len,
+                OffsetSize.fromSubtype(subtype),
+            ),
+        };
+    }
+
+    pub fn encode(self: *const Track, e: *bin.Emitter) RowEncodeError!void {
+        try e.putInt(u16, self.subtype, .little);
+        try e.putInt(u16, self.index_shift, .little);
+        try e.putInt(u32, self.bitmask, .little);
+        try e.putInt(u32, self.sample_rate, .little);
+        try e.putInt(u32, self.composer_id, .little);
+        try e.putInt(u32, self.file_size, .little);
+        try e.putInt(u32, self.unknown2, .little);
+        try e.putInt(u16, self.unknown3, .little);
+        try e.putInt(u16, self.unknown4, .little);
+        try e.putInt(u32, self.artwork_id, .little);
+        try e.putInt(u32, self.key_id, .little);
+        try e.putInt(u32, self.orig_artist_id, .little);
+        try e.putInt(u32, self.label_id, .little);
+        try e.putInt(u32, self.remixer_id, .little);
+        try e.putInt(u32, self.bitrate, .little);
+        try e.putInt(u32, self.track_number, .little);
+        try e.putInt(u32, self.tempo, .little);
+        try e.putInt(u32, self.genre_id, .little);
+        try e.putInt(u32, self.album_id, .little);
+        try e.putInt(u32, self.artist_id, .little);
+        try e.putInt(u32, self.id, .little);
+        try e.putInt(u16, self.disc_number, .little);
+        try e.putInt(u16, self.play_count, .little);
+        try e.putInt(u16, self.year, .little);
+        try e.putInt(u16, self.sample_depth, .little);
+        try e.putInt(u16, self.duration, .little);
+        try e.putInt(u16, self.unknown5, .little);
+        try e.putInt(u8, @intFromEnum(self.color), .little);
+        try e.putInt(u8, self.rating, .little);
+        try e.putInt(u16, @intFromEnum(self.file_type), .little);
+        try self.offsets.encode(
+            e,
+            track_fixed_len,
+            OffsetSize.fromSubtype(self.subtype),
+        );
+    }
+
+    pub fn heapBytesRequired(self: *const Track) u16 {
+        return @intCast(track_fixed_len + @as(u32, self.offsets.heapBytesRequired(
+            OffsetSize.fromSubtype(self.subtype),
+        )));
+    }
+
+    pub fn eql(a: Track, b: Track) bool {
+        return a.subtype == b.subtype and a.index_shift == b.index_shift and
+            a.bitmask == b.bitmask and a.sample_rate == b.sample_rate and
+            a.composer_id == b.composer_id and a.file_size == b.file_size and
+            a.unknown2 == b.unknown2 and a.unknown3 == b.unknown3 and
+            a.unknown4 == b.unknown4 and a.artwork_id == b.artwork_id and
+            a.key_id == b.key_id and a.orig_artist_id == b.orig_artist_id and
+            a.label_id == b.label_id and a.remixer_id == b.remixer_id and
+            a.bitrate == b.bitrate and a.track_number == b.track_number and
+            a.tempo == b.tempo and a.genre_id == b.genre_id and
+            a.album_id == b.album_id and a.artist_id == b.artist_id and
+            a.id == b.id and a.disc_number == b.disc_number and
+            a.play_count == b.play_count and a.year == b.year and
+            a.sample_depth == b.sample_depth and a.duration == b.duration and
+            a.unknown5 == b.unknown5 and a.color == b.color and
+            a.rating == b.rating and a.file_type == b.file_type and
+            a.offsets.eql(b.offsets);
+    }
+
+    pub fn deinit(self: *Track, alloc: std.mem.Allocator) void {
+        self.offsets.deinit(alloc);
+    }
+};
+
 /// A table row. Each variant declares its `page_type`, which selects it
 /// in `decode`; unknown page type values fail with `error.NotImplemented`
 /// until the ext rows land.
@@ -1558,6 +1901,7 @@ pub const Row = union(enum) {
     artist: Artist,
     album: Album,
     playlist_tree_node: PlaylistTreeNode,
+    track: Track,
     history_playlist: HistoryPlaylist,
     history_entry: HistoryEntry,
     playlist_entry: PlaylistEntry,
@@ -2849,8 +3193,8 @@ const testutil = @import("testutil");
 
 /// Parses `input` — a whole page, including the page header — and
 /// re-serializes it, for `testutil.expectFixturesRoundtrip`. The page
-/// size is the fixture length; pages whose row types are not implemented
-/// yet fail with `error.NotImplemented`.
+/// size is the fixture length; unknown page type values fail with
+/// `error.NotImplemented` (the ext rows land with P6).
 fn roundtripPage(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     var c = bin.Cursor.initAlloc(alloc, input);
     const header = try bin.takeStruct(&c, PageHeader, .little);
@@ -2893,6 +3237,12 @@ test "artist, album, and playlist tree page fixtures roundtrip byte-identical" {
     };
     inline for (prefixes) |prefix|
         try testutil.expectFixturesRoundtrip(roundtripPage, prefix, 1);
+}
+
+test "track page fixture roundtrips byte-identical" {
+    // The full prefix, so the ext-database track_tag_page fixture (P6)
+    // does not match.
+    try testutil.expectFixturesRoundtrip(roundtripPage, "track_page", 1);
 }
 
 // Data page and simple row tests, ported from the row tests of
@@ -3092,6 +3442,94 @@ test "playlist tree node row roundtrips" {
     try testing.expect(!(PlaylistTreeNode{}).isFolder());
 }
 
+test "track row roundtrips" {
+    const alloc = testing.allocator;
+    var row = Track{
+        .subtype = 0x24,
+        .bitmask = 788224,
+        .sample_rate = 44100,
+        .file_size = 6899624,
+        .unknown2 = 214020570,
+        .unknown3 = 64128,
+        .unknown4 = 1511,
+        .key_id = 5,
+        .label_id = 1,
+        .bitrate = 320,
+        .tempo = 12800,
+        .artist_id = 1,
+        .id = 1,
+        .sample_depth = 16,
+        .duration = 172,
+        .unknown5 = 41,
+        .file_type = .mp3,
+        .offsets = .{
+            .offsets = .{ .provided = .{ .size = .u16, .values = .{
+                136, 137, 138, 140, 142, 143, 144, 145, 148, 149,
+                150, 161, 162, 163, 164, 208, 219, 249, 262, 263,
+                280,
+            } } },
+            .inner = .{
+                .isrc = DeviceSQLString.empty(),
+                .lyricist = DeviceSQLString.empty(),
+                .unknown_string2 = try DeviceSQLString.fromUtf8(alloc, "3"),
+                .unknown_string3 = try DeviceSQLString.fromUtf8(alloc, "3"),
+                .unknown_string4 = DeviceSQLString.empty(),
+                .message = DeviceSQLString.empty(),
+                .publish_track_information = DeviceSQLString.empty(),
+                .autoload_hotcues = try DeviceSQLString.fromUtf8(alloc, "ON"),
+                .unknown_string5 = DeviceSQLString.empty(),
+                .unknown_string6 = DeviceSQLString.empty(),
+                .date_added = try DeviceSQLString.fromUtf8(alloc, "2018-05-25"),
+                .release_date = DeviceSQLString.empty(),
+                .mix_name = DeviceSQLString.empty(),
+                .unknown_string7 = DeviceSQLString.empty(),
+                .analyze_path = try DeviceSQLString.fromUtf8(
+                    alloc,
+                    "/PIONEER/USBANLZ/P016/0000875E/ANLZ0000.DAT",
+                ),
+                .analyze_date = try DeviceSQLString.fromUtf8(alloc, "2022-02-02"),
+                .comment = try DeviceSQLString.fromUtf8(
+                    alloc,
+                    "Tracks by www.loopmasters.com",
+                ),
+                .title = try DeviceSQLString.fromUtf8(alloc, "Demo Track 1"),
+                .unknown_string8 = DeviceSQLString.empty(),
+                .filename = try DeviceSQLString.fromUtf8(alloc, "Demo Track 1.mp3"),
+                .file_path = try DeviceSQLString.fromUtf8(
+                    alloc,
+                    "/Contents/Loopmasters/UnknownAlbum/Demo Track 1.mp3",
+                ),
+            },
+        },
+    };
+    defer row.offsets.deinit(alloc);
+    // From a demo_tracks export; the parse ends directly after the
+    // offsets, at the first string: 0x5C fixed fields plus the u16 magic
+    // and 21 u16 offsets.
+    try expectRowRoundtrip(
+        Track,
+        &.{
+            36,  0,   0,   0,   0,   7,   12,  0,   68,  172, 0,   0,   0,   0,   0,   0,   168, 71,  105, 0,   218, 177, 193,
+            12,  128, 250, 231, 5,   0,   0,   0,   0,   5,   0,   0,   0,   0,   0,   0,   0,   1,   0,   0,   0,   0,   0,
+            0,   0,   64,  1,   0,   0,   0,   0,   0,   0,   0,   50,  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   1,
+            0,   0,   0,   1,   0,   0,   0,   0,   0,   0,   0,   0,   0,   16,  0,   172, 0,   41,  0,   0,   0,   1,   0,
+            3,   0,   136, 0,   137, 0,   138, 0,   140, 0,   142, 0,   143, 0,   144, 0,   145, 0,   148, 0,   149, 0,   150,
+            0,   161, 0,   162, 0,   163, 0,   164, 0,   208, 0,   219, 0,   249, 0,   6,   1,   7,   1,   24,  1,   3,   3,
+            5,   51,  5,   51,  3,   3,   3,   7,   79,  78,  3,   3,   23,  50,  48,  49,  56,  45,  48,  53,  45,  50,  53,
+            3,   3,   3,   89,  47,  80,  73,  79,  78,  69,  69,  82,  47,  85,  83,  66,  65,  78,  76,  90,  47,  80,  48,
+            49,  54,  47,  48,  48,  48,  48,  56,  55,  53,  69,  47,  65,  78,  76,  90,  48,  48,  48,  48,  46,  68,  65,
+            84,  23,  50,  48,  50,  50,  45,  48,  50,  45,  48,  50,  61,  84,  114, 97,  99,  107, 115, 32,  98,  121, 32,
+            119, 119, 119, 46,  108, 111, 111, 112, 109, 97,  115, 116, 101, 114, 115, 46,  99,  111, 109, 27,  68,  101, 109,
+            111, 32,  84,  114, 97,  99,  107, 32,  49,  3,   35,  68,  101, 109, 111, 32,  84,  114, 97,  99,  107, 32,  49,
+            46,  109, 112, 51,  105, 47,  67,  111, 110, 116, 101, 110, 116, 115, 47,  76,  111, 111, 112, 109, 97,  115, 116,
+            101, 114, 115, 47,  85,  110, 107, 110, 111, 119, 110, 65,  108, 98,  117, 109, 47,  68,  101, 109, 111, 32,  84,
+            114, 97,  99,  107, 32,  49,  46,  109, 112, 51,
+        },
+        row,
+        0x5C + 22 * 2,
+    );
+}
+
 test "history row roundtrips" {
     var date = try DeviceSQLString.fromUtf8(testing.allocator, "2022-02-02");
     defer date.deinit(testing.allocator);
@@ -3193,12 +3631,7 @@ test "row decode dispatches by page type" {
     try testing.expect(std.meta.activeTag(row) == .genre);
     try testing.expectEqual(PageType.genres, row.pageType());
 
-    // Unwired and unknown page types are rejected explicitly.
-    var c3 = bin.Cursor.initAlloc(alloc, e.written());
-    try testing.expectError(
-        error.NotImplemented,
-        Row.decode(&c3, .tracks),
-    );
+    // Unknown page type values are rejected explicitly.
     var c4 = bin.Cursor.initAlloc(alloc, e.written());
     try testing.expectError(
         error.NotImplemented,
