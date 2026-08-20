@@ -10,6 +10,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const util = b.addModule("util", .{
+        .root_source_file = b.path("src/util.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const testutil = b.addModule("testutil", .{
         .root_source_file = b.path("src/testutil.zig"),
         .target = target,
@@ -38,6 +44,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "bin", .module = bin },
+            .{ .name = "util", .module = util },
             .{ .name = "xor", .module = xor },
             .{ .name = "testutil", .module = testutil },
         },
@@ -49,6 +56,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "bin", .module = bin },
+            .{ .name = "util", .module = util },
             .{ .name = "testutil", .module = testutil },
         },
     });
@@ -65,6 +73,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "xor", .module = xor },
                 .{ .name = "anlz", .module = anlz },
                 .{ .name = "pdb", .module = pdb },
+                .{ .name = "util", .module = util },
             },
         }),
     });

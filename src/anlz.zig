@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const bin = @import("bin");
+const util = @import("util");
 const xor = @import("xor");
 
 pub const ParseError = error{ UnexpectedEof, OutOfMemory, InvalidFormat, UnexpectedValue };
@@ -172,29 +173,6 @@ pub const CueType = enum(u8) {
     point = 1,
     /// Cue is a loop.
     loop = 2,
-    _,
-};
-
-/// Color assigned to a memory cue (see `ExtendedCue.color`).
-pub const ColorIndex = enum(u8) {
-    /// No color.
-    none = 0,
-    /// Pink color.
-    pink = 1,
-    /// Red color.
-    red = 2,
-    /// Orange color.
-    orange = 3,
-    /// Yellow color.
-    yellow = 4,
-    /// Green color.
-    green = 5,
-    /// Aqua color.
-    aqua = 6,
-    /// Blue color.
-    blue = 7,
-    /// Purple color.
-    purple = 8,
     _,
 };
 
@@ -422,7 +400,7 @@ pub const ExtendedCue = struct {
     loop_time: u32 = 0xFFFF_FFFF,
     /// Color assigned to this cue. Only used by memory cues; hot cues use a
     /// different value (see `hot_cue_color_index`).
-    color: ColorIndex = .none,
+    color: util.ColorIndex = .none,
     /// Unknown field, `1` in all known files (stored verbatim).
     unknown3: u8 = 1,
     /// Unknown field.
@@ -1814,7 +1792,7 @@ test "extended cue with empty comment roundtrips" {
     try testing.expectEqual(CueType.point, cue.cue_type);
     try testing.expectEqual(@as(u32, 0x0004_62F7), cue.time);
     try testing.expectEqual(@as(u32, 0xFFFF_FFFF), cue.loop_time);
-    try testing.expectEqual(ColorIndex.none, cue.color);
+    try testing.expectEqual(util.ColorIndex.none, cue.color);
     try testing.expectEqual(@as(u8, 1), cue.unknown3);
     try testing.expectEqual(@as(usize, 0), cue.comment.raw.len);
     try testing.expectEqualSlices(u8, &.{ 0x4D, 0x00, 0xFF }, &cue.hot_cue_color_rgb);

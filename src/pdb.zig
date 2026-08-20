@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const bin = @import("bin");
+const util = @import("util");
 
 /// Decoding error; `InvalidFormat` means the bytes do not follow the
 /// DeviceSQL string format.
@@ -864,30 +865,6 @@ fn totalEntries(page_size: usize) error{UnexpectedValue}!usize {
     return (page_size - fixed) / bin.serializedLen(IndexEntry);
 }
 
-/// Indexed color identifiers used for tracks and memory cues, stored as a
-/// single byte. Ported from rekordcrate's `util::ColorIndex`.
-pub const ColorIndex = enum(u8) {
-    /// No color.
-    none = 0,
-    /// Pink color.
-    pink = 1,
-    /// Red color.
-    red = 2,
-    /// Orange color.
-    orange = 3,
-    /// Yellow color.
-    yellow = 4,
-    /// Green color.
-    green = 5,
-    /// Aqua color.
-    aqua = 6,
-    /// Blue color.
-    blue = 7,
-    /// Purple color.
-    purple = 8,
-    _,
-};
-
 /// Audio file formats tracks reference, stored as the Track row's
 /// `file_type` field. Ported from rekordcrate's `util::FileType`; unknown
 /// values roundtrip verbatim.
@@ -1132,7 +1109,7 @@ pub const Color = struct {
     /// Unknown field.
     unknown2: u8 = 0,
     /// Numeric color ID.
-    color: ColorIndex = .none,
+    color: util.ColorIndex = .none,
     /// Unknown field.
     unknown3: u16 = 0,
     /// User-defined name of the color.
@@ -1465,7 +1442,7 @@ pub const Track = struct {
     /// Unknown field, apparently always `0x29` (41).
     unknown5: u16 = 0,
     /// Color row ID for this track (non-zero if set).
-    color: ColorIndex = .none,
+    color: util.ColorIndex = .none,
     /// User rating of this track (0 to 5 stars).
     rating: u8 = 0,
     /// Format of the file.
