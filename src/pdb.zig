@@ -2634,6 +2634,71 @@ pub const Database = struct {
         return page_index;
     }
 
+    /// Creates a new empty database of `db_type` with one table per entry
+    /// of `table_page_types` (see `standard_table_page_types` for the
+    /// fixed 20-entry order a device export needs), each table initialized
+    /// with an index page followed by an empty data page: `first_page` and
+    /// `last_page` both point at the index page and `empty_candidate` at
+    /// the data page, so the first `addRow` relinks the chain onto the
+    /// data page. Everything the database owns lives in its arena.
+    pub fn create(
+        alloc: std.mem.Allocator,
+        db_type: DatabaseType,
+        table_page_types: []const PageType,
+    ) DatabaseModifyError!Database {
+        const arena = try alloc.create(std.heap.ArenaAllocator);
+        errdefer alloc.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+
+        if (table_page_types.len > std.math.maxInt(u32) or
+            headerFixedAndTablesLen(table_page_types.len) > default_page_size)
+            return error.UnexpectedValue; // too many tables for page 0
+
+        const pages = try a.alloc(PageSlot, table_page_types.len * 2);
+        const tables = try a.alloc(Table, table_page_types.len);
+
+        var next_page: u32 = 1;
+        for (table_page_types, 0..) |page_type, i| {
+            const index_page_index = next_page;
+            const data_page_index = next_page + 1;
+            next_page += 2;
+            pages[2 * i] = .{
+                .page = Page.newIndex(index_page_index, page_type, page_chain_end),
+            };
+            pages[2 * i + 1] = .{
+                .page = try Page.newData(
+                    default_page_size,
+                    data_page_index,
+                    page_type,
+                    page_chain_end,
+                ),
+            };
+            tables[i] = .{
+                .page_type = page_type,
+                .empty_candidate = data_page_index,
+                .first_page = index_page_index,
+                // Empty table: the logical chain tail is the index page.
+                .last_page = index_page_index,
+            };
+        }
+
+        return .{
+            .arena = arena,
+            .db_type = db_type,
+            .header = .{
+                .page_size = default_page_size,
+                .num_tables = @intCast(table_page_types.len),
+                .next_unused_page = next_page,
+                .unknown = 5,
+                .sequence = 1,
+                .tables = tables,
+            },
+            .pages = pages,
+        };
+    }
+
     /// Validates every track row against `min_track_allocated_size` by
     /// walking the tracks table's page chain; ext databases have no
     /// tracks table and pass trivially. rekordcrate runs this on every
@@ -2689,6 +2754,9 @@ fn parsePage(
 /// of chain-final pages, and the exclusive upper bound of representable
 /// page indexes.
 pub const page_chain_end: u32 = 0x03FF_FFFF;
+
+/// Page size of a created database.
+const default_page_size: u32 = 4096;
 
 /// Error of the modification layer: `TableTypeNotFound` is a row whose
 /// page type no table in the header holds, `TrackRowTooSmall` a Track row
@@ -2761,6 +2829,149 @@ pub fn padTrackCommentToMinimum(
     }
 }
 
+/// The fixed 20-entry table order rekordbox writes into new `export.pdb`
+/// files, for `Database.create`: table indexes 9, 10, 14, 15, and 18 hold
+/// currently-unknown page types that must stay in place or CDJ players
+/// crash.
+pub const standard_table_page_types = [20]PageType{
+    .tracks,          .genres,          .artists,
+    .albums,          .labels,          .keys,
+    .colors,          .playlist_tree,   .playlist_entries,
+    @enumFromInt(9),  @enumFromInt(10), .history_playlists,
+    .history_entries, .artwork,         @enumFromInt(14),
+    @enumFromInt(15), .columns,         .menu,
+    @enumFromInt(18), .history,
+};
+
+/// The default color rows rekordbox inserts into a new export: an id, the
+/// color it names, and the color's display name.
+const default_colors = [_]struct { id: u8, color: util.ColorIndex, name: []const u8 }{
+    .{ .id = 1, .color = .pink, .name = "Pink" },
+    .{ .id = 2, .color = .red, .name = "Red" },
+    .{ .id = 3, .color = .orange, .name = "Orange" },
+    .{ .id = 4, .color = .yellow, .name = "Yellow" },
+    .{ .id = 5, .color = .green, .name = "Green" },
+    .{ .id = 6, .color = .aqua, .name = "Aqua" },
+    .{ .id = 7, .color = .blue, .name = "Blue" },
+    .{ .id = 8, .color = .purple, .name = "Purple" },
+};
+
+/// The default metadata-category rows rekordbox inserts into a new
+/// export: an id, an unknown constant, and the annotation-wrapped name.
+const default_columns = [_]struct { id: u16, unknown0: u16, name: []const u8 }{
+    .{ .id = 1, .unknown0 = 128, .name = "\u{FFFA}GENRE\u{FFFB}" },
+    .{ .id = 2, .unknown0 = 129, .name = "\u{FFFA}ARTIST\u{FFFB}" },
+    .{ .id = 3, .unknown0 = 130, .name = "\u{FFFA}ALBUM\u{FFFB}" },
+    .{ .id = 4, .unknown0 = 131, .name = "\u{FFFA}TRACK\u{FFFB}" },
+    .{ .id = 5, .unknown0 = 133, .name = "\u{FFFA}BPM\u{FFFB}" },
+    .{ .id = 6, .unknown0 = 134, .name = "\u{FFFA}RATING\u{FFFB}" },
+    .{ .id = 7, .unknown0 = 135, .name = "\u{FFFA}YEAR\u{FFFB}" },
+    .{ .id = 8, .unknown0 = 136, .name = "\u{FFFA}REMIXER\u{FFFB}" },
+    .{ .id = 9, .unknown0 = 137, .name = "\u{FFFA}LABEL\u{FFFB}" },
+    .{ .id = 10, .unknown0 = 138, .name = "\u{FFFA}ORIGINAL ARTIST\u{FFFB}" },
+    .{ .id = 11, .unknown0 = 139, .name = "\u{FFFA}KEY\u{FFFB}" },
+    .{ .id = 12, .unknown0 = 141, .name = "\u{FFFA}CUE\u{FFFB}" },
+    .{ .id = 13, .unknown0 = 142, .name = "\u{FFFA}COLOR\u{FFFB}" },
+    .{ .id = 14, .unknown0 = 146, .name = "\u{FFFA}TIME\u{FFFB}" },
+    .{ .id = 15, .unknown0 = 147, .name = "\u{FFFA}BITRATE\u{FFFB}" },
+    .{ .id = 16, .unknown0 = 148, .name = "\u{FFFA}FILE NAME\u{FFFB}" },
+    .{ .id = 17, .unknown0 = 132, .name = "\u{FFFA}PLAYLIST\u{FFFB}" },
+    .{ .id = 18, .unknown0 = 152, .name = "\u{FFFA}HOT CUE BANK\u{FFFB}" },
+    .{ .id = 19, .unknown0 = 149, .name = "\u{FFFA}HISTORY\u{FFFB}" },
+    .{ .id = 20, .unknown0 = 145, .name = "\u{FFFA}SEARCH\u{FFFB}" },
+    .{ .id = 21, .unknown0 = 150, .name = "\u{FFFA}COMMENTS\u{FFFB}" },
+    .{ .id = 22, .unknown0 = 140, .name = "\u{FFFA}DATE ADDED\u{FFFB}" },
+    .{ .id = 23, .unknown0 = 151, .name = "\u{FFFA}DJ PLAY COUNT\u{FFFB}" },
+    .{ .id = 24, .unknown0 = 144, .name = "\u{FFFA}FOLDER\u{FFFB}" },
+    .{ .id = 25, .unknown0 = 161, .name = "\u{FFFA}DEFAULT\u{FFFB}" },
+    .{ .id = 26, .unknown0 = 162, .name = "\u{FFFA}ALPHABET\u{FFFB}" },
+    .{ .id = 27, .unknown0 = 170, .name = "\u{FFFA}MATCHING\u{FFFB}" },
+};
+
+/// The default menu rows rekordbox inserts into a new export, in row
+/// order.
+const default_menus = [_]struct {
+    category_id: u16,
+    content_pointer: u16,
+    unknown: u8,
+    visibility: MenuVisibility,
+    sort_order: u16,
+}{
+    .{ .category_id = 1, .content_pointer = 1, .unknown = 99, .visibility = .hidden, .sort_order = 0 },
+    .{ .category_id = 5, .content_pointer = 6, .unknown = 5, .visibility = .hidden, .sort_order = 0 },
+    .{ .category_id = 6, .content_pointer = 7, .unknown = 99, .visibility = .hidden, .sort_order = 0 },
+    .{ .category_id = 7, .content_pointer = 8, .unknown = 99, .visibility = .hidden, .sort_order = 0 },
+    .{ .category_id = 8, .content_pointer = 9, .unknown = 99, .visibility = .hidden, .sort_order = 0 },
+    .{ .category_id = 9, .content_pointer = 10, .unknown = 99, .visibility = .hidden, .sort_order = 0 },
+    .{ .category_id = 10, .content_pointer = 11, .unknown = 99, .visibility = .hidden, .sort_order = 0 },
+    .{ .category_id = 13, .content_pointer = 15, .unknown = 99, .visibility = .hidden, .sort_order = 0 },
+    .{ .category_id = 14, .content_pointer = 19, .unknown = 4, .visibility = .hidden, .sort_order = 0 },
+    .{ .category_id = 15, .content_pointer = 20, .unknown = 6, .visibility = .hidden, .sort_order = 0 },
+    .{ .category_id = 16, .content_pointer = 21, .unknown = 99, .visibility = .hidden, .sort_order = 0 },
+    .{ .category_id = 18, .content_pointer = 23, .unknown = 99, .visibility = .hidden, .sort_order = 0 },
+    .{ .category_id = 2, .content_pointer = 2, .unknown = 2, .visibility = .visible, .sort_order = 1 },
+    .{ .category_id = 3, .content_pointer = 3, .unknown = 3, .visibility = .visible, .sort_order = 2 },
+    .{ .category_id = 4, .content_pointer = 4, .unknown = 1, .visibility = .visible, .sort_order = 3 },
+    .{ .category_id = 11, .content_pointer = 12, .unknown = 99, .visibility = .visible, .sort_order = 4 },
+    .{ .category_id = 17, .content_pointer = 5, .unknown = 99, .visibility = .visible, .sort_order = 5 },
+    .{ .category_id = 19, .content_pointer = 22, .unknown = 99, .visibility = .visible, .sort_order = 6 },
+    .{ .category_id = 20, .content_pointer = 18, .unknown = 99, .visibility = .visible, .sort_order = 7 },
+    .{ .category_id = 27, .content_pointer = 26, .unknown = 99, .visibility = @enumFromInt(2), .sort_order = 8 },
+    .{ .category_id = 24, .content_pointer = 17, .unknown = 99, .visibility = .visible, .sort_order = 9 },
+    .{ .category_id = 22, .content_pointer = 27, .unknown = 99, .visibility = .visible, .sort_order = 10 },
+};
+
+/// Inserts the default color rows (see `default_colors`) into the
+/// database's colors table.
+pub fn insertDefaultColors(db: *Database) DatabaseModifyError!void {
+    const a = db.arena.allocator();
+    for (default_colors) |entry| {
+        var row = Row{
+            .color = .{
+                .unknown2 = entry.id,
+                .color = entry.color,
+                .name = DeviceSQLString.fromUtf8(a, entry.name) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    // The comptime-verified literals can be neither.
+                    error.TooLong, error.InvalidEncoding => unreachable,
+                },
+            },
+        };
+        _ = try db.addRow(&row);
+    }
+}
+
+/// Inserts the default metadata-category rows (see `default_columns`)
+/// into the database's columns table.
+pub fn insertDefaultColumns(db: *Database) DatabaseModifyError!void {
+    const a = db.arena.allocator();
+    for (default_columns) |entry| {
+        var row = Row{ .column_entry = .{
+            .id = entry.id,
+            .unknown0 = entry.unknown0,
+            .column_name = DeviceSQLString.fromUtf8(a, entry.name) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.TooLong, error.InvalidEncoding => unreachable,
+            },
+        } };
+        _ = try db.addRow(&row);
+    }
+}
+
+/// Inserts the default menu rows (see `default_menus`) into the
+/// database's menu table.
+pub fn insertDefaultMenus(db: *Database) DatabaseModifyError!void {
+    for (default_menus) |entry| {
+        var row = Row{ .menu = .{
+            .category_id = entry.category_id,
+            .content_pointer = entry.content_pointer,
+            .unknown = entry.unknown,
+            .visibility = entry.visibility,
+            .sort_order = entry.sort_order,
+        } };
+        _ = try db.addRow(&row);
+    }
+}
 
 const testing = std.testing;
 
@@ -5415,6 +5626,53 @@ test "addRow-allocated pages are reachable through the chain" {
     );
 }
 
+test "create initializes an index/data page pair per table" {
+    const table_page_types = [_]PageType{ .tracks, .artists };
+    var db = try Database.create(testing.allocator, .plain, &table_page_types);
+    defer db.deinit();
+
+    try testing.expectEqual(@as(u32, 4096), db.header.page_size);
+    try testing.expectEqual(@as(u32, 2), db.header.num_tables);
+    try testing.expectEqual(@as(u32, 5), db.header.next_unused_page);
+    try testing.expectEqual(@as(usize, 4), db.pages.len);
+
+    const tracks_table = &db.header.tables[0];
+    try testing.expectEqual(@as(u32, 1), tracks_table.first_page);
+    // Empty table: the logical chain tail is the index page.
+    try testing.expectEqual(@as(u32, 1), tracks_table.last_page);
+    try testing.expectEqual(@as(u32, 2), tracks_table.empty_candidate);
+    const artists_table = &db.header.tables[1];
+    try testing.expectEqual(@as(u32, 3), artists_table.first_page);
+    try testing.expectEqual(@as(u32, 3), artists_table.last_page);
+    try testing.expectEqual(@as(u32, 4), artists_table.empty_candidate);
+
+    const tracks_index = db.pages[0].page;
+    try testing.expect(tracks_index.content == .index);
+    try testing.expectEqual(@as(u32, 1), tracks_index.header.page_index);
+    try testing.expectEqual(page_chain_end, tracks_index.header.next_page);
+    try testing.expectEqual(page_chain_end, tracks_index.content.index.header.next_page);
+
+    const tracks_data = db.pages[1].page;
+    try testing.expect(tracks_data.content == .data);
+    try testing.expectEqual(@as(u32, 2), tracks_data.header.page_index);
+    try testing.expectEqual(page_chain_end, tracks_data.header.next_page);
+    try testing.expectEqual(@as(u16, 4056), tracks_data.header.free_size);
+    try testing.expectEqual(@as(u16, 0), tracks_data.header.used_size);
+}
+
+test "create closes every new data page with the chain-end sentinel" {
+    const table_page_types = [_]PageType{ .tracks, .genres, .artists };
+    var db = try Database.create(testing.allocator, .plain, &table_page_types);
+    defer db.deinit();
+
+    for (db.pages) |slot| switch (slot) {
+        .page => |page| if (page.content == .data) {
+            try testing.expectEqual(page_chain_end, page.header.next_page);
+        },
+        .raw => unreachable,
+    };
+}
+
 /// The undersized Track row of rekordcrate's
 /// `test_add_row_rejects_undersized_track_row`: 200 heap bytes (92 fixed
 /// + 44 offset array + 64 string bytes), already 4-aligned, still below
@@ -5430,6 +5688,25 @@ fn undersizedTestTrack(a: std.mem.Allocator) !Track {
             .file_path = try DeviceSQLString.fromUtf8(a, "/Contents/02 - Music.mp3"),
         } },
     };
+}
+
+test "addRow rejects undersized track rows" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const track = try undersizedTestTrack(a);
+    try testing.expectEqual(@as(u16, 200), rowHeapBytesRequired(Track, track));
+    try testing.expectEqual(@as(u16, 200), allocatedRowSize(rowHeapBytesRequired(Track, track)));
+
+    const table_page_types = [_]PageType{.tracks};
+    var db = try Database.create(testing.allocator, .plain, &table_page_types);
+    defer db.deinit();
+
+    var row = Row{ .track = track };
+    try testing.expectError(error.TrackRowTooSmall, db.addRow(&row));
+    // Nothing was inserted anywhere.
+    try testing.expectEqual(@as(usize, 0), try countTableRows(&db, .tracks));
 }
 
 test "padTrackCommentToMinimum grows the comment to the row minimum" {
@@ -5450,4 +5727,67 @@ test "padTrackCommentToMinimum grows the comment to the row minimum" {
     const text = try track.offsets.inner.comment.utf8(a);
     try testing.expectEqual(@as(usize, 21), text.len);
     try testing.expect(std.mem.allEqual(u8, text, ' '));
+}
+
+/// The first row of the table for `page_type`, by page-chain order.
+fn firstTableRow(db: *const Database, page_type: PageType) !*const Row {
+    const table = db.header.findTable(page_type) orelse return error.NoTable;
+    var current = table.first_page;
+    while (true) {
+        const page = switch (db.pages[current - 1]) {
+            .page => |*page| page,
+            .raw => return error.UnparsedPage,
+        };
+        switch (page.content) {
+            .data => |*content| if (content.rows.len > 0)
+                return &content.rows[0].row,
+            .index => {},
+        }
+        if (current == table.last_page) break;
+        current = page.header.next_page;
+    }
+    return error.NoRows;
+}
+
+test "created databases carry the default color, column, and menu rows" {
+    const alloc = testing.allocator;
+    var db = try Database.create(alloc, .plain, &standard_table_page_types);
+    defer db.deinit();
+    try insertDefaultColors(&db);
+    try insertDefaultColumns(&db);
+    try insertDefaultMenus(&db);
+
+    try testing.expectEqual(@as(usize, 8), try countTableRows(&db, .colors));
+    try testing.expectEqual(@as(usize, 27), try countTableRows(&db, .columns));
+    try testing.expectEqual(@as(usize, 22), try countTableRows(&db, .menu));
+
+    // Spot-check the first color row and the GENRE column row.
+    const color_row = try firstTableRow(&db, .colors);
+    try testing.expectEqual(@as(u32, 0), color_row.color.unknown1);
+    try testing.expectEqual(@as(u8, 1), color_row.color.unknown2);
+    try testing.expectEqual(util.ColorIndex.pink, color_row.color.color);
+    try testing.expectEqualStrings(
+        "Pink",
+        try color_row.color.name.utf8(db.arena.allocator()),
+    );
+    const column_row = try firstTableRow(&db, .columns);
+    try testing.expectEqual(@as(u16, 1), column_row.column_entry.id);
+    try testing.expectEqual(@as(u16, 128), column_row.column_entry.unknown0);
+    try testing.expectEqualStrings(
+        "\u{FFFA}GENRE\u{FFFB}",
+        try column_row.column_entry.column_name.utf8(db.arena.allocator()),
+    );
+
+    // The created database serializes, re-parses with the same defaults,
+    // and re-serializes byte-stable.
+    const out = try db.serialize(alloc);
+    defer alloc.free(out);
+    var reparsed = try Database.parse(alloc, out, .plain);
+    defer reparsed.deinit();
+    try testing.expectEqual(@as(usize, 8), try countTableRows(&reparsed, .colors));
+    try testing.expectEqual(@as(usize, 27), try countTableRows(&reparsed, .columns));
+    try testing.expectEqual(@as(usize, 22), try countTableRows(&reparsed, .menu));
+    const out2 = try reparsed.serialize(alloc);
+    defer alloc.free(out2);
+    try testing.expectEqualSlices(u8, out, out2);
 }
