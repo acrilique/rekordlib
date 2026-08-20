@@ -3722,7 +3722,8 @@ test "data page decode rejects malformed pages" {
     // num_rows_valid disagreeing with the parsed row count.
     {
         var page = menuPageBytes(0);
-        std.mem.writeInt(u16, page[0x1A..][0..2], 0xC0 | 1, .little); // num_rows_valid = 1
+        // num_rows_valid = 1: bit 13 of the packed counts; num_rows stays 2.
+        page[0x19] = 0x20;
         var c = bin.Cursor.initAlloc(alloc, &page);
         const header = try bin.takeStruct(&c, PageHeader, .little);
         try testing.expectError(
@@ -3747,7 +3748,7 @@ test "data page decode rejects malformed pages" {
     // Row groups not fitting the page heap.
     {
         var page = menuPageBytes(0);
-        std.mem.writeInt(u16, page[0x18..][0..2], 0x0112, .little); // num_rows = 18
+        page[0x18] = 0x12; // num_rows = 18: two row groups, one past the heap
         var c = bin.Cursor.initAlloc(alloc, &page);
         const header = try bin.takeStruct(&c, PageHeader, .little);
         try testing.expectError(
