@@ -371,10 +371,10 @@ const offset_array_magic = 0x03;
 pub const OffsetArrayDecodeError = bin.ReadError || error{ InvalidFormat, UnexpectedValue };
 
 /// Encoding error of an offset array container: `UnexpectedValue` is a
-/// provided-offset width disagreeing with the argument, an offset too large
-/// for its width, or an `array_offset` argument exceeding the emitter
-/// position; `NotImplemented` is the unwired calculated mode.
-pub const OffsetArrayEncodeError = bin.WriteError || error{ UnexpectedValue, NotImplemented };
+/// provided-offset width disagreeing with the argument, an offset too
+/// large for its width (computed offsets included), or an `array_offset`
+/// argument exceeding the emitter position.
+pub const OffsetArrayEncodeError = bin.WriteError || error{UnexpectedValue};
 
 /// Specifies whether the offsets of an offset array are stored as `u8` or
 /// `u16`; the surrounding row's subtype selects the width (see
@@ -435,8 +435,10 @@ pub fn Offsets(comptime n: usize) type {
             values: [n]u16,
         },
 
-        /// Offsets are computed from the items during serialization and
-        /// patched back in; writing this mode is not implemented yet.
+        /// Offsets are computed during serialization — items appended in
+        /// order after the array, each start aligned per its
+        /// `requiredAlignment`, offsets patched back — the mode for newly
+        /// built rows.
         calculated,
 
         pub fn eql(a: Self, b: Self) bool {
@@ -538,32 +540,59 @@ pub fn OffsetArrayContainer(comptime T: type) type {
             };
         }
 
-        /// Writes the offsets, then each item at `base + offset` (the
-        /// inverse of `decode`, same `array_offset` convention); gaps the
-        /// offsets skip over are zero-filled.
+        /// Writes the magic and offsets, then each item — placed at
+        /// `base + offset` for provided offsets (the inverse of `decode`,
+        /// same `array_offset` convention; gaps the offsets skip over are
+        /// zero-filled), or appended in order for calculated ones, each
+        /// start aligned per its `requiredAlignment`, with the computed
+        /// offsets patched back into their reserved slots.
         pub fn encode(
             self: *const Self,
             e: *bin.Emitter,
             array_offset: usize,
             size: OffsetSize,
         ) OffsetArrayEncodeError!void {
-            const provided = switch (self.offsets) {
-                .provided => |p| p,
-                .calculated => return error.NotImplemented,
-            };
-            if (provided.size != size) return error.UnexpectedValue;
             const start = e.pos();
             if (array_offset > start) return error.UnexpectedValue; // base underflow
             const base = start - array_offset;
-            try size.putOffset(e, offset_array_magic);
-            for (provided.values) |value| try size.putOffset(e, value);
-            // One scratch emitter is reused for every item.
-            var sub = bin.Emitter.init(e.alloc);
-            defer sub.deinit();
-            inline for (Protocol.offsetItems(self.inner), provided.values) |item, offset| {
-                sub.clear();
-                try item.encode(&sub);
-                try e.putBytesAt(base + @as(usize, offset), sub.written());
+            switch (self.offsets) {
+                .provided => |provided| {
+                    if (provided.size != size) return error.UnexpectedValue;
+                    try size.putOffset(e, offset_array_magic);
+                    for (provided.values) |value| try size.putOffset(e, value);
+                    // One scratch emitter is reused for every item.
+                    var sub = bin.Emitter.init(e.alloc);
+                    defer sub.deinit();
+                    inline for (Protocol.offsetItems(self.inner), provided.values) |item, offset| {
+                        sub.clear();
+                        try item.encode(&sub);
+                        try e.putBytesAt(base + @as(usize, offset), sub.written());
+                    }
+                },
+                .calculated => {
+                    try size.putOffset(e, offset_array_magic);
+                    // Reserve zeroed slots; every offset is patched back
+                    // once its item's position is known.
+                    try e.pad(n * size.bytes());
+                    if (comptime Item != void) {
+                        inline for (Protocol.offsetItems(self.inner), 0..) |item, i| {
+                            const alignment: usize = @max(item.requiredAlignment(), 1);
+                            const current = e.pos() - base;
+                            const aligned = std.mem.alignForward(usize, current, alignment);
+                            if (aligned > current) try e.pad(aligned - current);
+                            const offset = e.pos() - base;
+                            if (offset > std.math.maxInt(u16) or
+                                (size == .u8 and offset > std.math.maxInt(u8)))
+                                return error.UnexpectedValue;
+                            try item.encode(e);
+                            const slot = start + size.bytes() * (i + 1);
+                            switch (size) {
+                                .u8 => e.patchIntAt(slot, u8, @intCast(offset), .little),
+                                .u16 => e.patchIntAt(slot, u16, @intCast(offset), .little),
+                            }
+                        }
+                    }
+                },
             }
         }
 
@@ -2071,9 +2100,8 @@ pub const Header = struct {
 pub const PageDecodeError = RowDecodeError;
 
 /// Encoding error of a page: the data and index content errors
-/// (`UnexpectedValue` covers a page too small for its content;
-/// `NotImplemented` is the unwired calculated offset mode).
-pub const PageEncodeError = bin.WriteError || error{ UnexpectedValue, NotImplemented };
+/// (`UnexpectedValue` covers a page too small for its content).
+pub const PageEncodeError = bin.WriteError || error{UnexpectedValue};
 
 /// The content of a page, selected by the page header's `is_index_page`
 /// flag bit.
@@ -2373,7 +2401,7 @@ pub const DatabaseDecodeError = bin.ReadError || error{UnexpectedValue};
 /// Encoding error of a whole database: the header, page, and content
 /// errors (whose `UnexpectedValue` covers content that does not fit its
 /// page).
-pub const DatabaseEncodeError = bin.WriteError || error{ UnexpectedValue, NotImplemented };
+pub const DatabaseEncodeError = bin.WriteError || error{UnexpectedValue};
 
 /// A whole `export.pdb`/`exportExt.pdb` image, parsed into an arena: the
 /// file header and every page after page 0. This is the deliberate
@@ -3629,16 +3657,6 @@ test "offset array encode validates provided offsets" {
     var e = bin.Emitter.init(alloc);
     defer e.deinit();
 
-    // Writing with calculated offsets is not wired yet.
-    const calculated: OffsetArrayContainer(Single) = .{
-        .offsets = .calculated,
-        .inner = .{ .value = .{ .value = 42 } },
-    };
-    try testing.expectError(
-        error.NotImplemented,
-        calculated.encode(&e, 0, .u8),
-    );
-
     // Provided width must match the write argument.
     const u16_stored: OffsetArrayContainer(Single) = .{
         .offsets = .{ .provided = .{ .size = .u16, .values = .{2} } },
@@ -3670,6 +3688,79 @@ test "offset array encode validates provided offsets" {
     try testing.expectError(
         error.UnexpectedValue,
         near.encode(&empty, 1, .u8),
+    );
+}
+
+test "calculated offsets append items in order and patch back" {
+    // Ported from rekordcrate's `calculated` test: offsets {3, 4} are
+    // computed from where the items land, not provided.
+    const alloc = testing.allocator;
+    var e = bin.Emitter.init(alloc);
+    defer e.deinit();
+    const multiple: OffsetArrayContainer(TestPair(TestU8Item)) = .{
+        .offsets = .calculated,
+        .inner = .{ .a = .{ .value = 0xC0 }, .b = .{ .value = 0xDE } },
+    };
+    try multiple.encode(&e, 0, .u8);
+    try testing.expectEqualSlices(
+        u8,
+        &.{ 0x03, 0x03, 0x04, 0xC0, 0xDE },
+        e.written(),
+    );
+}
+
+test "calculated offsets align ucs2 items to 4 bytes" {
+    // Ported from rekordcrate's `calculated_aligns_ucs2_item_to_4bytes`:
+    // "foo" ends at 7, so the UCS-2LE "é" is padded to start at 8 (one
+    // zero byte), and both patched offsets point at their items.
+    const alloc = testing.allocator;
+    var foo = try DeviceSQLString.fromUtf8(alloc, "foo");
+    defer foo.deinit(alloc);
+    var e_acute = try DeviceSQLString.fromUtf8(alloc, "é");
+    defer e_acute.deinit(alloc);
+
+    var e = bin.Emitter.init(alloc);
+    defer e.deinit();
+    const pair: OffsetArrayContainer(TestStringPair) = .{
+        .offsets = .calculated,
+        .inner = .{ .a = foo, .b = e_acute },
+    };
+    try pair.encode(&e, 0, .u8);
+    try testing.expectEqualSlices(
+        u8,
+        &.{
+            0x03, 0x03, 0x08, 0x09, 0x66, 0x6F, 0x6F, 0x00,
+            0x90, 0x06, 0x00, 0x00, 0xE9, 0x00,
+        },
+        e.written(),
+    );
+
+    // The patched offsets point where a decode would look.
+    var c = bin.Cursor.initAlloc(alloc, e.written());
+    var parsed = try OffsetArrayContainer(TestStringPair).decode(&c, 0, .u8);
+    defer parsed.deinit(alloc);
+    try testing.expectEqualSlices(u16, &.{ 3, 8 }, &parsed.offsets.provided.values);
+}
+
+test "calculated offsets reject items past the offset width" {
+    // A u8 offset cannot reach an item placed past byte 255: the long
+    // ASCII filler ends at 307.
+    const alloc = testing.allocator;
+    const filler = try alloc.alloc(u8, 300);
+    defer alloc.free(filler);
+    @memset(filler, 'a');
+    var long = try DeviceSQLString.fromUtf8(alloc, filler);
+    defer long.deinit(alloc);
+
+    var e = bin.Emitter.init(alloc);
+    defer e.deinit();
+    const pair: OffsetArrayContainer(TestStringPair) = .{
+        .offsets = .calculated,
+        .inner = .{ .a = long, .b = DeviceSQLString.empty() },
+    };
+    try testing.expectError(
+        error.UnexpectedValue,
+        pair.encode(&e, 0, .u8),
     );
 }
 
