@@ -4,12 +4,14 @@
 
 //! Parser and writer for the rekordbox `export.pdb` database (DeviceSQL):
 //! the string type, the offset arrays that locate row tail data, page
-//! headers with index pages, and data pages with their rows — including
-//! the tag rows of `exportExt.pdb`.
+//! headers with index pages, data pages with their rows — including
+//! the tag rows of `exportExt.pdb` — and whole databases assembled from
+//! the file header, its table of contents, and every page.
 //!
 //! Ported from rekordcrate's `src/pdb/string.rs`, `src/pdb/offset_array.rs`,
 //! `src/pdb/bitfields.rs`, `src/pdb/ext.rs`, and the page, index-page,
-//! data-page, and row parts of `src/pdb/mod.rs`.
+//! data-page, row, header, and table parts of `src/pdb/mod.rs` and
+//! `src/pdb/io.rs`.
 //!
 //! - <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/exports.html#devicesql-strings>
 
@@ -2159,6 +2161,154 @@ pub const Page = struct {
     }
 };
 
+/// One page slot of a database: the parsed page, or the whole page's
+/// bytes kept verbatim because the page failed to parse — an unknown page
+/// type with rows, or structural damage. Raw pages are written back
+/// byte-for-byte, the bytes the format does not model.
+pub const PageSlot = union(enum) {
+    /// The parsed page.
+    page: Page,
+    /// The page's raw bytes, owned by the database's arena.
+    raw: []const u8,
+
+    pub fn eql(a: PageSlot, b: PageSlot) bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+        return switch (a) {
+            .page => |*page| page.eql(&b.page),
+            .raw => |bytes| std.mem.eql(u8, bytes, b.raw),
+        };
+    }
+};
+
+/// Decoding error of a whole database.
+pub const DatabaseDecodeError = bin.ReadError || error{UnexpectedValue};
+
+/// Encoding error of a whole database: the header, page, and content
+/// errors (whose `UnexpectedValue` covers content that does not fit its
+/// page).
+pub const DatabaseEncodeError = bin.WriteError || error{ UnexpectedValue, NotImplemented };
+
+/// A whole `export.pdb`/`exportExt.pdb` image, parsed into an arena: the
+/// file header and every page after page 0. This is the deliberate
+/// whole-file-rewrite divergence from rekordcrate's lazy in-place page
+/// editor — see `docs/DIVERGENCES.md`; byte-identical roundtrips carry the
+/// safety argument and the perf budget the tripwire.
+pub const Database = struct {
+    /// Arena owning every value parsed into this instance. Rows and their
+    /// strings parse directly into it; `serialize` never allocates from
+    /// it.
+    arena: *std.heap.ArenaAllocator,
+    /// The type of database being parsed, which selects the meaning of
+    /// the page-type values in tables and page headers.
+    db_type: DatabaseType,
+    /// The file header (page 0).
+    header: Header,
+    /// Pages after page 0; `pages[i]` holds page index `i + 1`.
+    pages: []PageSlot,
+    /// Bytes after the last whole page, kept verbatim. Known files are
+    /// whole multiples of the page size, so this is normally empty.
+    tail: []const u8 = &.{},
+
+    /// Parses a whole database image of the given type. All pages are
+    /// parsed eagerly; a page that fails to parse — anything but
+    /// `error.OutOfMemory` — is kept as raw bytes and written back
+    /// verbatim instead of failing the database, mirroring the pages the
+    /// format does not model.
+    pub fn parse(
+        alloc: std.mem.Allocator,
+        buf: []const u8,
+        db_type: DatabaseType,
+    ) DatabaseDecodeError!Database {
+        const arena = try alloc.create(std.heap.ArenaAllocator);
+        errdefer alloc.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+
+        var c = bin.Cursor.initAlloc(a, buf);
+        const header = try Header.decode(&c, a);
+        const page_size: usize = header.page_size;
+        if (buf.len < page_size) return error.UnexpectedValue;
+
+        const num_pages = (buf.len - page_size) / page_size;
+        const pages = try a.alloc(PageSlot, num_pages);
+        for (pages, 0..) |*slot, i| {
+            const page_buf = buf[(i + 1) * page_size ..][0..page_size];
+            slot.* = parsePage(page_buf, page_size, db_type, a) catch |err|
+                switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => .{ .raw = try a.dupe(u8, page_buf) },
+                };
+        }
+        const tail_len = buf.len - page_size - num_pages * page_size;
+        return .{
+            .arena = arena,
+            .db_type = db_type,
+            .header = header,
+            .pages = pages,
+            .tail = if (tail_len == 0) &.{} else try a.dupe(
+                u8,
+                buf[buf.len - tail_len ..],
+            ),
+        };
+    }
+
+    /// Frees the instance and every value parsed into it.
+    pub fn deinit(db: *Database) void {
+        const child = db.arena.child_allocator;
+        db.arena.deinit();
+        child.destroy(db.arena);
+    }
+
+    /// Serializes the whole image — header page, every page slot, tail —
+    /// into a freshly allocated buffer the caller owns. The output length
+    /// equals the parsed input length: pages never grow or shrink, and
+    /// unparseable pages keep their bytes.
+    pub fn serialize(db: *const Database, alloc: std.mem.Allocator) DatabaseEncodeError![]u8 {
+        var e = bin.Emitter.init(alloc);
+        errdefer e.deinit();
+        try db.header.encode(&e);
+        const page_size: usize = db.header.page_size;
+        for (db.pages) |*slot| switch (slot.*) {
+            .page => |*page| try page.encode(&e, page_size),
+            .raw => |bytes| try e.putBytes(bytes),
+        };
+        try e.putBytes(db.tail);
+        return e.toOwnedSlice();
+    }
+
+    pub fn eql(a: *const Database, b: *const Database) bool {
+        if (a.db_type != b.db_type) return false;
+        // `num_tables` and `magic`/`gap` are derived or validated constants.
+        if (a.header.page_size != b.header.page_size or
+            a.header.next_unused_page != b.header.next_unused_page or
+            a.header.unknown != b.header.unknown or
+            a.header.sequence != b.header.sequence) return false;
+        if (a.header.tables.len != b.header.tables.len) return false;
+        for (a.header.tables, b.header.tables) |*at, *bt| {
+            if (!std.meta.eql(at.*, bt.*)) return false;
+        }
+        if (a.pages.len != b.pages.len) return false;
+        for (a.pages, b.pages) |*ap, *bp| {
+            if (!ap.eql(bp.*)) return false;
+        }
+        return std.mem.eql(u8, a.tail, b.tail);
+    }
+};
+
+/// Parses one page as a `PageSlot`, the eager per-page attempt of
+/// `Database.parse`. A page whose rows are not wired for the database
+/// type (unknown page types) fails with `error.NotImplemented`.
+fn parsePage(
+    page_buf: []const u8,
+    page_size: usize,
+    db_type: DatabaseType,
+    alloc: std.mem.Allocator,
+) PageDecodeError!PageSlot {
+    var c = bin.Cursor.initAlloc(alloc, page_buf);
+    return .{ .page = try Page.decode(&c, alloc, page_size, db_type) };
+}
+
 const testing = std.testing;
 
 /// Mirrors rekordcrate's `test_roundtrip`: parses `bytes` expecting
@@ -3424,6 +3574,112 @@ test "page decode dispatches content by the index flag" {
     try testing.expect(!data_page.header.page_flags.is_index_page);
     try testing.expectEqual(PageType.genres, data_page.header.page_type);
     try testing.expect(data_page.content == .data);
+}
+
+/// Parses the database fixture at `path` (relative to `testdata`) of
+/// `db_type` and checks the P7 acceptance: the header page roundtrips
+/// byte-identical, the only allowed difference elsewhere is dead-space
+/// zeroing (every differing output byte is zero — deleted-row remnants
+/// the writer does not preserve, which real files also carry on pages
+/// without the `contains_deleted` flag), re-writing the first output is
+/// byte-stable, and re-parsing it yields the same database.
+fn expectDatabaseRoundtrip(path: []const u8, db_type: DatabaseType) !void {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, "testdata", .{});
+    defer dir.close(io);
+    const input = try dir.readFileAlloc(io, path, alloc, .limited(1 << 22));
+    defer alloc.free(input);
+
+    var db = try Database.parse(alloc, input, db_type);
+    defer db.deinit();
+    const out1 = try db.serialize(alloc);
+    defer alloc.free(out1);
+
+    try testing.expectEqual(input.len, out1.len);
+    const page_size: usize = db.header.page_size;
+    if (!std.mem.eql(u8, input[0..page_size], out1[0..page_size])) {
+        std.debug.print("header page mismatch: {s}\n", .{path});
+        try testing.expectEqualSlices(u8, input[0..page_size], out1[0..page_size]);
+    }
+    var zeroed: usize = 0;
+    for (input, out1) |in_byte, out_byte| {
+        if (in_byte == out_byte) continue;
+        zeroed += 1;
+        if (out_byte != 0) {
+            std.debug.print(
+                "non-zeroing difference at byte {d}: {s}\n",
+                .{ zeroed, path },
+            );
+            try testing.expectEqual(@as(u8, 0), out_byte);
+        }
+    }
+
+    var db2 = try Database.parse(alloc, out1, db_type);
+    defer db2.deinit();
+    const out2 = try db2.serialize(alloc);
+    defer alloc.free(out2);
+    try testing.expectEqualSlices(u8, out1, out2);
+    try testing.expect(db.eql(&db2));
+}
+
+test "whole databases roundtrip byte-identical except zeroed dead space" {
+    const cases = .{
+        .{ .path = "pdb/num_rows/export.pdb", .db_type = DatabaseType.plain },
+        .{ .path = "complete_export/demo_tracks/PIONEER/rekordbox/export.pdb", .db_type = DatabaseType.plain },
+        .{ .path = "complete_export/demo_tracks/PIONEER/rekordbox/exportExt.pdb", .db_type = DatabaseType.ext },
+        .{ .path = "complete_export/empty/PIONEER/rekordbox/export.pdb", .db_type = DatabaseType.plain },
+        .{ .path = "complete_export/empty/PIONEER/rekordbox/exportExt.pdb", .db_type = DatabaseType.ext },
+        .{ .path = "complete_export/with_anlz/PIONEER/rekordbox/export.pdb", .db_type = DatabaseType.plain },
+        .{ .path = "complete_export/with_anlz/PIONEER/rekordbox/exportExt.pdb", .db_type = DatabaseType.ext },
+    };
+    inline for (cases) |case|
+        try expectDatabaseRoundtrip(case.path, case.db_type);
+}
+
+test "deleted-row page fixture pins dead-space zeroing and idempotent writes" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, "testdata/pdb/unit_tests", .{});
+    defer dir.close(io);
+    const input = try dir.readFileAlloc(io, "history_page_deleted.bin", alloc, .limited(1 << 16));
+    defer alloc.free(input);
+
+    var c = bin.Cursor.initAlloc(alloc, input);
+    var page = try Page.decode(&c, alloc, input.len, .plain);
+    defer page.deinit(alloc);
+    // demo_tracks history page 40: twelve used row slots, one valid row.
+    try testing.expect(page.header.page_flags.contains_deleted);
+    try testing.expectEqual(PageType.history, page.header.page_type);
+    try testing.expectEqual(@as(u32, 12), page.header.packed_row_counts.num_rows);
+    try testing.expectEqual(@as(u32, 1), page.header.packed_row_counts.num_rows_valid);
+    try testing.expectEqual(@as(usize, 1), page.content.data.rows.len);
+
+    var e1 = bin.Emitter.init(alloc);
+    defer e1.deinit();
+    try page.encode(&e1, input.len);
+    const out1 = e1.written();
+
+    // The write is allowed to differ from the fixture only by zeroing:
+    // every differing output byte is zero (deleted-row remnants).
+    var differing: usize = 0;
+    for (input, out1) |in_byte, out_byte| {
+        if (in_byte == out_byte) continue;
+        differing += 1;
+        try testing.expectEqual(@as(u8, 0), out_byte);
+    }
+    try testing.expect(differing > 0);
+
+    // And it is idempotent: re-parsing the output and writing again is
+    // byte-stable and keeps the same page.
+    var c2 = bin.Cursor.initAlloc(alloc, out1);
+    var reparsed = try Page.decode(&c2, alloc, input.len, .plain);
+    defer reparsed.deinit(alloc);
+    var e2 = bin.Emitter.init(alloc);
+    defer e2.deinit();
+    try reparsed.encode(&e2, input.len);
+    try testing.expectEqualSlices(u8, out1, e2.written());
+    try testing.expect(page.eql(&reparsed));
 }
 
 // Data page and simple row tests, ported from the row tests of
