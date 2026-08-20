@@ -468,15 +468,18 @@ fn putEncodedAt(e: *bin.Emitter, offset: usize, value: anytype) !void {
 /// * `OffsetItem`: the item type, holding the `decode`/`encode`/`deinit`/
 ///   `heapBytesRequired`/`requiredAlignment`/`eql` protocol of
 ///   `DeviceSQLString` (the alignment matters to calculated offsets)
-/// * `offsetItems(T) [n]OffsetItem`, a borrowing view, and
-///   `fromOffsetItems([n]OffsetItem) T`, which takes item ownership
-/// * `eql(a: T, b: T) bool`
 ///
-/// A `T` whose fields are all `OffsetItem`s can generate the last three
-/// declarations with `OffsetItemsOf`.
+/// Plus the item glue — `offsetItems(T) [n]OffsetItem` (a borrowing view),
+/// `fromOffsetItems([n]OffsetItem) T` (which takes item ownership), and
+/// `eql(a: T, b: T) bool` — declared either wholesale by `T` itself or,
+/// when every field of `T` is an `OffsetItem`, generated from the field
+/// list via `OffsetItemsOf`.
 pub fn OffsetArrayContainer(comptime T: type) type {
     const n = T.offset_count;
     const Item = T.OffsetItem;
+    // Item glue resolved once: the inner type's own declarations when it
+    // provides any of them, otherwise the ones generated from its fields.
+    const Protocol = if (@hasDecl(T, "offsetItems")) T else OffsetItemsOf(T, Item);
     return struct {
         const Self = @This();
 
@@ -526,7 +529,7 @@ pub fn OffsetArrayContainer(comptime T: type) type {
             }
             return .{
                 .offsets = .{ .provided = .{ .size = size, .values = values } },
-                .inner = T.fromOffsetItems(items),
+                .inner = Protocol.fromOffsetItems(items),
             };
         }
 
@@ -552,7 +555,7 @@ pub fn OffsetArrayContainer(comptime T: type) type {
             // One scratch emitter is reused for every item.
             var sub = bin.Emitter.init(e.alloc);
             defer sub.deinit();
-            inline for (T.offsetItems(self.inner), provided.values) |item, offset| {
+            inline for (Protocol.offsetItems(self.inner), provided.values) |item, offset| {
                 sub.clear();
                 try item.encode(&sub);
                 try e.putBytesAt(base + @as(usize, offset), sub.written());
@@ -570,7 +573,7 @@ pub fn OffsetArrayContainer(comptime T: type) type {
                 .provided => false,
             };
             var total: u32 = @intCast((n + 1) * size.bytes());
-            inline for (T.offsetItems(self.inner)) |item| {
+            inline for (Protocol.offsetItems(self.inner)) |item| {
                 if (calculated) {
                     const alignment: u32 = @max(item.requiredAlignment(), 1);
                     total = std.mem.alignForward(u32, total, alignment);
@@ -581,7 +584,7 @@ pub fn OffsetArrayContainer(comptime T: type) type {
         }
 
         pub fn eql(a: Self, b: Self) bool {
-            return a.offsets.eql(b.offsets) and a.inner.eql(b.inner);
+            return a.offsets.eql(b.offsets) and Protocol.eql(a.inner, b.inner);
         }
 
         /// Frees the items, which must have been allocated with `alloc`
@@ -589,7 +592,7 @@ pub fn OffsetArrayContainer(comptime T: type) type {
         /// deinit-ed with the same allocator.
         pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
             if (Item == void) return;
-            var items = T.offsetItems(self.inner);
+            var items = Protocol.offsetItems(self.inner);
             for (&items) |*item| item.deinit(alloc);
         }
     };
@@ -1260,10 +1263,6 @@ pub const TrailingName = struct {
 
     pub const offset_count = 1;
     pub const OffsetItem = DeviceSQLString;
-    const protocol = OffsetItemsOf(@This(), DeviceSQLString);
-    pub const offsetItems = protocol.offsetItems;
-    pub const fromOffsetItems = protocol.fromOffsetItems;
-    pub const eql = protocol.eql;
 };
 
 /// Contains the artist name and ID.
@@ -1385,10 +1384,6 @@ pub const TrackStrings = struct {
     /// One offset and slot per field, in declaration order.
     pub const offset_count = std.meta.fields(@This()).len;
     pub const OffsetItem = DeviceSQLString;
-    const protocol = OffsetItemsOf(@This(), DeviceSQLString);
-    pub const offsetItems = protocol.offsetItems;
-    pub const fromOffsetItems = protocol.fromOffsetItems;
-    pub const eql = protocol.eql;
 };
 
 /// The subtype every observed Track row carries: `0x24`, which selects
@@ -1482,10 +1477,6 @@ pub const TagOrCategoryStrings = struct {
     /// One offset and slot per field, in declaration order.
     pub const offset_count = 2;
     pub const OffsetItem = DeviceSQLString;
-    const protocol = OffsetItemsOf(@This(), DeviceSQLString);
-    pub const offsetItems = protocol.offsetItems;
-    pub const fromOffsetItems = protocol.fromOffsetItems;
-    pub const eql = protocol.eql;
 };
 
 /// A tag or category that can be assigned to tracks for the purpose of
@@ -2694,10 +2685,6 @@ fn TestSingle(comptime Item: type) type {
 
         pub const offset_count = 1;
         pub const OffsetItem = Item;
-        const protocol = OffsetItemsOf(@This(), Item);
-        pub const offsetItems = protocol.offsetItems;
-        pub const fromOffsetItems = protocol.fromOffsetItems;
-        pub const eql = protocol.eql;
     };
 }
 
@@ -2709,10 +2696,6 @@ fn TestPair(comptime Item: type) type {
 
         pub const offset_count = 2;
         pub const OffsetItem = Item;
-        const protocol = OffsetItemsOf(@This(), Item);
-        pub const offsetItems = protocol.offsetItems;
-        pub const fromOffsetItems = protocol.fromOffsetItems;
-        pub const eql = protocol.eql;
     };
 }
 
@@ -2721,10 +2704,6 @@ fn TestPair(comptime Item: type) type {
 const TestEmpty = struct {
     pub const offset_count = 0;
     pub const OffsetItem = void;
-    const protocol = OffsetItemsOf(@This(), void);
-    pub const offsetItems = protocol.offsetItems;
-    pub const fromOffsetItems = protocol.fromOffsetItems;
-    pub const eql = protocol.eql;
 };
 
 /// Two-string inner type for the heap-bytes tests, the analogue of
@@ -2736,10 +2715,6 @@ const TestStringPair = struct {
 
     pub const offset_count = 2;
     pub const OffsetItem = DeviceSQLString;
-    const protocol = OffsetItemsOf(@This(), DeviceSQLString);
-    pub const offsetItems = protocol.offsetItems;
-    pub const fromOffsetItems = protocol.fromOffsetItems;
-    pub const eql = protocol.eql;
 };
 
 /// Mirrors rekordcrate's `test_roundtrip_with_args` at `array_offset` 0:
