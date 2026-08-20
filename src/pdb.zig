@@ -454,6 +454,18 @@ pub fn Offsets(comptime n: usize) type {
     };
 }
 
+/// Serializes `value` — any type with an `encode(self, e)` method — into
+/// a scratch emitter and writes the finished bytes at `offset`,
+/// zero-filling any gap the position skips (see `bin.Emitter.putBytesAt`).
+/// The scratch emitter exists because such values are placed at absolute
+/// offsets instead of being appended in sequence.
+fn putEncodedAt(e: *bin.Emitter, offset: usize, value: anytype) !void {
+    var sub = bin.Emitter.init(e.alloc);
+    defer sub.deinit();
+    try value.encode(&sub);
+    try e.putBytesAt(offset, sub.written());
+}
+
 /// An array of `n` offsets followed by the data at those offsets, the tail
 /// structure rows use to locate strings (and other heap objects) after
 /// their fixed fields: a magic sized by `OffsetSize`, the `n` offsets, and
@@ -553,12 +565,9 @@ pub fn OffsetArrayContainer(comptime T: type) type {
             try size.putOffset(e, offset_array_magic);
             for (provided.values) |value| try size.putOffset(e, value);
             // `inline for` so zero-item containers can use `void` items:
-            // the body referencing `Item.encode` is never analyzed.
+            // the body's call into the item codec is never analyzed.
             inline for (T.offsetItems(self.inner), provided.values) |item, offset| {
-                var sub_emitter = bin.Emitter.init(e.alloc);
-                defer sub_emitter.deinit();
-                try item.encode(&sub_emitter);
-                try e.putBytesAt(base + @as(usize, offset), sub_emitter.written());
+                try putEncodedAt(e, base + @as(usize, offset), item);
             }
         }
 
@@ -1609,6 +1618,24 @@ pub const RowGroup = struct {
         return @popCount(group.row_presence_flags);
     }
 
+    /// Reads a group from `c`: the sixteen offsets, the presence flags,
+    /// and the unknown field, little-endian.
+    pub fn decode(c: *bin.Cursor) bin.ReadError!RowGroup {
+        var group: RowGroup = undefined;
+        for (&group.row_offsets) |*offset|
+            offset.* = try c.takeInt(u16, .little);
+        group.row_presence_flags = try c.takeInt(u16, .little);
+        group.unknown = try c.takeInt(u16, .little);
+        return group;
+    }
+
+    /// Writes the group, the inverse of `decode`.
+    pub fn encode(group: RowGroup, e: *bin.Emitter) bin.WriteError!void {
+        for (group.row_offsets) |offset| try e.putInt(u16, offset, .little);
+        try e.putInt(u16, group.row_presence_flags, .little);
+        try e.putInt(u16, group.unknown, .little);
+    }
+
     pub fn eql(a: *const RowGroup, b: *const RowGroup) bool {
         return a.unknown == b.unknown and
             a.row_presence_flags == b.row_presence_flags and
@@ -1667,10 +1694,7 @@ pub const DataPageContent = struct {
             const group_start = group_end - row_group_size;
             if (group_start < heap_start) return error.UnexpectedValue;
             var sub = bin.Cursor{ .buf = try c.range(group_start, group_end) };
-            for (&group.row_offsets) |*offset|
-                offset.* = try sub.takeInt(u16, .little);
-            group.row_presence_flags = try sub.takeInt(u16, .little);
-            group.unknown = try sub.takeInt(u16, .little);
+            group.* = try RowGroup.decode(&sub);
         }
 
         var rows = std.ArrayList(RowAtOffset).empty;
@@ -1718,20 +1742,12 @@ pub const DataPageContent = struct {
         const heap_end = heap_start + heap_size;
 
         for (self.rows) |at| {
-            var sub = bin.Emitter.init(e.alloc);
-            defer sub.deinit();
-            try at.row.encode(&sub);
-            try e.putBytesAt(heap_start + at.offset, sub.written());
+            try putEncodedAt(e, heap_start + at.offset, at.row);
         }
 
         for (self.row_groups, 0..) |group, g| {
-            var sub = bin.Emitter.init(e.alloc);
-            defer sub.deinit();
-            for (group.row_offsets) |offset| try sub.putInt(u16, offset, .little);
-            try sub.putInt(u16, group.row_presence_flags, .little);
-            try sub.putInt(u16, group.unknown, .little);
             const group_end = heap_end - row_group_size * g;
-            try e.putBytesAt(group_end - row_group_size, sub.written());
+            try putEncodedAt(e, group_end - row_group_size, group);
         }
         if (e.pos() < heap_end) try e.pad(heap_end - e.pos());
     }
