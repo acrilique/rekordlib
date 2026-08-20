@@ -858,6 +858,15 @@ pub const IndexPageContent = struct {
         alloc.free(content.entries);
         content.entries = &.{};
     }
+
+    pub fn eql(a: *const IndexPageContent, b: *const IndexPageContent) bool {
+        if (!std.meta.eql(a.header, b.header)) return false;
+        if (a.entries.len != b.entries.len) return false;
+        for (a.entries, b.entries) |ae, be| {
+            if (@as(u32, @bitCast(ae)) != @as(u32, @bitCast(be))) return false;
+        }
+        return true;
+    }
 };
 
 /// Number of entries a page of `page_size` bytes holds besides the page
@@ -2035,6 +2044,115 @@ pub const Header = struct {
     }
 };
 
+/// Decoding error of a page: row errors from the data content plus
+/// `UnexpectedValue` from the index content.
+pub const PageDecodeError = bin.ReadError || error{ InvalidFormat, UnexpectedValue, NotImplemented };
+
+/// Encoding error of a page: the data and index content errors
+/// (`UnexpectedValue` covers a page too small for its content;
+/// `NotImplemented` is the unwired calculated offset mode).
+pub const PageEncodeError = bin.WriteError || error{ UnexpectedValue, NotImplemented };
+
+/// The content of a page, selected by the page header's `is_index_page`
+/// flag bit.
+pub const PageContent = union(enum) {
+    /// The page contains data rows.
+    data: DataPageContent,
+    /// The page is an index page pointing at the table's data pages.
+    index: IndexPageContent,
+
+    /// Reads the content selected by `page_header.page_flags` from `c`,
+    /// positioned after the page header; `page_size` bounds the heap of a
+    /// data page and `db_type` selects its row dispatch.
+    pub fn decode(
+        c: *bin.Cursor,
+        alloc: std.mem.Allocator,
+        page_size: usize,
+        page_header: PageHeader,
+        db_type: DatabaseType,
+    ) PageDecodeError!PageContent {
+        if (page_header.page_flags.is_index_page)
+            return .{ .index = try IndexPageContent.decode(c, alloc) };
+        return .{
+            .data = try DataPageContent.decode(
+                c,
+                alloc,
+                page_size,
+                page_header,
+                db_type,
+            ),
+        };
+    }
+
+    /// Writes the content; together with the page header this fills
+    /// exactly one page.
+    pub fn encode(
+        content: *const PageContent,
+        e: *bin.Emitter,
+        page_size: usize,
+    ) PageEncodeError!void {
+        switch (content.*) {
+            .data => |*data| try data.encode(e, page_size),
+            .index => |*index| try index.encode(e, page_size),
+        }
+    }
+
+    pub fn eql(a: *const PageContent, b: *const PageContent) bool {
+        if (std.meta.activeTag(a.*) != std.meta.activeTag(b.*)) return false;
+        return switch (a.*) {
+            .data => |*data| data.eql(&b.data),
+            .index => |*index| index.eql(&b.index),
+        };
+    }
+
+    pub fn deinit(content: *PageContent, alloc: std.mem.Allocator) void {
+        switch (content.*) {
+            .data => |*data| data.deinit(alloc),
+            .index => |*index| index.deinit(alloc),
+        }
+    }
+};
+
+/// A table page: the 0x20-byte page header plus the content selected by
+/// its flags. A serialized page is exactly the database's page size long.
+pub const Page = struct {
+    /// The page header.
+    header: PageHeader = .{},
+    /// The content of the page.
+    content: PageContent = .{ .data = .{} },
+
+    /// Reads the page header (validating its constants) and the content
+    /// its flags select; `c` is positioned at the page start.
+    pub fn decode(
+        c: *bin.Cursor,
+        alloc: std.mem.Allocator,
+        page_size: usize,
+        db_type: DatabaseType,
+    ) PageDecodeError!Page {
+        const header = try bin.takeStruct(c, PageHeader, .little);
+        try bin.validateConstantFields(PageHeader, header);
+        return .{
+            .header = header,
+            .content = try PageContent.decode(c, alloc, page_size, header, db_type),
+        };
+    }
+
+    /// Writes the header and content — exactly `page_size` bytes.
+    pub fn encode(page: *const Page, e: *bin.Emitter, page_size: usize) PageEncodeError!void {
+        try bin.putStruct(e, page.header, .little);
+        try page.content.encode(e, page_size);
+    }
+
+    pub fn eql(a: *const Page, b: *const Page) bool {
+        if (!std.meta.eql(a.header, b.header)) return false;
+        return a.content.eql(&b.content);
+    }
+
+    pub fn deinit(page: *Page, alloc: std.mem.Allocator) void {
+        page.content.deinit(alloc);
+    }
+};
+
 const testing = std.testing;
 
 /// Mirrors rekordcrate's `test_roundtrip`: parses `bytes` expecting
@@ -3020,21 +3138,12 @@ fn roundtripPage(
     db_type: DatabaseType,
 ) ![]u8 {
     var c = bin.Cursor.initAlloc(alloc, input);
-    const header = try bin.takeStruct(&c, PageHeader, .little);
-    try bin.validateConstantFields(PageHeader, header);
+    var page = try Page.decode(&c, alloc, input.len, db_type);
+    defer page.deinit(alloc);
 
     var e = bin.Emitter.init(alloc);
     defer e.deinit();
-    try bin.putStruct(&e, header, .little);
-    if (header.page_flags.is_index_page) {
-        var content = try IndexPageContent.decode(&c, alloc);
-        defer content.deinit(alloc);
-        try content.encode(&e, input.len);
-    } else {
-        var content = try DataPageContent.decode(&c, alloc, input.len, header, db_type);
-        defer content.deinit(alloc);
-        try content.encode(&e, input.len);
-    }
+    try page.encode(&e, input.len);
     return e.toOwnedSlice();
 }
 
@@ -3284,6 +3393,31 @@ test "file header roundtrips, validates constants, and derives num_tables" {
     var e3 = bin.Emitter.init(alloc);
     defer e3.deinit();
     try testing.expectError(error.UnexpectedValue, cramped.encode(&e3));
+}
+
+test "page decode dispatches content by the index flag" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, "testdata/pdb/unit_tests", .{});
+    defer dir.close(io);
+
+    const index_bytes = try dir.readFileAlloc(io, "index_page.bin", alloc, .limited(1 << 16));
+    defer alloc.free(index_bytes);
+    var index_cursor = bin.Cursor.initAlloc(alloc, index_bytes);
+    var index_page = try Page.decode(&index_cursor, alloc, index_bytes.len, .plain);
+    defer index_page.deinit(alloc);
+    try testing.expect(index_page.header.page_flags.is_index_page);
+    try testing.expectEqual(PageType.tracks, index_page.header.page_type);
+    try testing.expect(index_page.content == .index);
+
+    const data_bytes = try dir.readFileAlloc(io, "genres_page.bin", alloc, .limited(1 << 16));
+    defer alloc.free(data_bytes);
+    var data_cursor = bin.Cursor.initAlloc(alloc, data_bytes);
+    var data_page = try Page.decode(&data_cursor, alloc, data_bytes.len, .plain);
+    defer data_page.deinit(alloc);
+    try testing.expect(!data_page.header.page_flags.is_index_page);
+    try testing.expectEqual(PageType.genres, data_page.header.page_type);
+    try testing.expect(data_page.content == .data);
 }
 
 // Data page and simple row tests, ported from the row tests of
