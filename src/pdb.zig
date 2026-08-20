@@ -488,8 +488,8 @@ pub fn OffsetArrayContainer(comptime T: type) type {
         /// Reads the offsets from `c`, then each item from its own
         /// sub-cursor at `base + offset`, where `base` is the cursor
         /// position the array starts at minus `array_offset` — the row
-        /// start. Track passes `0x5C` (its fixed-field size), Artist `8`,
-        /// Album `20`. The cursor is left directly after the offsets;
+        /// start; the row walkers pass the row's fixed-field size (see
+        /// `fixedLen`). The cursor is left directly after the offsets;
         /// items may lie beyond that, and are not required to fill the
         /// buffer they occupy.
         pub fn decode(c: *bin.Cursor, array_offset: usize, size: OffsetSize) OffsetArrayDecodeError!Self {
@@ -891,6 +891,154 @@ const history_date_magic: u32 = 0;
 /// always `0x1E19`.
 const history_version_magic: u16 = 0x1E19;
 
+/// Whether `T` is an `OffsetArrayContainer` instantiation: every type
+/// following the container protocol declares `offset_count` (as do the
+/// inner types, which never appear as row fields).
+fn isOffsetContainer(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(T, "offset_count"),
+        else => false,
+    };
+}
+
+/// Compile-time contract of the row walkers, checked once per row type:
+/// an offset-array container field must be preceded by the row's
+/// `subtype` field, whose parsed value selects the container's offset
+/// width mid-walk.
+fn validateRowType(comptime T: type) void {
+    comptime {
+        const fields = std.meta.fields(T);
+        for (fields, 0..) |field, i| {
+            if (!isOffsetContainer(field.type)) continue;
+            for (fields[0..i]) |prev| {
+                if (std.mem.eql(u8, prev.name, "subtype") and prev.type == u16) break;
+            } else @compileError(
+                @typeName(T) ++ "." ++ field.name ++
+                    ": offset containers must be preceded by a `subtype: u16` field",
+            );
+        }
+    }
+}
+
+/// Bytes a row's fixed fields occupy: every field except the
+/// variable-length strings and offset-array containers.
+fn fixedLen(comptime T: type) usize {
+    return comptime blk: {
+        var len: usize = 0;
+        for (std.meta.fields(T)) |field| {
+            if (field.type == DeviceSQLString or isOffsetContainer(field.type)) continue;
+            switch (@typeInfo(field.type)) {
+                .int => len += @sizeOf(field.type),
+                .@"enum" => |en| len += @sizeOf(en.tag_type),
+                else => @compileError("fixedLen: unsupported field type `" ++ @typeName(field.type) ++ "`"),
+            }
+        }
+        break :blk len;
+    };
+}
+
+/// Reads the fields of row type `T` in declaration order at
+/// little-endian: the row-layer analogue of `bin.takeStruct`. Supported
+/// field types are integers, non-exhaustive enums (so unknown values
+/// roundtrip verbatim), inline `DeviceSQLString`s at their field
+/// position, and a trailing offset-array container whose offsets reach
+/// back past the row's fixed fields (`fixedLen`) and whose width follows
+/// from the `subtype` field, which it must be declared after (see
+/// `validateRowType`). Fields a failing decode leaves behind are freed,
+/// so a row rejected mid-parse never leaks, and a `constant_fields`
+/// declaration is validated after the walk, as for page headers.
+fn decodeRow(comptime T: type, c: *bin.Cursor) RowDecodeError!T {
+    comptime validateRowType(T);
+    var row: T = .{};
+    errdefer {
+        if (c.alloc) |alloc| rowDeinit(T, &row, alloc);
+    }
+    inline for (std.meta.fields(T)) |field| {
+        if (comptime isOffsetContainer(field.type)) {
+            @field(row, field.name) = try field.type.decode(
+                c,
+                fixedLen(T),
+                OffsetSize.fromSubtype(row.subtype),
+            );
+        } else if (comptime field.type == DeviceSQLString) {
+            @field(row, field.name) = try DeviceSQLString.decode(c);
+        } else switch (@typeInfo(field.type)) {
+            .int => @field(row, field.name) = try c.takeInt(field.type, .little),
+            .@"enum" => |en| {
+                if (en.is_exhaustive)
+                    @compileError("decodeRow: enum fields must be non-exhaustive, `" ++ @typeName(field.type) ++ "` is not");
+                @field(row, field.name) = @enumFromInt(try c.takeInt(en.tag_type, .little));
+            },
+            else => @compileError("decodeRow: unsupported field type `" ++ @typeName(field.type) ++ "`"),
+        }
+    }
+    try bin.validateConstantFields(T, row);
+    return row;
+}
+
+/// Writes the fields of `row` in declaration order, the mirror image of
+/// `decodeRow` (whose documentation covers the supported field types).
+fn encodeRow(comptime T: type, row: T, e: *bin.Emitter) RowEncodeError!void {
+    inline for (std.meta.fields(T)) |field| {
+        if (comptime isOffsetContainer(field.type)) {
+            try @field(row, field.name).encode(
+                e,
+                fixedLen(T),
+                OffsetSize.fromSubtype(@field(row, "subtype")),
+            );
+        } else if (comptime field.type == DeviceSQLString) {
+            try @field(row, field.name).encode(e);
+        } else switch (@typeInfo(field.type)) {
+            .int => try e.putInt(field.type, @field(row, field.name), .little),
+            .@"enum" => |en| try e.putInt(
+                en.tag_type,
+                @intFromEnum(@field(row, field.name)),
+                .little,
+            ),
+            else => @compileError("encodeRow: unsupported field type `" ++ @typeName(field.type) ++ "`"),
+        }
+    }
+}
+
+/// Page heap space in bytes the row occupies: its fixed fields plus the
+/// strings and the trailing offset-array container at their actual
+/// sizes.
+fn rowHeapBytesRequired(comptime T: type, row: T) u16 {
+    var total: u32 = @intCast(fixedLen(T));
+    inline for (std.meta.fields(T)) |field| {
+        if (comptime isOffsetContainer(field.type)) {
+            total += @field(row, field.name).heapBytesRequired(
+                OffsetSize.fromSubtype(@field(row, "subtype")),
+            );
+        } else if (comptime field.type == DeviceSQLString) {
+            total += @field(row, field.name).heapBytesRequired();
+        }
+    }
+    return @intCast(total);
+}
+
+/// Field-by-field equality: strings and offset-array containers through
+/// their `eql`, everything else by value.
+fn rowEql(comptime T: type, a: T, b: T) bool {
+    inline for (std.meta.fields(T)) |field| {
+        if (comptime isOffsetContainer(field.type) or field.type == DeviceSQLString) {
+            if (!@field(a, field.name).eql(@field(b, field.name))) return false;
+        } else if (@field(a, field.name) != @field(b, field.name)) return false;
+    }
+    return true;
+}
+
+/// Frees the row's strings and offset-array containers, which must have
+/// been allocated with `alloc` (by `decodeRow` or by building the row);
+/// rows deinit-ed with the same allocator.
+fn rowDeinit(comptime T: type, row: *T, alloc: std.mem.Allocator) void {
+    inline for (std.meta.fields(T)) |field| {
+        if (comptime isOffsetContainer(field.type) or field.type == DeviceSQLString) {
+            @field(row.*, field.name).deinit(alloc);
+        }
+    }
+}
+
 /// Represents a musical genre.
 pub const Genre = struct {
     /// ID of this row.
@@ -899,28 +1047,6 @@ pub const Genre = struct {
     name: DeviceSQLString = DeviceSQLString.empty(),
 
     pub const page_type: PageType = .genres;
-
-    pub fn decode(c: *bin.Cursor) RowDecodeError!Genre {
-        const id = try c.takeInt(u32, .little);
-        return .{ .id = id, .name = try DeviceSQLString.decode(c) };
-    }
-
-    pub fn encode(self: *const Genre, e: *bin.Emitter) bin.WriteError!void {
-        try e.putInt(u32, self.id, .little);
-        try self.name.encode(e);
-    }
-
-    pub fn heapBytesRequired(self: *const Genre) u16 {
-        return @intCast(4 + @as(u32, self.name.heapBytesRequired()));
-    }
-
-    pub fn eql(a: Genre, b: Genre) bool {
-        return a.id == b.id and a.name.eql(b.name);
-    }
-
-    pub fn deinit(self: *Genre, alloc: std.mem.Allocator) void {
-        self.name.deinit(alloc);
-    }
 };
 
 /// Represents a record label.
@@ -931,28 +1057,6 @@ pub const Label = struct {
     name: DeviceSQLString = DeviceSQLString.empty(),
 
     pub const page_type: PageType = .labels;
-
-    pub fn decode(c: *bin.Cursor) RowDecodeError!Label {
-        const id = try c.takeInt(u32, .little);
-        return .{ .id = id, .name = try DeviceSQLString.decode(c) };
-    }
-
-    pub fn encode(self: *const Label, e: *bin.Emitter) bin.WriteError!void {
-        try e.putInt(u32, self.id, .little);
-        try self.name.encode(e);
-    }
-
-    pub fn heapBytesRequired(self: *const Label) u16 {
-        return @intCast(4 + @as(u32, self.name.heapBytesRequired()));
-    }
-
-    pub fn eql(a: Label, b: Label) bool {
-        return a.id == b.id and a.name.eql(b.name);
-    }
-
-    pub fn deinit(self: *Label, alloc: std.mem.Allocator) void {
-        self.name.deinit(alloc);
-    }
 };
 
 /// Represents a musical key.
@@ -965,30 +1069,6 @@ pub const Key = struct {
     name: DeviceSQLString = DeviceSQLString.empty(),
 
     pub const page_type: PageType = .keys;
-
-    pub fn decode(c: *bin.Cursor) RowDecodeError!Key {
-        const id = try c.takeInt(u32, .little);
-        const id2 = try c.takeInt(u32, .little);
-        return .{ .id = id, .id2 = id2, .name = try DeviceSQLString.decode(c) };
-    }
-
-    pub fn encode(self: *const Key, e: *bin.Emitter) bin.WriteError!void {
-        try e.putInt(u32, self.id, .little);
-        try e.putInt(u32, self.id2, .little);
-        try self.name.encode(e);
-    }
-
-    pub fn heapBytesRequired(self: *const Key) u16 {
-        return @intCast(8 + @as(u32, self.name.heapBytesRequired()));
-    }
-
-    pub fn eql(a: Key, b: Key) bool {
-        return a.id == b.id and a.id2 == b.id2 and a.name.eql(b.name);
-    }
-
-    pub fn deinit(self: *Key, alloc: std.mem.Allocator) void {
-        self.name.deinit(alloc);
-    }
 };
 
 /// Contains a numeric color ID and its user-defined name.
@@ -1005,42 +1085,6 @@ pub const Color = struct {
     name: DeviceSQLString = DeviceSQLString.empty(),
 
     pub const page_type: PageType = .colors;
-
-    pub fn decode(c: *bin.Cursor) RowDecodeError!Color {
-        const unknown1 = try c.takeInt(u32, .little);
-        const unknown2 = try c.takeInt(u8, .little);
-        const color: ColorIndex = @enumFromInt(try c.takeInt(u8, .little));
-        const unknown3 = try c.takeInt(u16, .little);
-        return .{
-            .unknown1 = unknown1,
-            .unknown2 = unknown2,
-            .color = color,
-            .unknown3 = unknown3,
-            .name = try DeviceSQLString.decode(c),
-        };
-    }
-
-    pub fn encode(self: *const Color, e: *bin.Emitter) bin.WriteError!void {
-        try e.putInt(u32, self.unknown1, .little);
-        try e.putInt(u8, self.unknown2, .little);
-        try e.putInt(u8, @intFromEnum(self.color), .little);
-        try e.putInt(u16, self.unknown3, .little);
-        try self.name.encode(e);
-    }
-
-    pub fn heapBytesRequired(self: *const Color) u16 {
-        return @intCast(8 + @as(u32, self.name.heapBytesRequired()));
-    }
-
-    pub fn eql(a: Color, b: Color) bool {
-        return a.unknown1 == b.unknown1 and a.unknown2 == b.unknown2 and
-            a.color == b.color and a.unknown3 == b.unknown3 and
-            a.name.eql(b.name);
-    }
-
-    pub fn deinit(self: *Color, alloc: std.mem.Allocator) void {
-        self.name.deinit(alloc);
-    }
 };
 
 /// Contains the artwork path and ID.
@@ -1051,28 +1095,6 @@ pub const Artwork = struct {
     path: DeviceSQLString = DeviceSQLString.empty(),
 
     pub const page_type: PageType = .artwork;
-
-    pub fn decode(c: *bin.Cursor) RowDecodeError!Artwork {
-        const id = try c.takeInt(u32, .little);
-        return .{ .id = id, .path = try DeviceSQLString.decode(c) };
-    }
-
-    pub fn encode(self: *const Artwork, e: *bin.Emitter) bin.WriteError!void {
-        try e.putInt(u32, self.id, .little);
-        try self.path.encode(e);
-    }
-
-    pub fn heapBytesRequired(self: *const Artwork) u16 {
-        return @intCast(4 + @as(u32, self.path.heapBytesRequired()));
-    }
-
-    pub fn eql(a: Artwork, b: Artwork) bool {
-        return a.id == b.id and a.path.eql(b.path);
-    }
-
-    pub fn deinit(self: *Artwork, alloc: std.mem.Allocator) void {
-        self.path.deinit(alloc);
-    }
 };
 
 /// Represents a history playlist, recorded every time the device is
@@ -1084,28 +1106,6 @@ pub const HistoryPlaylist = struct {
     name: DeviceSQLString = DeviceSQLString.empty(),
 
     pub const page_type: PageType = .history_playlists;
-
-    pub fn decode(c: *bin.Cursor) RowDecodeError!HistoryPlaylist {
-        const id = try c.takeInt(u32, .little);
-        return .{ .id = id, .name = try DeviceSQLString.decode(c) };
-    }
-
-    pub fn encode(self: *const HistoryPlaylist, e: *bin.Emitter) bin.WriteError!void {
-        try e.putInt(u32, self.id, .little);
-        try self.name.encode(e);
-    }
-
-    pub fn heapBytesRequired(self: *const HistoryPlaylist) u16 {
-        return @intCast(4 + @as(u32, self.name.heapBytesRequired()));
-    }
-
-    pub fn eql(a: HistoryPlaylist, b: HistoryPlaylist) bool {
-        return a.id == b.id and a.name.eql(b.name);
-    }
-
-    pub fn deinit(self: *HistoryPlaylist, alloc: std.mem.Allocator) void {
-        self.name.deinit(alloc);
-    }
 };
 
 /// Links a track to a history playlist, at its position.
@@ -1118,28 +1118,6 @@ pub const HistoryEntry = struct {
     entry_index: u32 = 0,
 
     pub const page_type: PageType = .history_entries;
-
-    pub fn decode(c: *bin.Cursor) RowDecodeError!HistoryEntry {
-        return bin.takeStruct(c, HistoryEntry, .little);
-    }
-
-    pub fn encode(self: *const HistoryEntry, e: *bin.Emitter) bin.WriteError!void {
-        try bin.putStruct(e, self.*, .little);
-    }
-
-    pub fn heapBytesRequired(self: *const HistoryEntry) u16 {
-        _ = self;
-        return @intCast(bin.serializedLen(HistoryEntry));
-    }
-
-    pub fn eql(a: HistoryEntry, b: HistoryEntry) bool {
-        return std.meta.eql(a, b);
-    }
-
-    pub fn deinit(self: *HistoryEntry, alloc: std.mem.Allocator) void {
-        _ = self;
-        _ = alloc;
-    }
 };
 
 /// Links a track to a playlist, at its position.
@@ -1152,28 +1130,6 @@ pub const PlaylistEntry = struct {
     playlist_id: u32 = 0,
 
     pub const page_type: PageType = .playlist_entries;
-
-    pub fn decode(c: *bin.Cursor) RowDecodeError!PlaylistEntry {
-        return bin.takeStruct(c, PlaylistEntry, .little);
-    }
-
-    pub fn encode(self: *const PlaylistEntry, e: *bin.Emitter) bin.WriteError!void {
-        try bin.putStruct(e, self.*, .little);
-    }
-
-    pub fn heapBytesRequired(self: *const PlaylistEntry) u16 {
-        _ = self;
-        return @intCast(bin.serializedLen(PlaylistEntry));
-    }
-
-    pub fn eql(a: PlaylistEntry, b: PlaylistEntry) bool {
-        return std.meta.eql(a, b);
-    }
-
-    pub fn deinit(self: *PlaylistEntry, alloc: std.mem.Allocator) void {
-        _ = self;
-        _ = alloc;
-    }
 };
 
 /// A sync log row, written at least once per synchronization event (e.g.
@@ -1188,8 +1144,12 @@ pub const History = struct {
     index_shift: u16 = 0,
     /// Tracks present in the database after this sync event.
     num_tracks: u32 = 0,
+    /// Magic value between `num_tracks` and `date`; always zero.
+    date_magic: u32 = history_date_magic,
     /// Sync date, e.g. "2022-02-02".
     date: DeviceSQLString = DeviceSQLString.empty(),
+    /// Magic value between `date` and `version`; always `0x1E19`.
+    version_magic: u16 = history_version_magic,
     /// Format/protocol version string, "1000" in all known exports.
     version: DeviceSQLString = DeviceSQLString.empty(),
     /// Device or backup label; can be empty.
@@ -1197,56 +1157,9 @@ pub const History = struct {
 
     pub const page_type: PageType = .history;
 
-    pub fn decode(c: *bin.Cursor) RowDecodeError!History {
-        const alloc = c.alloc orelse return bin.ReadError.OutOfMemory;
-        const subtype = try c.takeInt(u16, .little);
-        const index_shift = try c.takeInt(u16, .little);
-        const num_tracks = try c.takeInt(u32, .little);
-        if (try c.takeInt(u32, .little) != history_date_magic)
-            return error.UnexpectedValue;
-        var date = try DeviceSQLString.decode(c);
-        errdefer date.deinit(alloc);
-        if (try c.takeInt(u16, .little) != history_version_magic)
-            return error.UnexpectedValue;
-        var version = try DeviceSQLString.decode(c);
-        errdefer version.deinit(alloc);
-        return .{
-            .subtype = subtype,
-            .index_shift = index_shift,
-            .num_tracks = num_tracks,
-            .date = date,
-            .version = version,
-            .label = try DeviceSQLString.decode(c),
-        };
-    }
-
-    pub fn encode(self: *const History, e: *bin.Emitter) bin.WriteError!void {
-        try e.putInt(u16, self.subtype, .little);
-        try e.putInt(u16, self.index_shift, .little);
-        try e.putInt(u32, self.num_tracks, .little);
-        try e.putInt(u32, history_date_magic, .little);
-        try self.date.encode(e);
-        try e.putInt(u16, history_version_magic, .little);
-        try self.version.encode(e);
-        try self.label.encode(e);
-    }
-
-    pub fn heapBytesRequired(self: *const History) u16 {
-        return @intCast(12 + @as(u32, self.date.heapBytesRequired()) +
-            2 + self.version.heapBytesRequired() + self.label.heapBytesRequired());
-    }
-
-    pub fn eql(a: History, b: History) bool {
-        return a.subtype == b.subtype and a.index_shift == b.index_shift and
-            a.num_tracks == b.num_tracks and a.date.eql(b.date) and
-            a.version.eql(b.version) and a.label.eql(b.label);
-    }
-
-    pub fn deinit(self: *History, alloc: std.mem.Allocator) void {
-        self.date.deinit(alloc);
-        self.version.deinit(alloc);
-        self.label.deinit(alloc);
-    }
+    /// Fields that must hold their default value in all known files;
+    /// other values are rejected on parse (see `bin.validateConstantFields`).
+    pub const constant_fields = .{ .date_magic, .version_magic };
 };
 
 /// One of the metadata categories tracks can be browsed by on CDJs.
@@ -1265,31 +1178,6 @@ pub const ColumnEntry = struct {
     column_name: DeviceSQLString = DeviceSQLString.empty(),
 
     pub const page_type: PageType = .columns;
-
-    pub fn decode(c: *bin.Cursor) RowDecodeError!ColumnEntry {
-        const id = try c.takeInt(u16, .little);
-        const unknown0 = try c.takeInt(u16, .little);
-        return .{ .id = id, .unknown0 = unknown0, .column_name = try DeviceSQLString.decode(c) };
-    }
-
-    pub fn encode(self: *const ColumnEntry, e: *bin.Emitter) bin.WriteError!void {
-        try e.putInt(u16, self.id, .little);
-        try e.putInt(u16, self.unknown0, .little);
-        try self.column_name.encode(e);
-    }
-
-    pub fn heapBytesRequired(self: *const ColumnEntry) u16 {
-        return @intCast(4 + @as(u32, self.column_name.heapBytesRequired()));
-    }
-
-    pub fn eql(a: ColumnEntry, b: ColumnEntry) bool {
-        return a.id == b.id and a.unknown0 == b.unknown0 and
-            a.column_name.eql(b.column_name);
-    }
-
-    pub fn deinit(self: *ColumnEntry, alloc: std.mem.Allocator) void {
-        self.column_name.deinit(alloc);
-    }
 };
 
 /// Defines one of the active menus on the CDJ.
@@ -1311,35 +1199,7 @@ pub const Menu = struct {
     sort_order: u16 = 0,
 
     pub const page_type: PageType = .menu;
-
-    pub fn decode(c: *bin.Cursor) RowDecodeError!Menu {
-        return bin.takeStruct(c, Menu, .little);
-    }
-
-    pub fn encode(self: *const Menu, e: *bin.Emitter) bin.WriteError!void {
-        try bin.putStruct(e, self.*, .little);
-    }
-
-    pub fn heapBytesRequired(self: *const Menu) u16 {
-        _ = self;
-        return @intCast(bin.serializedLen(Menu));
-    }
-
-    pub fn eql(a: Menu, b: Menu) bool {
-        return std.meta.eql(a, b);
-    }
-
-    pub fn deinit(self: *Menu, alloc: std.mem.Allocator) void {
-        _ = self;
-        _ = alloc;
-    }
 };
-
-/// Fixed-field sizes of the rows with trailing offset arrays: their
-/// offsets are relative to the row start, this many bytes back from the
-/// array.
-const artist_fixed_len: usize = 8;
-const album_fixed_len: usize = 20;
 
 /// The single name string at the end of Artist and Album rows, located by
 /// the row's offset array.
@@ -1377,48 +1237,6 @@ pub const Artist = struct {
     offsets: OffsetArrayContainer(TrailingName) = .{},
 
     pub const page_type: PageType = .artists;
-
-    pub fn decode(c: *bin.Cursor) RowDecodeError!Artist {
-        const subtype = try c.takeInt(u16, .little);
-        const index_shift = try c.takeInt(u16, .little);
-        const id = try c.takeInt(u32, .little);
-        return .{
-            .subtype = subtype,
-            .index_shift = index_shift,
-            .id = id,
-            .offsets = try OffsetArrayContainer(TrailingName).decode(
-                c,
-                artist_fixed_len,
-                OffsetSize.fromSubtype(subtype),
-            ),
-        };
-    }
-
-    pub fn encode(self: *const Artist, e: *bin.Emitter) RowEncodeError!void {
-        try e.putInt(u16, self.subtype, .little);
-        try e.putInt(u16, self.index_shift, .little);
-        try e.putInt(u32, self.id, .little);
-        try self.offsets.encode(
-            e,
-            artist_fixed_len,
-            OffsetSize.fromSubtype(self.subtype),
-        );
-    }
-
-    pub fn heapBytesRequired(self: *const Artist) u16 {
-        return @intCast(artist_fixed_len + @as(u32, self.offsets.heapBytesRequired(
-            OffsetSize.fromSubtype(self.subtype),
-        )));
-    }
-
-    pub fn eql(a: Artist, b: Artist) bool {
-        return a.subtype == b.subtype and a.index_shift == b.index_shift and
-            a.id == b.id and a.offsets.eql(b.offsets);
-    }
-
-    pub fn deinit(self: *Artist, alloc: std.mem.Allocator) void {
-        self.offsets.deinit(alloc);
-    }
 };
 
 /// Contains the album name, the ID of its artist, and its own ID.
@@ -1441,59 +1259,6 @@ pub const Album = struct {
     offsets: OffsetArrayContainer(TrailingName) = .{},
 
     pub const page_type: PageType = .albums;
-
-    pub fn decode(c: *bin.Cursor) RowDecodeError!Album {
-        const subtype = try c.takeInt(u16, .little);
-        const index_shift = try c.takeInt(u16, .little);
-        const unknown2 = try c.takeInt(u32, .little);
-        const artist_id = try c.takeInt(u32, .little);
-        const id = try c.takeInt(u32, .little);
-        const unknown3 = try c.takeInt(u32, .little);
-        return .{
-            .subtype = subtype,
-            .index_shift = index_shift,
-            .unknown2 = unknown2,
-            .artist_id = artist_id,
-            .id = id,
-            .unknown3 = unknown3,
-            .offsets = try OffsetArrayContainer(TrailingName).decode(
-                c,
-                album_fixed_len,
-                OffsetSize.fromSubtype(subtype),
-            ),
-        };
-    }
-
-    pub fn encode(self: *const Album, e: *bin.Emitter) RowEncodeError!void {
-        try e.putInt(u16, self.subtype, .little);
-        try e.putInt(u16, self.index_shift, .little);
-        try e.putInt(u32, self.unknown2, .little);
-        try e.putInt(u32, self.artist_id, .little);
-        try e.putInt(u32, self.id, .little);
-        try e.putInt(u32, self.unknown3, .little);
-        try self.offsets.encode(
-            e,
-            album_fixed_len,
-            OffsetSize.fromSubtype(self.subtype),
-        );
-    }
-
-    pub fn heapBytesRequired(self: *const Album) u16 {
-        return @intCast(album_fixed_len + @as(u32, self.offsets.heapBytesRequired(
-            OffsetSize.fromSubtype(self.subtype),
-        )));
-    }
-
-    pub fn eql(a: Album, b: Album) bool {
-        return a.subtype == b.subtype and a.index_shift == b.index_shift and
-            a.unknown2 == b.unknown2 and a.artist_id == b.artist_id and
-            a.id == b.id and a.unknown3 == b.unknown3 and
-            a.offsets.eql(b.offsets);
-    }
-
-    pub fn deinit(self: *Album, alloc: std.mem.Allocator) void {
-        self.offsets.deinit(alloc);
-    }
 };
 
 /// A node in the playlist tree: a folder grouping other nodes or a leaf
@@ -1524,45 +1289,6 @@ pub const PlaylistTreeNode = struct {
     /// leaf playlist.
     pub fn isFolder(self: *const PlaylistTreeNode) bool {
         return self.node_is_folder > 0;
-    }
-
-    pub fn decode(c: *bin.Cursor) RowDecodeError!PlaylistTreeNode {
-        const parent_id = try c.takeInt(u32, .little);
-        const unknown = try c.takeInt(u32, .little);
-        const sort_order = try c.takeInt(u32, .little);
-        const id = try c.takeInt(u32, .little);
-        const node_is_folder = try c.takeInt(u32, .little);
-        return .{
-            .parent_id = parent_id,
-            .unknown = unknown,
-            .sort_order = sort_order,
-            .id = id,
-            .node_is_folder = node_is_folder,
-            .name = try DeviceSQLString.decode(c),
-        };
-    }
-
-    pub fn encode(self: *const PlaylistTreeNode, e: *bin.Emitter) bin.WriteError!void {
-        try e.putInt(u32, self.parent_id, .little);
-        try e.putInt(u32, self.unknown, .little);
-        try e.putInt(u32, self.sort_order, .little);
-        try e.putInt(u32, self.id, .little);
-        try e.putInt(u32, self.node_is_folder, .little);
-        try self.name.encode(e);
-    }
-
-    pub fn heapBytesRequired(self: *const PlaylistTreeNode) u16 {
-        return @intCast(20 + @as(u32, self.name.heapBytesRequired()));
-    }
-
-    pub fn eql(a: PlaylistTreeNode, b: PlaylistTreeNode) bool {
-        return a.parent_id == b.parent_id and a.unknown == b.unknown and
-            a.sort_order == b.sort_order and a.id == b.id and
-            a.node_is_folder == b.node_is_folder and a.name.eql(b.name);
-    }
-
-    pub fn deinit(self: *PlaylistTreeNode, alloc: std.mem.Allocator) void {
-        self.name.deinit(alloc);
     }
 };
 
@@ -1650,10 +1376,6 @@ pub const TrackStrings = struct {
 /// `u16` offsets for the trailing offset array (bit `0x04` set).
 const track_subtype: u16 = 0x24;
 
-/// The Track row's fixed-field size, which its offset-array offsets are
-/// relative back past.
-const track_fixed_len: usize = 0x5C;
-
 /// Contains a track: its metadata, foreign-key IDs into the other tables,
 /// and the 21 strings behind the row's trailing offset array (base
 /// `0x5C`, the fixed-field size).
@@ -1727,148 +1449,13 @@ pub const Track = struct {
     offsets: OffsetArrayContainer(TrackStrings) = .{},
 
     pub const page_type: PageType = .tracks;
-
-    pub fn decode(c: *bin.Cursor) RowDecodeError!Track {
-        const subtype = try c.takeInt(u16, .little);
-        const index_shift = try c.takeInt(u16, .little);
-        const bitmask = try c.takeInt(u32, .little);
-        const sample_rate = try c.takeInt(u32, .little);
-        const composer_id = try c.takeInt(u32, .little);
-        const file_size = try c.takeInt(u32, .little);
-        const unknown2 = try c.takeInt(u32, .little);
-        const unknown3 = try c.takeInt(u16, .little);
-        const unknown4 = try c.takeInt(u16, .little);
-        const artwork_id = try c.takeInt(u32, .little);
-        const key_id = try c.takeInt(u32, .little);
-        const orig_artist_id = try c.takeInt(u32, .little);
-        const label_id = try c.takeInt(u32, .little);
-        const remixer_id = try c.takeInt(u32, .little);
-        const bitrate = try c.takeInt(u32, .little);
-        const track_number = try c.takeInt(u32, .little);
-        const tempo = try c.takeInt(u32, .little);
-        const genre_id = try c.takeInt(u32, .little);
-        const album_id = try c.takeInt(u32, .little);
-        const artist_id = try c.takeInt(u32, .little);
-        const id = try c.takeInt(u32, .little);
-        const disc_number = try c.takeInt(u16, .little);
-        const play_count = try c.takeInt(u16, .little);
-        const year = try c.takeInt(u16, .little);
-        const sample_depth = try c.takeInt(u16, .little);
-        const duration = try c.takeInt(u16, .little);
-        const unknown5 = try c.takeInt(u16, .little);
-        const color: ColorIndex = @enumFromInt(try c.takeInt(u8, .little));
-        const rating = try c.takeInt(u8, .little);
-        const file_type: FileType = @enumFromInt(try c.takeInt(u16, .little));
-        return .{
-            .subtype = subtype,
-            .index_shift = index_shift,
-            .bitmask = bitmask,
-            .sample_rate = sample_rate,
-            .composer_id = composer_id,
-            .file_size = file_size,
-            .unknown2 = unknown2,
-            .unknown3 = unknown3,
-            .unknown4 = unknown4,
-            .artwork_id = artwork_id,
-            .key_id = key_id,
-            .orig_artist_id = orig_artist_id,
-            .label_id = label_id,
-            .remixer_id = remixer_id,
-            .bitrate = bitrate,
-            .track_number = track_number,
-            .tempo = tempo,
-            .genre_id = genre_id,
-            .album_id = album_id,
-            .artist_id = artist_id,
-            .id = id,
-            .disc_number = disc_number,
-            .play_count = play_count,
-            .year = year,
-            .sample_depth = sample_depth,
-            .duration = duration,
-            .unknown5 = unknown5,
-            .color = color,
-            .rating = rating,
-            .file_type = file_type,
-            .offsets = try OffsetArrayContainer(TrackStrings).decode(
-                c,
-                track_fixed_len,
-                OffsetSize.fromSubtype(subtype),
-            ),
-        };
-    }
-
-    pub fn encode(self: *const Track, e: *bin.Emitter) RowEncodeError!void {
-        try e.putInt(u16, self.subtype, .little);
-        try e.putInt(u16, self.index_shift, .little);
-        try e.putInt(u32, self.bitmask, .little);
-        try e.putInt(u32, self.sample_rate, .little);
-        try e.putInt(u32, self.composer_id, .little);
-        try e.putInt(u32, self.file_size, .little);
-        try e.putInt(u32, self.unknown2, .little);
-        try e.putInt(u16, self.unknown3, .little);
-        try e.putInt(u16, self.unknown4, .little);
-        try e.putInt(u32, self.artwork_id, .little);
-        try e.putInt(u32, self.key_id, .little);
-        try e.putInt(u32, self.orig_artist_id, .little);
-        try e.putInt(u32, self.label_id, .little);
-        try e.putInt(u32, self.remixer_id, .little);
-        try e.putInt(u32, self.bitrate, .little);
-        try e.putInt(u32, self.track_number, .little);
-        try e.putInt(u32, self.tempo, .little);
-        try e.putInt(u32, self.genre_id, .little);
-        try e.putInt(u32, self.album_id, .little);
-        try e.putInt(u32, self.artist_id, .little);
-        try e.putInt(u32, self.id, .little);
-        try e.putInt(u16, self.disc_number, .little);
-        try e.putInt(u16, self.play_count, .little);
-        try e.putInt(u16, self.year, .little);
-        try e.putInt(u16, self.sample_depth, .little);
-        try e.putInt(u16, self.duration, .little);
-        try e.putInt(u16, self.unknown5, .little);
-        try e.putInt(u8, @intFromEnum(self.color), .little);
-        try e.putInt(u8, self.rating, .little);
-        try e.putInt(u16, @intFromEnum(self.file_type), .little);
-        try self.offsets.encode(
-            e,
-            track_fixed_len,
-            OffsetSize.fromSubtype(self.subtype),
-        );
-    }
-
-    pub fn heapBytesRequired(self: *const Track) u16 {
-        return @intCast(track_fixed_len + @as(u32, self.offsets.heapBytesRequired(
-            OffsetSize.fromSubtype(self.subtype),
-        )));
-    }
-
-    pub fn eql(a: Track, b: Track) bool {
-        return a.subtype == b.subtype and a.index_shift == b.index_shift and
-            a.bitmask == b.bitmask and a.sample_rate == b.sample_rate and
-            a.composer_id == b.composer_id and a.file_size == b.file_size and
-            a.unknown2 == b.unknown2 and a.unknown3 == b.unknown3 and
-            a.unknown4 == b.unknown4 and a.artwork_id == b.artwork_id and
-            a.key_id == b.key_id and a.orig_artist_id == b.orig_artist_id and
-            a.label_id == b.label_id and a.remixer_id == b.remixer_id and
-            a.bitrate == b.bitrate and a.track_number == b.track_number and
-            a.tempo == b.tempo and a.genre_id == b.genre_id and
-            a.album_id == b.album_id and a.artist_id == b.artist_id and
-            a.id == b.id and a.disc_number == b.disc_number and
-            a.play_count == b.play_count and a.year == b.year and
-            a.sample_depth == b.sample_depth and a.duration == b.duration and
-            a.unknown5 == b.unknown5 and a.color == b.color and
-            a.rating == b.rating and a.file_type == b.file_type and
-            a.offsets.eql(b.offsets);
-    }
-
-    pub fn deinit(self: *Track, alloc: std.mem.Allocator) void {
-        self.offsets.deinit(alloc);
-    }
 };
 
-/// A table row. Each variant declares its `page_type`, which selects it
-/// in `decode`; unknown page type values fail with `error.NotImplemented`
-/// until the ext rows land.
+/// A table row. Each variant is a plain field-declaration list whose
+/// fields are serialized in declaration order by the generic row codec
+/// (`decodeRow` and siblings); each declares its `page_type`, which
+/// selects it in `decode`. Unknown page type values fail with
+/// `error.NotImplemented` until the ext rows land.
 pub const Row = union(enum) {
     genre: Genre,
     label: Label,
@@ -1891,21 +1478,21 @@ pub const Row = union(enum) {
     pub fn decode(c: *bin.Cursor, page_type: PageType) RowDecodeError!Row {
         return inline for (std.meta.fields(Row)) |field| {
             if (field.type.page_type == page_type)
-                break @unionInit(Row, field.name, try field.type.decode(c));
+                break @unionInit(Row, field.name, try decodeRow(field.type, c));
         } else error.NotImplemented;
     }
 
-    /// Writes the row, the inverse of the per-type `decode`.
+    /// Writes the row, the inverse of `Row.decode`.
     pub fn encode(self: Row, e: *bin.Emitter) RowEncodeError!void {
         return switch (self) {
-            inline else => |row| try row.encode(e),
+            inline else => |row| try encodeRow(@TypeOf(row), row, e),
         };
     }
 
     /// Page heap space in bytes the row occupies.
     pub fn heapBytesRequired(self: *const Row) u16 {
         return switch (self.*) {
-            inline else => |row| row.heapBytesRequired(),
+            inline else => |row| rowHeapBytesRequired(@TypeOf(row), row),
         };
     }
 
@@ -1919,7 +1506,7 @@ pub const Row = union(enum) {
     pub fn eql(a: Row, b: Row) bool {
         if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
         return switch (a) {
-            inline else => |row, tag| row.eql(@field(b, @tagName(tag))),
+            inline else => |row, tag| rowEql(@TypeOf(row), row, @field(b, @tagName(tag))),
         };
     }
 
@@ -1927,7 +1514,7 @@ pub const Row = union(enum) {
     /// deinit-ed with the same allocator.
     pub fn deinit(self: *Row, alloc: std.mem.Allocator) void {
         switch (self.*) {
-            inline else => |*row| row.deinit(alloc),
+            inline else => |*row| rowDeinit(@TypeOf(row.*), row, alloc),
         }
     }
 };
@@ -3229,12 +2816,13 @@ test "track page fixture roundtrips byte-identical" {
 
 /// Mirrors the row tests of rekordcrate's `test_roundtrip`: parses
 /// `bytes` expecting `expected`, re-encodes `expected` expecting `bytes`
-/// back, and checks `heapBytesRequired` against the serialized length.
-/// `expected` must not own memory, since it is never deinit-ed; strings
-/// in it are borrowed from the caller. `end_pos` is the cursor position
-/// the parse must end at — the buffer end for rows whose strings are
-/// inline, directly after the offsets for rows with a trailing offset
-/// array (whose items are read via sub-cursors at their offsets).
+/// back, and checks `rowHeapBytesRequired` against the serialized
+/// length, all through the generic row codec. `expected` must not own
+/// memory, since it is never deinit-ed; strings in it are borrowed from
+/// the caller. `end_pos` is the cursor position the parse must end at —
+/// the buffer end for rows whose strings are inline, directly after the
+/// offsets for rows with a trailing offset array (whose items are read
+/// via sub-cursors at their offsets).
 fn expectRowRoundtrip(
     comptime T: type,
     bytes: []const u8,
@@ -3242,19 +2830,19 @@ fn expectRowRoundtrip(
     end_pos: ?usize,
 ) !void {
     var c = bin.Cursor.initAlloc(testing.allocator, bytes);
-    var parsed = try T.decode(&c);
-    defer parsed.deinit(testing.allocator);
+    var parsed = try decodeRow(T, &c);
+    defer rowDeinit(T, &parsed, testing.allocator);
     try testing.expectEqual(end_pos orelse bytes.len, c.pos);
-    try testing.expect(expected.eql(parsed));
+    try testing.expect(rowEql(T, expected, parsed));
 
     var e = bin.Emitter.init(testing.allocator);
     defer e.deinit();
-    try expected.encode(&e);
+    try encodeRow(T, expected, &e);
     try testing.expectEqualSlices(u8, bytes, e.written());
 
     try testing.expectEqual(
         @as(u16, @intCast(bytes.len)),
-        expected.heapBytesRequired(),
+        rowHeapBytesRequired(T, expected),
     );
 }
 
@@ -3564,14 +3152,14 @@ test "history row rejects wrong magics" {
     const alloc = testing.allocator;
     var date = try DeviceSQLString.fromUtf8(alloc, "2022-02-02");
     defer date.deinit(alloc);
-    var row = History{
+    const row = History{
         .subtype = 0x0280,
         .num_tracks = 5,
         .date = date,
     };
     var e = bin.Emitter.init(alloc);
     defer e.deinit();
-    try row.encode(&e);
+    try encodeRow(History, row, &e);
     const bytes = e.written();
 
     // The row layout: subtype(2) index_shift(2) num_tracks(4) | zero
@@ -3583,14 +3171,14 @@ test "history row rejects wrong magics" {
         defer alloc.free(corrupt);
         corrupt[i] ^= 0xFF;
         var c = bin.Cursor.initAlloc(alloc, corrupt);
-        try testing.expectError(error.UnexpectedValue, History.decode(&c));
+        try testing.expectError(error.UnexpectedValue, decodeRow(History, &c));
     }
     var corrupt_date = try alloc.dupe(u8, bytes);
     defer alloc.free(corrupt_date);
     corrupt_date[13] ^= 0xFF;
     var c = bin.Cursor.initAlloc(alloc, corrupt_date);
-    var parsed = try History.decode(&c);
-    defer parsed.deinit(alloc);
+    var parsed = try decodeRow(History, &c);
+    defer rowDeinit(History, &parsed, alloc);
 }
 
 test "row decode dispatches by page type" {
