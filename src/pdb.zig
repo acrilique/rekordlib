@@ -1955,6 +1955,23 @@ pub const Row = union(enum) {
     }
 };
 
+// Row types must declare pairwise distinct `page_type`s: `Row.decode`
+// dispatches on first match, so a duplicate would silently parse one
+// type's bytes as another — a live risk when the ext rows arrive, since
+// `exportExt.pdb` reuses values 3 and 4 with different meanings.
+comptime {
+    const fields = std.meta.fields(Row);
+    for (fields, 0..) |a, i| {
+        for (fields[i + 1 ..]) |b| {
+            if (a.type.page_type == b.type.page_type)
+                @compileError(
+                    "row types " ++ @typeName(a.type) ++ " and " ++
+                        @typeName(b.type) ++ " declare the same page type",
+                );
+        }
+    }
+}
+
 /// The header of the data-containing part of a page (8 bytes).
 pub const DataPageHeader = struct {
     /// Unknown field. Often 1 or `0x1fff`; also observed: 8, 27, 22, 17, 2.
