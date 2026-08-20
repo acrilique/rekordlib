@@ -2046,7 +2046,7 @@ pub const Header = struct {
 
 /// Decoding error of a page: row errors from the data content plus
 /// `UnexpectedValue` from the index content.
-pub const PageDecodeError = bin.ReadError || error{ InvalidFormat, UnexpectedValue, NotImplemented };
+pub const PageDecodeError = RowDecodeError;
 
 /// Encoding error of a page: the data and index content errors
 /// (`UnexpectedValue` covers a page too small for its content;
