@@ -16,19 +16,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const testutil = b.addModule("testutil", .{
-        .root_source_file = b.path("src/testutil.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     const setting = b.addModule("setting", .{
         .root_source_file = b.path("src/setting.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "bin", .module = bin },
-            .{ .name = "testutil", .module = testutil },
         },
     });
 
@@ -46,7 +39,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "bin", .module = bin },
             .{ .name = "util", .module = util },
             .{ .name = "xor", .module = xor },
-            .{ .name = "testutil", .module = testutil },
         },
     });
 
@@ -57,7 +49,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "bin", .module = bin },
             .{ .name = "util", .module = util },
-            .{ .name = "testutil", .module = testutil },
         },
     });
 
@@ -80,35 +71,24 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(lib);
 
-    const mod_tests = b.addTest(.{
-        .root_module = bin,
+    const test_mod = b.addModule("test", .{
+        .root_source_file = b.path("test/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "bin", .module = bin },
+            .{ .name = "util", .module = util },
+            .{ .name = "anlz", .module = anlz },
+            .{ .name = "pdb", .module = pdb },
+            .{ .name = "setting", .module = setting },
+        },
     });
 
-    const setting_tests = b.addTest(.{
-        .root_module = setting,
+    const tests = b.addTest(.{
+        .root_module = test_mod,
     });
 
-    const xor_tests = b.addTest(.{
-        .root_module = xor,
-    });
-
-    const anlz_tests = b.addTest(.{
-        .root_module = anlz,
-    });
-
-    const pdb_tests = b.addTest(.{
-        .root_module = pdb,
-    });
-
-    const run_mod_tests = b.addRunArtifact(mod_tests);
-    const run_setting_tests = b.addRunArtifact(setting_tests);
-    const run_xor_tests = b.addRunArtifact(xor_tests);
-    const run_anlz_tests = b.addRunArtifact(anlz_tests);
-    const run_pdb_tests = b.addRunArtifact(pdb_tests);
+    const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_setting_tests.step);
-    test_step.dependOn(&run_xor_tests.step);
-    test_step.dependOn(&run_anlz_tests.step);
-    test_step.dependOn(&run_pdb_tests.step);
+    test_step.dependOn(&run_tests.step);
 }
