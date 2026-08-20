@@ -652,6 +652,18 @@ fn OffsetItemsOf(comptime T: type, comptime Item: type) type {
     };
 }
 
+/// The type of database being parsed, which selects the meaning of the
+/// page-type values in page headers and table entries: standard
+/// `export.pdb` files or extended `exportExt.pdb` files, whose tables
+/// reuse values 3 and 4 for tags and track tags instead of albums and
+/// labels. Row dispatch is gated on this (see `Row.decode`).
+pub const DatabaseType = enum {
+    /// Standard `export.pdb` files.
+    plain,
+    /// Extended `exportExt.pdb` files.
+    ext,
+};
+
 /// The type of rows a page holds, as stored in page headers and table
 /// entries: the wire constants of `export.pdb` tables. In `exportExt.pdb`
 /// databases values 3 and 4 carry the ext meanings (tags, track tags)
@@ -898,7 +910,8 @@ pub const MenuVisibility = enum(u8) {
 
 /// Decoding error of a row: `InvalidFormat` comes from string bodies,
 /// `UnexpectedValue` from the History magic constants, `NotImplemented`
-/// from page types whose rows are not wired yet.
+/// from page types whose rows are not wired for the database type being
+/// parsed.
 pub const RowDecodeError = bin.ReadError || error{ InvalidFormat, UnexpectedValue, NotImplemented };
 
 /// Decoding error of a data page: row errors plus `UnexpectedValue` for
@@ -1476,10 +1489,16 @@ pub const Row = union(enum) {
     menu: Menu,
 
     /// Reads the row for `page_type` from `c`, which starts at the row's
-    /// heap offset.
-    pub fn decode(c: *bin.Cursor, page_type: PageType) RowDecodeError!Row {
+    /// heap offset. Plain row types only dispatch in plain databases;
+    /// pages of the other database type, and unknown page type values,
+    /// fail with `error.NotImplemented` until the ext rows land.
+    pub fn decode(
+        c: *bin.Cursor,
+        page_type: PageType,
+        db_type: DatabaseType,
+    ) RowDecodeError!Row {
         return inline for (std.meta.fields(Row)) |field| {
-            if (field.type.page_type == page_type)
+            if (field.type.page_type == page_type and db_type == .plain)
                 break @unionInit(Row, field.name, try decodeRow(field.type, c));
         } else error.NotImplemented;
     }
@@ -1644,13 +1663,15 @@ pub const DataPageContent = struct {
     /// Reads the data page header, the row groups backwards from the end
     /// of the heap (as many as `page_header.packed_row_counts.num_rows`
     /// implies), and every present row at its heap offset. `c` is
-    /// positioned at the data page header; `page_size` bounds the heap.
+    /// positioned at the data page header; `page_size` bounds the heap;
+    /// `db_type` selects the row dispatch for `page_header.page_type`.
     /// The parsed row count must equal `num_rows_valid`.
     pub fn decode(
         c: *bin.Cursor,
         alloc: std.mem.Allocator,
         page_size: usize,
         page_header: PageHeader,
+        db_type: DatabaseType,
     ) DataPageDecodeError!DataPageContent {
         const heap_size = try dataPageHeapSize(page_size);
         const header = try bin.takeStruct(c, DataPageHeader, .little);
@@ -1687,7 +1708,7 @@ pub const DataPageContent = struct {
                 var sub = bin.Cursor{ .buf = c.buf[pos..], .alloc = alloc };
                 try rows.append(alloc, .{
                     .offset = offset,
-                    .row = try Row.decode(&sub, page_header.page_type),
+                    .row = try Row.decode(&sub, page_header.page_type, db_type),
                 });
             }
         }
@@ -2733,11 +2754,16 @@ test "index page fixture parses with known field values" {
 
 const testutil = @import("testutil");
 
-/// Parses `input` — a whole page, including the page header — and
-/// re-serializes it, for `testutil.expectFixturesRoundtrip`. The page
-/// size is the fixture length; unknown page type values fail with
+/// Parses `input` — a whole page, including the page header — of a
+/// database of `db_type` and re-serializes it, for
+/// `testutil.expectFixturesRoundtrip`. The page size is the fixture
+/// length; page types whose rows are not wired for `db_type` fail with
 /// `error.NotImplemented` (the ext rows land with P6).
-fn roundtripPage(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+fn roundtripPage(
+    alloc: std.mem.Allocator,
+    input: []const u8,
+    db_type: DatabaseType,
+) ![]u8 {
     var c = bin.Cursor.initAlloc(alloc, input);
     const header = try bin.takeStruct(&c, PageHeader, .little);
     try bin.validateConstantFields(PageHeader, header);
@@ -2750,15 +2776,21 @@ fn roundtripPage(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
         defer content.deinit(alloc);
         try content.encode(&e, input.len);
     } else {
-        var content = try DataPageContent.decode(&c, alloc, input.len, header);
+        var content = try DataPageContent.decode(&c, alloc, input.len, header, db_type);
         defer content.deinit(alloc);
         try content.encode(&e, input.len);
     }
     return e.toOwnedSlice();
 }
 
+/// `roundtripPage` for plain databases, in the shape
+/// `testutil.expectFixturesRoundtrip` takes.
+fn roundtripPlainPage(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+    return roundtripPage(alloc, input, .plain);
+}
+
 test "index page fixture roundtrips byte-identical" {
-    try testutil.expectFixturesRoundtrip(roundtripPage, "index_page", 1);
+    try testutil.expectFixturesRoundtrip(roundtripPlainPage, "index_page", 1);
 }
 
 test "data page fixtures roundtrip byte-identical" {
@@ -2770,7 +2802,7 @@ test "data page fixtures roundtrip byte-identical" {
         "menu",
     };
     inline for (prefixes) |prefix|
-        try testutil.expectFixturesRoundtrip(roundtripPage, prefix, 1);
+        try testutil.expectFixturesRoundtrip(roundtripPlainPage, prefix, 1);
 }
 
 test "artist, album, and playlist tree page fixtures roundtrip byte-identical" {
@@ -2778,13 +2810,13 @@ test "artist, album, and playlist tree page fixtures roundtrip byte-identical" {
         "artists", "artist_page_long", "albums", "playlist_tree",
     };
     inline for (prefixes) |prefix|
-        try testutil.expectFixturesRoundtrip(roundtripPage, prefix, 1);
+        try testutil.expectFixturesRoundtrip(roundtripPlainPage, prefix, 1);
 }
 
 test "track page fixture roundtrips byte-identical" {
     // The full prefix, so the ext-database track_tag_page fixture (P6)
     // does not match.
-    try testutil.expectFixturesRoundtrip(roundtripPage, "track_page", 1);
+    try testutil.expectFixturesRoundtrip(roundtripPlainPage, "track_page", 1);
 }
 
 // Data page and simple row tests, ported from the row tests of
@@ -3169,16 +3201,22 @@ test "row decode dispatches by page type" {
     try name.encode(&e);
 
     var c = bin.Cursor.initAlloc(alloc, e.written());
-    var row = try Row.decode(&c, .genres);
+    var row = try Row.decode(&c, .genres, .plain);
     defer row.deinit(alloc);
     try testing.expect(std.meta.activeTag(row) == .genre);
     try testing.expectEqual(PageType.genres, row.pageType());
 
-    // Unknown page type values are rejected explicitly.
+    // Unknown page type values, and plain page types in an ext database,
+    // are rejected explicitly.
     var c4 = bin.Cursor.initAlloc(alloc, e.written());
     try testing.expectError(
         error.NotImplemented,
-        Row.decode(&c4, @enumFromInt(0x63)),
+        Row.decode(&c4, @enumFromInt(0x63), .plain),
+    );
+    var c5 = bin.Cursor.initAlloc(alloc, e.written());
+    try testing.expectError(
+        error.NotImplemented,
+        Row.decode(&c5, .genres, .ext),
     );
 }
 
@@ -3249,7 +3287,7 @@ test "data page roundtrips with heap bytes in unused row group slots" {
 
     var c = bin.Cursor.initAlloc(alloc, &page);
     const header = try bin.takeStruct(&c, PageHeader, .little);
-    var content = try DataPageContent.decode(&c, alloc, page.len, header);
+    var content = try DataPageContent.decode(&c, alloc, page.len, header, .plain);
     defer content.deinit(alloc);
 
     // The page parsed into its two rows in allocation order and one
@@ -3262,7 +3300,7 @@ test "data page roundtrips with heap bytes in unused row group slots" {
     try testing.expect(content.rows[1].row.eql(.{ .menu = .{ .category_id = 2, .content_pointer = 2 } }));
     try testing.expectEqual(@as(u16, 0x0101), content.row_groups[0].row_offsets[0]);
 
-    const out = try roundtripPage(alloc, &page);
+    const out = try roundtripPage(alloc, &page, .plain);
     defer alloc.free(out);
     try testing.expectEqualSlices(u8, &page, out);
 }
@@ -3307,7 +3345,7 @@ test "data page decode rejects malformed pages" {
         const header = try bin.takeStruct(&c, PageHeader, .little);
         try testing.expectError(
             error.UnexpectedValue,
-            DataPageContent.decode(&c, alloc, page.len, header),
+            DataPageContent.decode(&c, alloc, page.len, header, .plain),
         );
     }
 
@@ -3320,7 +3358,7 @@ test "data page decode rejects malformed pages" {
         const header = try bin.takeStruct(&c, PageHeader, .little);
         try testing.expectError(
             error.UnexpectedEof,
-            DataPageContent.decode(&c, alloc, page.len, header),
+            DataPageContent.decode(&c, alloc, page.len, header, .plain),
         );
     }
 
@@ -3332,7 +3370,7 @@ test "data page decode rejects malformed pages" {
         const header = try bin.takeStruct(&c, PageHeader, .little);
         try testing.expectError(
             error.UnexpectedValue,
-            DataPageContent.decode(&c, alloc, page.len, header),
+            DataPageContent.decode(&c, alloc, page.len, header, .plain),
         );
     }
 
@@ -3342,14 +3380,14 @@ test "data page decode rejects malformed pages" {
         var c = bin.Cursor.init(&.{});
         try testing.expectError(
             error.UnexpectedValue,
-            DataPageContent.decode(&c, alloc, 0x20, .{}),
+            DataPageContent.decode(&c, alloc, 0x20, .{}, .plain),
         );
     }
     {
         var c = bin.Cursor.init(&([_]u8{0} ** 8));
         try testing.expectError(
             error.UnexpectedValue,
-            DataPageContent.decode(&c, alloc, 0x28, .{ .packed_row_counts = .{ .num_rows = 1 } }),
+            DataPageContent.decode(&c, alloc, 0x28, .{ .packed_row_counts = .{ .num_rows = 1 } }, .plain),
         );
     }
 
