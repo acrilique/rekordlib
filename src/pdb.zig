@@ -399,6 +399,26 @@ pub const OffsetSize = enum {
     pub fn fromSubtype(subtype: u16) OffsetSize {
         return if (subtype & 0x04 == 0) .u8 else .u16;
     }
+
+    /// Reads one stored offset at this width, widened to `u16`.
+    fn takeOffset(size: OffsetSize, c: *bin.Cursor) bin.ReadError!u16 {
+        return switch (size) {
+            .u8 => try c.takeInt(u8, .little),
+            .u16 => try c.takeInt(u16, .little),
+        };
+    }
+
+    /// Writes one stored offset at this width, rejecting a value too
+    /// wide for it.
+    fn putOffset(size: OffsetSize, e: *bin.Emitter, value: u16) (bin.WriteError || error{UnexpectedValue})!void {
+        switch (size) {
+            .u8 => {
+                if (value > std.math.maxInt(u8)) return error.UnexpectedValue;
+                try e.putInt(u8, @intCast(value), .little);
+            },
+            .u16 => try e.putInt(u16, value, .little),
+        }
+    }
 };
 
 /// The offsets of an `OffsetArrayContainer`: either exactly as stored in
@@ -476,18 +496,10 @@ pub fn OffsetArrayContainer(comptime T: type) type {
             const start = c.pos;
             if (array_offset > start) return error.UnexpectedValue; // base underflow
             var values: [n]u16 = undefined;
-            switch (size) {
-                .u8 => {
-                    if (try c.takeInt(u8, .little) != offset_array_magic)
-                        return error.InvalidFormat;
-                    for (&values) |*value| value.* = try c.takeInt(u8, .little);
-                },
-                .u16 => {
-                    if (try c.takeInt(u16, .little) != offset_array_magic)
-                        return error.InvalidFormat;
-                    for (&values) |*value| value.* = try c.takeInt(u16, .little);
-                },
-            }
+            // The magic is stored like an offset of the chosen width.
+            if (try size.takeOffset(c) != offset_array_magic)
+                return error.InvalidFormat;
+            for (&values) |*value| value.* = try size.takeOffset(c);
             const base = start - array_offset;
             var items: [n]Item = undefined;
             // The comptime guard lets zero-item containers use `void`
@@ -535,19 +547,8 @@ pub fn OffsetArrayContainer(comptime T: type) type {
             const start = e.pos();
             if (array_offset > start) return error.UnexpectedValue; // base underflow
             const base = start - array_offset;
-            switch (size) {
-                .u8 => {
-                    try e.putInt(u8, offset_array_magic, .little);
-                    for (provided.values) |value| {
-                        if (value > std.math.maxInt(u8)) return error.UnexpectedValue;
-                        try e.putInt(u8, @intCast(value), .little);
-                    }
-                },
-                .u16 => {
-                    try e.putInt(u16, offset_array_magic, .little);
-                    for (provided.values) |value| try e.putInt(u16, value, .little);
-                },
-            }
+            try size.putOffset(e, offset_array_magic);
+            for (provided.values) |value| try size.putOffset(e, value);
             // `inline for` so zero-item containers can use `void` items:
             // the body referencing `Item.encode` is never analyzed.
             inline for (T.offsetItems(self.inner), provided.values) |item, offset| {
