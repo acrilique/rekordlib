@@ -2057,7 +2057,13 @@ pub const Header = struct {
         return null;
     }
 
-
+    /// The mutable counterpart of `findTable`.
+    pub fn findTableMut(header: *Header, page_type: PageType) ?*Table {
+        for (header.tables) |*table| {
+            if (table.page_type == page_type) return table;
+        }
+        return null;
+    }
 };
 
 /// Decoding error of a page: row errors from the data content plus
@@ -2476,7 +2482,190 @@ pub const Database = struct {
         return std.mem.eql(u8, a.tail, b.tail);
     }
 
+    /// Appends `row` to the table holding its page type, allocating a new
+    /// page when no existing one fits. On success the database owns the
+    /// row — build its strings with the database's arena
+    /// (`db.arena.allocator()`) and neither reuse nor free `row` after the
+    /// call; on error, ownership is unchanged.
+    ///
+    /// The insert tries the table's tail page first, then its
+    /// `empty_candidate` (when that is a parsed data page of the right
+    /// type, unlike the tail), and only then allocates a fresh page,
+    /// relinking the chain onto it: the previous tail's `next_page` is
+    /// patched in both places it is stored — the page header and, for
+    /// index pages, the index header's duplicate.
+    pub fn addRow(db: *Database, row: *Row) DatabaseModifyError!RowRef {
+        switch (row.*) {
+            .track => |*track| try validateTrackRowSize(track),
+            else => {},
+        }
 
+        const page_type = row.pageType();
+        const row_size = row.heapBytesRequired();
+
+        const table = db.header.findTable(page_type) orelse
+            return error.TableTypeNotFound;
+        const old_last_page = table.last_page;
+        // A representable page index, checked before any insert like
+        // rekordcrate's `PageIndex` conversion.
+        if (table.empty_candidate >= page_chain_end)
+            return error.UnexpectedValue;
+        const empty_candidate = table.empty_candidate;
+
+        // The chain tail must be a page that exists and parsed, like the
+        // oracle's eager load; an index-page tail (an empty created table)
+        // simply fails the insert below.
+        if (old_last_page < 1 or old_last_page > db.pages.len)
+            return error.UnexpectedValue;
+        if (db.pages[old_last_page - 1] == .raw)
+            return error.UnexpectedValue;
+
+        // The chain tail first.
+        if (try db.tryInsertRow(old_last_page, row_size, row)) |row_ref|
+            return row_ref;
+
+        // Tail was full or an index page. An `empty_candidate` unlike the
+        // tail that is a parsed data page of the right type is tried next
+        // and becomes the new tail.
+        if (empty_candidate != old_last_page and
+            empty_candidate >= 1 and empty_candidate <= db.pages.len)
+        {
+            const usable = switch (db.pages[empty_candidate - 1]) {
+                .page => |*page| page.header.page_type == page_type and
+                    page.content == .data,
+                .raw => false,
+            };
+            if (usable) {
+                if (try db.tryInsertRow(empty_candidate, row_size, row)) |row_ref| {
+                    try db.relinkChainEnd(old_last_page, empty_candidate);
+                    const table_mut = db.header.findTableMut(page_type) orelse
+                        return error.TableTypeNotFound;
+                    table_mut.last_page = empty_candidate;
+                    return row_ref;
+                }
+            }
+        }
+
+        // No existing page fits: allocate a fresh one and link it on.
+        const new_page_index = try db.allocDataPage(page_type);
+        try db.relinkChainEnd(old_last_page, new_page_index);
+        const table_mut = db.header.findTableMut(page_type) orelse
+            return error.TableTypeNotFound;
+        table_mut.last_page = new_page_index;
+
+        return try db.tryInsertRow(new_page_index, row_size, row) orelse
+            error.UnexpectedValue; // a freshly allocated page has no room
+    }
+
+    /// Tries to append a row to page `page_index`'s heap. Returns null —
+    /// leaving the database unchanged — when the page is absent, unparsed,
+    /// an index page, or full; `row` is only moved on success.
+    fn tryInsertRow(
+        db: *Database,
+        page_index: u32,
+        row_size: u16,
+        row: *Row,
+    ) DatabaseModifyError!?RowRef {
+        if (page_index < 1 or page_index > db.pages.len) return null;
+        const page = switch (db.pages[page_index - 1]) {
+            .page => |*page| page,
+            .raw => return null,
+        };
+        const row_offset = page.header.used_size;
+        const ticket = (try page.allocRow(db.arena.allocator(), row_size)) orelse
+            return null;
+        try page.commitRow(db.arena.allocator(), ticket, row.*);
+        return .{ .page_index = page_index, .row_offset = row_offset };
+    }
+
+    /// Points page `previous_page_index`'s `next_page` at
+    /// `current_page_index`, patching both stored copies when it is an
+    /// index page.
+    fn relinkChainEnd(
+        db: *Database,
+        previous_page_index: u32,
+        current_page_index: u32,
+    ) error{UnexpectedValue}!void {
+        if (previous_page_index < 1 or previous_page_index > db.pages.len)
+            return error.UnexpectedValue;
+        const page = switch (db.pages[previous_page_index - 1]) {
+            .page => |*page| page,
+            .raw => return error.UnexpectedValue,
+        };
+        page.header.next_page = current_page_index;
+        switch (page.content) {
+            .index => |*index| index.header.next_page = current_page_index,
+            .data => {},
+        }
+    }
+
+    /// Allocates a fresh empty data page and returns its index, bumping
+    /// `next_unused_page`. Page indexes the file lacked — the counter can
+    /// exceed the pages present — become zero-filled gap pages, written as
+    /// zeros exactly like rekordcrate's seek over unloaded pages.
+    fn allocDataPage(db: *Database, page_type: PageType) DatabaseModifyError!u32 {
+        // Pages are appended at the end of the image; a trailing partial
+        // page would be displaced by the new page's bytes.
+        if (db.tail.len != 0) return error.UnexpectedValue;
+        const page_index = db.header.next_unused_page;
+        if (page_index >= page_chain_end) return error.UnexpectedValue;
+        if (db.pages.len >= page_index)
+            return error.UnexpectedValue; // counter names an existing page
+
+        const a = db.arena.allocator();
+        // Grow to hold every page index up to and including `page_index`.
+        const grown = try a.realloc(db.pages, page_index);
+        const page_size: usize = db.header.page_size;
+        for (grown[db.pages.len .. page_index - 1]) |*slot| {
+            const zeros = try a.alloc(u8, page_size);
+            @memset(zeros, 0);
+            slot.* = .{ .raw = zeros };
+        }
+        grown[page_index - 1] = .{
+            .page = try Page.newData(
+                db.header.page_size,
+                page_index,
+                page_type,
+                page_chain_end,
+            ),
+        };
+        db.pages = grown;
+        db.header.next_unused_page = page_index + 1;
+        return page_index;
+    }
+
+    /// Validates every track row against `min_track_allocated_size` by
+    /// walking the tracks table's page chain; ext databases have no
+    /// tracks table and pass trivially. rekordcrate runs this on every
+    /// flush; the device writer calls it before serializing, the
+    /// whole-image model's equivalent moment.
+    pub fn validateAllTrackRows(
+        db: *const Database,
+    ) error{ TableTypeNotFound, TrackRowTooSmall, UnexpectedValue }!void {
+        if (db.db_type != .plain) return;
+        const table = db.header.findTable(.tracks) orelse
+            return error.TableTypeNotFound;
+        var current = table.first_page;
+        while (true) {
+            if (current < 1 or current > db.pages.len)
+                return error.UnexpectedValue;
+            const page = switch (db.pages[current - 1]) {
+                .page => |*page| page,
+                .raw => return error.UnexpectedValue,
+            };
+            switch (page.content) {
+                .data => |*content| for (content.rows) |*at| switch (at.row) {
+                    .track => |*track| try validateTrackRowSize(track),
+                    else => {},
+                },
+                .index => {},
+            }
+            if (current == table.last_page) return;
+            const next = page.header.next_page;
+            if (next <= current) return error.UnexpectedValue;
+            current = next;
+        }
+    }
 };
 
 /// Parses one page as a `PageSlot`, the eager per-page attempt of
@@ -2495,6 +2684,30 @@ fn parsePage(
 // Modification layer, ported from the `allocate_row`, `add_row`, and
 // `create` logic of rekordcrate's `src/pdb/mod.rs` and `src/pdb/io.rs`
 // plus its `src/pdb/defaults.rs`.
+
+/// Sentinel closing a page chain: the value stored in `next_page` fields
+/// of chain-final pages, and the exclusive upper bound of representable
+/// page indexes.
+pub const page_chain_end: u32 = 0x03FF_FFFF;
+
+/// Error of the modification layer: `TableTypeNotFound` is a row whose
+/// page type no table in the header holds, `TrackRowTooSmall` a Track row
+/// below `min_track_allocated_size`, and `UnexpectedValue` a database
+/// whose page chains or allocation counters are inconsistent with the
+/// operation, or misuse of the allocate/commit pair.
+pub const DatabaseModifyError = error{
+    OutOfMemory,
+    TableTypeNotFound,
+    TrackRowTooSmall,
+    UnexpectedValue,
+};
+
+/// Locates an added row: the page holding it and the row's heap offset
+/// within that page.
+pub const RowRef = struct {
+    page_index: u32,
+    row_offset: u16,
+};
 
 /// Minimum value for the allocated (4-byte-aligned) size of a Track row,
 /// in bytes: a CDJ-350 crashes entering its "TRACK" menu when any track
@@ -4832,6 +5045,33 @@ test "data page decode rejects malformed pages" {
 // `src/pdb/io.rs`, its `src/pdb/defaults.rs`, and
 // `tests/test_pdb_write.rs`.
 
+/// Parses the `num_rows` fixture as a plain database.
+fn parseNumRows(alloc: std.mem.Allocator) !Database {
+    const input = try testutil.readFixture(
+        alloc,
+        "pdb/num_rows/export.pdb",
+        .limited(1 << 22),
+    );
+    defer alloc.free(input);
+    return Database.parse(alloc, input, .plain);
+}
+
+/// Deep-clones a row by encoding and re-decoding it, allocating the copy
+/// (strings included) with `alloc`. The roundtrip is byte-exact, so string
+/// forms and provided offsets are preserved — the test stand-in for
+/// Rust's `Clone`.
+fn cloneRow(
+    alloc: std.mem.Allocator,
+    row: *const Row,
+    db_type: DatabaseType,
+) !Row {
+    var e = bin.Emitter.init(alloc);
+    defer e.deinit();
+    try row.encode(&e);
+    var c = bin.Cursor.initAlloc(alloc, e.written());
+    return Row.decode(&c, row.pageType(), db_type);
+}
+
 /// Builds a Key row with `id` duplicated into `id2`, for the allocate
 /// tests ported from rekordcrate's `test_modification.rs`.
 fn testKeyRow(a: std.mem.Allocator, id: u32, name: []const u8) !Row {
@@ -5064,6 +5304,115 @@ test "allocRow returns null on a full page without mutating it" {
     // Index pages never allocate rows at all.
     var index_page = Page.newIndex(12, .keys, 0x03FF_FFFF);
     try testing.expect((try index_page.allocRow(a, 16)) == null);
+}
+
+test "allocDataPage updates the header and grows storage" {
+    const alloc = testing.allocator;
+    var db = try parseNumRows(alloc);
+    defer db.deinit();
+    const next_unused_before = db.header.next_unused_page;
+
+    const new_page_index = try db.allocDataPage(.keys);
+
+    try testing.expectEqual(next_unused_before, new_page_index);
+    // Storage covers every page index up to the new one, plus gap slots
+    // for any indexes the file lacked.
+    try testing.expectEqual(@as(usize, new_page_index), db.pages.len);
+    try testing.expectEqual(next_unused_before + 1, db.header.next_unused_page);
+
+    const new_page = db.pages[new_page_index - 1].page;
+    try testing.expectEqual(new_page_index, new_page.header.page_index);
+    try testing.expectEqual(PageType.keys, new_page.header.page_type);
+    try testing.expectEqual(page_chain_end, new_page.header.next_page);
+    try testing.expect(new_page.content == .data);
+    // The whole heap free: the page behind its 0x20-byte header and the
+    // 8-byte data page header.
+    try testing.expectEqual(@as(u16, 4056), new_page.header.free_size);
+    try testing.expectEqual(@as(u16, 0), new_page.header.used_size);
+}
+
+test "addRow patches both next_page copies when linking a new page" {
+    const alloc = testing.allocator;
+    var db = try parseNumRows(alloc);
+    defer db.deinit();
+
+    const tracks_table = db.header.findTableMut(.tracks).?;
+    const first_page_index = tracks_table.first_page;
+    const original_last_page = tracks_table.last_page;
+
+    // A template track cloned from the original tail page.
+    const template = blk: {
+        const page = db.pages[original_last_page - 1].page;
+        try testing.expect(page.content == .data);
+        try testing.expect(page.content.data.rows.len > 0);
+        break :blk try cloneRow(
+            db.arena.allocator(),
+            &page.content.data.rows[0].row,
+            .plain,
+        );
+    };
+
+    // The first page is an index page; disconnecting it and naming it the
+    // tail forces `addRow` down the fresh-page path.
+    {
+        const first = &db.pages[first_page_index - 1].page;
+        try testing.expect(first.content == .index);
+        first.header.next_page = page_chain_end;
+        first.content.index.header.next_page = page_chain_end;
+    }
+    db.header.findTableMut(.tracks).?.last_page = first_page_index;
+
+    var row = template;
+    const row_ref = try db.addRow(&row);
+
+    try testing.expectEqual(@as(u16, 0), row_ref.row_offset);
+    const first = db.pages[first_page_index - 1].page;
+    try testing.expectEqual(row_ref.page_index, first.header.next_page);
+    try testing.expectEqual(row_ref.page_index, first.content.index.header.next_page);
+    try testing.expectEqual(row_ref.page_index, db.header.findTable(.tracks).?.last_page);
+}
+
+test "addRow-allocated pages are reachable through the chain" {
+    const alloc = testing.allocator;
+    var db = try parseNumRows(alloc);
+    defer db.deinit();
+    const next_unused_before = db.header.next_unused_page;
+    const entries_before = try countTableRows(&db, .history_entries);
+
+    // The tail page has 8 bytes free — less than a HistoryEntry row — so
+    // appending forces a fresh page (rekordcrate's fixture note).
+    const template = blk: {
+        const table = db.header.findTable(.history_entries).?;
+        var current = table.first_page;
+        while (true) {
+            const page = db.pages[current - 1].page;
+            if (page.content == .data and page.content.data.rows.len > 0)
+                break :blk try cloneRow(
+                    db.arena.allocator(),
+                    &page.content.data.rows[0].row,
+                    .plain,
+                );
+            if (current == table.last_page) return error.TestUnexpectedResult;
+            current = page.header.next_page;
+        }
+    };
+    var first = template;
+    var second = try cloneRow(db.arena.allocator(), &template, .plain);
+    _ = try db.addRow(&first);
+    // The second append lands on the freshly allocated page, exercising
+    // link-following too.
+    _ = try db.addRow(&second);
+
+    try testing.expect(db.header.next_unused_page > next_unused_before);
+
+    const out = try db.serialize(alloc);
+    defer alloc.free(out);
+    var reparsed = try Database.parse(alloc, out, .plain);
+    defer reparsed.deinit();
+    try testing.expectEqual(
+        entries_before + 2,
+        try countTableRows(&reparsed, .history_entries),
+    );
 }
 
 /// The undersized Track row of rekordcrate's
