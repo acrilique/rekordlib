@@ -5947,3 +5947,85 @@ test "num_rows mutation: set all track ratings and round-trip" {
     defer alloc.free(out2);
     try testing.expectEqualSlices(u8, out, out2);
 }
+
+/// Finds the track row with `id`, by walking the tracks table's page
+/// chain.
+fn findTrack(db: *const Database, id: u32) !*const Track {
+    const table = db.header.findTable(.tracks) orelse return error.NoTable;
+    var current = table.first_page;
+    while (true) {
+        const page = switch (db.pages[current - 1]) {
+            .page => |*page| page,
+            .raw => return error.UnparsedPage,
+        };
+        switch (page.content) {
+            .data => |*content| for (content.rows) |*at| switch (at.row) {
+                .track => |*track| if (track.id == id) return track,
+                else => {},
+            },
+            .index => {},
+        }
+        if (current == table.last_page) break;
+        current = page.header.next_page;
+    }
+    return error.NoRows;
+}
+
+test "num_rows append: track row with new strings via calculated offsets" {
+    const alloc = testing.allocator;
+    var db = try parseNumRows(alloc);
+    defer db.deinit();
+    const before = try countTableRows(&db, .tracks);
+
+    // A track built from scratch — its offset array defaults to calculated,
+    // so all 21 offsets are computed and patched during serialization. The
+    // title is non-ASCII, placing a UCS-2LE item that must land 4-byte
+    // aligned behind the strings before it.
+    const a = db.arena.allocator();
+    const track = Track{
+        .id = 999_999,
+        .artist_id = 1,
+        .album_id = 1,
+        .sample_rate = 44_100,
+        .bitrate = 320,
+        .tempo = 12_800,
+        .duration = 200,
+        .rating = 3,
+        .offsets = .{ .inner = .{
+            .title = try DeviceSQLString.fromUtf8(a, "I ♥ Zig"),
+            .filename = try DeviceSQLString.fromUtf8(a, "01 - Calculated.mp3"),
+            .file_path = try DeviceSQLString.fromUtf8(a, "/Contents/01 - Calculated.mp3"),
+        } },
+    };
+    try validateTrackRowSize(&track);
+
+    var row = Row{ .track = track };
+    _ = try db.addRow(&row);
+    try db.validateAllTrackRows();
+
+    const out = try db.serialize(alloc);
+    defer alloc.free(out);
+    var reparsed = try Database.parse(alloc, out, .plain);
+    defer reparsed.deinit();
+
+    // The appended row is reachable and carries the new strings.
+    try testing.expectEqual(before + 1, try countTableRows(&reparsed, .tracks));
+    const added = try findTrack(&reparsed, 999_999);
+    try testing.expectEqual(@as(u32, 12_800), added.tempo);
+    try testing.expectEqual(@as(u8, 3), added.rating);
+    const ra = reparsed.arena.allocator();
+    try testing.expectEqualStrings(
+        "I ♥ Zig",
+        try added.offsets.inner.title.utf8(ra),
+    );
+    try testing.expectEqualStrings(
+        "/Contents/01 - Calculated.mp3",
+        try added.offsets.inner.file_path.utf8(ra),
+    );
+
+    // The calculated offsets are canonical: the re-parsed image
+    // re-serializes byte-stable.
+    const out2 = try reparsed.serialize(alloc);
+    defer alloc.free(out2);
+    try testing.expectEqualSlices(u8, out, out2);
+}
