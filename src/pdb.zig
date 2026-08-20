@@ -1921,6 +1921,120 @@ fn rowExtentBefore(_: void, a: RowExtent, b: RowExtent) bool {
     return a.start < b.start;
 }
 
+/// One table of the database: a chain of pages holding rows of one page
+/// type, plus the page indexes the writer uses to allocate and relink.
+pub const Table = struct {
+    /// Identifies the type of rows that this table contains; the meaning
+    /// of the stored value depends on the database type (see
+    /// `DatabaseType`).
+    page_type: PageType = .tracks,
+    /// Unknown field, maybe links to a chain of empty pages if the database
+    /// is ever garbage collected (?). Often points past the end of the
+    /// file.
+    empty_candidate: u32 = 0,
+    /// Index of the first page that belongs to this table; the first page
+    /// is an index page and contains no rows, so the row data of a
+    /// non-empty table lives in the pages after.
+    first_page: u32 = 0,
+    /// Index of the last page that belongs to this table.
+    last_page: u32 = 0,
+};
+
+/// Fixed byte count of the file header before the tables: seven `u32`
+/// fields (see `Header`).
+const header_fixed_len = 7 * @sizeOf(u32);
+
+/// Bytes the header's fixed fields plus `count` table entries occupy.
+fn headerFixedAndTablesLen(count: u64) u64 {
+    return header_fixed_len + count * bin.serializedLen(Table);
+}
+
+/// Decoding error of the file header: `UnexpectedValue` is a wrong magic,
+/// a page size too small for the header and its tables, or a file shorter
+/// than one page.
+pub const HeaderDecodeError = bin.ReadError || error{UnexpectedValue};
+
+/// Encoding error of the file header: `UnexpectedValue` is a table count
+/// that does not fit the page, or a page size below `header_fixed_len`.
+pub const HeaderEncodeError = bin.WriteError || error{UnexpectedValue};
+
+/// The file header, occupying the start of page 0: the page geometry, the
+/// allocation counter, and the table of contents. Serializing pads page 0
+/// with zeros up to the page size, as observed in every known file.
+pub const Header = struct {
+    /// Magic signature; always zero.
+    magic: u32 = 0,
+    /// Size of a single page in bytes. The byte offset of a page is its
+    /// (1-based) index multiplied by this value; page 0 is this header.
+    page_size: u32 = 4096,
+    /// Number of tables; re-derived from `tables` when the header is
+    /// written.
+    num_tables: u32 = 0,
+    /// Index of the next page a writer may allocate. Not used as any
+    /// table's `empty_candidate`; sometimes points past the end of the
+    /// file.
+    next_unused_page: u32 = 0,
+    /// Unknown field; observed as 5 in real exports, and set to 5 by
+    /// rekordcrate's `create`.
+    unknown: u32 = 5,
+    /// Unknown field; always incremented by at least one, sometimes by two
+    /// or three.
+    sequence: u32 = 1,
+    /// Gap between the fixed fields and the tables; always zero.
+    gap: u32 = 0,
+    /// The table of contents, `num_tables` entries on the wire. The slice
+    /// is skipped by the struct walker; `decode` and `encode` own it.
+    tables: []Table = &.{},
+
+    pub const constant_fields = .{ .magic, .gap };
+
+    /// Reads the fixed fields (validating the magics and that the tables
+    /// fit within page 0), then the `num_tables` table entries. The
+    /// returned `tables` slice is allocated with `alloc`.
+    pub fn decode(c: *bin.Cursor, alloc: std.mem.Allocator) HeaderDecodeError!Header {
+        var header = try bin.takeStruct(c, Header, .little);
+        try bin.validateConstantFields(Header, header);
+        if (headerFixedAndTablesLen(header.num_tables) > header.page_size)
+            return error.UnexpectedValue;
+        header.tables = try bin.takeStructSlice(
+            alloc,
+            c,
+            Table,
+            .little,
+            header.num_tables,
+        );
+        return header;
+    }
+
+    /// Writes the fixed fields with `num_tables` derived from `tables`,
+    /// the table entries, and zero padding up to `page_size` — exactly one
+    /// page, the whole of page 0.
+    pub fn encode(header: *const Header, e: *bin.Emitter) HeaderEncodeError!void {
+        if (header.tables.len > std.math.maxInt(u32) or
+            headerFixedAndTablesLen(header.tables.len) > header.page_size)
+            return error.UnexpectedValue;
+        var fixed = header.*;
+        fixed.num_tables = @intCast(header.tables.len);
+        try bin.putStruct(e, fixed, .little);
+        for (header.tables) |table| try bin.putStruct(e, table, .little);
+        const pad_len: usize = @intCast(
+            header.page_size - headerFixedAndTablesLen(header.tables.len),
+        );
+        try e.pad(pad_len);
+    }
+
+    /// Finds the first table whose page type equals `page_type`, or null.
+    /// In ext databases the wire values 3 and 4 carry tag meanings, so
+    /// callers pass the raw value (for example
+    /// `@enumFromInt(@intFromEnum(ExtPageType.tag))`).
+    pub fn findTable(header: *const Header, page_type: PageType) ?*const Table {
+        for (header.tables) |*table| {
+            if (table.page_type == page_type) return table;
+        }
+        return null;
+    }
+};
+
 const testing = std.testing;
 
 /// Mirrors rekordcrate's `test_roundtrip`: parses `bytes` expecting
@@ -3091,6 +3205,85 @@ test "track tag page fixture parses with known field values" {
     const third = content.rows[2].row.track_tag;
     try testing.expectEqual(@as(u32, 2), third.track_id);
     try testing.expectEqual(@as(u32, 2498240426), third.tag_id);
+}
+
+// File header, page, and whole-database tests, ported from the header
+// vector of rekordcrate's `test_roundtrip.rs`, the chain semantics of
+// `io.rs`'s `PageIterator`, and `tests/test_pdb_num_rows.rs`.
+
+test "file header roundtrips, validates constants, and derives num_tables" {
+    const alloc = testing.allocator;
+    var tables = [_]Table{
+        .{ .page_type = .tracks, .empty_candidate = 47, .first_page = 1, .last_page = 2 },
+        .{ .page_type = .genres, .empty_candidate = 4, .first_page = 3, .last_page = 3 },
+    };
+    var header = Header{
+        .page_size = 256,
+        .next_unused_page = 51,
+        .unknown = 5,
+        .sequence = 34,
+        .tables = &tables,
+    };
+
+    var e = bin.Emitter.init(alloc);
+    defer e.deinit();
+    try header.encode(&e);
+    const bytes = e.written();
+    // The header fills exactly page 0: fixed fields, the two table
+    // entries (ending at byte 60), and zero padding.
+    try testing.expectEqual(@as(usize, 256), bytes.len);
+    try testing.expect(std.mem.allEqual(u8, bytes[60..], 0));
+
+    var c = bin.Cursor.init(bytes);
+    const decoded = try Header.decode(&c, alloc);
+    defer alloc.free(decoded.tables);
+    // Decoding stops after the tables; the zero padding of page 0 is not
+    // part of the model.
+    try testing.expectEqual(@as(usize, 60), c.pos);
+    try testing.expectEqual(@as(u32, 256), decoded.page_size);
+    try testing.expectEqual(@as(u32, 2), decoded.num_tables);
+    try testing.expectEqual(@as(u32, 51), decoded.next_unused_page);
+    try testing.expectEqual(@as(u32, 5), decoded.unknown);
+    try testing.expectEqual(@as(u32, 34), decoded.sequence);
+    try testing.expectEqual(@as(usize, 2), decoded.tables.len);
+    try testing.expectEqual(PageType.genres, decoded.tables[1].page_type);
+    try testing.expectEqual(@as(u32, 4), decoded.tables[1].empty_candidate);
+    try testing.expectEqual(@as(u32, 3), decoded.tables[1].first_page);
+    try testing.expectEqual(@as(u32, 3), decoded.tables[1].last_page);
+    try testing.expectEqual(header.findTable(.tracks).?.last_page, 2);
+
+    // Encoding derives `num_tables` from the tables slice.
+    header.tables = header.tables[0..1];
+    var e2 = bin.Emitter.init(alloc);
+    defer e2.deinit();
+    try header.encode(&e2);
+    var c2 = bin.Cursor.init(e2.written());
+    const decoded2 = try Header.decode(&c2, alloc);
+    defer alloc.free(decoded2.tables);
+    try testing.expectEqual(@as(u32, 1), decoded2.num_tables);
+
+    // The magics are structural constants.
+    const corruptible = try alloc.dupe(u8, bytes);
+    defer alloc.free(corruptible);
+    corruptible[0] = 1; // magic
+    var bad = bin.Cursor.init(corruptible);
+    try testing.expectError(error.UnexpectedValue, Header.decode(&bad, alloc));
+    corruptible[0] = 0;
+    corruptible[24] = 1; // gap
+    var bad2 = bin.Cursor.init(corruptible);
+    try testing.expectError(error.UnexpectedValue, Header.decode(&bad2, alloc));
+
+    // A table count whose entries would not fit in page 0 is rejected on
+    // both sides, before anything is read or written.
+    corruptible[24] = 0;
+    corruptible[8] = 0xFF; // num_tables
+    corruptible[9] = 0xFF;
+    var bad3 = bin.Cursor.init(corruptible);
+    try testing.expectError(error.UnexpectedValue, Header.decode(&bad3, alloc));
+    var cramped = Header{ .page_size = 28, .tables = &tables };
+    var e3 = bin.Emitter.init(alloc);
+    defer e3.deinit();
+    try testing.expectError(error.UnexpectedValue, cramped.encode(&e3));
 }
 
 // Data page and simple row tests, ported from the row tests of
