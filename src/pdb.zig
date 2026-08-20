@@ -547,8 +547,13 @@ pub fn OffsetArrayContainer(comptime T: type) type {
             const base = start - array_offset;
             try size.putOffset(e, offset_array_magic);
             for (provided.values) |value| try size.putOffset(e, value);
+            // One scratch emitter is reused for every item.
+            var sub = bin.Emitter.init(e.alloc);
+            defer sub.deinit();
             inline for (T.offsetItems(self.inner), provided.values) |item, offset| {
-                try putEncodedAt(e, base + @as(usize, offset), item);
+                sub.clear();
+                try item.encode(&sub);
+                try e.putBytesAt(base + @as(usize, offset), sub.written());
             }
         }
 
@@ -1840,12 +1845,14 @@ pub const DataPageContent = struct {
 
         // Each row's true extent is measured off its encoded bytes — gaps
         // between offset-array items included — because `putBytesAt` would
-        // let overlapping rows overwrite each other without an error.
+        // let overlapping rows overwrite each other without an error. One
+        // scratch emitter is reused for every row.
         var extents = std.ArrayList(RowExtent).empty;
         defer extents.deinit(e.alloc);
+        var sub = bin.Emitter.init(e.alloc);
+        defer sub.deinit();
         for (self.rows) |at| {
-            var sub = bin.Emitter.init(e.alloc);
-            defer sub.deinit();
+            sub.clear();
             try at.row.encode(&sub);
             const start = heap_start + at.offset;
             try e.putBytesAt(start, sub.written());

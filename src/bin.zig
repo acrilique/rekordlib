@@ -98,6 +98,12 @@ pub const Emitter = struct {
         return e.list.items;
     }
 
+    /// Discards the written bytes while keeping the buffer's capacity, for
+    /// serializing many values through one emitter.
+    pub fn clear(e: *Emitter) void {
+        e.list.clearRetainingCapacity();
+    }
+
     pub fn toOwnedSlice(e: *Emitter) WriteError![]u8 {
         return e.list.toOwnedSlice(e.alloc);
     }
