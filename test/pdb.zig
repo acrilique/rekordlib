@@ -1514,7 +1514,6 @@ test "num_rows parses and serializes within the perf budget" {
     ).nanoseconds);
 
     const elapsed_ms = elapsed_ns / std.time.ns_per_ms;
-    std.debug.print("\nnum_rows (2.9 MB) parse+serialize: {d} ms (budget {d} ms)\n", .{ elapsed_ms, num_rows_perf_budget_ms });
     try testing.expect(elapsed_ms < num_rows_perf_budget_ms);
 }
 
