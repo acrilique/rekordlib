@@ -2,20 +2,14 @@
 // v. 2.0. If a copy of the MPL was not distributed with this file, You can
 // obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Parser and writer for the rekordbox `export.pdb` database (DeviceSQL).
+//! Parser and writer for the rekordbox `export.pdb` database (DeviceSQL):
+//! the string type, the offset arrays that locate row tail data, page
+//! headers with index pages, and data pages with their rows — including
+//! the tag rows of `exportExt.pdb`.
 //!
-//! Currently contains `DeviceSQLString`, the string type used by all row
-//! types; the offset arrays that locate strings and other tail data
-//! within rows; the page headers with index pages; and data pages with
-//! all plain row types, from the simple ones to artist, album, playlist
-//! tree node, and track, plus the tag and track-tag rows of
-//! `exportExt.pdb` databases. The tables and the whole-file database
-//! are not implemented yet.
-//!
-//! Initially ported from rekordcrate's `src/pdb/string.rs`,
-//! `src/pdb/offset_array.rs`, `src/pdb/bitfields.rs`, `src/pdb/ext.rs`,
-//! and the page, index-page, data-page, and row parts of
-//! `src/pdb/mod.rs`
+//! Ported from rekordcrate's `src/pdb/string.rs`, `src/pdb/offset_array.rs`,
+//! `src/pdb/bitfields.rs`, `src/pdb/ext.rs`, and the page, index-page,
+//! data-page, and row parts of `src/pdb/mod.rs`.
 //!
 //! - <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/exports.html#devicesql-strings>
 
@@ -138,10 +132,8 @@ pub const DeviceSQLString = union(enum) {
         }
 
         /// Parses an ISRC body — `0x03` magic byte, NUL-terminated ASCII,
-        /// exactly filling `len` bytes — or returns `null` when the body is
-        /// not of that shape, so UCS-2LE gets a chance. The exact fill is
-        /// required so parsing stays in sync with the length field and
-        /// roundtrips stay byte-identical.
+        /// exactly filling `len` bytes — or returns `null` when the body
+        /// is not of that shape, so UCS-2LE gets a chance.
         fn decodeIsrc(
             c: *bin.Cursor,
             alloc: std.mem.Allocator,
@@ -299,10 +291,7 @@ pub const DeviceSQLString = union(enum) {
     /// Reads a string from `c`, which must have an allocator set (see
     /// `bin.Cursor.initAlloc`). Content bytes are not validated on parse,
     /// only by `utf8`; structural constants (flag values, the padding
-    /// byte, the ISRC body shape) are. The error set is wider than the
-    /// custom-codec contract of `bin.takeStruct` (`ReadError!T`): strings
-    /// in pdb rows are read through dedicated cursors rather than as
-    /// inline struct fields.
+    /// byte, the ISRC body shape) are.
     pub fn decode(c: *bin.Cursor) DecodeError!DeviceSQLString {
         const alloc = c.alloc orelse return bin.ReadError.OutOfMemory;
         const first = try c.takeInt(u8, .little);
@@ -381,12 +370,10 @@ pub const OffsetArrayDecodeError = bin.ReadError || error{ InvalidFormat, Unexpe
 pub const OffsetArrayEncodeError = bin.WriteError || error{ UnexpectedValue, NotImplemented };
 
 /// Specifies whether the offsets of an offset array are stored as `u8` or
-/// `u16`; the surrounding row's subtype selects the width (bit `0x04` set
-/// means `u16`, see `fromSubtype`).
+/// `u16`; the surrounding row's subtype selects the width (see
+/// `fromSubtype`).
 pub const OffsetSize = enum {
-    /// Offsets are stored as `u8`, preceded by the `u8` magic `0x03`.
     u8,
-    /// Offsets are stored as `u16`, preceded by the `u16` magic `0x0003`.
     u16,
 
     /// Bytes one stored offset occupies, magic excluded.
@@ -435,8 +422,7 @@ pub fn Offsets(comptime n: usize) type {
         /// The offsets as they appear in the file (or as explicitly chosen
         /// by the caller), written verbatim.
         provided: struct {
-            /// Width the offsets are stored at; on write it must equal the
-            /// offset size the surrounding row's subtype selects.
+            /// Width the offsets are stored at.
             size: OffsetSize,
             /// Offset values, relative to the row start.
             values: [n]u16,
@@ -459,9 +445,7 @@ pub fn Offsets(comptime n: usize) type {
 
 /// Serializes `value` — any type with an `encode(self, e)` method — into
 /// a scratch emitter and writes the finished bytes at `offset`,
-/// zero-filling any gap the position skips (see `bin.Emitter.putBytesAt`).
-/// The scratch emitter exists because such values are placed at absolute
-/// offsets instead of being appended in sequence.
+/// zero-filling any gap (see `bin.Emitter.putBytesAt`).
 fn putEncodedAt(e: *bin.Emitter, offset: usize, value: anytype) !void {
     var sub = bin.Emitter.init(e.alloc);
     defer sub.deinit();
@@ -504,12 +488,11 @@ pub fn OffsetArrayContainer(comptime T: type) type {
         inner: T = .{},
 
         /// Reads the offsets from `c`, then each item from its own
-        /// sub-cursor at `base + offset`, where `base` is the cursor
-        /// position the array starts at minus `array_offset` — the row
-        /// start; the row walkers pass the row's fixed-field size (see
-        /// `fixedLen`). The cursor is left directly after the offsets;
-        /// items may lie beyond that, and are not required to fill the
-        /// buffer they occupy.
+        /// sub-cursor at `base + offset`, `base` being the row start
+        /// (the row walkers pass `fixedLen`). The cursor is left
+        /// directly after the offsets; items may lie beyond that and
+        /// need not fill the buffer they occupy. Items decoded before
+        /// a failure are freed.
         pub fn decode(c: *bin.Cursor, array_offset: usize, size: OffsetSize) OffsetArrayDecodeError!Self {
             const start = c.pos;
             if (array_offset > start) return error.UnexpectedValue; // base underflow
@@ -521,9 +504,7 @@ pub fn OffsetArrayContainer(comptime T: type) type {
             const base = start - array_offset;
             var items: [n]Item = undefined;
             // The comptime guard lets zero-item containers use `void`
-            // items, whose type has no `decode`; items decoded before a
-            // failure are freed, so a partially decoded container (a row
-            // rejected mid-parse) never leaks.
+            // items, whose type has no `decode`.
             if (Item != void) {
                 const alloc = c.alloc orelse return bin.ReadError.OutOfMemory;
                 var decoded: usize = 0;
@@ -549,8 +530,7 @@ pub fn OffsetArrayContainer(comptime T: type) type {
 
         /// Writes the offsets, then each item at `base + offset` (the
         /// inverse of `decode`, same `array_offset` convention); gaps the
-        /// offsets skip over are zero-filled. Writing with calculated
-        /// offsets is not implemented yet.
+        /// offsets skip over are zero-filled.
         pub fn encode(
             self: *const Self,
             e: *bin.Emitter,
@@ -567,8 +547,6 @@ pub fn OffsetArrayContainer(comptime T: type) type {
             const base = start - array_offset;
             try size.putOffset(e, offset_array_magic);
             for (provided.values) |value| try size.putOffset(e, value);
-            // `inline for` so zero-item containers can use `void` items:
-            // the body's call into the item codec is never analyzed.
             inline for (T.offsetItems(self.inner), provided.values) |item, offset| {
                 try putEncodedAt(e, base + @as(usize, offset), item);
             }
@@ -585,8 +563,6 @@ pub fn OffsetArrayContainer(comptime T: type) type {
                 .provided => false,
             };
             var total: u32 = @intCast((n + 1) * size.bytes());
-            // `inline for` so zero-item containers can use `void` items:
-            // the body referencing the item methods is never analyzed.
             inline for (T.offsetItems(self.inner)) |item| {
                 if (calculated) {
                     const alignment: u32 = @max(item.requiredAlignment(), 1);
@@ -668,10 +644,8 @@ pub const DatabaseType = enum {
 
 /// The type of rows a page holds, as stored in page headers and table
 /// entries: the wire constants of `export.pdb` tables. In `exportExt.pdb`
-/// databases values 3 and 4 carry the ext meanings (tags, track tags,
-/// see `ExtPageType`) instead of albums and labels; `DatabaseType`
-/// selects the meaning during row dispatch. Unknown values roundtrip
-/// verbatim.
+/// databases values 3 and 4 carry ext meanings instead (see
+/// `DatabaseType`). Unknown values roundtrip verbatim.
 pub const PageType = enum(u32) {
     /// Track metadata: title, artist, genre, artwork ID, playing time, etc.
     tracks = 0,
@@ -708,10 +682,9 @@ pub const PageType = enum(u32) {
     _,
 };
 
-/// The type of ext pages found inside a `Table` of `exportExt.pdb`
-/// files, where the wire values 3 and 4 carry these meanings instead of
-/// albums and labels (see `DatabaseType`). Unknown values have no ext
-/// meaning and fail row dispatch with `error.NotImplemented`.
+/// Page types of `exportExt.pdb` databases whose wire values collide
+/// with plain meanings (see `DatabaseType`). Unknown values fail row
+/// dispatch with `error.NotImplemented`.
 pub const ExtPageType = enum(u32) {
     /// Rows that can be assigned to tracks for the purpose of
     /// categorization.
@@ -730,9 +703,8 @@ pub const PackedRowCounts = packed struct(u24) {
 };
 
 /// Page flags stored in the page header, LSB-first: the first declared
-/// field is bit 0, so the declaration order reads backwards compared to
-/// typical bit notation. The default value is the typical data page
-/// (`0x24`); index pages set `is_index_page` (`0x64`).
+/// field is bit 0. The default value is the typical data page (`0x24`);
+/// index pages set `is_index_page` (`0x64`).
 pub const PageFlags = packed struct(u8) {
     /// Unknown flag that appears to never be set.
     unknown0: bool = false,
@@ -938,8 +910,10 @@ pub const DataPageDecodeError = RowDecodeError;
 /// fallible part of a row write (see `OffsetArrayEncodeError`).
 pub const RowEncodeError = OffsetArrayEncodeError;
 
-/// Encoding error of a data page: row encoding errors; row groups not
-/// fitting the page fail with `UnexpectedValue`.
+/// Encoding error of a data page: row encoding errors; `UnexpectedValue`
+/// covers row groups not fitting the page, rows overlapping each other or
+/// reaching past the row groups' first used byte, and content overrunning
+/// the heap.
 pub const DataPageEncodeError = RowEncodeError;
 
 /// Magic value between a History row's `num_tracks` and `date` fields;
@@ -950,9 +924,8 @@ const history_date_magic: u32 = 0;
 /// always `0x1E19`.
 const history_version_magic: u16 = 0x1E19;
 
-/// Whether `T` is an `OffsetArrayContainer` instantiation: every type
-/// following the container protocol declares `offset_count` (as do the
-/// inner types, which never appear as row fields).
+/// Whether `T` is an `OffsetArrayContainer` instantiation, recognized by
+/// its `offset_count` declaration.
 fn isOffsetContainer(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(T, "offset_count"),
@@ -960,10 +933,9 @@ fn isOffsetContainer(comptime T: type) bool {
     };
 }
 
-/// Compile-time contract of the row walkers, checked once per row type:
-/// an offset-array container field must be preceded by the row's
-/// `subtype` field, whose parsed value selects the container's offset
-/// width mid-walk.
+/// Compile-time contract of the row walkers: an offset-array container
+/// field must be preceded by the row's `subtype` field, which selects
+/// its offset width.
 fn validateRowType(comptime T: type) void {
     comptime {
         const fields = std.meta.fields(T);
@@ -999,13 +971,11 @@ fn fixedLen(comptime T: type) usize {
 /// Reads the fields of row type `T` in declaration order at
 /// little-endian: the row-layer analogue of `bin.takeStruct`. Supported
 /// field types are integers, non-exhaustive enums (so unknown values
-/// roundtrip verbatim), inline `DeviceSQLString`s at their field
-/// position, and a trailing offset-array container whose offsets reach
-/// back past the row's fixed fields (`fixedLen`) and whose width follows
-/// from the `subtype` field, which it must be declared after (see
-/// `validateRowType`). Fields a failing decode leaves behind are freed,
-/// so a row rejected mid-parse never leaks, and a `constant_fields`
-/// declaration is validated after the walk, as for page headers.
+/// roundtrip verbatim), inline `DeviceSQLString`s, and a trailing
+/// offset-array container whose offsets reach back past the row's
+/// fixed fields (`fixedLen`). Fields a failing decode leaves behind
+/// are freed, and a `constant_fields` declaration is validated after
+/// the walk, as for page headers.
 fn decodeRow(comptime T: type, c: *bin.Cursor) RowDecodeError!T {
     comptime validateRowType(T);
     var row: T = .{};
@@ -1325,11 +1295,8 @@ pub const PlaylistTreeNode = struct {
     /// ID of this row.
     id: u32 = 0,
     /// Non-zero when the node is a folder, zero when it is a leaf
-    /// playlist. The name is rekordcrate's, whose doc comment inverts the
-    /// meaning ("non-zero if it's a leaf"); its code and the fixtures
-    /// agree that non-zero means folder — its `is_folder()` accessor, its
-    /// writer rejecting leaf parents, and the fixture rows named
-    /// "folder*" carrying 1.
+    /// playlist (rekordcrate's doc comment inverts the meaning; its
+    /// code and the fixtures agree on this one).
     node_is_folder: u32 = 0,
     /// Name of this node, as shown when navigating the menu.
     name: DeviceSQLString = DeviceSQLString.empty(),
@@ -1556,8 +1523,7 @@ pub const TrackTag = struct {
 
 /// Whether rows of type `T` live in pages of `page_type` in a database of
 /// `db_type`: plain row types declare `page_type`, ext row types declare
-/// `ext_page_type` — whose wire values collide with plain meanings
-/// (albums, labels), hence the database-type gate.
+/// `ext_page_type` (see `DatabaseType`).
 fn rowMatchesPageType(
     comptime T: type,
     page_type: PageType,
@@ -1579,12 +1545,11 @@ fn rowPageType(comptime T: type) PageType {
     return @enumFromInt(@intFromEnum(T.ext_page_type));
 }
 
-/// A table row. Each variant is a plain field-declaration list whose
-/// fields are serialized in declaration order by the generic row codec
-/// (`decodeRow` and siblings); each declares its `page_type` (plain rows)
-/// or its `ext_page_type` (ext rows), which selects it in `decode` for
-/// the matching database type. Page types of the other database type and
-/// unknown page type values fail with `error.NotImplemented`.
+/// A table row: a field-declaration list serialized in declaration order
+/// by the generic row codec (`decodeRow` and siblings). Each variant
+/// declares its `page_type` (plain rows) or `ext_page_type` (ext rows),
+/// which selects it in `decode`; page types of the other database type
+/// and unknown values fail with `error.NotImplemented`.
 pub const Row = union(enum) {
     genre: Genre,
     label: Label,
@@ -1658,10 +1623,7 @@ pub const Row = union(enum) {
 
 // Row types must declare pairwise distinct dispatch keys within each
 // database type: `Row.decode` dispatches on first match, so a duplicate
-// would silently parse one type's bytes as another. Ext row types
-// deliberately reuse the wire values 3 and 4 that mean albums and labels
-// in plain databases, which is safe only because the database-type gate
-// keeps the two classes apart.
+// would silently parse one type's bytes as another.
 comptime {
     const fields = std.meta.fields(Row);
     for (fields, 0..) |a, i| {
@@ -1710,9 +1672,7 @@ const row_group_size: usize = row_group_max_rows * 2 + 4;
 ///
 /// Slots before the first present one are not row offsets — the page heap
 /// may store row data in their bytes. Parsing and writing keep them
-/// verbatim; the oracle instead writes only from the first present offset
-/// onward, relying on its in-place file edits to leave the leading bytes
-/// untouched.
+/// verbatim.
 pub const RowGroup = struct {
     /// Row offsets relative to the start of the page heap, in slot order:
     /// slot 15 holds the group's first-allocated row, later rows fill the
@@ -1829,8 +1789,10 @@ pub const DataPageContent = struct {
             for (0..row_group_max_rows) |bit| {
                 const offset = group.presentOffset(@intCast(bit)) orelse continue;
                 const pos = heap_start + offset;
-                if (pos > c.buf.len) return error.UnexpectedEof;
-                var sub = bin.Cursor{ .buf = c.buf[pos..], .alloc = alloc };
+                // Bounded at the heap end, not the buffer end: a corrupt
+                // offset must not read past this page.
+                if (pos > heap_end) return error.UnexpectedEof;
+                var sub = bin.Cursor{ .buf = c.buf[pos..heap_end], .alloc = alloc };
                 try rows.append(alloc, .{
                     .offset = offset,
                     .row = try Row.decode(&sub, page_header.page_type, db_type),
@@ -1864,15 +1826,50 @@ pub const DataPageContent = struct {
         const heap_start = e.pos();
         const heap_end = heap_start + heap_size;
 
-        for (self.rows) |at| {
-            try putEncodedAt(e, heap_start + at.offset, at.row);
+        // Rows may reach into the row groups' unused leading slots —
+        // which can legally carry row data (see `RowGroup`) — but not
+        // past the lowest group's first used slot byte, `2 * @clz`
+        // bytes into its block. Without row groups, any heap byte is
+        // available.
+        var rows_limit = heap_end;
+        if (self.row_groups.len > 0) {
+            const lowest = self.row_groups[self.row_groups.len - 1];
+            const lowest_start = heap_end - row_group_size * self.row_groups.len;
+            rows_limit = lowest_start + 2 * @as(usize, @clz(lowest.row_presence_flags));
         }
+
+        // Each row's true extent is measured off its encoded bytes — gaps
+        // between offset-array items included — because `putBytesAt` would
+        // let overlapping rows overwrite each other without an error.
+        var extents = std.ArrayList(RowExtent).empty;
+        defer extents.deinit(e.alloc);
+        for (self.rows) |at| {
+            var sub = bin.Emitter.init(e.alloc);
+            defer sub.deinit();
+            try at.row.encode(&sub);
+            const start = heap_start + at.offset;
+            try e.putBytesAt(start, sub.written());
+            try extents.append(
+                e.alloc,
+                .{ .start = start, .end = start + sub.written().len },
+            );
+        }
+        std.mem.sort(RowExtent, extents.items, {}, rowExtentBefore);
+        // Sorted by start and disjoint, the running end is the maximum.
+        var prev_end = heap_start;
+        for (extents.items) |extent| {
+            if (extent.start < prev_end) return error.UnexpectedValue; // rows overlap
+            prev_end = extent.end;
+        }
+        if (prev_end > rows_limit)
+            return error.UnexpectedValue; // a row reaches into the row groups
 
         for (self.row_groups, 0..) |group, g| {
             const group_end = heap_end - row_group_size * g;
             try putEncodedAt(e, group_end - row_group_size, group);
         }
         if (e.pos() < heap_end) try e.pad(heap_end - e.pos());
+        if (e.pos() != heap_end) return error.UnexpectedValue; // overran the heap
     }
 
     pub fn eql(a: *const DataPageContent, b: *const DataPageContent) bool {
@@ -1903,6 +1900,18 @@ fn dataPageHeapSize(page_size: usize) error{UnexpectedValue}!usize {
     const fixed = bin.serializedLen(PageHeader) + bin.serializedLen(DataPageHeader);
     if (page_size < fixed) return error.UnexpectedValue;
     return page_size - fixed;
+}
+
+/// Byte range a serialized row occupies in the page heap, for
+/// `DataPageContent.encode`'s overlap check.
+const RowExtent = struct {
+    start: usize,
+    end: usize,
+};
+
+/// Orders row extents by start offset for the overlap check.
+fn rowExtentBefore(_: void, a: RowExtent, b: RowExtent) bool {
+    return a.start < b.start;
 }
 
 const testing = std.testing;
@@ -3687,6 +3696,100 @@ test "data page roundtrips with heap bytes in unused row group slots" {
     try testing.expectEqualSlices(u8, &page, out);
 }
 
+test "data page encode rejects rows that overlap or reach the row groups" {
+    const alloc = testing.allocator;
+
+    // Two 8-byte rows overlapping by four bytes.
+    {
+        var rows = [_]RowAtOffset{
+            .{ .offset = 0, .row = .{ .menu = .{} } },
+            .{ .offset = 4, .row = .{ .menu = .{} } },
+        };
+        var offsets: [row_group_max_rows]u16 = @splat(0);
+        offsets[14] = 4;
+        offsets[15] = 0;
+        var groups = [_]RowGroup{.{
+            .row_offsets = offsets,
+            .row_presence_flags = 0x0003,
+        }};
+        const content = DataPageContent{ .row_groups = &groups, .rows = &rows };
+        var e = bin.Emitter.init(alloc);
+        defer e.deinit();
+        try testing.expectError(error.UnexpectedValue, content.encode(&e, 96));
+    }
+
+    // The heap's row region ends at the row groups' first used byte. With
+    // a full group (presence 0xffff) that is the block start, heap byte
+    // 20 (the block spans heap bytes 20-55): a row may end exactly at 20,
+    // one byte further is rejected. Offsets are heap-relative.
+    {
+        var rows = [_]RowAtOffset{
+            .{ .offset = 4, .row = .{ .menu = .{} } },
+            .{ .offset = 12, .row = .{ .menu = .{} } }, // ends at 20, the limit
+        };
+        var offsets: [row_group_max_rows]u16 = @splat(0);
+        offsets[14] = 12;
+        offsets[15] = 4;
+        var groups = [_]RowGroup{.{
+            .row_offsets = offsets,
+            .row_presence_flags = 0xFFFF,
+        }};
+        const content = DataPageContent{ .row_groups = &groups, .rows = &rows };
+        var e = bin.Emitter.init(alloc);
+        defer e.deinit();
+        try content.encode(&e, 96);
+        try testing.expectEqual(@as(usize, 96 - 0x20), e.written().len);
+
+        var late = [_]RowAtOffset{
+            .{ .offset = 4, .row = .{ .menu = .{} } },
+            .{ .offset = 13, .row = .{ .menu = .{} } }, // ends at 21, in the group
+        };
+        const reaching = DataPageContent{ .row_groups = &groups, .rows = &late };
+        var e2 = bin.Emitter.init(alloc);
+        defer e2.deinit();
+        try testing.expectError(error.UnexpectedValue, reaching.encode(&e2, 96));
+    }
+
+    // The same row further up is legal when the leading slots are unused:
+    // presence 0x0001 leaves heap bytes 20-49 as leading slots, and the
+    // row ends exactly at the first used byte, 50.
+    {
+        var rows = [_]RowAtOffset{
+            .{ .offset = 42, .row = .{ .menu = .{} } }, // ends at 50, the limit
+        };
+        var offsets: [row_group_max_rows]u16 = @splat(0);
+        offsets[15] = 42;
+        var groups = [_]RowGroup{.{
+            .row_offsets = offsets,
+            .row_presence_flags = 0x0001,
+        }};
+        const content = DataPageContent{ .row_groups = &groups, .rows = &rows };
+        var e = bin.Emitter.init(alloc);
+        defer e.deinit();
+        try content.encode(&e, 96);
+        try testing.expectEqual(@as(usize, 96 - 0x20), e.written().len);
+
+        var over = [_]RowAtOffset{
+            .{ .offset = 43, .row = .{ .menu = .{} } }, // ends at 51, past it
+        };
+        const reaching = DataPageContent{ .row_groups = &groups, .rows = &over };
+        var e2 = bin.Emitter.init(alloc);
+        defer e2.deinit();
+        try testing.expectError(error.UnexpectedValue, reaching.encode(&e2, 96));
+    }
+
+    // Without row groups the whole heap is available, but not beyond it.
+    {
+        var rows = [_]RowAtOffset{
+            .{ .offset = 56 - 8 + 1, .row = .{ .menu = .{} } },
+        };
+        const content = DataPageContent{ .rows = &rows };
+        var e = bin.Emitter.init(alloc);
+        defer e.deinit();
+        try testing.expectError(error.UnexpectedValue, content.encode(&e, 96));
+    }
+}
+
 test "data page encode derives page layout from row groups" {
     const alloc = testing.allocator;
     var page = menuPageBytes(0);
@@ -3742,6 +3845,25 @@ test "data page decode rejects malformed pages" {
         try testing.expectError(
             error.UnexpectedEof,
             DataPageContent.decode(&c, alloc, page.len, header, .plain),
+        );
+    }
+
+    // A row offset pointing past the heap but inside the cursor's buffer
+    // (what a whole-file cursor sees): the zero bytes there would parse
+    // as a valid row; the heap-end bound rejects it.
+    {
+        var page = menuPageBytes(0);
+        const group_start = 96 - row_group_size;
+        std.mem.writeInt(u16, page[group_start + 28 ..][0..2], 0x1000, .little); // slot 14
+        const bigger = try alloc.alloc(u8, 0x28 + 0x1000 + 8);
+        defer alloc.free(bigger);
+        @memset(bigger, 0);
+        @memcpy(bigger[0..96], &page);
+        var c = bin.Cursor.initAlloc(alloc, bigger);
+        const header = try bin.takeStruct(&c, PageHeader, .little);
+        try testing.expectError(
+            error.UnexpectedEof,
+            DataPageContent.decode(&c, alloc, 96, header, .plain),
         );
     }
 
