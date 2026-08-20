@@ -6,12 +6,16 @@
 //! the string type, the offset arrays that locate row tail data, page
 //! headers with index pages, data pages with their rows — including
 //! the tag rows of `exportExt.pdb` — and whole databases assembled from
-//! the file header, its table of contents, and every page.
+//! the file header, its table of contents, and every page. The
+//! modification layer allocates rows inside pages, appends rows to tables
+//! with page-chain relinking, and creates new databases with the default
+//! color, column, and menu rows.
 //!
 //! Ported from rekordcrate's `src/pdb/string.rs`, `src/pdb/offset_array.rs`,
-//! `src/pdb/bitfields.rs`, `src/pdb/ext.rs`, and the page, index-page,
-//! data-page, row, header, and table parts of `src/pdb/mod.rs` and
-//! `src/pdb/io.rs`.
+//! `src/pdb/bitfields.rs`, `src/pdb/ext.rs`, and `src/pdb/defaults.rs`,
+//! the page, index-page, data-page, row, header, and table parts of
+//! `src/pdb/mod.rs`, and the modification parts of `src/pdb/io.rs`
+//! (`create`, `add_row`, `allocate_row`).
 //!
 //! - <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/exports.html#devicesql-strings>
 
@@ -1678,6 +1682,16 @@ pub const row_group_max_rows: usize = 16;
 /// flags and the unknown field.
 const row_group_size: usize = row_group_max_rows * 2 + 4;
 
+/// Bytes a row group's presence flags and unknown field occupy, charged to
+/// the page's free space when a new group is allocated.
+const row_group_header_size: u16 = 4;
+
+/// Bytes one row-group offset slot occupies, charged per allocated row.
+const row_group_offset_size: u16 = 2;
+
+/// Byte alignment every row allocation is rounded up to.
+const row_alignment: usize = 4;
+
 /// A group of row offsets, built backwards from the end of the page heap
 /// as pages fill. Holds up to sixteen offsets plus a presence bitmask:
 /// bit `i` says whether the offset in slot `15 - i` holds a live row, so
@@ -2042,6 +2056,8 @@ pub const Header = struct {
         }
         return null;
     }
+
+
 };
 
 /// Decoding error of a page: row errors from the data content plus
@@ -2113,6 +2129,34 @@ pub const PageContent = union(enum) {
     }
 };
 
+/// Ticket from `Page.allocRow` for `Page.commitRow`: where a row will sit
+/// once committed.
+pub const RowAlloc = struct {
+    /// Heap offset assigned to the row; also its identity in the page's
+    /// `rows`.
+    row_offset: u16,
+    /// Index of the row group holding the row, and the row's presence bit
+    /// within that group.
+    row_group_index: usize,
+    row_subindex: u4,
+};
+
+/// Grows `slice` by one element, appending `item`. An empty slice owns no
+/// memory to realloc, so it is allocated fresh.
+fn appendElem(
+    comptime T: type,
+    alloc: std.mem.Allocator,
+    slice: []T,
+    item: T,
+) error{OutOfMemory}![]T {
+    const grown = if (slice.len == 0)
+        try alloc.alloc(T, slice.len + 1)
+    else
+        try alloc.realloc(slice, slice.len + 1);
+    grown[grown.len - 1] = item;
+    return grown;
+}
+
 /// A table page: the 0x20-byte page header plus the content selected by
 /// its flags. A serialized page is exactly the database's page size long.
 pub const Page = struct {
@@ -2150,6 +2194,151 @@ pub const Page = struct {
 
     pub fn deinit(page: *Page, alloc: std.mem.Allocator) void {
         page.content.deinit(alloc);
+    }
+
+    /// Creates a new empty data page: default (data-page) flags, the whole
+    /// heap free, nothing used.
+    pub fn newData(
+        page_size: u32,
+        page_index: u32,
+        page_type: PageType,
+        next_page: u32,
+    ) error{UnexpectedValue}!Page {
+        const heap = try dataPageHeapSize(page_size);
+        const free_size = std.math.cast(u16, heap) orelse
+            return error.UnexpectedValue; // page too large for the header fields
+        return .{
+            .header = .{
+                .page_index = page_index,
+                .page_type = page_type,
+                .next_page = next_page,
+                .free_size = free_size,
+            },
+            .content = .{ .data = .{} },
+        };
+    }
+
+    /// Creates a new empty index page.
+    pub fn newIndex(
+        page_index: u32,
+        page_type: PageType,
+        next_page: u32,
+    ) Page {
+        return .{
+            .header = .{
+                .page_index = page_index,
+                .page_type = page_type,
+                .next_page = next_page,
+                .page_flags = .{ .is_index_page = true },
+            },
+            .content = .{ .index = .{
+                .header = .{ .page_index = page_index, .next_page = next_page },
+            } },
+        };
+    }
+
+    /// Allocates `bytes` of page heap for a new row — rounded up to the
+    /// 4-byte alignment rows are placed at — reserving a row-group offset
+    /// slot and charging the page's free/used accounting, and returns the
+    /// ticket for `commitRow`. Returns null when the page is an index page
+    /// or has insufficient free space, leaving the page unchanged.
+    ///
+    /// The allocate/commit pair replaces rekordcrate's insert closure, so
+    /// a row only moves once its space is known. Allocation without a
+    /// following `commitRow` is a legal state — the offset slot and
+    /// `num_rows` already account for the row while the presence bit and
+    /// `num_rows_valid` do not, exactly a deleted row's footprint — and a
+    /// later `allocRow` may follow an uncommitted one.
+    pub fn allocRow(
+        page: *Page,
+        alloc: std.mem.Allocator,
+        bytes: u16,
+    ) error{OutOfMemory}!?RowAlloc {
+        const dpc = switch (page.content) {
+            .data => |*data| data,
+            .index => return null,
+        };
+        const counts = &page.header.packed_row_counts;
+        if (counts.num_rows == std.math.maxInt(u13)) return null;
+
+        // Assume the upper bound of required space: a new group's header
+        // plus one offset slot, even when the current group has room.
+        const aligned = std.mem.alignForward(usize, bytes, row_alignment);
+        const required = aligned + row_group_header_size + row_group_offset_size;
+        if (page.header.free_size < required) return null;
+
+        // Checked arithmetic: a page whose free/used accounting exceeds
+        // the `u16` fields is treated as full, not wrapped.
+        const used: usize = @as(usize, page.header.used_size) + aligned;
+        var free: usize = @as(usize, page.header.free_size) - aligned;
+        if (used > std.math.maxInt(u16)) return null;
+        const offset: u16 = page.header.used_size;
+
+        counts.num_rows += 1;
+        const num_rows: usize = counts.num_rows;
+        const row_group_index = (num_rows - 1) / row_group_max_rows;
+        const row_subindex: u4 = @intCast((num_rows - 1) % row_group_max_rows);
+
+        if (row_group_index == dpc.row_groups.len) {
+            dpc.row_groups = try appendElem(
+                RowGroup,
+                alloc,
+                dpc.row_groups,
+                .{},
+            );
+            free -= row_group_header_size;
+        }
+        dpc.row_groups[row_group_index].row_offsets[row_group_max_rows - 1 - row_subindex] = offset;
+        page.header.free_size = @intCast(free - row_group_offset_size);
+        page.header.used_size = @intCast(used);
+
+        return .{
+            .row_offset = offset,
+            .row_group_index = row_group_index,
+            .row_subindex = row_subindex,
+        };
+    }
+
+    /// Commits the row of a completed `allocRow` ticket: places `row` at
+    /// the ticket's heap offset, marks the offset slot present, and counts
+    /// the row valid. The ticket must be this page's most recent
+    /// allocation and not yet committed. On error the page keeps the
+    /// interrupted state; on success the page owns `row`, which must share
+    /// the page's allocator (the database's arena).
+    pub fn commitRow(
+        page: *Page,
+        alloc: std.mem.Allocator,
+        ticket: RowAlloc,
+        row: Row,
+    ) error{ OutOfMemory, UnexpectedValue }!void {
+        const dpc = switch (page.content) {
+            .data => |*data| data,
+            .index => return error.UnexpectedValue,
+        };
+        if (page.header.packed_row_counts.num_rows_valid ==
+            std.math.maxInt(u11)) return error.UnexpectedValue;
+        if (ticket.row_group_index >= dpc.row_groups.len)
+            return error.UnexpectedValue;
+        const group = &dpc.row_groups[ticket.row_group_index];
+        const slot = row_group_max_rows - 1 - @as(usize, ticket.row_subindex);
+        if (group.row_offsets[slot] != ticket.row_offset)
+            return error.UnexpectedValue; // stale ticket
+        const presence: u16 = @as(u16, 1) << ticket.row_subindex;
+        if (group.row_presence_flags & presence != 0)
+            return error.UnexpectedValue; // already committed
+        // Rows are stored in allocation order, which is ascending offset
+        // order; the appended row must not overtake an existing one.
+        if (dpc.rows.len > 0 and dpc.rows[dpc.rows.len - 1].offset >= ticket.row_offset)
+            return error.UnexpectedValue;
+
+        dpc.rows = try appendElem(
+            RowAtOffset,
+            alloc,
+            dpc.rows,
+            .{ .offset = ticket.row_offset, .row = row },
+        );
+        group.row_presence_flags |= presence;
+        page.header.packed_row_counts.num_rows_valid += 1;
     }
 };
 
@@ -2286,6 +2475,8 @@ pub const Database = struct {
         }
         return std.mem.eql(u8, a.tail, b.tail);
     }
+
+
 };
 
 /// Parses one page as a `PageSlot`, the eager per-page attempt of
@@ -2300,6 +2491,7 @@ fn parsePage(
     var c = bin.Cursor.initAlloc(alloc, page_buf);
     return .{ .page = try Page.decode(&c, alloc, page_size, db_type) };
 }
+
 
 const testing = std.testing;
 
@@ -4577,4 +4769,243 @@ test "data page decode rejects malformed pages" {
             content.encode(&e, 96 - 0x20),
         );
     }
+}
+
+// Modification layer tests, ported from rekordcrate's
+// `src/pdb/test_modification.rs`, the `add_row`/`create` tests of
+// `src/pdb/io.rs`, its `src/pdb/defaults.rs`, and
+// `tests/test_pdb_write.rs`.
+
+/// Builds a Key row with `id` duplicated into `id2`, for the allocate
+/// tests ported from rekordcrate's `test_modification.rs`.
+fn testKeyRow(a: std.mem.Allocator, id: u32, name: []const u8) !Row {
+    return Row{ .key = .{
+        .id = id,
+        .id2 = id,
+        .name = try DeviceSQLString.fromUtf8(a, name),
+    } };
+}
+
+/// A Keys data page holding one full row group of sixteen rows (the setup
+/// of rekordcrate's `allocate_row_full_row_group`).
+fn fullKeysPage(a: std.mem.Allocator) !Page {
+    const names = [row_group_max_rows][]const u8{
+        "Emin",  "Fmaj", "E",    "Amin", "2d", "Bmin", "Cmin",  "Cmaj",
+        "Abmin", "Dmin", "Gmin", "Dm",   "Am", "A#",   "G#min", "A#min",
+    };
+    const offsets = [row_group_max_rows]u16{
+        0x0000, 0x0010, 0x0020, 0x002C, 0x003C, 0x0048, 0x0058, 0x0068,
+        0x0078, 0x0088, 0x0098, 0x00A8, 0x00B4, 0x00C0, 0x00CC, 0x00DC,
+    };
+    var group = RowGroup{ .row_presence_flags = 0xFFFF };
+    const rows = try a.alloc(RowAtOffset, row_group_max_rows);
+    for (names, offsets, 0..) |name, offset, i| {
+        group.row_offsets[row_group_max_rows - 1 - i] = offset;
+        rows[i] = .{ .offset = offset, .row = try testKeyRow(a, @intCast(i + 1), name) };
+    }
+    return Page{
+        .header = .{
+            .page_index = 12,
+            .page_type = .keys,
+            .next_page = 51,
+            .unknown1 = 13484,
+            .packed_row_counts = .{ .num_rows = 16, .num_rows_valid = 16 },
+            .free_size = 2000,
+            .used_size = 0x00EC,
+        },
+        .content = .{ .data = .{
+            .row_groups = try a.dupe(RowGroup, &.{group}),
+            .rows = rows,
+        } },
+    };
+}
+
+test "allocRow on an empty page charges row, group header, and offset" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var page = Page{
+        .header = .{
+            .page_index = 12,
+            .page_type = .keys,
+            .next_page = 51,
+            .unknown1 = 13484,
+            .free_size = 3000,
+        },
+        .content = .{ .data = .{} },
+    };
+
+    var row = try testKeyRow(a, 1, "Emin");
+    const ticket = (try page.allocRow(a, row.heapBytesRequired())).?;
+    try page.commitRow(a, ticket, row);
+
+    const expected = Page{
+        .header = .{
+            .page_index = 12,
+            .page_type = .keys,
+            .next_page = 51,
+            .unknown1 = 13484,
+            .packed_row_counts = .{ .num_rows = 1, .num_rows_valid = 1 },
+            // The 13-byte row aligns to 16 bytes; the new group's header
+            // (4) and the offset slot (2) are charged besides.
+            .free_size = 2978,
+            .used_size = 16,
+        },
+        .content = .{ .data = .{
+            .row_groups = try a.dupe(RowGroup, &.{.{ .row_presence_flags = 0x0001 }}),
+            .rows = try a.dupe(RowAtOffset, &.{.{ .offset = 0x0000, .row = row }}),
+        } },
+    };
+    try testing.expect(page.eql(&expected));
+}
+
+test "allocRow with room in the existing group charges only the offset" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const row1 = try testKeyRow(a, 1, "Emin");
+    var page = Page{
+        .header = .{
+            .page_index = 12,
+            .page_type = .keys,
+            .next_page = 51,
+            .unknown1 = 13484,
+            .packed_row_counts = .{ .num_rows = 1, .num_rows_valid = 1 },
+            .free_size = 2978,
+            .used_size = 16,
+        },
+        .content = .{ .data = .{
+            .row_groups = try a.dupe(RowGroup, &.{.{ .row_presence_flags = 0x0001 }}),
+            .rows = try a.dupe(RowAtOffset, &.{.{ .offset = 0x0000, .row = row1 }}),
+        } },
+    };
+
+    var row2 = try testKeyRow(a, 2, "Fmaj");
+    const ticket = (try page.allocRow(a, row2.heapBytesRequired())).?;
+    try page.commitRow(a, ticket, row2);
+
+    var expected_group = RowGroup{ .row_presence_flags = 0x0003 };
+    expected_group.row_offsets[14] = 0x0010;
+    const expected = Page{
+        .header = .{
+            .page_index = 12,
+            .page_type = .keys,
+            .next_page = 51,
+            .unknown1 = 13484,
+            .packed_row_counts = .{ .num_rows = 2, .num_rows_valid = 2 },
+            // Again 16 aligned bytes plus the one offset slot.
+            .free_size = 2960,
+            .used_size = 32,
+        },
+        .content = .{ .data = .{
+            .row_groups = try a.dupe(RowGroup, &.{expected_group}),
+            .rows = try a.dupe(RowAtOffset, &.{
+                .{ .offset = 0x0000, .row = row1 },
+                .{ .offset = 0x0010, .row = row2 },
+            }),
+        } },
+    };
+    try testing.expect(page.eql(&expected));
+}
+
+test "an uncommitted allocRow leaves the interrupted state" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const row1 = try testKeyRow(a, 1, "Emin");
+    var page = Page{
+        .header = .{
+            .page_index = 12,
+            .page_type = .keys,
+            .next_page = 51,
+            .unknown1 = 13484,
+            .packed_row_counts = .{ .num_rows = 1, .num_rows_valid = 1 },
+            .free_size = 2978,
+            .used_size = 16,
+        },
+        .content = .{ .data = .{
+            .row_groups = try a.dupe(RowGroup, &.{.{ .row_presence_flags = 0x0001 }}),
+            .rows = try a.dupe(RowAtOffset, &.{.{ .offset = 0x0000, .row = row1 }}),
+        } },
+    };
+
+    // Dropped without a commit: the offset slot and `num_rows` account
+    // for the row, the presence bit and `num_rows_valid` do not.
+    _ = (try page.allocRow(a, 16)).?;
+
+    var expected_group = RowGroup{ .row_presence_flags = 0x0001 };
+    expected_group.row_offsets[14] = 0x0010;
+    const expected = Page{
+        .header = .{
+            .page_index = 12,
+            .page_type = .keys,
+            .next_page = 51,
+            .unknown1 = 13484,
+            .packed_row_counts = .{ .num_rows = 2, .num_rows_valid = 1 },
+            .free_size = 2960,
+            .used_size = 32,
+        },
+        .content = .{ .data = .{
+            .row_groups = try a.dupe(RowGroup, &.{expected_group}),
+            .rows = try a.dupe(RowAtOffset, &.{.{ .offset = 0x0000, .row = row1 }}),
+        } },
+    };
+    try testing.expect(page.eql(&expected));
+}
+
+test "allocRow opens a second row group when the first is full" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var page = try fullKeysPage(a);
+    var row = try testKeyRow(a, 17, "Amaj");
+    const ticket = (try page.allocRow(a, row.heapBytesRequired())).?;
+    try page.commitRow(a, ticket, row);
+
+    var second_group = RowGroup{ .row_presence_flags = 0x0001 };
+    second_group.row_offsets[15] = 0x00EC;
+    var expected = try fullKeysPage(a);
+    expected.header.packed_row_counts = .{ .num_rows = 17, .num_rows_valid = 17 };
+    expected.header.free_size = 1978;
+    expected.header.used_size = 0x00FC;
+    expected.content.data.row_groups = try a.realloc(
+        expected.content.data.row_groups,
+        2,
+    );
+    expected.content.data.row_groups[1] = second_group;
+    expected.content.data.rows = try a.realloc(expected.content.data.rows, 17);
+    expected.content.data.rows[16] = .{ .offset = 0x00EC, .row = row };
+    try testing.expect(page.eql(&expected));
+}
+
+test "allocRow returns null on a full page without mutating it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A tiny free size fakes a full page without constructing any rows.
+    var page = Page{
+        .header = .{
+            .page_index = 12,
+            .page_type = .keys,
+            .next_page = 51,
+            .unknown1 = 13484,
+            .free_size = 1,
+        },
+        .content = .{ .data = .{} },
+    };
+
+    var row = try testKeyRow(a, 1, "Emin");
+    try testing.expect((try page.allocRow(a, row.heapBytesRequired())) == null);
+    try testing.expectEqual(@as(u16, 0), page.header.used_size);
+    try testing.expectEqual(@as(u16, 1), page.header.free_size);
+    try testing.expectEqual(@as(u13, 0), page.header.packed_row_counts.num_rows);
+
+    // Index pages never allocate rows at all.
+    var index_page = Page.newIndex(12, .keys, 0x03FF_FFFF);
+    try testing.expect((try index_page.allocRow(a, 16)) == null);
 }
