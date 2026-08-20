@@ -1565,8 +1565,9 @@ pub const PlaylistTreeNode = struct {
     }
 };
 
-/// The string fields of a Track row, stored behind its offset array in
-/// this fixed slot order — the order of the offsets in the file.
+/// The string fields of a Track row, stored behind its offset array. The
+/// fields' declaration order is the fixed slot order — the order of the
+/// offsets in the file.
 pub const TrackStrings = struct {
     /// International Standard Recording Code (ISRC), in mangled format.
     isrc: DeviceSQLString = DeviceSQLString.empty(),
@@ -1614,49 +1615,24 @@ pub const TrackStrings = struct {
     /// Path of the file.
     file_path: DeviceSQLString = DeviceSQLString.empty(),
 
-    pub const offset_count = 21;
+    /// One offset and slot per field, in declaration order.
+    pub const offset_count = std.meta.fields(@This()).len;
     pub const OffsetItem = DeviceSQLString;
 
     pub fn offsetItems(inner: TrackStrings) [offset_count]DeviceSQLString {
-        return .{
-            inner.isrc,                      inner.lyricist,
-            inner.unknown_string2,           inner.unknown_string3,
-            inner.unknown_string4,           inner.message,
-            inner.publish_track_information, inner.autoload_hotcues,
-            inner.unknown_string5,           inner.unknown_string6,
-            inner.date_added,                inner.release_date,
-            inner.mix_name,                  inner.unknown_string7,
-            inner.analyze_path,              inner.analyze_date,
-            inner.comment,                   inner.title,
-            inner.unknown_string8,           inner.filename,
-            inner.file_path,
-        };
+        var items: [offset_count]DeviceSQLString = undefined;
+        inline for (std.meta.fields(TrackStrings), 0..) |field, i| {
+            items[i] = @field(inner, field.name);
+        }
+        return items;
     }
 
     pub fn fromOffsetItems(items: [offset_count]DeviceSQLString) TrackStrings {
-        return .{
-            .isrc = items[0],
-            .lyricist = items[1],
-            .unknown_string2 = items[2],
-            .unknown_string3 = items[3],
-            .unknown_string4 = items[4],
-            .message = items[5],
-            .publish_track_information = items[6],
-            .autoload_hotcues = items[7],
-            .unknown_string5 = items[8],
-            .unknown_string6 = items[9],
-            .date_added = items[10],
-            .release_date = items[11],
-            .mix_name = items[12],
-            .unknown_string7 = items[13],
-            .analyze_path = items[14],
-            .analyze_date = items[15],
-            .comment = items[16],
-            .title = items[17],
-            .unknown_string8 = items[18],
-            .filename = items[19],
-            .file_path = items[20],
-        };
+        var inner: TrackStrings = undefined;
+        inline for (std.meta.fields(TrackStrings), 0..) |field, i| {
+            @field(inner, field.name) = items[i];
+        }
+        return inner;
     }
 
     pub fn eql(a: TrackStrings, b: TrackStrings) bool {
