@@ -5791,3 +5791,68 @@ test "created databases carry the default color, column, and menu rows" {
     defer alloc.free(out2);
     try testing.expectEqualSlices(u8, out, out2);
 }
+
+/// Counts the track rows with `rating`, by walking the tracks table's
+/// page chain.
+fn countTracks(db: *const Database, rating: u8) !usize {
+    const table = db.header.findTable(.tracks) orelse return error.NoTable;
+    var count: usize = 0;
+    var current = table.first_page;
+    while (true) {
+        const page = switch (db.pages[current - 1]) {
+            .page => |*page| page,
+            .raw => return error.UnparsedPage,
+        };
+        switch (page.content) {
+            .data => |*content| for (content.rows) |*at| switch (at.row) {
+                .track => |*track| {
+                    if (track.rating == rating) count += 1;
+                },
+                else => {},
+            },
+            .index => {},
+        }
+        if (current == table.last_page) return count;
+        current = page.header.next_page;
+    }
+}
+
+test "num_rows mutation: set all track ratings and round-trip" {
+    const alloc = testing.allocator;
+    var db = try parseNumRows(alloc);
+    defer db.deinit();
+
+    // Set the rating of every track to 5 stars (ported from rekordcrate's
+    // tests/test_pdb_write.rs); the fixed-size edit leaves every row's
+    // serialized length unchanged.
+    const table = db.header.findTable(.tracks).?;
+    var current = table.first_page;
+    while (true) {
+        const page = &db.pages[current - 1].page;
+        switch (page.content) {
+            .data => |*content| for (content.rows) |*at| switch (at.row) {
+                .track => |*track| track.rating = 5,
+                else => {},
+            },
+            .index => {},
+        }
+        if (current == table.last_page) break;
+        current = page.header.next_page;
+    }
+
+    // rekordcrate's flush validates every track row before writing.
+    try db.validateAllTrackRows();
+
+    const out = try db.serialize(alloc);
+    defer alloc.free(out);
+    var reparsed = try Database.parse(alloc, out, .plain);
+    defer reparsed.deinit();
+
+    try testing.expectEqual(@as(usize, 3886), try countTracks(&reparsed, 5));
+    try testing.expectEqual(@as(usize, 0), try countTracks(&reparsed, 0));
+
+    // The mutated image re-serializes byte-stable.
+    const out2 = try reparsed.serialize(alloc);
+    defer alloc.free(out2);
+    try testing.expectEqualSlices(u8, out, out2);
+}
