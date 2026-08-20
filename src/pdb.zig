@@ -2492,6 +2492,62 @@ fn parsePage(
     return .{ .page = try Page.decode(&c, alloc, page_size, db_type) };
 }
 
+// Modification layer, ported from the `allocate_row`, `add_row`, and
+// `create` logic of rekordcrate's `src/pdb/mod.rs` and `src/pdb/io.rs`
+// plus its `src/pdb/defaults.rs`.
+
+/// Minimum value for the allocated (4-byte-aligned) size of a Track row,
+/// in bytes: a CDJ-350 crashes entering its "TRACK" menu when any track
+/// row is shorter than this; 221 was the smallest value found to avoid
+/// the crash (by trial and error). Device-derived constant — copy
+/// exactly; any "cleanup" here is a latent CDJ crash.
+pub const min_track_allocated_size: u16 = 221;
+
+/// A row's allocated size: its heap bytes rounded up to the 4-byte
+/// alignment rows are placed at.
+pub fn allocatedRowSize(row_size: u16) u16 {
+    return @intCast(std.mem.alignForward(usize, row_size, row_alignment));
+}
+
+/// Rejects Track rows whose allocated size is below
+/// `min_track_allocated_size`; `addRow` enforces it, and the device
+/// writer enforces it on whole databases before serializing (see
+/// `Database.validateAllTrackRows`).
+pub fn validateTrackRowSize(track: *const Track) error{TrackRowTooSmall}!void {
+    if (allocatedRowSize(rowHeapBytesRequired(Track, track.*)) < min_track_allocated_size)
+        return error.TrackRowTooSmall;
+}
+
+/// Grows the row's `comment` with trailing spaces — semantically harmless
+/// free text — until `validateTrackRowSize` passes, the padding
+/// rekordcrate's high-level writer applies (only `comment` is re-encoded
+/// per pass, like the oracle). Strings are created with `alloc`, which
+/// must be the allocator the row's strings use; each replaced comment is
+/// freed, so nothing leaks under a general allocator (an arena reclaims
+/// everything at once).
+pub fn padTrackCommentToMinimum(
+    track: *Track,
+    alloc: std.mem.Allocator,
+) error{ TooLong, InvalidEncoding, OutOfMemory }!void {
+    var text = std.ArrayList(u8).empty;
+    defer text.deinit(alloc);
+    const current = try track.offsets.inner.comment.utf8(alloc);
+    defer alloc.free(current);
+    try text.appendSlice(alloc, current);
+
+    while (true) {
+        const candidate = try DeviceSQLString.fromUtf8(alloc, text.items);
+        var replaced = track.offsets.inner.comment;
+        track.offsets.inner.comment = candidate;
+        replaced.deinit(alloc);
+        validateTrackRowSize(track) catch {
+            try text.append(alloc, ' ');
+            continue;
+        };
+        return;
+    }
+}
+
 
 const testing = std.testing;
 
@@ -5008,4 +5064,41 @@ test "allocRow returns null on a full page without mutating it" {
     // Index pages never allocate rows at all.
     var index_page = Page.newIndex(12, .keys, 0x03FF_FFFF);
     try testing.expect((try index_page.allocRow(a, 16)) == null);
+}
+
+/// The undersized Track row of rekordcrate's
+/// `test_add_row_rejects_undersized_track_row`: 200 heap bytes (92 fixed
+/// + 44 offset array + 64 string bytes), already 4-aligned, still below
+/// the 221-byte minimum.
+fn undersizedTestTrack(a: std.mem.Allocator) !Track {
+    return .{
+        .id = 1,
+        .artist_id = 1,
+        .album_id = 1,
+        .offsets = .{ .inner = .{
+            .title = try DeviceSQLString.fromUtf8(a, "Music"),
+            .filename = try DeviceSQLString.fromUtf8(a, "02 - Music.mp3"),
+            .file_path = try DeviceSQLString.fromUtf8(a, "/Contents/02 - Music.mp3"),
+        } },
+    };
+}
+
+test "padTrackCommentToMinimum grows the comment to the row minimum" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var track = try undersizedTestTrack(a);
+    try padTrackCommentToMinimum(&track, a);
+    try validateTrackRowSize(&track);
+
+    // 21 spaces grow the empty comment from 1 to 22 bytes: 200 + 21 = 221
+    // heap bytes, 224 allocated.
+    try testing.expectEqual(
+        @as(u16, 224),
+        allocatedRowSize(rowHeapBytesRequired(Track, track)),
+    );
+    const text = try track.offsets.inner.comment.utf8(a);
+    try testing.expectEqual(@as(usize, 21), text.len);
+    try testing.expect(std.mem.allEqual(u8, text, ' '));
 }
