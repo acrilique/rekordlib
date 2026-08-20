@@ -789,7 +789,10 @@ pub const IndexPageHeader = struct {
     magic: u16 = 0x03EC,
     /// Offset where the next index entry will be written, from the
     /// beginning of the entries array. Sometimes differs from
-    /// `num_entries` for unknown reasons.
+    /// `num_entries` for unknown reasons; observed naming a slot past the
+    /// declared entries, and the slots it covers can hold live entries
+    /// that `num_entries` does not count — `decode` reads up to it so
+    /// those entries survive a write.
     next_offset: u16 = 0,
     /// Redundant copy of the page index.
     page_index: u32 = 0,
@@ -797,8 +800,9 @@ pub const IndexPageHeader = struct {
     next_page: u32 = 0,
     /// Magic value `0x0000_0000_03ff_ffff`.
     magic2: u64 = 0x0000_0000_03FF_FFFF,
-    /// Number of index entries in this page; re-derived from `entries`
-    /// when the content is written.
+    /// Number of index entries this page declares. Real pages sometimes
+    /// carry meaningful entries beyond this count (see `next_offset`);
+    /// written verbatim, never re-derived.
     num_entries: u16 = 0,
     /// Points to the first empty index entry, or `0x1fff` if none. In
     /// real databases this is either equal to `num_entries`, `0x1fff`
@@ -823,32 +827,34 @@ const index_page_zero_tail = 20;
 /// The content of an index page: a header followed by the index entries
 /// pointing at the table's data pages. Serializing writes the entries,
 /// pads with empty entries up to the page's capacity, and terminates with
-/// 20 zero bytes; parsing reads only the real entries.
+/// 20 zero bytes; parsing reads the declared entries and any live ones
+/// `next_offset` covers beyond them.
 pub const IndexPageContent = struct {
     header: IndexPageHeader = .{},
     entries: []IndexEntry = &.{},
 
-    /// Reads the header (validating its magics) and exactly
-    /// `num_entries` entries; the padding entries and trailing zeros are
-    /// not read.
+    /// Reads the header (validating its magics) and
+    /// `max(num_entries, next_offset)` entries; the padding entries and
+    /// trailing zeros are not read. The count covers the undeclared live
+    /// entries real pages carry past `num_entries` (see `next_offset`).
     pub fn decode(c: *bin.Cursor, alloc: std.mem.Allocator) IndexPageDecodeError!IndexPageContent {
         const header = try bin.takeStruct(c, IndexPageHeader, .little);
         try bin.validateConstantFields(IndexPageHeader, header);
-        const entries = try bin.takeStructSlice(alloc, c, IndexEntry, .little, header.num_entries);
+        const read_count: usize = @max(header.num_entries, header.next_offset);
+        const entries = try bin.takeStructSlice(alloc, c, IndexEntry, .little, read_count);
         return .{ .header = header, .entries = entries };
     }
 
-    /// Writes the header with `num_entries` derived from `entries`, the
-    /// entries, `totalEntries(page_size) - entries.len` empty entries,
-    /// and the trailing zeros.
+    /// Writes the header with its verbatim `num_entries`, the entries,
+    /// `totalEntries(page_size) - entries.len` empty entries, and the
+    /// trailing zeros.
     pub fn encode(self: *const IndexPageContent, e: *bin.Emitter, page_size: usize) IndexPageEncodeError!void {
-        if (self.entries.len > std.math.maxInt(u16)) return error.UnexpectedValue;
+        if (self.entries.len > std.math.maxInt(u16) or
+            self.entries.len < self.header.num_entries) return error.UnexpectedValue;
         const capacity = try totalEntries(page_size);
         if (self.entries.len > capacity) return error.UnexpectedValue;
 
-        var header = self.header;
-        header.num_entries = @intCast(self.entries.len);
-        try bin.putStruct(e, header, .little);
+        try bin.putStruct(e, self.header, .little);
         for (self.entries) |entry| try bin.putStruct(e, entry, .little);
         for (self.entries.len..capacity) |_| try bin.putStruct(e, IndexEntry.empty, .little);
         try e.pad(index_page_zero_tail);
