@@ -8,12 +8,14 @@
 //! types; the offset arrays that locate strings and other tail data
 //! within rows; the page headers with index pages; and data pages with
 //! all plain row types, from the simple ones to artist, album, playlist
-//! tree node, and track. The ext rows, tables, and the whole-file
-//! database are not implemented yet.
+//! tree node, and track, plus the tag rows of `exportExt.pdb` databases.
+//! The track-tag ext rows, tables, and the whole-file database are not
+//! implemented yet.
 //!
 //! Initially ported from rekordcrate's `src/pdb/string.rs`,
-//! `src/pdb/offset_array.rs`, `src/pdb/bitfields.rs`, and the page,
-//! index-page, data-page, and row parts of `src/pdb/mod.rs`
+//! `src/pdb/offset_array.rs`, `src/pdb/bitfields.rs`, `src/pdb/ext.rs`,
+//! and the page, index-page, data-page, and row parts of
+//! `src/pdb/mod.rs`
 //!
 //! - <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/exports.html#devicesql-strings>
 
@@ -666,9 +668,10 @@ pub const DatabaseType = enum {
 
 /// The type of rows a page holds, as stored in page headers and table
 /// entries: the wire constants of `export.pdb` tables. In `exportExt.pdb`
-/// databases values 3 and 4 carry the ext meanings (tags, track tags)
-/// instead of albums and labels; distinguishing the two arrives with the
-/// ext row support. Unknown values roundtrip verbatim.
+/// databases values 3 and 4 carry the ext meanings (tags, track tags,
+/// see `ExtPageType`) instead of albums and labels; `DatabaseType`
+/// selects the meaning during row dispatch. Unknown values roundtrip
+/// verbatim.
 pub const PageType = enum(u32) {
     /// Track metadata: title, artist, genre, artwork ID, playing time, etc.
     tracks = 0,
@@ -703,6 +706,18 @@ pub const PageType = enum(u32) {
     /// Synchronization of the USB with rekordbox or a device.
     history = 19,
     _,
+};
+
+/// The type of ext pages found inside a `Table` of `exportExt.pdb`
+/// files, where the wire values 3 and 4 carry these meanings instead of
+/// albums and labels (see `DatabaseType`). Unknown values have no ext
+/// meaning and fail row dispatch with `error.NotImplemented`.
+pub const ExtPageType = enum(u32) {
+    /// Rows that can be assigned to tracks for the purpose of
+    /// categorization.
+    tag = 3,
+    /// Rows holding the associations between tag ids and track ids.
+    track_tag = 4,
 };
 
 /// Packed field in the page header containing the number of used row
@@ -1466,11 +1481,90 @@ pub const Track = struct {
     pub const page_type: PageType = .tracks;
 };
 
+/// The strings associated with a tag or category, stored behind the row's
+/// offset array. The fields' declaration order is the fixed slot order —
+/// the order of the offsets in the file.
+pub const TagOrCategoryStrings = struct {
+    /// The name of the tag or category.
+    name: DeviceSQLString = DeviceSQLString.empty(),
+    /// String with unknown purpose, often empty.
+    unknown: DeviceSQLString = DeviceSQLString.empty(),
+
+    /// One offset and slot per field, in declaration order.
+    pub const offset_count = 2;
+    pub const OffsetItem = DeviceSQLString;
+    const protocol = OffsetItemsOf(@This(), DeviceSQLString);
+    pub const offsetItems = protocol.offsetItems;
+    pub const fromOffsetItems = protocol.fromOffsetItems;
+    pub const eql = protocol.eql;
+};
+
+/// A tag or category that can be assigned to tracks for the purpose of
+/// categorization, from the tag tables of `exportExt.pdb`. A non-zero
+/// `raw_is_category` marks a category row; tag rows reference their
+/// category through `parent_id`.
+pub const TagOrCategory = struct {
+    /// Selects the offset width of the trailing offset array; observed
+    /// values are `0x0680` (u8 offsets) and `0x0684` (u16).
+    subtype: u16 = 0x0680,
+    /// Unknown field, called `index_shift` elsewhere; appears to always
+    /// be `0x20 * row index`.
+    index_shift: u16 = 0,
+    /// Unknown purpose; not always zero.
+    unknown1: u32 = 0,
+    /// Unknown purpose; not always zero.
+    unknown2: u32 = 0,
+    /// ID of the parent category row, or 0 when there is no parent
+    /// (rekordcrate's `Option<NonZero<u32>>` collapsed to the wire
+    /// value it serializes to).
+    parent_id: u32 = 0,
+    /// Zero-based position at which this tag is displayed within its
+    /// category; for a category row, the position of the category within
+    /// the category list.
+    position: u32 = 0,
+    /// Numeric ID of the tag or category.
+    id: u32 = 0,
+    /// Non-zero (observed: `1 << 24`) when this row represents a category
+    /// rather than a tag.
+    raw_is_category: u32 = 0,
+    /// The offsets and the strings at the end of the row (base `0x1C`,
+    /// the fixed-field size).
+    offsets: OffsetArrayContainer(TagOrCategoryStrings) = .{},
+
+    pub const ext_page_type: ExtPageType = .tag;
+};
+
+/// Whether rows of type `T` live in pages of `page_type` in a database of
+/// `db_type`: plain row types declare `page_type`, ext row types declare
+/// `ext_page_type` — whose wire values collide with plain meanings
+/// (albums, labels), hence the database-type gate.
+fn rowMatchesPageType(
+    comptime T: type,
+    page_type: PageType,
+    db_type: DatabaseType,
+) bool {
+    if (comptime @hasDecl(T, "page_type")) {
+        return db_type == .plain and T.page_type == page_type;
+    } else {
+        return db_type == .ext and
+            @intFromEnum(page_type) == @intFromEnum(T.ext_page_type);
+    }
+}
+
+/// The page-type wire value rows of type `T` dispatch on: the `page_type`
+/// decl of plain row types, or the raw value of an ext row type's
+/// `ext_page_type`, which collides with a plain meaning.
+fn rowPageType(comptime T: type) PageType {
+    if (@hasDecl(T, "page_type")) return T.page_type;
+    return @enumFromInt(@intFromEnum(T.ext_page_type));
+}
+
 /// A table row. Each variant is a plain field-declaration list whose
 /// fields are serialized in declaration order by the generic row codec
-/// (`decodeRow` and siblings); each declares its `page_type`, which
-/// selects it in `decode`. Unknown page type values fail with
-/// `error.NotImplemented` until the ext rows land.
+/// (`decodeRow` and siblings); each declares its `page_type` (plain rows)
+/// or its `ext_page_type` (ext rows), which selects it in `decode` for
+/// the matching database type. Page types of the other database type and
+/// unknown page type values fail with `error.NotImplemented`.
 pub const Row = union(enum) {
     genre: Genre,
     label: Label,
@@ -1487,18 +1581,17 @@ pub const Row = union(enum) {
     history: History,
     column_entry: ColumnEntry,
     menu: Menu,
+    tag: TagOrCategory,
 
     /// Reads the row for `page_type` from `c`, which starts at the row's
-    /// heap offset. Plain row types only dispatch in plain databases;
-    /// pages of the other database type, and unknown page type values,
-    /// fail with `error.NotImplemented` until the ext rows land.
+    /// heap offset, dispatching per `rowMatchesPageType`.
     pub fn decode(
         c: *bin.Cursor,
         page_type: PageType,
         db_type: DatabaseType,
     ) RowDecodeError!Row {
         return inline for (std.meta.fields(Row)) |field| {
-            if (field.type.page_type == page_type and db_type == .plain)
+            if (rowMatchesPageType(field.type, page_type, db_type))
                 break @unionInit(Row, field.name, try decodeRow(field.type, c));
         } else error.NotImplemented;
     }
@@ -1517,10 +1610,12 @@ pub const Row = union(enum) {
         };
     }
 
-    /// The page type rows of this variant belong to.
+    /// The page type rows of this variant belong to; for ext rows this is
+    /// the raw wire value, whose plain meaning differs — pair it with the
+    /// database type before comparing against page headers.
     pub fn pageType(self: Row) PageType {
         return switch (self) {
-            inline else => |row| @TypeOf(row).page_type,
+            inline else => |row| comptime rowPageType(@TypeOf(row)),
         };
     }
 
@@ -1540,15 +1635,24 @@ pub const Row = union(enum) {
     }
 };
 
-// Row types must declare pairwise distinct `page_type`s: `Row.decode`
-// dispatches on first match, so a duplicate would silently parse one
-// type's bytes as another — a live risk when the ext rows arrive, since
-// `exportExt.pdb` reuses values 3 and 4 with different meanings.
+// Row types must declare pairwise distinct dispatch keys within each
+// database type: `Row.decode` dispatches on first match, so a duplicate
+// would silently parse one type's bytes as another. Ext row types
+// deliberately reuse the wire values 3 and 4 that mean albums and labels
+// in plain databases, which is safe only because the database-type gate
+// keeps the two classes apart.
 comptime {
     const fields = std.meta.fields(Row);
     for (fields, 0..) |a, i| {
         for (fields[i + 1 ..]) |b| {
-            if (a.type.page_type == b.type.page_type)
+            const clash =
+                if (@hasDecl(a.type, "page_type") and @hasDecl(b.type, "page_type"))
+                    a.type.page_type == b.type.page_type
+                else if (@hasDecl(a.type, "ext_page_type") and @hasDecl(b.type, "ext_page_type"))
+                    @intFromEnum(a.type.ext_page_type) == @intFromEnum(b.type.ext_page_type)
+                else
+                    false;
+            if (clash)
                 @compileError(
                     "row types " ++ @typeName(a.type) ++ " and " ++
                         @typeName(b.type) ++ " declare the same page type",
@@ -2758,7 +2862,7 @@ const testutil = @import("testutil");
 /// database of `db_type` and re-serializes it, for
 /// `testutil.expectFixturesRoundtrip`. The page size is the fixture
 /// length; page types whose rows are not wired for `db_type` fail with
-/// `error.NotImplemented` (the ext rows land with P6).
+/// `error.NotImplemented` (the track-tag rows land next).
 fn roundtripPage(
     alloc: std.mem.Allocator,
     input: []const u8,
@@ -2789,6 +2893,11 @@ fn roundtripPlainPage(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     return roundtripPage(alloc, input, .plain);
 }
 
+/// `roundtripPage` for ext databases.
+fn roundtripExtPage(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+    return roundtripPage(alloc, input, .ext);
+}
+
 test "index page fixture roundtrips byte-identical" {
     try testutil.expectFixturesRoundtrip(roundtripPlainPage, "index_page", 1);
 }
@@ -2814,9 +2923,84 @@ test "artist, album, and playlist tree page fixtures roundtrip byte-identical" {
 }
 
 test "track page fixture roundtrips byte-identical" {
-    // The full prefix, so the ext-database track_tag_page fixture (P6)
-    // does not match.
+    // The full prefix, so the ext-database track_tag_page fixture does
+    // not match.
     try testutil.expectFixturesRoundtrip(roundtripPlainPage, "track_page", 1);
+}
+
+test "tag page fixture roundtrips byte-identical" {
+    try testutil.expectFixturesRoundtrip(roundtripExtPage, "tag_page", 1);
+}
+
+test "tag page fixture parses with known field values" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, "testdata/pdb/unit_tests", .{});
+    defer dir.close(io);
+    const bytes = try dir.readFileAlloc(io, "tag_page.bin", alloc, .limited(1 << 16));
+    defer alloc.free(bytes);
+
+    var c = bin.Cursor.initAlloc(alloc, bytes);
+    const header = try bin.takeStruct(&c, PageHeader, .little);
+    try testing.expectEqual(@as(u32, 8), header.page_index);
+    try testing.expectEqual(
+        @intFromEnum(ExtPageType.tag),
+        @intFromEnum(header.page_type),
+    );
+    try testing.expectEqual(@as(u32, 20), header.next_page);
+    try testing.expectEqual(@as(u32, 2), header.unknown1);
+    try testing.expectEqual(@as(u32, 23), header.packed_row_counts.num_rows);
+    try testing.expectEqual(@as(u32, 23), header.packed_row_counts.num_rows_valid);
+    try testing.expectEqual(@as(u16, 2770), header.free_size);
+    try testing.expectEqual(@as(u16, 1232), header.used_size);
+
+    var content = try DataPageContent.decode(&c, alloc, bytes.len, header, .ext);
+    defer content.deinit(alloc);
+    try testing.expectEqual(@as(u16, 23), content.header.unknown5);
+
+    // Two row groups; both carry the same value in `unknown` as in the
+    // presence flags (a full group and a 7-of-16 one).
+    try testing.expectEqual(@as(usize, 2), content.row_groups.len);
+    try testing.expectEqual(@as(u16, 0xFFFF), content.row_groups[0].row_presence_flags);
+    try testing.expectEqual(@as(u16, 0xFFFF), content.row_groups[0].unknown);
+    try testing.expectEqual(@as(u16, 0x007F), content.row_groups[1].row_presence_flags);
+    try testing.expectEqual(@as(u16, 0x007F), content.row_groups[1].unknown);
+
+    // 23 rows: 16 in the first group, 7 in the second.
+    try testing.expectEqual(@as(usize, 23), content.rows.len);
+    try testing.expectEqual(@as(u16, 0x0000), content.rows[0].offset);
+    try testing.expectEqual(@as(u16, 0x0038), content.rows[1].offset);
+    try testing.expectEqual(@as(u16, 0x0354), content.rows[16].offset);
+
+    // The first row is the category "TagCategory1".
+    var category_name = try DeviceSQLString.fromUtf8(alloc, "TagCategory1");
+    defer category_name.deinit(alloc);
+    const first = content.rows[0].row.tag;
+    try testing.expectEqual(@as(u16, 0x0680), first.subtype);
+    try testing.expectEqual(@as(u16, 0), first.index_shift);
+    try testing.expectEqual(@as(u32, 0), first.unknown1);
+    try testing.expectEqual(@as(u32, 0), first.unknown2);
+    try testing.expectEqual(@as(u32, 0), first.parent_id);
+    try testing.expectEqual(@as(u32, 0), first.position);
+    try testing.expectEqual(@as(u32, 1), first.id);
+    try testing.expectEqual(@as(u32, 1) << 24, first.raw_is_category);
+    try testing.expect(category_name.eql(first.offsets.inner.name));
+    try testing.expect(DeviceSQLString.empty().eql(first.offsets.inner.unknown));
+
+    // The second is a tag in that category, with a random-looking id.
+    const second = content.rows[1].row.tag;
+    try testing.expectEqual(@as(u16, 0x20), second.index_shift);
+    try testing.expectEqual(@as(u32, 1), second.parent_id);
+    try testing.expectEqual(@as(u32, 0xCE03_BAA5), second.id);
+    try testing.expectEqual(@as(u32, 0), second.raw_is_category);
+
+    // The fourth is the second category, a root like the first.
+    const fourth = content.rows[3].row.tag;
+    try testing.expectEqual(@as(u16, 0x60), fourth.index_shift);
+    try testing.expectEqual(@as(u32, 0), fourth.parent_id);
+    try testing.expectEqual(@as(u32, 1), fourth.position);
+    try testing.expectEqual(@as(u32, 2), fourth.id);
+    try testing.expectEqual(@as(u32, 1) << 24, fourth.raw_is_category);
 }
 
 // Data page and simple row tests, ported from the row tests of
@@ -3105,6 +3289,39 @@ test "track row roundtrips" {
     );
 }
 
+test "tag row roundtrips" {
+    var name = try DeviceSQLString.fromUtf8(testing.allocator, "TagCategory1");
+    defer name.deinit(testing.allocator);
+    // The first row of the tag_page fixture: a category. The parse ends
+    // directly after the offsets: 0x1C fixed fields plus the u8 magic and
+    // 2 u8 offsets.
+    try expectRowRoundtrip(
+        TagOrCategory,
+        &.{
+            0x80, 0x06, // subtype 0x0680
+            0x00, 0x00, // index_shift
+            0x00, 0x00, 0x00, 0x00, // unknown1
+            0x00, 0x00, 0x00, 0x00, // unknown2
+            0x00, 0x00, 0x00, 0x00, // parent_id
+            0x00, 0x00, 0x00, 0x00, // position
+            0x01, 0x00, 0x00, 0x00, // id
+            0x00, 0x00, 0x00, 0x01, // raw_is_category = 1 << 24
+            0x03, 0x1F, 0x2C, // offset array
+            0x1B, 'T', 'a', 'g', 'C', 'a', 't', 'e', 'g', 'o', 'r', 'y', '1',
+            0x03, // unknown: empty
+        },
+        .{
+            .id = 1,
+            .raw_is_category = 1 << 24,
+            .offsets = .{
+                .offsets = .{ .provided = .{ .size = .u8, .values = .{ 0x1F, 0x2C } } },
+                .inner = .{ .name = name, .unknown = DeviceSQLString.empty() },
+            },
+        },
+        0x1C + 3,
+    );
+}
+
 test "history row roundtrips" {
     var date = try DeviceSQLString.fromUtf8(testing.allocator, "2022-02-02");
     defer date.deinit(testing.allocator);
@@ -3218,6 +3435,72 @@ test "row decode dispatches by page type" {
         error.NotImplemented,
         Row.decode(&c5, .genres, .ext),
     );
+}
+
+test "row decode gates plain and ext dispatch by database type" {
+    const alloc = testing.allocator;
+
+    // The wire value 3 means albums in plain databases: valid album bytes
+    // parse as an album row only there.
+    var album_name = try DeviceSQLString.fromUtf8(alloc, "GOOD LUCK");
+    defer album_name.deinit(alloc);
+    var e = bin.Emitter.init(alloc);
+    defer e.deinit();
+    try encodeRow(
+        Album,
+        .{
+            .subtype = 0x80,
+            .artist_id = 2,
+            .id = 2,
+            .offsets = .{
+                .offsets = .{ .provided = .{ .size = .u8, .values = .{0x16} } },
+                .inner = .{ .name = album_name },
+            },
+        },
+        &e,
+    );
+    var c = bin.Cursor.initAlloc(alloc, e.written());
+    var album = try Row.decode(&c, .albums, .plain);
+    defer album.deinit(alloc);
+    try testing.expect(std.meta.activeTag(album) == .album);
+    // In an ext database the same wire value dispatches to the tag codec,
+    // which rejects the album layout.
+    var c2 = bin.Cursor.initAlloc(alloc, e.written());
+    try testing.expectError(error.InvalidFormat, Row.decode(&c2, .albums, .ext));
+
+    // The same wire value means tags in ext databases: valid tag bytes
+    // parse as a tag row there (and as an album in a plain database,
+    // whose codec rejects the tag layout).
+    var tag_name = try DeviceSQLString.fromUtf8(alloc, "TagCategory1");
+    defer tag_name.deinit(alloc);
+    var te = bin.Emitter.init(alloc);
+    defer te.deinit();
+    try encodeRow(
+        TagOrCategory,
+        .{
+            .id = 1,
+            .raw_is_category = 1 << 24,
+            .offsets = .{
+                .offsets = .{ .provided = .{ .size = .u8, .values = .{ 0x1F, 0x2C } } },
+                .inner = .{ .name = tag_name, .unknown = DeviceSQLString.empty() },
+            },
+        },
+        &te,
+    );
+    var c3 = bin.Cursor.initAlloc(alloc, te.written());
+    var tag = try Row.decode(
+        &c3,
+        @enumFromInt(@intFromEnum(ExtPageType.tag)),
+        .ext,
+    );
+    defer tag.deinit(alloc);
+    try testing.expect(std.meta.activeTag(tag) == .tag);
+    try testing.expectEqual(
+        @intFromEnum(ExtPageType.tag),
+        @intFromEnum(tag.pageType()),
+    );
+    var c4 = bin.Cursor.initAlloc(alloc, te.written());
+    try testing.expectError(error.InvalidFormat, Row.decode(&c4, .albums, .plain));
 }
 
 test "row group slots fill from the array end, presence bits upwards" {
