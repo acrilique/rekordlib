@@ -2121,30 +2121,14 @@ pub const DataPageContent = struct {
             try e.putBytesAt(heap_start + at.offset, sub.written());
         }
 
-        var group_bytes: [row_group_size]u8 = undefined;
         for (self.row_groups, 0..) |group, g| {
-            for (group.row_offsets, 0..) |offset, i| {
-                std.mem.writeInt(
-                    u16,
-                    group_bytes[2 * i ..][0..2],
-                    offset,
-                    .little,
-                );
-            }
-            std.mem.writeInt(
-                u16,
-                group_bytes[2 * row_group_max_rows ..][0..2],
-                group.row_presence_flags,
-                .little,
-            );
-            std.mem.writeInt(
-                u16,
-                group_bytes[2 * row_group_max_rows + 2 ..][0..2],
-                group.unknown,
-                .little,
-            );
+            var sub = bin.Emitter.init(e.alloc);
+            defer sub.deinit();
+            for (group.row_offsets) |offset| try sub.putInt(u16, offset, .little);
+            try sub.putInt(u16, group.row_presence_flags, .little);
+            try sub.putInt(u16, group.unknown, .little);
             const group_end = heap_end - row_group_size * g;
-            try e.putBytesAt(group_end - row_group_size, &group_bytes);
+            try e.putBytesAt(group_end - row_group_size, sub.written());
         }
         if (e.pos() < heap_end) try e.pad(heap_end - e.pos());
     }
