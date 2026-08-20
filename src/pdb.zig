@@ -470,6 +470,9 @@ pub fn Offsets(comptime n: usize) type {
 /// * `offsetItems(T) [n]OffsetItem`, a borrowing view, and
 ///   `fromOffsetItems([n]OffsetItem) T`, which takes item ownership
 /// * `eql(a: T, b: T) bool`
+///
+/// A `T` whose fields are all `OffsetItem`s can generate the last three
+/// declarations with `OffsetItemsOf`.
 pub fn OffsetArrayContainer(comptime T: type) type {
     const n = T.offset_count;
     const Item = T.OffsetItem;
@@ -593,6 +596,48 @@ pub fn OffsetArrayContainer(comptime T: type) type {
             if (Item == void) return;
             var items = T.offsetItems(self.inner);
             for (&items) |*item| item.deinit(alloc);
+        }
+    };
+}
+
+/// Generates the offset-array inner-type declarations — `offsetItems`,
+/// `fromOffsetItems`, and `eql` — for a `T` whose fields are all `Item`,
+/// mapping slots to fields in declaration order, which is the wire slot
+/// order. Zero-field types are allowed, with `Item` of `void`.
+fn OffsetItemsOf(comptime T: type, comptime Item: type) type {
+    const fields = std.meta.fields(T);
+    for (fields) |field| {
+        if (field.type != Item)
+            @compileError(
+                "OffsetItemsOf: every field of " ++ @typeName(T) ++
+                    " must be a " ++ @typeName(Item) ++ ", `" ++
+                    field.name ++ "` is not",
+            );
+    }
+    return struct {
+        pub fn offsetItems(inner: T) [fields.len]Item {
+            var items: [fields.len]Item = undefined;
+            inline for (fields, 0..) |field, i| {
+                items[i] = @field(inner, field.name);
+            }
+            return items;
+        }
+
+        pub fn fromOffsetItems(items: [fields.len]Item) T {
+            var inner: T = undefined;
+            inline for (fields, 0..) |field, i| {
+                @field(inner, field.name) = items[i];
+            }
+            return inner;
+        }
+
+        pub fn eql(a: T, b: T) bool {
+            const a_items = offsetItems(a);
+            const b_items = offsetItems(b);
+            inline for (0..fields.len) |i| {
+                if (!a_items[i].eql(b_items[i])) return false;
+            }
+            return true;
         }
     };
 }
@@ -1209,18 +1254,10 @@ pub const TrailingName = struct {
 
     pub const offset_count = 1;
     pub const OffsetItem = DeviceSQLString;
-
-    pub fn offsetItems(inner: TrailingName) [offset_count]DeviceSQLString {
-        return .{inner.name};
-    }
-
-    pub fn fromOffsetItems(items: [offset_count]DeviceSQLString) TrailingName {
-        return .{ .name = items[0] };
-    }
-
-    pub fn eql(a: TrailingName, b: TrailingName) bool {
-        return a.name.eql(b.name);
-    }
+    const protocol = OffsetItemsOf(@This(), DeviceSQLString);
+    pub const offsetItems = protocol.offsetItems;
+    pub const fromOffsetItems = protocol.fromOffsetItems;
+    pub const eql = protocol.eql;
 };
 
 /// Contains the artist name and ID.
@@ -1345,31 +1382,10 @@ pub const TrackStrings = struct {
     /// One offset and slot per field, in declaration order.
     pub const offset_count = std.meta.fields(@This()).len;
     pub const OffsetItem = DeviceSQLString;
-
-    pub fn offsetItems(inner: TrackStrings) [offset_count]DeviceSQLString {
-        var items: [offset_count]DeviceSQLString = undefined;
-        inline for (std.meta.fields(TrackStrings), 0..) |field, i| {
-            items[i] = @field(inner, field.name);
-        }
-        return items;
-    }
-
-    pub fn fromOffsetItems(items: [offset_count]DeviceSQLString) TrackStrings {
-        var inner: TrackStrings = undefined;
-        inline for (std.meta.fields(TrackStrings), 0..) |field, i| {
-            @field(inner, field.name) = items[i];
-        }
-        return inner;
-    }
-
-    pub fn eql(a: TrackStrings, b: TrackStrings) bool {
-        const a_items = a.offsetItems();
-        const b_items = b.offsetItems();
-        for (a_items, b_items) |a_item, b_item| {
-            if (!a_item.eql(b_item)) return false;
-        }
-        return true;
-    }
+    const protocol = OffsetItemsOf(@This(), DeviceSQLString);
+    pub const offsetItems = protocol.offsetItems;
+    pub const fromOffsetItems = protocol.fromOffsetItems;
+    pub const eql = protocol.eql;
 };
 
 /// The subtype every observed Track row carries: `0x24`, which selects
@@ -2135,18 +2151,10 @@ fn TestSingle(comptime Item: type) type {
 
         pub const offset_count = 1;
         pub const OffsetItem = Item;
-
-        pub fn offsetItems(inner: @This()) [offset_count]Item {
-            return .{inner.value};
-        }
-
-        pub fn fromOffsetItems(items: [offset_count]Item) @This() {
-            return .{ .value = items[0] };
-        }
-
-        pub fn eql(a: @This(), b: @This()) bool {
-            return a.value.eql(b.value);
-        }
+        const protocol = OffsetItemsOf(@This(), Item);
+        pub const offsetItems = protocol.offsetItems;
+        pub const fromOffsetItems = protocol.fromOffsetItems;
+        pub const eql = protocol.eql;
     };
 }
 
@@ -2158,18 +2166,10 @@ fn TestPair(comptime Item: type) type {
 
         pub const offset_count = 2;
         pub const OffsetItem = Item;
-
-        pub fn offsetItems(inner: @This()) [offset_count]Item {
-            return .{ inner.a, inner.b };
-        }
-
-        pub fn fromOffsetItems(items: [offset_count]Item) @This() {
-            return .{ .a = items[0], .b = items[1] };
-        }
-
-        pub fn eql(x: @This(), y: @This()) bool {
-            return x.a.eql(y.a) and x.b.eql(y.b);
-        }
+        const protocol = OffsetItemsOf(@This(), Item);
+        pub const offsetItems = protocol.offsetItems;
+        pub const fromOffsetItems = protocol.fromOffsetItems;
+        pub const eql = protocol.eql;
     };
 }
 
@@ -2178,18 +2178,10 @@ fn TestPair(comptime Item: type) type {
 const TestEmpty = struct {
     pub const offset_count = 0;
     pub const OffsetItem = void;
-
-    pub fn offsetItems(_: TestEmpty) [offset_count]void {
-        return .{};
-    }
-
-    pub fn fromOffsetItems(_: [offset_count]void) TestEmpty {
-        return .{};
-    }
-
-    pub fn eql(_: TestEmpty, _: TestEmpty) bool {
-        return true;
-    }
+    const protocol = OffsetItemsOf(@This(), void);
+    pub const offsetItems = protocol.offsetItems;
+    pub const fromOffsetItems = protocol.fromOffsetItems;
+    pub const eql = protocol.eql;
 };
 
 /// Two-string inner type for the heap-bytes tests, the analogue of
@@ -2201,18 +2193,10 @@ const TestStringPair = struct {
 
     pub const offset_count = 2;
     pub const OffsetItem = DeviceSQLString;
-
-    pub fn offsetItems(inner: TestStringPair) [offset_count]DeviceSQLString {
-        return .{ inner.a, inner.b };
-    }
-
-    pub fn fromOffsetItems(items: [offset_count]DeviceSQLString) TestStringPair {
-        return .{ .a = items[0], .b = items[1] };
-    }
-
-    pub fn eql(x: TestStringPair, y: TestStringPair) bool {
-        return x.a.eql(y.a) and x.b.eql(y.b);
-    }
+    const protocol = OffsetItemsOf(@This(), DeviceSQLString);
+    pub const offsetItems = protocol.offsetItems;
+    pub const fromOffsetItems = protocol.fromOffsetItems;
+    pub const eql = protocol.eql;
 };
 
 /// Mirrors rekordcrate's `test_roundtrip_with_args` at `array_offset` 0:
