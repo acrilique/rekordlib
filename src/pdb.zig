@@ -8,9 +8,9 @@
 //! types; the offset arrays that locate strings and other tail data
 //! within rows; the page headers with index pages; and data pages with
 //! all plain row types, from the simple ones to artist, album, playlist
-//! tree node, and track, plus the tag rows of `exportExt.pdb` databases.
-//! The track-tag ext rows, tables, and the whole-file database are not
-//! implemented yet.
+//! tree node, and track, plus the tag and track-tag rows of
+//! `exportExt.pdb` databases. The tables and the whole-file database
+//! are not implemented yet.
 //!
 //! Initially ported from rekordcrate's `src/pdb/string.rs`,
 //! `src/pdb/offset_array.rs`, `src/pdb/bitfields.rs`, `src/pdb/ext.rs`,
@@ -1534,6 +1534,26 @@ pub const TagOrCategory = struct {
     pub const ext_page_type: ExtPageType = .tag;
 };
 
+/// An M*N junction row between tags and tracks, from the track-tag
+/// tables of `exportExt.pdb`.
+pub const TrackTag = struct {
+    /// Magic value; always zero.
+    magic: u32 = 0,
+    /// The ID of the track.
+    track_id: u32 = 0,
+    /// The ID of the tag.
+    tag_id: u32 = 0,
+    /// Unknown purpose; seems to be always 3.
+    unknown_const: u32 = 3,
+
+    pub const ext_page_type: ExtPageType = .track_tag;
+
+    /// Fields that must hold their default value in all known files;
+    /// other values are rejected on parse (see
+    /// `bin.validateConstantFields`).
+    pub const constant_fields = .{.magic};
+};
+
 /// Whether rows of type `T` live in pages of `page_type` in a database of
 /// `db_type`: plain row types declare `page_type`, ext row types declare
 /// `ext_page_type` — whose wire values collide with plain meanings
@@ -1582,6 +1602,7 @@ pub const Row = union(enum) {
     column_entry: ColumnEntry,
     menu: Menu,
     tag: TagOrCategory,
+    track_tag: TrackTag,
 
     /// Reads the row for `page_type` from `c`, which starts at the row's
     /// heap offset, dispatching per `rowMatchesPageType`.
@@ -2862,7 +2883,7 @@ const testutil = @import("testutil");
 /// database of `db_type` and re-serializes it, for
 /// `testutil.expectFixturesRoundtrip`. The page size is the fixture
 /// length; page types whose rows are not wired for `db_type` fail with
-/// `error.NotImplemented` (the track-tag rows land next).
+/// `error.NotImplemented`.
 fn roundtripPage(
     alloc: std.mem.Allocator,
     input: []const u8,
@@ -3001,6 +3022,59 @@ test "tag page fixture parses with known field values" {
     try testing.expectEqual(@as(u32, 1), fourth.position);
     try testing.expectEqual(@as(u32, 2), fourth.id);
     try testing.expectEqual(@as(u32, 1) << 24, fourth.raw_is_category);
+}
+
+test "track tag page fixture roundtrips byte-identical" {
+    try testutil.expectFixturesRoundtrip(roundtripExtPage, "track_tag_page", 1);
+}
+
+test "track tag page fixture parses with known field values" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, "testdata/pdb/unit_tests", .{});
+    defer dir.close(io);
+    const bytes = try dir.readFileAlloc(io, "track_tag_page.bin", alloc, .limited(1 << 16));
+    defer alloc.free(bytes);
+
+    var c = bin.Cursor.initAlloc(alloc, bytes);
+    const header = try bin.takeStruct(&c, PageHeader, .little);
+    try testing.expectEqual(@as(u32, 10), header.page_index);
+    try testing.expectEqual(
+        @intFromEnum(ExtPageType.track_tag),
+        @intFromEnum(header.page_type),
+    );
+    try testing.expectEqual(@as(u32, 21), header.next_page);
+    try testing.expectEqual(@as(u32, 54), header.unknown1);
+    try testing.expectEqual(@as(u32, 52), header.packed_row_counts.num_rows);
+    try testing.expectEqual(@as(u32, 52), header.packed_row_counts.num_rows_valid);
+    try testing.expectEqual(@as(u16, 3104), header.free_size);
+    try testing.expectEqual(@as(u16, 832), header.used_size);
+
+    var content = try DataPageContent.decode(&c, alloc, bytes.len, header, .ext);
+    defer content.deinit(alloc);
+    try testing.expectEqual(@as(u16, 1), content.header.unknown5);
+    try testing.expectEqual(@as(u16, 51), content.header.unknown_not_num_rows_large);
+
+    // Four row groups: three full ones, the last holding rows 49-52 in
+    // slots 12-15 with only bits 0-3 present.
+    try testing.expectEqual(@as(usize, 4), content.row_groups.len);
+    try testing.expectEqual(@as(u16, 0xFFFF), content.row_groups[0].row_presence_flags);
+    try testing.expectEqual(@as(u16, 0x000F), content.row_groups[3].row_presence_flags);
+    try testing.expectEqual(@as(u16, 0x0008), content.row_groups[3].unknown);
+
+    // 52 rows of 16 bytes each: tracks appear once per tag they carry
+    // (track 2 with two different tags in the first rows).
+    try testing.expectEqual(@as(usize, 52), content.rows.len);
+    const first = content.rows[0].row.track_tag;
+    try testing.expectEqual(@as(u32, 1), first.track_id);
+    try testing.expectEqual(@as(u32, 2498240426), first.tag_id);
+    try testing.expectEqual(@as(u32, 3), first.unknown_const);
+    const second = content.rows[1].row.track_tag;
+    try testing.expectEqual(@as(u32, 2), second.track_id);
+    try testing.expectEqual(@as(u32, 4052665282), second.tag_id);
+    const third = content.rows[2].row.track_tag;
+    try testing.expectEqual(@as(u32, 2), third.track_id);
+    try testing.expectEqual(@as(u32, 2498240426), third.tag_id);
 }
 
 // Data page and simple row tests, ported from the row tests of
@@ -3320,6 +3394,31 @@ test "tag row roundtrips" {
         },
         0x1C + 3,
     );
+}
+
+test "track tag row roundtrips" {
+    // The first row of the track_tag_page fixture.
+    try expectRowRoundtrip(
+        TrackTag,
+        &.{
+            0x00, 0x00, 0x00, 0x00, // magic
+            0x01, 0x00, 0x00, 0x00, // track_id
+            0xAA, 0x1F, 0xE8, 0x94, // tag_id
+            0x03, 0x00, 0x00, 0x00, // unknown_const
+        },
+        .{ .track_id = 1, .tag_id = 2498240426 },
+        null,
+    );
+
+    // A nonzero magic is rejected on parse.
+    const alloc = testing.allocator;
+    var c = bin.Cursor.initAlloc(alloc, &.{
+        0x01, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00,
+        0xAA, 0x1F, 0xE8, 0x94,
+        0x03, 0x00, 0x00, 0x00,
+    });
+    try testing.expectError(error.UnexpectedValue, decodeRow(TrackTag, &c));
 }
 
 test "history row roundtrips" {
