@@ -3390,7 +3390,11 @@ test "tag row roundtrips" {
             0x01, 0x00, 0x00, 0x00, // id
             0x00, 0x00, 0x00, 0x01, // raw_is_category = 1 << 24
             0x03, 0x1F, 0x2C, // offset array
-            0x1B, 'T', 'a', 'g', 'C', 'a', 't', 'e', 'g', 'o', 'r', 'y', '1',
+            0x1B, 'T',  'a',
+            'g',  'C',  'a',
+            't',  'e',  'g',
+            'o',  'r',  'y',
+            '1',
             0x03, // unknown: empty
         },
         .{
