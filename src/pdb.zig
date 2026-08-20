@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const bin = @import("bin");
+const testutil = @import("testutil");
 const util = @import("util");
 
 /// Decoding error; `InvalidFormat` means the bytes do not follow the
@@ -3207,10 +3208,11 @@ test "index page content rejects malformed input" {
 
 test "index page fixture parses with known field values" {
     const alloc = testing.allocator;
-    const io = testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "testdata/pdb/unit_tests", .{});
-    defer dir.close(io);
-    const bytes = try dir.readFileAlloc(io, "index_page.bin", alloc, .limited(1 << 16));
+    const bytes = try testutil.readFixture(
+        alloc,
+        "pdb/unit_tests/index_page.bin",
+        .limited(1 << 16),
+    );
     defer alloc.free(bytes);
 
     var c = bin.Cursor.initAlloc(alloc, bytes);
@@ -3255,8 +3257,6 @@ test "index page fixture parses with known field values" {
     try testing.expectEqual(@as(u29, 603), last.page_index);
     try testing.expectEqual(@as(u3, 3), last.index_flags);
 }
-
-const testutil = @import("testutil");
 
 /// Parses `input` — a whole page, including the page header — of a
 /// database of `db_type` and re-serializes it, for
@@ -3325,10 +3325,11 @@ test "tag page fixture roundtrips byte-identical" {
 
 test "tag page fixture parses with known field values" {
     const alloc = testing.allocator;
-    const io = testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "testdata/pdb/unit_tests", .{});
-    defer dir.close(io);
-    const bytes = try dir.readFileAlloc(io, "tag_page.bin", alloc, .limited(1 << 16));
+    const bytes = try testutil.readFixture(
+        alloc,
+        "pdb/unit_tests/tag_page.bin",
+        .limited(1 << 16),
+    );
     defer alloc.free(bytes);
 
     var c = bin.Cursor.initAlloc(alloc, bytes);
@@ -3400,10 +3401,11 @@ test "track tag page fixture roundtrips byte-identical" {
 
 test "track tag page fixture parses with known field values" {
     const alloc = testing.allocator;
-    const io = testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "testdata/pdb/unit_tests", .{});
-    defer dir.close(io);
-    const bytes = try dir.readFileAlloc(io, "track_tag_page.bin", alloc, .limited(1 << 16));
+    const bytes = try testutil.readFixture(
+        alloc,
+        "pdb/unit_tests/track_tag_page.bin",
+        .limited(1 << 16),
+    );
     defer alloc.free(bytes);
 
     var c = bin.Cursor.initAlloc(alloc, bytes);
@@ -3528,11 +3530,12 @@ test "file header roundtrips, validates constants, and derives num_tables" {
 
 test "page decode dispatches content by the index flag" {
     const alloc = testing.allocator;
-    const io = testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "testdata/pdb/unit_tests", .{});
-    defer dir.close(io);
 
-    const index_bytes = try dir.readFileAlloc(io, "index_page.bin", alloc, .limited(1 << 16));
+    const index_bytes = try testutil.readFixture(
+        alloc,
+        "pdb/unit_tests/index_page.bin",
+        .limited(1 << 16),
+    );
     defer alloc.free(index_bytes);
     var index_cursor = bin.Cursor.initAlloc(alloc, index_bytes);
     var index_page = try Page.decode(&index_cursor, alloc, index_bytes.len, .plain);
@@ -3541,7 +3544,11 @@ test "page decode dispatches content by the index flag" {
     try testing.expectEqual(PageType.tracks, index_page.header.page_type);
     try testing.expect(index_page.content == .index);
 
-    const data_bytes = try dir.readFileAlloc(io, "genres_page.bin", alloc, .limited(1 << 16));
+    const data_bytes = try testutil.readFixture(
+        alloc,
+        "pdb/unit_tests/genres_page.bin",
+        .limited(1 << 16),
+    );
     defer alloc.free(data_bytes);
     var data_cursor = bin.Cursor.initAlloc(alloc, data_bytes);
     var data_page = try Page.decode(&data_cursor, alloc, data_bytes.len, .plain);
@@ -3560,10 +3567,7 @@ test "page decode dispatches content by the index flag" {
 /// byte-stable, and re-parsing it yields the same database.
 fn expectDatabaseRoundtrip(path: []const u8, db_type: DatabaseType) !void {
     const alloc = testing.allocator;
-    const io = testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "testdata", .{});
-    defer dir.close(io);
-    const input = try dir.readFileAlloc(io, path, alloc, .limited(1 << 22));
+    const input = try testutil.readFixture(alloc, path, .limited(1 << 22));
     defer alloc.free(input);
 
     var db = try Database.parse(alloc, input, db_type);
@@ -3640,10 +3644,7 @@ fn countTableRows(db: *const Database, page_type: PageType) !usize {
 
 test "num_rows database row counts per table" {
     const alloc = testing.allocator;
-    const io = testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "testdata", .{});
-    defer dir.close(io);
-    const input = try dir.readFileAlloc(io, "pdb/num_rows/export.pdb", alloc, .limited(1 << 22));
+    const input = try testutil.readFixture(alloc, "pdb/num_rows/export.pdb", .limited(1 << 22));
     defer alloc.free(input);
 
     var db = try Database.parse(alloc, input, .plain);
@@ -3682,10 +3683,11 @@ test "num_rows database row counts per table" {
 
 test "deleted-row page fixture pins dead-space zeroing and idempotent writes" {
     const alloc = testing.allocator;
-    const io = testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "testdata/pdb/unit_tests", .{});
-    defer dir.close(io);
-    const input = try dir.readFileAlloc(io, "history_page_deleted.bin", alloc, .limited(1 << 16));
+    const input = try testutil.readFixture(
+        alloc,
+        "pdb/unit_tests/history_page_deleted.bin",
+        .limited(1 << 16),
+    );
     defer alloc.free(input);
 
     var c = bin.Cursor.initAlloc(alloc, input);
@@ -3733,9 +3735,7 @@ const num_rows_perf_budget_ms = 2000;
 test "num_rows parses and serializes within the perf budget" {
     const alloc = testing.allocator;
     const io = testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "testdata", .{});
-    defer dir.close(io);
-    const input = try dir.readFileAlloc(io, "pdb/num_rows/export.pdb", alloc, .limited(1 << 22));
+    const input = try testutil.readFixture(alloc, "pdb/num_rows/export.pdb", .limited(1 << 22));
     defer alloc.free(input);
 
     const start = std.Io.Timestamp.now(io, .awake);

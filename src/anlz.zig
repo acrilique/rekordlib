@@ -1353,10 +1353,7 @@ test "ANLZ fixtures roundtrip byte-identical" {
 
 /// Reads a fixture from `testdata`.
 fn readFixture(alloc: std.mem.Allocator, sub_path: []const u8) ![]u8 {
-    const io = testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "testdata", .{});
-    defer dir.close(io);
-    return dir.readFileAlloc(io, sub_path, alloc, std.Io.Limit.limited(1 << 20));
+    return testutil.readFixture(alloc, sub_path, .limited(1 << 20));
 }
 
 /// Path of the P053 `.DAT` fixture, relative to `testdata`.

@@ -7,6 +7,19 @@
 const std = @import("std");
 const testing = std.testing;
 
+/// Reads the fixture at `sub_path`, relative to `testdata`, into a buffer
+/// the caller owns; `limit` caps the read.
+pub fn readFixture(
+    alloc: std.mem.Allocator,
+    sub_path: []const u8,
+    limit: std.Io.Limit,
+) ![]u8 {
+    const io = testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, "testdata", .{});
+    defer dir.close(io);
+    return dir.readFileAlloc(io, sub_path, alloc, limit);
+}
+
 /// Runs `roundtrip` on every `testdata` fixture whose basename starts with
 /// `prefix` and checks that it re-serializes byte-identical, with at least
 /// `min_count` files found. `roundtrip` parses `input` and returns the
