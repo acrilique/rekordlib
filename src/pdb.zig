@@ -3637,6 +3637,74 @@ test "whole databases roundtrip byte-identical except zeroed dead space" {
         try expectDatabaseRoundtrip(case.path, case.db_type);
 }
 
+/// Counts the valid rows of the table for `page_type` by walking its page
+/// chain from `first_page` to `last_page` the way the oracle's
+/// `PageIterator` does, rejecting non-increasing links, pages outside the
+/// file, and pages that did not parse.
+fn countTableRows(db: *const Database, page_type: PageType) !usize {
+    const table = db.header.findTable(page_type) orelse return error.NoTable;
+    var count: usize = 0;
+    var current = table.first_page;
+    while (true) {
+        if (current == 0 or current > db.pages.len) return error.PageMissing;
+        const page = switch (db.pages[current - 1]) {
+            .page => |*page| page,
+            .raw => return error.UnparsedPage,
+        };
+        switch (page.content) {
+            .data => |*content| count += content.rows.len,
+            .index => {},
+        }
+        if (current == table.last_page) break;
+        const next = page.header.next_page;
+        if (next <= current) return error.PageOrderViolation;
+        current = next;
+    }
+    return count;
+}
+
+test "num_rows database row counts per table" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, "testdata", .{});
+    defer dir.close(io);
+    const input = try dir.readFileAlloc(io, "pdb/num_rows/export.pdb", alloc, .limited(1 << 22));
+    defer alloc.free(input);
+
+    var db = try Database.parse(alloc, input, .plain);
+    defer db.deinit();
+
+    // Ported from rekordcrate's `tests/test_pdb_num_rows.rs`, plus the
+    // menu rows the oracle test does not cover.
+    const expectations = .{
+        .{ .page_type = PageType.tracks, .count = 3886 },
+        .{ .page_type = PageType.genres, .count = 315 },
+        .{ .page_type = PageType.artists, .count = 2216 },
+        .{ .page_type = PageType.albums, .count = 2226 },
+        .{ .page_type = PageType.labels, .count = 688 },
+        .{ .page_type = PageType.keys, .count = 67 },
+        .{ .page_type = PageType.colors, .count = 8 },
+        .{ .page_type = PageType.playlist_tree, .count = 104 },
+        .{ .page_type = PageType.playlist_entries, .count = 7440 },
+        .{ .page_type = PageType.history_playlists, .count = 1 },
+        .{ .page_type = PageType.history_entries, .count = 73 },
+        .{ .page_type = PageType.artwork, .count = 2178 },
+        .{ .page_type = PageType.columns, .count = 27 },
+        .{ .page_type = PageType.menu, .count = 22 },
+        .{ .page_type = PageType.history, .count = 1 },
+    };
+    inline for (expectations) |case|
+        try testing.expectEqual(case.count, try countTableRows(&db, case.page_type));
+
+    // The database carries a table of an unknown page type (wire value
+    // 18) with 17 rows; the row model does not cover it, so its data
+    // page is kept raw and written back verbatim.
+    try testing.expectError(
+        error.UnparsedPage,
+        countTableRows(&db, @enumFromInt(18)),
+    );
+}
+
 test "deleted-row page fixture pins dead-space zeroing and idempotent writes" {
     const alloc = testing.allocator;
     const io = testing.io;
@@ -3680,6 +3748,33 @@ test "deleted-row page fixture pins dead-space zeroing and idempotent writes" {
     try reparsed.encode(&e2, input.len);
     try testing.expectEqualSlices(u8, out1, e2.written());
     try testing.expect(page.eql(&reparsed));
+}
+
+/// Perf budget of the full-image model on the largest fixture, in
+/// milliseconds of Debug build: the tripwire for the lazy-pages fallback
+/// (see PLAN.md, "Revisit triggers").
+const num_rows_perf_budget_ms = 2000;
+
+test "num_rows parses and serializes within the perf budget" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, "testdata", .{});
+    defer dir.close(io);
+    const input = try dir.readFileAlloc(io, "pdb/num_rows/export.pdb", alloc, .limited(1 << 22));
+    defer alloc.free(input);
+
+    const start = std.Io.Timestamp.now(io, .awake);
+    var db = try Database.parse(alloc, input, .plain);
+    defer db.deinit();
+    const out = try db.serialize(alloc);
+    defer alloc.free(out);
+    const elapsed_ns: u64 = @intCast(start.durationTo(
+        std.Io.Timestamp.now(io, .awake),
+    ).nanoseconds);
+
+    const elapsed_ms = elapsed_ns / std.time.ns_per_ms;
+    std.debug.print("\nnum_rows (2.9 MB) parse+serialize: {d} ms (budget {d} ms)\n", .{ elapsed_ms, num_rows_perf_budget_ms });
+    try testing.expect(elapsed_ms < num_rows_perf_budget_ms);
 }
 
 // Data page and simple row tests, ported from the row tests of
