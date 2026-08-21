@@ -985,7 +985,7 @@ const KEY_DATA = [19]u8{
 /// byte is the table entry offset by `len_entries`, modulo 256.
 pub fn getKey(len_entries: u16) [19]u8 {
     var key: [19]u8 = undefined;
-    for (KEY_DATA, 0..) |byte, i| key[i] = @truncate(@as(u16, byte) + len_entries);
+    for (KEY_DATA, 0..) |byte, i| key[i] = @truncate(@as(u16, byte) +% len_entries);
     return key;
 }
 
