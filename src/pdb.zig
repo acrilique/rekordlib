@@ -2392,6 +2392,9 @@ pub const Database = struct {
     header: Header,
     /// Pages after page 0; `pages[i]` holds page index `i + 1`.
     pages: []PageSlot,
+    /// Capacity of the `pages` allocation; the slice's length is the page
+    /// count.
+    pages_cap: usize = 0,
     /// Bytes after the last whole page, kept verbatim. Known files are
     /// whole multiples of the page size, so this is normally empty.
     tail: []const u8 = &.{},
@@ -2433,6 +2436,7 @@ pub const Database = struct {
             .db_type = db_type,
             .header = header,
             .pages = pages,
+            .pages_cap = pages.len,
             .tail = if (tail_len == 0) &.{} else try a.dupe(
                 u8,
                 buf[buf.len - tail_len ..],
@@ -2605,15 +2609,24 @@ pub const Database = struct {
             return error.UnexpectedValue; // counter names an existing page
 
         const a = db.arena.allocator();
-        // Grow to hold every page index up to and including `page_index`.
-        const grown = try a.realloc(db.pages, page_index);
+        // Grow to hold every page index up to and including `page_index`,
+        // at least doubling the capacity (see `appendElem`).
+        if (db.pages_cap < page_index) {
+            const new_cap = @max(@max(db.pages_cap *| 2, 4), page_index);
+            const grown = try a.alloc(PageSlot, new_cap);
+            @memcpy(grown[0..db.pages.len], db.pages);
+            // The old allocation is abandoned in the arena.
+            db.pages = grown[0..db.pages.len];
+            db.pages_cap = new_cap;
+        }
         const page_size: usize = db.header.page_size;
-        for (grown[db.pages.len .. page_index - 1]) |*slot| {
+        for (db.pages.ptr[db.pages.len .. page_index - 1]) |*slot| {
             const zeros = try a.alloc(u8, page_size);
             @memset(zeros, 0);
             slot.* = .{ .raw = zeros };
         }
-        grown[page_index - 1] = .{
+        db.pages = db.pages.ptr[0..page_index];
+        db.pages[page_index - 1] = .{
             .page = try Page.newData(
                 db.header.page_size,
                 page_index,
@@ -2621,7 +2634,6 @@ pub const Database = struct {
                 page_chain_end,
             ),
         };
-        db.pages = grown;
         db.header.next_unused_page = page_index + 1;
         return page_index;
     }
@@ -2688,6 +2700,7 @@ pub const Database = struct {
                 .tables = tables,
             },
             .pages = pages,
+            .pages_cap = pages.len,
         };
     }
 
