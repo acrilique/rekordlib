@@ -152,3 +152,38 @@ test "dat files are in the order rekordbox writes them" {
         &device.dat_files,
     );
 }
+
+test "artwork spec pins shard folders, file names, and resolutions" {
+    const alloc = testing.allocator;
+
+    // The with_anlz export stores id 1 and 2 under shard folder 00001; the
+    // Artwork rows carry the thumbnail paths.
+    var spec = try device.artworkSpec(alloc, 1);
+    defer spec.deinit(alloc);
+    try testing.expectEqualStrings("/PIONEER/Artwork/00001/a1.jpg", spec.thumbnail_path);
+    try testing.expectEqualStrings("/PIONEER/Artwork/00001/a1_m.jpg", spec.medium_path);
+
+    // Shard folders: id/20 + 1, five digits.
+    const shard_bounds = [_]struct { id: u32, folder: []const u8 }{
+        .{ .id = 0, .folder = "00001" },
+        .{ .id = 19, .folder = "00001" },
+        .{ .id = 20, .folder = "00002" },
+        .{ .id = 39, .folder = "00002" },
+    };
+    for (shard_bounds) |case| {
+        const folder = try device.artworkFolder(alloc, case.id);
+        defer alloc.free(folder);
+        try testing.expectEqualStrings(case.folder, folder);
+    }
+
+    var spec2 = try device.artworkSpec(alloc, 20);
+    defer spec2.deinit(alloc);
+    try testing.expectEqualStrings("/PIONEER/Artwork/00002/a20.jpg", spec2.thumbnail_path);
+    try testing.expectEqualStrings("/PIONEER/Artwork/00002/a20_m.jpg", spec2.medium_path);
+
+    try testing.expectEqual(device.ArtworkCodec.jpeg, spec.codec);
+    try testing.expectEqual(@as(u16, 80), spec.thumbnail_resolution.width);
+    try testing.expectEqual(@as(u16, 80), spec.thumbnail_resolution.height);
+    try testing.expectEqual(@as(u16, 240), spec.medium_resolution.width);
+    try testing.expectEqual(@as(u16, 240), spec.medium_resolution.height);
+}

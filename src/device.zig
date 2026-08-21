@@ -212,3 +212,68 @@ pub fn anlzDevicePath(alloc: std.mem.Allocator, audio_path: []const u8) PathErro
         .{ h.p_value, h.hash },
     );
 }
+
+/// Image codec an artwork file must use (decision 5: the library delegates
+/// media decoding and conversion to the caller).
+pub const ArtworkCodec = enum {
+    jpeg,
+};
+
+/// Pixel dimensions of an artwork file.
+pub const Resolution = struct {
+    width: u16,
+    height: u16,
+};
+
+/// What a caller must create on the device for an artwork row with `id`:
+/// two JPEG files under the `PIONEER/Artwork` shard folder. The caller
+/// writes the files and stores `thumbnail_path` in the pdb Artwork row, as
+/// Rekordbox does.
+pub const ArtworkSpec = struct {
+    /// Device-root-absolute path of the 80x80 thumbnail `a{id}.jpg` — the
+    /// path stored in the pdb Artwork row.
+    thumbnail_path: []u8,
+    /// Device-root-absolute path of the 240x240 image `a{id}_m.jpg`.
+    medium_path: []u8,
+    /// Codec both files must use.
+    codec: ArtworkCodec,
+    /// Dimensions of `thumbnail_path`.
+    thumbnail_resolution: Resolution,
+    /// Dimensions of `medium_path`.
+    medium_resolution: Resolution,
+
+    pub fn deinit(spec: *ArtworkSpec, alloc: std.mem.Allocator) void {
+        alloc.free(spec.thumbnail_path);
+        alloc.free(spec.medium_path);
+    }
+};
+
+/// Describe the artwork files for `id` (decision 5: the library never
+/// decodes or converts media; it only tells the caller what to write).
+pub fn artworkSpec(alloc: std.mem.Allocator, id: u32) std.mem.Allocator.Error!ArtworkSpec {
+    const folder = try artworkFolder(alloc, id);
+    defer alloc.free(folder);
+    const thumbnail_path = try std.fmt.allocPrint(
+        alloc,
+        "/PIONEER/Artwork/{s}/a{d}.jpg",
+        .{ folder, id },
+    );
+    errdefer alloc.free(thumbnail_path);
+    const medium_path = try std.fmt.allocPrint(
+        alloc,
+        "/PIONEER/Artwork/{s}/a{d}_m.jpg",
+        .{ folder, id },
+    );
+    return .{
+        .thumbnail_path = thumbnail_path,
+        .medium_path = medium_path,
+        .codec = .jpeg,
+        .thumbnail_resolution = .{ .width = 80, .height = 80 },
+        .medium_resolution = .{ .width = 240, .height = 240 },
+    };
+}
+
+/// Five-digit shard folder name for artwork `id`: `id/20 + 1`, zero-padded.
+pub fn artworkFolder(alloc: std.mem.Allocator, id: u32) std.mem.Allocator.Error![]u8 {
+    return std.fmt.allocPrint(alloc, "{d:0>5}", .{id / 20 + 1});
+}
