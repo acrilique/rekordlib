@@ -2015,6 +2015,14 @@ pub const HeaderDecodeError = bin.ReadError || error{UnexpectedValue};
 /// that does not fit the page, or a page size below `header_fixed_len`.
 pub const HeaderEncodeError = bin.WriteError || error{UnexpectedValue};
 
+/// The shared search behind `Header.findTable` and `Header.findTableMut`.
+fn findTableIn(tables: []Table, page_type: PageType) ?*Table {
+    for (tables) |*table| {
+        if (table.page_type == page_type) return table;
+    }
+    return null;
+}
+
 /// The file header, occupying the start of page 0: the page geometry, the
 /// allocation counter, and the table of contents. Serializing pads page 0
 /// with zeros up to the page size, as observed in every known file.
@@ -2084,18 +2092,12 @@ pub const Header = struct {
     /// Ext callers pass the raw colliding value, e.g.
     /// `@enumFromInt(@intFromEnum(ExtPageType.tag))`.
     pub fn findTable(header: *const Header, page_type: PageType) ?*const Table {
-        for (header.tables) |*table| {
-            if (table.page_type == page_type) return table;
-        }
-        return null;
+        return findTableIn(header.tables, page_type);
     }
 
     /// The mutable counterpart of `findTable`.
     pub fn findTableMut(header: *Header, page_type: PageType) ?*Table {
-        for (header.tables) |*table| {
-            if (table.page_type == page_type) return table;
-        }
-        return null;
+        return findTableIn(header.tables, page_type);
     }
 };
 
