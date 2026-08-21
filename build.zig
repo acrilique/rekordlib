@@ -52,6 +52,12 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const device = b.addModule("device", .{
+        .root_source_file = b.path("src/device.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const lib = b.addLibrary(.{
         .name = "rekordlib",
         .root_module = b.createModule(.{
@@ -64,6 +70,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "xor", .module = xor },
                 .{ .name = "anlz", .module = anlz },
                 .{ .name = "pdb", .module = pdb },
+                .{ .name = "device", .module = device },
                 .{ .name = "util", .module = util },
             },
         }),
@@ -81,6 +88,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "anlz", .module = anlz },
             .{ .name = "pdb", .module = pdb },
             .{ .name = "setting", .module = setting },
+            .{ .name = "device", .module = device },
         },
     });
 
