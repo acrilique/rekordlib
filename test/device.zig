@@ -359,3 +359,52 @@ test "playlist tree nests folders in row order" {
     try testing.expectEqual(@as(u32, 102), folder.children.items[1].playlist.id);
     try testing.expectEqualStrings("Leaf A", folder.children.items[1].playlist.name);
 }
+
+test "playlist tree cuts parent-id cycles" {
+    const alloc = testing.allocator;
+
+    const input = try testutil.readFixture(
+        alloc,
+        "complete_export/with_anlz/PIONEER/rekordbox/export.pdb",
+        .limited(1 << 22),
+    );
+    defer alloc.free(input);
+    var db = try pdb.Database.parse(alloc, input, .plain);
+    defer db.deinit();
+
+    // The two cycle shapes reachable from the root: a folder carrying the
+    // root's own id 0 parented to 0, and a duplicated folder id parented to
+    // itself. Before the visited guard, both recursed until the stack
+    // overflowed.
+    const a = db.arena.allocator();
+    const nodes = [_]pdb.PlaylistTreeNode{
+        .{ .id = 0, .parent_id = 0, .node_is_folder = 1, .name = try pdb.DeviceSQLString.fromUtf8(a, "Root cycle") },
+        .{ .id = 5, .parent_id = 0, .node_is_folder = 1, .name = try pdb.DeviceSQLString.fromUtf8(a, "Outer") },
+        .{ .id = 5, .parent_id = 5, .node_is_folder = 1, .name = try pdb.DeviceSQLString.fromUtf8(a, "Inner") },
+    };
+    for (nodes) |node| {
+        const boxed = try a.create(pdb.PlaylistTreeNode);
+        boxed.* = node;
+        var row = pdb.Row{ .playlist_tree_node = boxed };
+        _ = try db.addRow(&row);
+    }
+
+    var playlists = try device.getPlaylists(alloc, &db);
+    defer {
+        for (playlists.items) |*node| node.deinit(alloc);
+        playlists.deinit(alloc);
+    }
+
+    // The top level holds the real playlist and the id-0 folder; the
+    // duplicated id 5 is expanded once (inside the id-0 folder) and skipped
+    // at the top level.
+    try testing.expectEqual(@as(usize, 2), playlists.items.len);
+    try testing.expectEqual(@as(u32, 1), playlists.items[0].playlist.id);
+    const root_cycle = playlists.items[1].folder;
+    try testing.expectEqual(@as(u32, 0), root_cycle.id);
+    try testing.expectEqual(@as(usize, 2), root_cycle.children.items.len);
+    try testing.expectEqual(@as(u32, 1), root_cycle.children.items[0].playlist.id);
+    const inner = root_cycle.children.items[1].folder;
+    try testing.expectEqual(@as(u32, 5), inner.id);
+    try testing.expectEqual(@as(usize, 0), inner.children.items.len);
+}

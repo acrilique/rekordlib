@@ -446,15 +446,18 @@ fn deinitGroups(alloc: std.mem.Allocator, groups: *PlaylistGroups) void {
 }
 
 /// Appends the children of `parent` to `out`, in row order, recursing into
-/// folders.
+/// folders. A folder whose id is already in `visited` is skipped, so
+/// parent-id cycles in corrupt data cannot recurse forever.
 fn buildChildren(
     alloc: std.mem.Allocator,
     groups: *const PlaylistGroups,
+    visited: *std.AutoHashMap(u32, void),
     parent: u32,
     out: *std.ArrayList(PlaylistNode),
 ) GetPlaylistsError!void {
     const nodes = groups.get(parent) orelse return;
     for (nodes.items) |node| {
+        if (node.isFolder() and (try visited.getOrPut(node.id)).found_existing) continue;
         const name = try node.name.utf8(alloc);
         errdefer alloc.free(name);
         if (node.isFolder()) {
@@ -463,7 +466,7 @@ fn buildChildren(
                 for (children.items) |*child| child.deinit(alloc);
                 children.deinit(alloc);
             }
-            try buildChildren(alloc, groups, node.id, &children);
+            try buildChildren(alloc, groups, visited, node.id, &children);
             try out.append(alloc, .{ .folder = .{
                 .id = node.id,
                 .name = name,
@@ -478,7 +481,9 @@ fn buildChildren(
 /// Builds the playlist tree from the database's playlist-tree rows: nodes
 /// parented to 0 form the top level, folders recurse into their children,
 /// and names are decoded to owned UTF-8. Nodes unreachable from the root
-/// (parented to a missing id) do not appear, as in rekordcrate.
+/// (parented to a missing id) do not appear, as in rekordcrate; a folder id
+/// is expanded at most once, so parent-id cycles in corrupt data cannot
+/// recurse forever.
 ///
 /// The caller owns the returned list; free it by deinitializing every
 /// element and then the list itself:
@@ -505,11 +510,14 @@ pub fn getPlaylists(
         else => {},
     };
 
+    var visited = std.AutoHashMap(u32, void).init(alloc);
+    defer visited.deinit();
+
     var roots = std.ArrayList(PlaylistNode).empty;
     errdefer {
         for (roots.items) |*node| node.deinit(alloc);
         roots.deinit(alloc);
     }
-    try buildChildren(alloc, &groups, 0, &roots);
+    try buildChildren(alloc, &groups, &visited, 0, &roots);
     return roots;
 }
