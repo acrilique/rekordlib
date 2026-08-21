@@ -2458,6 +2458,12 @@ pub const Database = struct {
     pub fn serialize(db: *const Database, alloc: std.mem.Allocator) DatabaseEncodeError![]u8 {
         var e = bin.Emitter.init(alloc);
         errdefer e.deinit();
+        // The image size is known exactly; reserving it up front spares the
+        // emitter's doubling reallocations and their full-image copies.
+        const total: u64 = @as(u64, db.header.page_size) * (db.pages.len + 1) +
+            db.tail.len;
+        try e.ensureTotalCapacity(std.math.cast(usize, total) orelse
+            return error.OutOfMemory);
         try db.header.encode(&e);
         const page_size: usize = db.header.page_size;
         for (db.pages) |*slot| switch (slot.*) {

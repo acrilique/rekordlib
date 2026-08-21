@@ -108,6 +108,13 @@ pub const Emitter = struct {
         return e.list.toOwnedSlice(e.alloc);
     }
 
+    /// Reserves room for `n` bytes in total, so an output of known size can
+    /// be written without intermediate reallocations and the copies they
+    /// cause.
+    pub fn ensureTotalCapacity(e: *Emitter, n: usize) WriteError!void {
+        try e.list.ensureTotalCapacity(e.alloc, n);
+    }
+
     pub fn putBytes(e: *Emitter, bytes: []const u8) WriteError!void {
         try e.list.appendSlice(e.alloc, bytes);
     }
