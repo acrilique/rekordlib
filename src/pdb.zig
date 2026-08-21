@@ -1046,21 +1046,21 @@ pub fn decodeRow(comptime T: type, c: *bin.Cursor) RowDecodeError!T {
 
 /// Writes the fields of `row` in declaration order; see `decodeRow` for
 /// the supported field types.
-pub fn encodeRow(comptime T: type, row: T, e: *bin.Emitter) RowEncodeError!void {
+pub fn encodeRow(comptime T: type, row: *const T, e: *bin.Emitter) RowEncodeError!void {
     inline for (std.meta.fields(T)) |field| {
         if (comptime isOffsetContainer(field.type)) {
-            try @field(row, field.name).encode(
+            try @field(row.*, field.name).encode(
                 e,
                 fixedLen(T),
-                OffsetSize.fromSubtype(@field(row, "subtype")),
+                OffsetSize.fromSubtype(@field(row.*, "subtype")),
             );
         } else if (comptime field.type == DeviceSQLString) {
-            try @field(row, field.name).encode(e);
+            try @field(row.*, field.name).encode(e);
         } else switch (@typeInfo(field.type)) {
-            .int => try e.putInt(field.type, @field(row, field.name), .little),
+            .int => try e.putInt(field.type, @field(row.*, field.name), .little),
             .@"enum" => |en| try e.putInt(
                 en.tag_type,
-                @intFromEnum(@field(row, field.name)),
+                @intFromEnum(@field(row.*, field.name)),
                 .little,
             ),
             else => @compileError("encodeRow: unsupported field type `" ++ @typeName(field.type) ++ "`"),
@@ -1071,15 +1071,15 @@ pub fn encodeRow(comptime T: type, row: T, e: *bin.Emitter) RowEncodeError!void 
 /// Page heap space in bytes the row occupies: its fixed fields plus the
 /// strings and the trailing offset-array container at their actual
 /// sizes.
-pub fn rowHeapBytesRequired(comptime T: type, row: T) u32 {
+pub fn rowHeapBytesRequired(comptime T: type, row: *const T) u32 {
     var total: u32 = @intCast(fixedLen(T));
     inline for (std.meta.fields(T)) |field| {
         if (comptime isOffsetContainer(field.type)) {
-            total += @field(row, field.name).heapBytesRequired(
-                OffsetSize.fromSubtype(@field(row, "subtype")),
+            total += @field(row.*, field.name).heapBytesRequired(
+                OffsetSize.fromSubtype(@field(row.*, "subtype")),
             );
         } else if (comptime field.type == DeviceSQLString) {
-            total += @field(row, field.name).heapBytesRequired();
+            total += @field(row.*, field.name).heapBytesRequired();
         }
     }
     return total;
@@ -1087,11 +1087,11 @@ pub fn rowHeapBytesRequired(comptime T: type, row: T) u32 {
 
 /// Field-by-field equality: strings and offset-array containers through
 /// their `eql`, everything else by value.
-pub fn rowEql(comptime T: type, a: T, b: T) bool {
+pub fn rowEql(comptime T: type, a: *const T, b: *const T) bool {
     inline for (std.meta.fields(T)) |field| {
         if (comptime isOffsetContainer(field.type) or field.type == DeviceSQLString) {
-            if (!@field(a, field.name).eql(@field(b, field.name))) return false;
-        } else if (@field(a, field.name) != @field(b, field.name)) return false;
+            if (!@field(a.*, field.name).eql(@field(b.*, field.name))) return false;
+        } else if (@field(a.*, field.name) != @field(b.*, field.name)) return false;
     }
     return true;
 }
@@ -1589,16 +1589,16 @@ pub const Row = union(enum) {
         } else error.NotImplemented;
     }
 
-    pub fn encode(self: Row, e: *bin.Emitter) RowEncodeError!void {
-        return switch (self) {
-            inline else => |row| try encodeRow(@TypeOf(row), row, e),
+    pub fn encode(self: *const Row, e: *bin.Emitter) RowEncodeError!void {
+        return switch (self.*) {
+            inline else => |*row| try encodeRow(@TypeOf(row.*), row, e),
         };
     }
 
     /// Page heap space in bytes the row occupies.
     pub fn heapBytesRequired(self: *const Row) u32 {
         return switch (self.*) {
-            inline else => |row| rowHeapBytesRequired(@TypeOf(row), row),
+            inline else => |*row| rowHeapBytesRequired(@TypeOf(row.*), row),
         };
     }
 
@@ -1611,10 +1611,10 @@ pub const Row = union(enum) {
         };
     }
 
-    pub fn eql(a: Row, b: Row) bool {
-        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-        return switch (a) {
-            inline else => |row, tag| rowEql(@TypeOf(row), row, @field(b, @tagName(tag))),
+    pub fn eql(a: *const Row, b: *const Row) bool {
+        if (std.meta.activeTag(a.*) != std.meta.activeTag(b.*)) return false;
+        return switch (a.*) {
+            inline else => |*row, tag| rowEql(@TypeOf(row.*), row, &@field(b.*, @tagName(tag))),
         };
     }
 
@@ -1861,7 +1861,7 @@ pub const DataPageContent = struct {
         defer extents.deinit(e.alloc);
         var sub = bin.Emitter.init(e.alloc);
         defer sub.deinit();
-        for (self.rows) |at| {
+        for (self.rows) |*at| {
             sub.clear();
             try at.row.encode(&sub);
             const start = heap_start + at.offset;
@@ -1897,7 +1897,7 @@ pub const DataPageContent = struct {
         }
         if (a.rows.len != b.rows.len) return false;
         for (a.rows, b.rows) |*ar, *br| {
-            if (ar.offset != br.offset or !ar.row.eql(br.row)) return false;
+            if (ar.offset != br.offset or !ar.row.eql(&br.row)) return false;
         }
         return true;
     }
@@ -2358,9 +2358,9 @@ pub const PageSlot = union(enum) {
     /// The page's raw bytes, owned by the database's arena.
     raw: []const u8,
 
-    pub fn eql(a: PageSlot, b: PageSlot) bool {
-        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-        return switch (a) {
+    pub fn eql(a: *const PageSlot, b: *const PageSlot) bool {
+        if (std.meta.activeTag(a.*) != std.meta.activeTag(b.*)) return false;
+        return switch (a.*) {
             .page => |*page| page.eql(&b.page),
             .raw => |bytes| std.mem.eql(u8, bytes, b.raw),
         };
@@ -2487,7 +2487,7 @@ pub const Database = struct {
         }
         if (a.pages.len != b.pages.len) return false;
         for (a.pages, b.pages) |*ap, *bp| {
-            if (!ap.eql(bp.*)) return false;
+            if (!ap.eql(bp)) return false;
         }
         return std.mem.eql(u8, a.tail, b.tail);
     }
@@ -2809,7 +2809,7 @@ pub fn allocatedRowSize(row_size: u32) u32 {
 pub fn validateTrackRowSize(
     track: *const Track,
 ) error{ TrackRowTooSmall, TrackRowTooLarge }!void {
-    const row_size = allocatedRowSize(rowHeapBytesRequired(Track, track.*));
+    const row_size = allocatedRowSize(rowHeapBytesRequired(Track, track));
     if (row_size > std.math.maxInt(u16))
         return error.TrackRowTooLarge;
     if (row_size < min_track_allocated_size)

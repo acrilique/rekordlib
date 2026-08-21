@@ -1540,16 +1540,16 @@ fn expectRowRoundtrip(
     var parsed = try pdb.decodeRow(T, &c);
     defer pdb.rowDeinit(T, &parsed, testing.allocator);
     try testing.expectEqual(end_pos orelse bytes.len, c.pos);
-    try testing.expect(pdb.rowEql(T, expected, parsed));
+    try testing.expect(pdb.rowEql(T, &expected, &parsed));
 
     var e = bin.Emitter.init(testing.allocator);
     defer e.deinit();
-    try pdb.encodeRow(T, expected, &e);
+    try pdb.encodeRow(T, &expected, &e);
     try testing.expectEqualSlices(u8, bytes, e.written());
 
     try testing.expectEqual(
         @as(u16, @intCast(bytes.len)),
-        pdb.rowHeapBytesRequired(T, expected),
+        pdb.rowHeapBytesRequired(T, &expected),
     );
 }
 
@@ -1928,7 +1928,7 @@ test "history row rejects wrong magics" {
     };
     var e = bin.Emitter.init(alloc);
     defer e.deinit();
-    try pdb.encodeRow(pdb.History, row, &e);
+    try pdb.encodeRow(pdb.History, &row, &e);
     const bytes = e.written();
 
     // The row layout: subtype(2) index_shift(2) num_tracks(4) | zero
@@ -1991,7 +1991,7 @@ test "row decode gates plain and ext dispatch by database type" {
     defer e.deinit();
     try pdb.encodeRow(
         pdb.Album,
-        .{
+        &.{
             .subtype = 0x80,
             .artist_id = 2,
             .id = 2,
@@ -2020,7 +2020,7 @@ test "row decode gates plain and ext dispatch by database type" {
     defer te.deinit();
     try pdb.encodeRow(
         pdb.TagOrCategory,
-        .{
+        &.{
             .id = 1,
             .raw_is_category = 1 << 24,
             .offsets = .{
@@ -2122,8 +2122,8 @@ test "data page roundtrips with heap bytes in unused row group slots" {
     try testing.expectEqual(@as(usize, 2), content.rows.len);
     try testing.expectEqual(@as(u16, 0), content.rows[0].offset);
     try testing.expectEqual(@as(u16, 8), content.rows[1].offset);
-    try testing.expect(content.rows[0].row.eql(.{ .menu = .{ .category_id = 1, .unknown = 99 } }));
-    try testing.expect(content.rows[1].row.eql(.{ .menu = .{ .category_id = 2, .content_pointer = 2 } }));
+    try testing.expect(content.rows[0].row.eql(&.{ .menu = .{ .category_id = 1, .unknown = 99 } }));
+    try testing.expect(content.rows[1].row.eql(&.{ .menu = .{ .category_id = 2, .content_pointer = 2 } }));
     try testing.expectEqual(@as(u16, 0x0101), content.row_groups[0].row_offsets[0]);
 
     const out = try roundtripPage(alloc, &page, .plain);
@@ -2789,8 +2789,8 @@ test "addRow rejects undersized track rows" {
     const a = arena.allocator();
 
     const track = try undersizedTestTrack(a);
-    try testing.expectEqual(@as(u16, 200), pdb.rowHeapBytesRequired(pdb.Track, track));
-    try testing.expectEqual(@as(u16, 200), pdb.allocatedRowSize(pdb.rowHeapBytesRequired(pdb.Track, track)));
+    try testing.expectEqual(@as(u16, 200), pdb.rowHeapBytesRequired(pdb.Track, &track));
+    try testing.expectEqual(@as(u16, 200), pdb.allocatedRowSize(pdb.rowHeapBytesRequired(pdb.Track, &track)));
 
     const table_page_types = [_]pdb.PageType{.tracks};
     var db = try pdb.Database.create(testing.allocator, .plain, &table_page_types);
@@ -2815,7 +2815,7 @@ test "padTrackCommentToMinimum grows the comment to the row minimum" {
     // heap bytes, 224 allocated.
     try testing.expectEqual(
         @as(u16, 224),
-        pdb.allocatedRowSize(pdb.rowHeapBytesRequired(pdb.Track, track)),
+        pdb.allocatedRowSize(pdb.rowHeapBytesRequired(pdb.Track, &track)),
     );
     const text = try track.offsets.inner.comment.utf8(a);
     try testing.expectEqual(@as(usize, 21), text.len);
