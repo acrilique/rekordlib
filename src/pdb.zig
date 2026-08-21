@@ -237,8 +237,7 @@ pub const DeviceSQLString = union(enum) {
         };
     }
 
-    /// Frees the content, which must have been allocated with `alloc` (by
-    /// `fromUtf8`, `fromIsrc`, or a `Cursor` set up with `initAlloc`).
+    /// Frees the content.
     pub fn deinit(s: *DeviceSQLString, alloc: std.mem.Allocator) void {
         switch (s.*) {
             .short_ascii => |content| alloc.free(content),
@@ -321,7 +320,6 @@ pub const DeviceSQLString = union(enum) {
         return .{ .long = body };
     }
 
-    /// Writes the string, the inverse of `decode`.
     pub fn encode(s: DeviceSQLString, e: *bin.Emitter) bin.WriteError!void {
         switch (s) {
             .short_ascii => |content| {
@@ -434,10 +432,8 @@ pub fn Offsets(comptime n: usize) type {
             values: [n]u16,
         },
 
-        /// Offsets are computed during serialization — items appended in
-        /// order after the array, each start aligned per its
-        /// `requiredAlignment`, offsets patched back — the mode for newly
-        /// built rows.
+        /// Offsets computed during serialization, the mode for newly
+        /// built rows; see `OffsetArrayContainer.encode`.
         calculated,
 
         pub fn eql(a: Self, b: Self) bool {
@@ -559,7 +555,6 @@ pub fn OffsetArrayContainer(comptime T: type) type {
                     if (provided.size != size) return error.UnexpectedValue;
                     try size.putOffset(e, offset_array_magic);
                     for (provided.values) |value| try size.putOffset(e, value);
-                    // One scratch emitter is reused for every item.
                     var sub = bin.Emitter.init(e.alloc);
                     defer sub.deinit();
                     inline for (Protocol.offsetItems(self.inner), provided.values) |item, offset| {
@@ -570,8 +565,6 @@ pub fn OffsetArrayContainer(comptime T: type) type {
                 },
                 .calculated => {
                     try size.putOffset(e, offset_array_magic);
-                    // Reserve zeroed slots; every offset is patched back
-                    // once its item's position is known.
                     try e.pad(n * size.bytes());
                     if (comptime Item != void) {
                         inline for (Protocol.offsetItems(self.inner), 0..) |item, i| {
@@ -596,11 +589,10 @@ pub fn OffsetArrayContainer(comptime T: type) type {
         }
 
         /// Page heap space in bytes the container occupies: the magic and
-        /// offsets plus every item, with each item's start aligned per its
-        /// `requiredAlignment` when the offsets are calculated (provided
-        /// offsets measure the file's actual placement, so gaps between
-        /// items do not count).
-        pub fn heapBytesRequired(self: *const Self, size: OffsetSize) u16 {
+        /// offsets plus every item, alignment padding included when the
+        /// offsets are calculated. Provided offsets measure the file's
+        /// actual placement, so gaps between items do not count.
+        pub fn heapBytesRequired(self: *const Self, size: OffsetSize) u32 {
             const calculated = switch (self.offsets) {
                 .calculated => true,
                 .provided => false,
@@ -613,16 +605,14 @@ pub fn OffsetArrayContainer(comptime T: type) type {
                 }
                 total += item.heapBytesRequired();
             }
-            return @intCast(total);
+            return total;
         }
 
         pub fn eql(a: Self, b: Self) bool {
             return a.offsets.eql(b.offsets) and Protocol.eql(a.inner, b.inner);
         }
 
-        /// Frees the items, which must have been allocated with `alloc`
-        /// (by `decode` or by building the inner value); containers
-        /// deinit-ed with the same allocator.
+        /// Frees the items.
         pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
             if (Item == void) return;
             var items = Protocol.offsetItems(self.inner);
@@ -686,23 +676,23 @@ pub const DatabaseType = enum {
 };
 
 /// The type of rows a page holds, as stored in page headers and table
-/// entries: the wire constants of `export.pdb` tables. In `exportExt.pdb`
-/// databases values 3 and 4 carry ext meanings instead (see
-/// `DatabaseType`). Unknown values roundtrip verbatim.
+/// entries: the wire constants of `export.pdb` tables (see `DatabaseType`
+/// for the ext meanings of values 3 and 4). Unknown values roundtrip
+/// verbatim.
 pub const PageType = enum(u32) {
     /// Track metadata: title, artist, genre, artwork ID, playing time, etc.
     tracks = 0,
-    /// Musical genres, for reference by tracks and searching.
+    /// Musical genres.
     genres = 1,
-    /// Artists, for reference by tracks and searching.
+    /// Artists.
     artists = 2,
-    /// Albums, for reference by tracks and searching.
+    /// Albums.
     albums = 3,
-    /// Music labels, for reference by tracks and searching.
+    /// Music labels.
     labels = 4,
-    /// Musical keys, for reference by tracks, searching, and key matching.
+    /// Musical keys.
     keys = 5,
-    /// Color labels, for reference by tracks and searching.
+    /// Color labels.
     colors = 6,
     /// The hierarchical tree structure of playlists and folders grouping
     /// them.
@@ -863,18 +853,14 @@ pub const IndexPageEncodeError = bin.WriteError || error{UnexpectedValue};
 const index_page_zero_tail = 20;
 
 /// The content of an index page: a header followed by the index entries
-/// pointing at the table's data pages. Serializing writes the entries,
-/// pads with empty entries up to the page's capacity, and terminates with
-/// 20 zero bytes; parsing reads the declared entries and any live ones
-/// `next_offset` covers beyond them.
+/// pointing at the table's data pages.
 pub const IndexPageContent = struct {
     header: IndexPageHeader = .{},
     entries: []IndexEntry = &.{},
 
     /// Reads the header (validating its magics) and
     /// `max(num_entries, next_offset)` entries; the padding entries and
-    /// trailing zeros are not read. The count covers the undeclared live
-    /// entries real pages carry past `num_entries` (see `next_offset`).
+    /// trailing zeros are not read.
     pub fn decode(c: *bin.Cursor, alloc: std.mem.Allocator) IndexPageDecodeError!IndexPageContent {
         const header = try bin.takeStruct(c, IndexPageHeader, .little);
         try bin.validateConstantFields(IndexPageHeader, header);
@@ -974,12 +960,7 @@ pub const RowEncodeError = OffsetArrayEncodeError;
 /// the heap.
 pub const DataPageEncodeError = RowEncodeError;
 
-/// Magic value between a History row's `num_tracks` and `date` fields;
-/// always zero.
 const history_date_magic: u32 = 0;
-
-/// Magic value between a History row's `date` and `version` fields;
-/// always `0x1E19`.
 const history_version_magic: u16 = 0x1E19;
 
 /// Whether `T` is an `OffsetArrayContainer` instantiation, recognized by
@@ -1063,8 +1044,8 @@ pub fn decodeRow(comptime T: type, c: *bin.Cursor) RowDecodeError!T {
     return row;
 }
 
-/// Writes the fields of `row` in declaration order, the mirror image of
-/// `decodeRow` (whose documentation covers the supported field types).
+/// Writes the fields of `row` in declaration order; see `decodeRow` for
+/// the supported field types.
 pub fn encodeRow(comptime T: type, row: T, e: *bin.Emitter) RowEncodeError!void {
     inline for (std.meta.fields(T)) |field| {
         if (comptime isOffsetContainer(field.type)) {
@@ -1090,7 +1071,7 @@ pub fn encodeRow(comptime T: type, row: T, e: *bin.Emitter) RowEncodeError!void 
 /// Page heap space in bytes the row occupies: its fixed fields plus the
 /// strings and the trailing offset-array container at their actual
 /// sizes.
-pub fn rowHeapBytesRequired(comptime T: type, row: T) u16 {
+pub fn rowHeapBytesRequired(comptime T: type, row: T) u32 {
     var total: u32 = @intCast(fixedLen(T));
     inline for (std.meta.fields(T)) |field| {
         if (comptime isOffsetContainer(field.type)) {
@@ -1101,7 +1082,7 @@ pub fn rowHeapBytesRequired(comptime T: type, row: T) u16 {
             total += @field(row, field.name).heapBytesRequired();
         }
     }
-    return @intCast(total);
+    return total;
 }
 
 /// Field-by-field equality: strings and offset-array containers through
@@ -1115,9 +1096,7 @@ pub fn rowEql(comptime T: type, a: T, b: T) bool {
     return true;
 }
 
-/// Frees the row's strings and offset-array containers, which must have
-/// been allocated with `alloc` (by `decodeRow` or by building the row);
-/// rows deinit-ed with the same allocator.
+/// Frees the row's strings and offset-array containers.
 pub fn rowDeinit(comptime T: type, row: *T, alloc: std.mem.Allocator) void {
     inline for (std.meta.fields(T)) |field| {
         if (comptime isOffsetContainer(field.type) or field.type == DeviceSQLString) {
@@ -1126,7 +1105,6 @@ pub fn rowDeinit(comptime T: type, row: *T, alloc: std.mem.Allocator) void {
     }
 }
 
-/// Represents a musical genre.
 pub const Genre = struct {
     /// ID of this row.
     id: u32 = 0,
@@ -1136,7 +1114,6 @@ pub const Genre = struct {
     pub const page_type: PageType = .genres;
 };
 
-/// Represents a record label.
 pub const Label = struct {
     /// ID of this row.
     id: u32 = 0,
@@ -1146,7 +1123,6 @@ pub const Label = struct {
     pub const page_type: PageType = .labels;
 };
 
-/// Represents a musical key.
 pub const Key = struct {
     /// ID of this row.
     id: u32 = 0,
@@ -1158,7 +1134,6 @@ pub const Key = struct {
     pub const page_type: PageType = .keys;
 };
 
-/// Contains a numeric color ID and its user-defined name.
 pub const Color = struct {
     /// Unknown field.
     unknown1: u32 = 0,
@@ -1174,7 +1149,6 @@ pub const Color = struct {
     pub const page_type: PageType = .colors;
 };
 
-/// Contains the artwork path and ID.
 pub const Artwork = struct {
     /// ID of this row.
     id: u32 = 0,
@@ -1184,8 +1158,6 @@ pub const Artwork = struct {
     pub const page_type: PageType = .artwork;
 };
 
-/// Represents a history playlist, recorded every time the device is
-/// mounted by a player.
 pub const HistoryPlaylist = struct {
     /// ID of this row.
     id: u32 = 0,
@@ -1300,8 +1272,8 @@ pub const TrailingName = struct {
 
 /// Contains the artist name and ID.
 pub const Artist = struct {
-    /// Selects the offset width of the trailing offset array; observed
-    /// values are `0x60` (u8 offsets) and `0x64` (u16).
+    /// Selects the trailing offset array's width (see
+    /// `OffsetSize.fromSubtype`); observed values `0x60` and `0x64`.
     subtype: u16 = 0x60,
     /// Unknown field, called `index_shift` by flesniak; appears to always
     /// be `0x20 * row index`.
@@ -1316,11 +1288,10 @@ pub const Artist = struct {
 
 /// Contains the album name, the ID of its artist, and its own ID.
 pub const Album = struct {
-    /// Selects the offset width of the trailing offset array; the usual
-    /// value is `0x0080` (u8 offsets).
+    /// Selects the trailing offset array's width (see
+    /// `OffsetSize.fromSubtype`); the usual value is `0x0080`.
     subtype: u16 = 0x0080,
-    /// Unknown field, called `index_shift` by flesniak; appears to always
-    /// be `0x20 * row index`.
+    /// Unknown field; appears to always be `0x20 * row index`.
     index_shift: u16 = 0,
     /// Unknown field.
     unknown2: u32 = 0,
@@ -1364,9 +1335,7 @@ pub const PlaylistTreeNode = struct {
     }
 };
 
-/// The string fields of a Track row, stored behind its offset array. The
-/// fields' declaration order is the fixed slot order — the order of the
-/// offsets in the file.
+/// The string fields of a Track row, stored behind its offset array.
 pub const TrackStrings = struct {
     /// International Standard Recording Code (ISRC), in mangled format.
     isrc: DeviceSQLString = DeviceSQLString.empty(),
@@ -1414,24 +1383,20 @@ pub const TrackStrings = struct {
     /// Path of the file.
     file_path: DeviceSQLString = DeviceSQLString.empty(),
 
-    /// One offset and slot per field, in declaration order.
     pub const offset_count = std.meta.fields(@This()).len;
     pub const OffsetItem = DeviceSQLString;
 };
 
-/// The subtype every observed Track row carries: `0x24`, which selects
-/// `u16` offsets for the trailing offset array (bit `0x04` set).
+/// The subtype every observed Track row carries.
 const track_subtype: u16 = 0x24;
 
 /// Contains a track: its metadata, foreign-key IDs into the other tables,
-/// and the 21 strings behind the row's trailing offset array (base
-/// `0x5C`, the fixed-field size).
+/// and the 21 strings behind the row's trailing offset array.
 pub const Track = struct {
-    /// Selects the offset width of the trailing offset array; always
-    /// `0x24` in observed files, see `track_subtype`.
+    /// Selects the trailing offset array's width (see
+    /// `OffsetSize.fromSubtype` and `track_subtype`).
     subtype: u16 = track_subtype,
-    /// Unknown field, called `index_shift` by flesniak; appears to always
-    /// be `0x20 * row index`.
+    /// Unknown field; appears to always be `0x20 * row index`.
     index_shift: u16 = 0,
     /// Unknown field, called `bitmask` by flesniak; appears to always be
     /// `0x000c0700`.
@@ -1499,15 +1464,13 @@ pub const Track = struct {
 };
 
 /// The strings associated with a tag or category, stored behind the row's
-/// offset array. The fields' declaration order is the fixed slot order —
-/// the order of the offsets in the file.
+/// offset array.
 pub const TagOrCategoryStrings = struct {
     /// The name of the tag or category.
     name: DeviceSQLString = DeviceSQLString.empty(),
     /// String with unknown purpose, often empty.
     unknown: DeviceSQLString = DeviceSQLString.empty(),
 
-    /// One offset and slot per field, in declaration order.
     pub const offset_count = 2;
     pub const OffsetItem = DeviceSQLString;
 };
@@ -1517,11 +1480,10 @@ pub const TagOrCategoryStrings = struct {
 /// `raw_is_category` marks a category row; tag rows reference their
 /// category through `parent_id`.
 pub const TagOrCategory = struct {
-    /// Selects the offset width of the trailing offset array; observed
-    /// values are `0x0680` (u8 offsets) and `0x0684` (u16).
+    /// Selects the trailing offset array's width (see
+    /// `OffsetSize.fromSubtype`); observed values `0x0680` and `0x0684`.
     subtype: u16 = 0x0680,
-    /// Unknown field, called `index_shift` elsewhere; appears to always
-    /// be `0x20 * row index`.
+    /// Unknown field; appears to always be `0x20 * row index`.
     index_shift: u16 = 0,
     /// Unknown purpose; not always zero.
     unknown1: u32 = 0,
@@ -1540,8 +1502,7 @@ pub const TagOrCategory = struct {
     /// Non-zero (observed: `1 << 24`) when this row represents a category
     /// rather than a tag.
     raw_is_category: u32 = 0,
-    /// The offsets and the strings at the end of the row (base `0x1C`,
-    /// the fixed-field size).
+    /// The offsets and the strings at the end of the row.
     offsets: OffsetArrayContainer(TagOrCategoryStrings) = .{},
 
     pub const ext_page_type: ExtPageType = .tag;
@@ -1585,7 +1546,7 @@ fn rowMatchesPageType(
 
 /// The page-type wire value rows of type `T` dispatch on: the `page_type`
 /// decl of plain row types, or the raw value of an ext row type's
-/// `ext_page_type`, which collides with a plain meaning.
+/// `ext_page_type`.
 fn rowPageType(comptime T: type) PageType {
     if (@hasDecl(T, "page_type")) return T.page_type;
     return @enumFromInt(@intFromEnum(T.ext_page_type));
@@ -1628,7 +1589,6 @@ pub const Row = union(enum) {
         } else error.NotImplemented;
     }
 
-    /// Writes the row, the inverse of `Row.decode`.
     pub fn encode(self: Row, e: *bin.Emitter) RowEncodeError!void {
         return switch (self) {
             inline else => |row| try encodeRow(@TypeOf(row), row, e),
@@ -1636,15 +1596,15 @@ pub const Row = union(enum) {
     }
 
     /// Page heap space in bytes the row occupies.
-    pub fn heapBytesRequired(self: *const Row) u16 {
+    pub fn heapBytesRequired(self: *const Row) u32 {
         return switch (self.*) {
             inline else => |row| rowHeapBytesRequired(@TypeOf(row), row),
         };
     }
 
-    /// The page type rows of this variant belong to; for ext rows this is
-    /// the raw wire value, whose plain meaning differs — pair it with the
-    /// database type before comparing against page headers.
+    /// The page type rows of this variant belong to; pair it with the
+    /// database type before comparing against page headers (see
+    /// `DatabaseType`).
     pub fn pageType(self: Row) PageType {
         return switch (self) {
             inline else => |row| comptime rowPageType(@TypeOf(row)),
@@ -1706,8 +1666,6 @@ pub const DataPageHeader = struct {
 /// Maximum number of rows in a row group.
 pub const row_group_max_rows: usize = 16;
 
-/// Bytes one row group occupies: the sixteen offsets plus the presence
-/// flags and the unknown field.
 pub const row_group_size: usize = row_group_max_rows * 2 + 4;
 
 /// Bytes a row group's presence flags and unknown field occupy, charged to
@@ -1730,9 +1688,7 @@ const row_alignment: usize = 4;
 /// may store row data in their bytes. Parsing and writing keep them
 /// verbatim.
 pub const RowGroup = struct {
-    /// Row offsets relative to the start of the page heap, in slot order:
-    /// slot 15 holds the group's first-allocated row, later rows fill the
-    /// slots below, so the values descend through the array.
+    /// Row offsets relative to the start of the page heap, in slot order.
     row_offsets: [row_group_max_rows]u16 = @splat(0),
     /// Bitmask marking which rows of the group are present: bit `i`
     /// belongs to slot `15 - i`.
@@ -1755,8 +1711,6 @@ pub const RowGroup = struct {
         return @popCount(group.row_presence_flags);
     }
 
-    /// Reads a group from `c`: the sixteen offsets, the presence flags,
-    /// and the unknown field, little-endian.
     pub fn decode(c: *bin.Cursor) bin.ReadError!RowGroup {
         var group: RowGroup = undefined;
         for (&group.row_offsets) |*offset|
@@ -1766,7 +1720,6 @@ pub const RowGroup = struct {
         return group;
     }
 
-    /// Writes the group, the inverse of `decode`.
     pub fn encode(group: RowGroup, e: *bin.Emitter) bin.WriteError!void {
         for (group.row_offsets) |offset| try e.putInt(u16, offset, .little);
         try e.putInt(u16, group.row_presence_flags, .little);
@@ -1896,8 +1849,7 @@ pub const DataPageContent = struct {
 
         // Each row's true extent is measured off its encoded bytes — gaps
         // between offset-array items included — because `putBytesAt` would
-        // let overlapping rows overwrite each other without an error. One
-        // scratch emitter is reused for every row.
+        // let overlapping rows overwrite each other without an error.
         var extents = std.ArrayList(RowExtent).empty;
         defer extents.deinit(e.alloc);
         var sub = bin.Emitter.init(e.alloc);
@@ -1991,8 +1943,6 @@ pub const Table = struct {
     last_page: u32 = 0,
 };
 
-/// Fixed byte count of the file header before the tables: seven `u32`
-/// fields (see `Header`).
 const header_fixed_len = 7 * @sizeOf(u32);
 
 /// Bytes the header's fixed fields plus `count` table entries occupy.
@@ -2075,9 +2025,8 @@ pub const Header = struct {
     }
 
     /// Finds the first table whose page type equals `page_type`, or null.
-    /// In ext databases the wire values 3 and 4 carry tag meanings, so
-    /// callers pass the raw value (for example
-    /// `@enumFromInt(@intFromEnum(ExtPageType.tag))`).
+    /// Ext callers pass the raw colliding value, e.g.
+    /// `@enumFromInt(@intFromEnum(ExtPageType.tag))`.
     pub fn findTable(header: *const Header, page_type: PageType) ?*const Table {
         for (header.tables) |*table| {
             if (table.page_type == page_type) return table;
@@ -2105,9 +2054,7 @@ pub const PageEncodeError = bin.WriteError || error{UnexpectedValue};
 /// The content of a page, selected by the page header's `is_index_page`
 /// flag bit.
 pub const PageContent = union(enum) {
-    /// The page contains data rows.
     data: DataPageContent,
-    /// The page is an index page pointing at the table's data pages.
     index: IndexPageContent,
 
     /// Reads the content selected by `page_header.page_flags` from `c`,
@@ -2270,11 +2217,11 @@ pub const Page = struct {
         };
     }
 
-    /// Allocates `bytes` of page heap for a new row — rounded up to the
-    /// 4-byte alignment rows are placed at — reserving a row-group offset
-    /// slot and charging the page's free/used accounting, and returns the
-    /// ticket for `commitRow`. Returns null when the page is an index page
-    /// or has insufficient free space, leaving the page unchanged.
+    /// Allocates `bytes` of page heap for a new row — rounded up to
+    /// `row_alignment` — reserving a row-group offset slot and charging
+    /// the page's free/used accounting, and returns the ticket for
+    /// `commitRow`. Returns null when the page is an index page or has
+    /// insufficient free space, leaving the page unchanged.
     ///
     /// The allocate/commit pair replaces rekordcrate's insert closure, so
     /// a row only moves once its space is known. Allocation without a
@@ -2285,7 +2232,7 @@ pub const Page = struct {
     pub fn allocRow(
         page: *Page,
         alloc: std.mem.Allocator,
-        bytes: u16,
+        bytes: u32,
     ) error{OutOfMemory}!?RowAlloc {
         const dpc = switch (page.content) {
             .data => |*data| data,
@@ -2518,9 +2465,7 @@ pub const Database = struct {
     /// The insert tries the table's tail page first, then its
     /// `empty_candidate` (when that is a parsed data page of the right
     /// type, unlike the tail), and only then allocates a fresh page,
-    /// relinking the chain onto it: the previous tail's `next_page` is
-    /// patched in both places it is stored — the page header and, for
-    /// index pages, the index header's duplicate.
+    /// relinking the chain onto it.
     pub fn addRow(db: *Database, row: *Row) DatabaseModifyError!RowRef {
         switch (row.*) {
             .track => |*track| try validateTrackRowSize(track),
@@ -2547,13 +2492,9 @@ pub const Database = struct {
         if (db.pages[old_last_page - 1] == .raw)
             return error.UnexpectedValue;
 
-        // The chain tail first.
         if (try db.tryInsertRow(old_last_page, row_size, row)) |row_ref|
             return row_ref;
 
-        // Tail was full or an index page. An `empty_candidate` unlike the
-        // tail that is a parsed data page of the right type is tried next
-        // and becomes the new tail.
         if (empty_candidate != old_last_page and
             empty_candidate >= 1 and empty_candidate <= db.pages.len)
         {
@@ -2573,7 +2514,6 @@ pub const Database = struct {
             }
         }
 
-        // No existing page fits: allocate a fresh one and link it on.
         const new_page_index = try db.allocDataPage(page_type);
         try db.relinkChainEnd(old_last_page, new_page_index);
         const table_mut = db.header.findTableMut(page_type) orelse
@@ -2590,7 +2530,7 @@ pub const Database = struct {
     fn tryInsertRow(
         db: *Database,
         page_index: u32,
-        row_size: u16,
+        row_size: u32,
         row: *Row,
     ) DatabaseModifyError!?RowRef {
         if (page_index < 1 or page_index > db.pages.len) return null;
@@ -2606,8 +2546,7 @@ pub const Database = struct {
     }
 
     /// Points page `previous_page_index`'s `next_page` at
-    /// `current_page_index`, patching both stored copies when it is an
-    /// index page.
+    /// `current_page_index`.
     fn relinkChainEnd(
         db: *Database,
         previous_page_index: u32,
@@ -2733,7 +2672,7 @@ pub const Database = struct {
     /// whole-image model's equivalent moment.
     pub fn validateAllTrackRows(
         db: *const Database,
-    ) error{ TableTypeNotFound, TrackRowTooSmall, UnexpectedValue }!void {
+    ) error{ TableTypeNotFound, TrackRowTooSmall, TrackRowTooLarge, UnexpectedValue }!void {
         if (db.db_type != .plain) return;
         const table = db.header.findTable(.tracks) orelse
             return error.TableTypeNotFound;
@@ -2787,13 +2726,15 @@ const default_page_size: u32 = 4096;
 
 /// Error of the modification layer: `TableTypeNotFound` is a row whose
 /// page type no table in the header holds, `TrackRowTooSmall` a Track row
-/// below `min_track_allocated_size`, and `UnexpectedValue` a database
+/// below `min_track_allocated_size`, `TrackRowTooLarge` a Track row whose
+/// heap bytes exceed the `u16` page accounting, and `UnexpectedValue` a database
 /// whose page chains or allocation counters are inconsistent with the
 /// operation, or misuse of the allocate/commit pair.
 pub const DatabaseModifyError = error{
     OutOfMemory,
     TableTypeNotFound,
     TrackRowTooSmall,
+    TrackRowTooLarge,
     UnexpectedValue,
 };
 
@@ -2811,18 +2752,22 @@ pub const RowRef = struct {
 /// exactly; any "cleanup" here is a latent CDJ crash.
 pub const min_track_allocated_size: u16 = 221;
 
-/// A row's allocated size: its heap bytes rounded up to the 4-byte
-/// alignment rows are placed at.
-pub fn allocatedRowSize(row_size: u16) u16 {
-    return @intCast(std.mem.alignForward(usize, row_size, row_alignment));
+/// A row's allocated size: its heap bytes rounded up to `row_alignment`.
+pub fn allocatedRowSize(row_size: u32) u32 {
+    return @intCast(std.mem.alignForward(u64, row_size, row_alignment));
 }
 
 /// Rejects Track rows whose allocated size is below
 /// `min_track_allocated_size`; `addRow` enforces it, and the device
 /// writer enforces it on whole databases before serializing (see
 /// `Database.validateAllTrackRows`).
-pub fn validateTrackRowSize(track: *const Track) error{TrackRowTooSmall}!void {
-    if (allocatedRowSize(rowHeapBytesRequired(Track, track.*)) < min_track_allocated_size)
+pub fn validateTrackRowSize(
+    track: *const Track,
+) error{ TrackRowTooSmall, TrackRowTooLarge }!void {
+    const row_size = allocatedRowSize(rowHeapBytesRequired(Track, track.*));
+    if (row_size > std.math.maxInt(u16))
+        return error.TrackRowTooLarge;
+    if (row_size < min_track_allocated_size)
         return error.TrackRowTooSmall;
 }
 
@@ -2948,8 +2893,6 @@ const default_menus = [_]struct {
     .{ .category_id = 22, .content_pointer = 27, .unknown = 99, .visibility = .visible, .sort_order = 10 },
 };
 
-/// Inserts the default color rows (see `default_colors`) into the
-/// database's colors table.
 pub fn insertDefaultColors(db: *Database) DatabaseModifyError!void {
     const a = db.arena.allocator();
     for (default_colors) |entry| {
@@ -2968,8 +2911,6 @@ pub fn insertDefaultColors(db: *Database) DatabaseModifyError!void {
     }
 }
 
-/// Inserts the default metadata-category rows (see `default_columns`)
-/// into the database's columns table.
 pub fn insertDefaultColumns(db: *Database) DatabaseModifyError!void {
     const a = db.arena.allocator();
     for (default_columns) |entry| {
@@ -2985,8 +2926,6 @@ pub fn insertDefaultColumns(db: *Database) DatabaseModifyError!void {
     }
 }
 
-/// Inserts the default menu rows (see `default_menus`) into the
-/// database's menu table.
 pub fn insertDefaultMenus(db: *Database) DatabaseModifyError!void {
     for (default_menus) |entry| {
         var row = Row{ .menu = .{
