@@ -2585,7 +2585,7 @@ pub const Database = struct {
         const page_type = row.pageType();
         const row_size = row.heapBytesRequired();
 
-        const table = db.header.findTable(page_type) orelse
+        const table = db.header.findTableMut(page_type) orelse
             return error.TableTypeNotFound;
         const old_last_page = table.last_page;
         // A representable page index, checked before any insert like
@@ -2614,9 +2614,7 @@ pub const Database = struct {
             if (usable) {
                 if (try db.tryInsertRow(empty_candidate, row_size, row)) |row_ref| {
                     try db.relinkChainEnd(old_last_page, empty_candidate);
-                    const table_mut = db.header.findTableMut(page_type) orelse
-                        return error.TableTypeNotFound;
-                    table_mut.last_page = empty_candidate;
+                    table.last_page = empty_candidate;
                     return row_ref;
                 }
             }
@@ -2624,9 +2622,7 @@ pub const Database = struct {
 
         const new_page_index = try db.allocDataPage(page_type);
         try db.relinkChainEnd(old_last_page, new_page_index);
-        const table_mut = db.header.findTableMut(page_type) orelse
-            return error.TableTypeNotFound;
-        table_mut.last_page = new_page_index;
+        table.last_page = new_page_index;
 
         return try db.tryInsertRow(new_page_index, row_size, row) orelse
             error.UnexpectedValue; // a freshly allocated page has no room
