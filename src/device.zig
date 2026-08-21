@@ -101,12 +101,13 @@ pub const Layout = struct {
     /// `audio_path` is the path relative to the drive root, starting with a
     /// leading slash (e.g. `/Contents/Artist/Album/01 Title.mp3`).
     pub fn anlzDir(l: Layout, alloc: std.mem.Allocator, audio_path: []const u8) PathError![]u8 {
-        const h = try pathHash(audio_path);
-        const p_folder = try std.fmt.allocPrint(alloc, "P{X:0>3}", .{h.p_value});
-        defer alloc.free(p_folder);
-        const leaf_folder = try std.fmt.allocPrint(alloc, "{X:0>8}", .{h.hash});
-        defer alloc.free(leaf_folder);
-        return std.fs.path.join(alloc, &.{ l.root, "PIONEER", "USBANLZ", p_folder, leaf_folder });
+        var p_folder: [4]u8 = undefined;
+        var leaf_folder: [8]u8 = undefined;
+        const names = anlzFolderNames(try pathHash(audio_path), &p_folder, &leaf_folder);
+        return std.fs.path.join(
+            alloc,
+            &.{ l.root, "PIONEER", "USBANLZ", names.p_folder, names.leaf_folder },
+        );
     }
 
     /// Host path to a track's `ANLZ0000.DAT` (base sections: beatgrid,
@@ -204,17 +205,35 @@ pub fn pathHash(audio_path: []const u8) error{InvalidUtf8}!PathHash {
     return .{ .p_value = p_value, .hash = hash_result };
 }
 
+/// Formats a path hash's two folder names — `P{XXX}` and `{HHHHHHHH}` —
+/// the single source of the USBANLZ naming scheme. The buffers exactly fit
+/// every value `pathHash` produces (`p_value` is 7 bits, `hash` is below
+/// 200 003), so the prints fill them completely and cannot fail; the
+/// returned slices point into the buffers.
+fn anlzFolderNames(
+    h: PathHash,
+    p_folder: *[4]u8,
+    leaf_folder: *[8]u8,
+) struct { p_folder: []const u8, leaf_folder: []const u8 } {
+    return .{
+        .p_folder = std.fmt.bufPrint(p_folder, "P{X:0>3}", .{h.p_value}) catch unreachable,
+        .leaf_folder = std.fmt.bufPrint(leaf_folder, "{X:0>8}", .{h.hash}) catch unreachable,
+    };
+}
+
 /// Device-relative path stored in the pdb `analyze_path` column: the `.DAT`
 /// the player loads first; sibling `.EXT`/`.2EX` are found by extension
 /// substitution on the same stem. The path is keyed by the audio file's
 /// device-relative path (with a leading slash), matching what Pioneer
 /// hardware recomputes — see `pathHash`.
 pub fn anlzDevicePath(alloc: std.mem.Allocator, audio_path: []const u8) PathError![]u8 {
-    const h = try pathHash(audio_path);
+    var p_folder: [4]u8 = undefined;
+    var leaf_folder: [8]u8 = undefined;
+    const names = anlzFolderNames(try pathHash(audio_path), &p_folder, &leaf_folder);
     return std.fmt.allocPrint(
         alloc,
-        "/PIONEER/USBANLZ/P{X:0>3}/{X:0>8}/ANLZ0000.DAT",
-        .{ h.p_value, h.hash },
+        "/PIONEER/USBANLZ/{s}/{s}/ANLZ0000.DAT",
+        .{ names.p_folder, names.leaf_folder },
     );
 }
 
