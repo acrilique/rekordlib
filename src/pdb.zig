@@ -2336,6 +2336,21 @@ pub const Page = struct {
         if (dpc.rows.len > 0 and dpc.rows[dpc.rows.len - 1].offset >= ticket.row_offset)
             return error.UnexpectedValue;
 
+        // Pre-size the rows slice on a page's first commit: the first
+        // row's charge bounds how many rows of at least its size the page
+        // heap can hold, so a table of uniform rows allocates the slice
+        // once instead of doubling through abandoned arena buffers.
+        // Smaller rows may still exceed the bound; appendElem then grows.
+        if (dpc.rows_cap == 0 and dpc.rows.len == 0) {
+            const charge: usize = allocatedRowSize(row.heapBytesRequired()) +
+                row_group_offset_size;
+            const heap: usize = @as(usize, page.header.free_size) +
+                page.header.used_size;
+            const bound = heap / charge + 1;
+            dpc.rows = (try alloc.alloc(RowAtOffset, bound))[0..0];
+            dpc.rows_cap = bound;
+        }
+
         try appendElem(
             RowAtOffset,
             alloc,
