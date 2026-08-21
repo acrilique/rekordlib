@@ -469,7 +469,8 @@ fn putEncodedAt(e: *bin.Emitter, offset: usize, value: anytype) !void {
 /// * `offset_count`: how many items (and offsets) it comprises
 /// * `OffsetItem`: the item type, holding the `decode`/`encode`/`deinit`/
 ///   `heapBytesRequired`/`requiredAlignment`/`eql` protocol of
-///   `DeviceSQLString` (the alignment matters to calculated offsets)
+///   `DeviceSQLString`; `requiredAlignment` returns the power-of-two
+///   alignment, at least 1, that a calculated offset must respect
 ///
 /// Plus the item glue — `offsetItems(T) [n]OffsetItem` (a borrowing view),
 /// `fromOffsetItems([n]OffsetItem) T` (which takes item ownership), and
@@ -568,7 +569,7 @@ pub fn OffsetArrayContainer(comptime T: type) type {
                     try e.pad(n * size.bytes());
                     if (comptime Item != void) {
                         inline for (Protocol.offsetItems(self.inner), 0..) |item, i| {
-                            const alignment: usize = @max(item.requiredAlignment(), 1);
+                            const alignment: usize = item.requiredAlignment();
                             const current = e.pos() - base;
                             const aligned = std.mem.alignForward(usize, current, alignment);
                             if (aligned > current) try e.pad(aligned - current);
@@ -600,7 +601,7 @@ pub fn OffsetArrayContainer(comptime T: type) type {
             var total: u32 = @intCast((n + 1) * size.bytes());
             inline for (Protocol.offsetItems(self.inner)) |item| {
                 if (calculated) {
-                    const alignment: u32 = @max(item.requiredAlignment(), 1);
+                    const alignment: u32 = item.requiredAlignment();
                     total = std.mem.alignForward(u32, total, alignment);
                 }
                 total += item.heapBytesRequired();
