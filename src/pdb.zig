@@ -2428,6 +2428,16 @@ pub const PageSlot = union(enum) {
     }
 };
 
+/// The parsed page at 1-based `page_index`, or null when the index falls
+/// outside `slots` or the slot holds raw bytes.
+fn parsedPageAt(slots: []PageSlot, page_index: u32) ?*Page {
+    if (page_index < 1 or page_index > slots.len) return null;
+    return switch (slots[page_index - 1]) {
+        .page => |*page| page,
+        .raw => null,
+    };
+}
+
 /// Decoding error of a whole database.
 pub const DatabaseDecodeError = bin.ReadError || error{UnexpectedValue};
 
@@ -2585,9 +2595,7 @@ pub const Database = struct {
         // The chain tail must be a page that exists and parsed, like the
         // oracle's eager load; an index-page tail (an empty created table)
         // simply fails the insert below.
-        if (old_last_page < 1 or old_last_page > db.pages.len)
-            return error.UnexpectedValue;
-        if (db.pages[old_last_page - 1] == .raw)
+        if (parsedPageAt(db.pages, old_last_page) == null)
             return error.UnexpectedValue;
 
         if (try db.tryInsertRow(old_last_page, row_size, row)) |row_ref|
@@ -2631,11 +2639,7 @@ pub const Database = struct {
         row_size: u32,
         row: *Row,
     ) DatabaseModifyError!?RowRef {
-        if (page_index < 1 or page_index > db.pages.len) return null;
-        const page = switch (db.pages[page_index - 1]) {
-            .page => |*page| page,
-            .raw => return null,
-        };
+        const page = parsedPageAt(db.pages, page_index) orelse return null;
         const ticket = (try page.allocRow(db.arena.allocator(), row_size)) orelse
             return null;
         try page.commitRow(db.arena.allocator(), ticket, row.*);
@@ -2649,12 +2653,8 @@ pub const Database = struct {
         previous_page_index: u32,
         current_page_index: u32,
     ) error{UnexpectedValue}!void {
-        if (previous_page_index < 1 or previous_page_index > db.pages.len)
+        const page = parsedPageAt(db.pages, previous_page_index) orelse
             return error.UnexpectedValue;
-        const page = switch (db.pages[previous_page_index - 1]) {
-            .page => |*page| page,
-            .raw => return error.UnexpectedValue,
-        };
         page.header.next_page = current_page_index;
         switch (page.content) {
             .index => |*index| index.header.next_page = current_page_index,
@@ -2784,12 +2784,8 @@ pub const Database = struct {
             return error.TableTypeNotFound;
         var current = table.first_page;
         while (true) {
-            if (current < 1 or current > db.pages.len)
+            const page = parsedPageAt(db.pages, current) orelse
                 return error.UnexpectedValue;
-            const page = switch (db.pages[current - 1]) {
-                .page => |*page| page,
-                .raw => return error.UnexpectedValue,
-            };
             switch (page.content) {
                 .data => |*content| for (content.rows) |*at| switch (at.row) {
                     .track => |track| try validateTrackRowSize(track),
