@@ -331,7 +331,9 @@ pub const Settings = struct {
 const dat_limit = std.Io.Limit.limited(1 << 16);
 
 /// Reads and parses one `*SETTING.DAT` file; a missing, unreadable, or
-/// invalid file is reported as a warning and as null.
+/// invalid file is reported as null — unlike the oracle, which also
+/// `eprintln!`s a warning, the library stays silent and leaves reporting
+/// to the caller inspecting the null fields.
 fn loadSettingFile(
     comptime Payload: type,
     io: std.Io,
@@ -341,15 +343,9 @@ fn loadSettingFile(
 ) ?Payload {
     const path = layout.datPath(alloc, filename) catch return null;
     defer alloc.free(path);
-    const buf = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, dat_limit) catch |err| {
-        std.log.warn("could not load {s}: {t}", .{ path, err });
-        return null;
-    };
+    const buf = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, dat_limit) catch return null;
     defer alloc.free(buf);
-    const parsed = setting.Setting(Payload).parse(buf) catch |err| {
-        std.log.warn("could not load {s}: {t}", .{ path, err });
-        return null;
-    };
+    const parsed = setting.Setting(Payload).parse(buf) catch return null;
     return parsed.data;
 }
 
