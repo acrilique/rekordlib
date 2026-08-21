@@ -281,8 +281,13 @@ pub fn putStruct(e: *Emitter, value: anytype, comptime endian: std.builtin.Endia
 /// Reads `n` elements of `T` in declaration order at `endian` (see
 /// `takeStruct` for the supported field types), allocating the returned
 /// slice with `alloc`; the caller owns it. The partial slice is freed if any
-/// element fails to read.
+/// element fails to read. Runs whose `n` elements cannot fit the remaining
+/// input fail with `UnexpectedEof` before anything is allocated, so
+/// attacker-controlled counts cannot amplify into oversized allocations.
 pub fn takeStructSlice(alloc: std.mem.Allocator, c: *Cursor, comptime T: type, comptime endian: std.builtin.Endian, n: usize) ReadError![]T {
+    const elem_len = comptime serializedLen(T);
+    const run_len: u64 = @as(u64, n) * elem_len;
+    if (run_len > c.remaining()) return ReadError.UnexpectedEof;
     const out = try alloc.alloc(T, n);
     errdefer alloc.free(out);
     for (out) |*item| item.* = try takeStruct(c, T, endian);
