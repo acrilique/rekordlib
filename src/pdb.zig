@@ -2993,53 +2993,66 @@ const default_menus = [_]struct {
     .{ .category_id = 22, .content_pointer = 27, .unknown = 99, .visibility = .visible, .sort_order = 10 },
 };
 
+/// The `Row` variant holding a `*T` payload.
+fn rowOf(comptime T: type, payload: *T) Row {
+    const tag = comptime blk: {
+        for (std.meta.fields(Row)) |field| {
+            if (RowPayload(field.type) == T) break :blk field.name;
+        }
+        @compileError("rowOf: no Row variant holds " ++ @typeName(T));
+    };
+    return @unionInit(Row, tag, payload);
+}
+
+/// Builds one of the default-row strings; the comptime-verified literals
+/// can be neither too long nor invalidly encoded, so only allocation can
+/// fail.
+fn defaultString(a: std.mem.Allocator, text: []const u8) error{OutOfMemory}!DeviceSQLString {
+    return DeviceSQLString.fromUtf8(a, text) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooLong, error.InvalidEncoding => unreachable,
+    };
+}
+
+/// Creates `payload` in the database's arena, boxes it into its `Row`
+/// variant, and adds it as a row.
+fn addDefaultRow(db: *Database, payload: anytype) DatabaseModifyError!void {
+    const owned = try db.arena.allocator().create(@TypeOf(payload));
+    owned.* = payload;
+    var row = rowOf(@TypeOf(payload), owned);
+    _ = try db.addRow(&row);
+}
+
 pub fn insertDefaultColors(db: *Database) DatabaseModifyError!void {
     const a = db.arena.allocator();
     for (default_colors) |entry| {
-        const color = try a.create(Color);
-        color.* = .{
+        try addDefaultRow(db, Color{
             .unknown2 = entry.id,
             .color = entry.color,
-            .name = DeviceSQLString.fromUtf8(a, entry.name) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                // The comptime-verified literals can be neither.
-                error.TooLong, error.InvalidEncoding => unreachable,
-            },
-        };
-        var row = Row{ .color = color };
-        _ = try db.addRow(&row);
+            .name = try defaultString(a, entry.name),
+        });
     }
 }
 
 pub fn insertDefaultColumns(db: *Database) DatabaseModifyError!void {
     const a = db.arena.allocator();
     for (default_columns) |entry| {
-        const column = try a.create(ColumnEntry);
-        column.* = .{
+        try addDefaultRow(db, ColumnEntry{
             .id = entry.id,
             .unknown0 = entry.unknown0,
-            .column_name = DeviceSQLString.fromUtf8(a, entry.name) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.TooLong, error.InvalidEncoding => unreachable,
-            },
-        };
-        var row = Row{ .column_entry = column };
-        _ = try db.addRow(&row);
+            .column_name = try defaultString(a, entry.name),
+        });
     }
 }
 
 pub fn insertDefaultMenus(db: *Database) DatabaseModifyError!void {
-    const a = db.arena.allocator();
     for (default_menus) |entry| {
-        const menu = try a.create(Menu);
-        menu.* = .{
+        try addDefaultRow(db, Menu{
             .category_id = entry.category_id,
             .content_pointer = entry.content_pointer,
             .unknown = entry.unknown,
             .visibility = entry.visibility,
             .sort_order = entry.sort_order,
-        };
-        var row = Row{ .menu = menu };
-        _ = try db.addRow(&row);
+        });
     }
 }
