@@ -1387,24 +1387,9 @@ test "whole databases roundtrip byte-identical except zeroed dead space" {
 /// `PageIterator` does, rejecting non-increasing links, pages outside the
 /// file, and pages that did not parse.
 fn countTableRows(db: *const pdb.Database, page_type: pdb.PageType) !usize {
-    const table = db.header.findTable(page_type) orelse return error.NoTable;
+    var it = try db.rows(page_type);
     var count: usize = 0;
-    var current = table.first_page;
-    while (true) {
-        if (current == 0 or current > db.pages.len) return error.PageMissing;
-        const page = switch (db.pages[current - 1]) {
-            .page => |*page| page,
-            .raw => return error.UnparsedPage,
-        };
-        switch (page.content) {
-            .data => |*content| count += content.rows.len,
-            .index => {},
-        }
-        if (current == table.last_page) break;
-        const next = page.header.next_page;
-        if (next <= current) return error.PageOrderViolation;
-        current = next;
-    }
+    while (try it.next()) |_| count += 1;
     return count;
 }
 
@@ -2897,26 +2882,15 @@ test "created databases carry the default color, column, and menu rows" {
 /// Counts the track rows with `rating`, by walking the tracks table's
 /// page chain.
 fn countTracks(db: *const pdb.Database, rating: u8) !usize {
-    const table = db.header.findTable(.tracks) orelse return error.NoTable;
+    var it = try db.rows(.tracks);
     var count: usize = 0;
-    var current = table.first_page;
-    while (true) {
-        const page = switch (db.pages[current - 1]) {
-            .page => |*page| page,
-            .raw => return error.UnparsedPage,
-        };
-        switch (page.content) {
-            .data => |*content| for (content.rows) |*at| switch (at.row) {
-                .track => |track| {
-                    if (track.rating == rating) count += 1;
-                },
-                else => {},
-            },
-            .index => {},
-        }
-        if (current == table.last_page) return count;
-        current = page.header.next_page;
-    }
+    while (try it.next()) |row| switch (row.*) {
+        .track => |track| {
+            if (track.rating == rating) count += 1;
+        },
+        else => {},
+    };
+    return count;
 }
 
 test "num_rows mutation: set all track ratings and round-trip" {

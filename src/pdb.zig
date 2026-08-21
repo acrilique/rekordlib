@@ -2565,6 +2565,20 @@ pub const Database = struct {
         return std.mem.eql(u8, a.tail, b.tail);
     }
 
+    /// Iterates the rows of the table holding `page_type`, in page order
+    /// (see `RowIterator`).
+    pub fn rows(db: *const Database, page_type: PageType) RowIterError!RowIterator {
+        const table = db.header.findTable(page_type) orelse return error.NoTable;
+        var it = RowIterator{
+            .db = db,
+            .last_page = table.last_page,
+            .current = table.first_page,
+            .next_page = page_chain_end,
+        };
+        try it.loadPage();
+        return it;
+    }
+
     /// Appends `row` to the table holding its page type, allocating a new
     /// page when no existing one fits. On success the database owns the
     /// row and its boxed payload — allocate the payload with the
@@ -2796,6 +2810,74 @@ pub const Database = struct {
             if (next <= current) return error.UnexpectedValue;
             current = next;
         }
+    }
+};
+
+/// Error of `Database.rows` and `RowIterator.next`: `NoTable` is a page
+/// type no table in the header holds, `PageNotPresent` a chained page
+/// index outside the file, `PageOrderViolation` a chain link that does not
+/// advance (rekordcrate's `PageIterator` assumes pages in a table are
+/// linked in increasing order by index), and `UnparsedPage` a chained page
+/// kept raw because its rows are not wired for the database type.
+pub const RowIterError = error{
+    NoTable,
+    PageNotPresent,
+    PageOrderViolation,
+    UnparsedPage,
+};
+
+/// Iterates the rows of one table's page chain in page order — the order
+/// the writer appends them in; index pages carry no rows and are skipped.
+/// Every hop validates that the chain advances and stays inside the file,
+/// so a corrupted chain errors instead of looping. Rows are borrowed from
+/// the database for the iterator's lifetime.
+pub const RowIterator = struct {
+    db: *const Database,
+    /// 1-based index of the page whose rows are being yielded.
+    current: u32,
+    /// The chain's final page; walking stops after it.
+    last_page: u32,
+    /// Chain link of the current page, read when it was loaded.
+    next_page: u32,
+    /// Rows of the current data page and the yield position in it.
+    rows: []const RowAtOffset = &.{},
+    i: usize = 0,
+    done: bool = false,
+
+    /// Loads `current`, adopting its rows (an index page adopts none) and
+    /// its chain link.
+    fn loadPage(it: *RowIterator) RowIterError!void {
+        if (it.current < 1 or it.current > it.db.pages.len)
+            return error.PageNotPresent;
+        const page = switch (it.db.pages[it.current - 1]) {
+            .page => |*page| page,
+            .raw => return error.UnparsedPage,
+        };
+        switch (page.content) {
+            .data => |*content| it.rows = content.rows,
+            .index => it.rows = &.{},
+        }
+        it.i = 0;
+        it.next_page = page.header.next_page;
+    }
+
+    /// The table's next row, or null once the chain is exhausted.
+    pub fn next(it: *RowIterator) RowIterError!?*const Row {
+        while (!it.done) {
+            if (it.i < it.rows.len) {
+                const row = &it.rows[it.i].row;
+                it.i += 1;
+                return row;
+            }
+            if (it.current == it.last_page) {
+                it.done = true;
+                return null;
+            }
+            if (it.next_page <= it.current) return error.PageOrderViolation;
+            it.current = it.next_page;
+            try it.loadPage();
+        }
+        return null;
     }
 };
 
