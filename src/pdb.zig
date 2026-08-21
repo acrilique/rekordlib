@@ -2893,9 +2893,14 @@ pub fn padTrackCommentToMinimum(
         var replaced = track.offsets.inner.comment;
         track.offsets.inner.comment = candidate;
         replaced.deinit(alloc);
-        validateTrackRowSize(track) catch {
-            try text.append(alloc, ' ');
-            continue;
+        validateTrackRowSize(track) catch |err| switch (err) {
+            // Padding can only grow the row, so a too-large row can never
+            // pass; looping would just spin until the comment overflows.
+            error.TrackRowTooLarge => return error.TooLong,
+            error.TrackRowTooSmall => {
+                try text.append(alloc, ' ');
+                continue;
+            },
         };
         return;
     }
