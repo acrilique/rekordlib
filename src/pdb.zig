@@ -1751,8 +1751,12 @@ pub const DataPageContent = struct {
     /// the heap: the group holding the page's first rows ends at the heap
     /// end, later groups sit below it.
     row_groups: []RowGroup = &.{},
+    /// Capacity of the `row_groups` allocation; see `appendElem`.
+    row_groups_cap: usize = 0,
     /// Rows in allocation order: row-group order, presence bits ascending.
     rows: []RowAtOffset = &.{},
+    /// Capacity of the `rows` allocation; see `appendElem`.
+    rows_cap: usize = 0,
 
     /// Reads the data page header, the row groups backwards from the end
     /// of the heap (as many as `page_header.packed_row_counts.num_rows`
@@ -1811,10 +1815,13 @@ pub const DataPageContent = struct {
         if (rows.items.len != page_header.packed_row_counts.num_rows_valid)
             return error.UnexpectedValue;
 
+        const owned_rows = try rows.toOwnedSlice(alloc);
         return .{
             .header = header,
             .row_groups = groups,
-            .rows = try rows.toOwnedSlice(alloc),
+            .row_groups_cap = groups.len,
+            .rows = owned_rows,
+            .rows_cap = owned_rows.len,
         };
     }
 
@@ -1897,10 +1904,13 @@ pub const DataPageContent = struct {
 
     pub fn deinit(content: *DataPageContent, alloc: std.mem.Allocator) void {
         for (content.rows) |*at| at.row.deinit(alloc);
-        alloc.free(content.rows);
+        // The allocations may be larger than the slices (geometric growth).
+        alloc.free(content.rows.ptr[0..@max(content.rows.len, content.rows_cap)]);
         content.rows = &.{};
-        alloc.free(content.row_groups);
+        content.rows_cap = 0;
+        alloc.free(content.row_groups.ptr[0..@max(content.row_groups.len, content.row_groups_cap)]);
         content.row_groups = &.{};
+        content.row_groups_cap = 0;
     }
 };
 
@@ -2121,20 +2131,34 @@ pub const RowAlloc = struct {
     row_subindex: u4,
 };
 
-/// Grows `slice` by one element, appending `item`. An empty slice owns no
-/// memory to realloc, so it is allocated fresh.
+/// Appends `item` to `slice`, growing its allocation geometrically through
+/// `cap`, the allocation's element capacity: an exact-length reallocation
+/// per element is O(n^2) in time and — because the modification layer's
+/// arenas abandon the outgrown buffer — in peak memory too. An empty slice
+/// owns no memory to grow from.
 fn appendElem(
     comptime T: type,
     alloc: std.mem.Allocator,
-    slice: []T,
+    slice: *[]T,
+    cap: *usize,
     item: T,
-) error{OutOfMemory}![]T {
-    const grown = if (slice.len == 0)
-        try alloc.alloc(T, slice.len + 1)
-    else
-        try alloc.realloc(slice, slice.len + 1);
-    grown[grown.len - 1] = item;
-    return grown;
+) error{OutOfMemory}!void {
+    // A capacity at or below the length means none is tracked — an empty
+    // slice, or one built externally (decode tracks an exact capacity):
+    // grow by doubling from the length either way.
+    if (cap.* <= slice.*.len) {
+        const new_cap = @max(slice.*.len *| 2, 4);
+        const grown = try alloc.alloc(T, new_cap);
+        @memcpy(grown[0..slice.*.len], slice.*);
+        // Frees an exact-length buffer of ours; a foreign slice (cap
+        // below length) is left to its owner — the database's arena
+        // reclaims it regardless.
+        if (cap.* > 0) alloc.free(slice.ptr[0..cap.*]);
+        cap.* = new_cap;
+        slice.* = grown[0..slice.*.len];
+    }
+    slice.*.len += 1;
+    slice.*[slice.*.len - 1] = item;
 }
 
 /// A table page: the 0x20-byte page header plus the content selected by
@@ -2260,10 +2284,11 @@ pub const Page = struct {
         const row_subindex: u4 = @intCast((num_rows - 1) % row_group_max_rows);
 
         if (row_group_index == dpc.row_groups.len) {
-            dpc.row_groups = try appendElem(
+            try appendElem(
                 RowGroup,
                 alloc,
-                dpc.row_groups,
+                &dpc.row_groups,
+                &dpc.row_groups_cap,
                 .{},
             );
             free -= row_group_header_size;
@@ -2311,10 +2336,11 @@ pub const Page = struct {
         if (dpc.rows.len > 0 and dpc.rows[dpc.rows.len - 1].offset >= ticket.row_offset)
             return error.UnexpectedValue;
 
-        dpc.rows = try appendElem(
+        try appendElem(
             RowAtOffset,
             alloc,
-            dpc.rows,
+            &dpc.rows,
+            &dpc.rows_cap,
             .{ .offset = ticket.row_offset, .row = row },
         );
         group.row_presence_flags |= presence;
