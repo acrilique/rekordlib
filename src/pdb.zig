@@ -404,7 +404,7 @@ pub const OffsetSize = enum {
 
     /// Writes one stored offset at this width, rejecting a value too
     /// wide for it.
-    fn putOffset(size: OffsetSize, e: *bin.Emitter, value: u16) (bin.WriteError || error{UnexpectedValue})!void {
+    fn putOffset(size: OffsetSize, e: *bin.Emitter, value: u16) OffsetArrayEncodeError!void {
         switch (size) {
             .u8 => {
                 if (value > std.math.maxInt(u8)) return error.UnexpectedValue;
