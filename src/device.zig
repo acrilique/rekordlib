@@ -4,11 +4,16 @@
 
 //! On-disk layout of a Rekordbox device export: where `export.pdb`,
 //! `exportExt.pdb`, the `*SETTING.DAT` files and the `PIONEER`/`USBANLZ`/
-//! `Contents` directories live relative to the device root.
+//! `Contents` directories live relative to the device root, plus the
+//! read-side handle that opens an export's settings and database through
+//! that layout.
 //!
-//! Ported from rekordcrate's `src/device/layout.rs`.
+//! Ported from rekordcrate's `src/device/layout.rs` and
+//! `src/device/reader.rs`.
 
 const std = @import("std");
+const pdb = @import("pdb");
+const setting = @import("setting");
 
 /// Error of the layout functions that hash or format an audio path.
 pub const PathError = error{ OutOfMemory, InvalidUtf8 };
@@ -276,4 +281,235 @@ pub fn artworkSpec(alloc: std.mem.Allocator, id: u32) std.mem.Allocator.Error!Ar
 /// Five-digit shard folder name for artwork `id`: `id/20 + 1`, zero-padded.
 pub fn artworkFolder(alloc: std.mem.Allocator, id: u32) std.mem.Allocator.Error![]u8 {
     return std.fmt.allocPrint(alloc, "{d:0>5}", .{id / 20 + 1});
+}
+
+/// The settings payload a `*SETTING.DAT` kind carries (see `dat_files`).
+pub fn SettingPayload(comptime kind: SettingKind) type {
+    return switch (kind) {
+        .dev_setting => setting.DevSetting,
+        .djm_my_setting => setting.DJMMySetting,
+        .my_setting => setting.MySetting,
+        .my_setting2 => setting.MySetting2,
+    };
+}
+
+/// The parsed payloads of the four `*SETTING.DAT` files. A file that is
+/// missing, unreadable, or invalid leaves its field null.
+///
+/// rekordcrate instead flattens every individual setting into `Option`
+/// fields of one `Settings` struct; that shape exists for its `Display`
+/// impl, which the no-dump decision (roadmap decision 1) does not need —
+/// see `docs/DIVERGENCES.md`.
+pub const Settings = struct {
+    dev_setting: ?setting.DevSetting = null,
+    djm_my_setting: ?setting.DJMMySetting = null,
+    my_setting: ?setting.MySetting = null,
+    my_setting2: ?setting.MySetting2 = null,
+};
+
+/// Size cap when reading a `*SETTING.DAT` file; the largest known payload
+/// is a few hundred bytes.
+const dat_limit = std.Io.Limit.limited(1 << 16);
+
+/// Reads and parses one `*SETTING.DAT` file; a missing, unreadable, or
+/// invalid file is reported as a warning and as null.
+fn loadSettingFile(
+    comptime Payload: type,
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    layout: Layout,
+    filename: []const u8,
+) ?Payload {
+    const path = layout.datPath(alloc, filename) catch return null;
+    defer alloc.free(path);
+    const buf = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, dat_limit) catch |err| {
+        std.log.warn("could not load {s}: {t}", .{ path, err });
+        return null;
+    };
+    defer alloc.free(buf);
+    const parsed = setting.Setting(Payload).parse(buf) catch |err| {
+        std.log.warn("could not load {s}: {t}", .{ path, err });
+        return null;
+    };
+    return parsed.data;
+}
+
+/// Error of `DeviceExportReader.openPdb`.
+pub const OpenPdbError = std.Io.Dir.ReadFileAllocError || pdb.DatabaseDecodeError;
+
+/// Size cap when reading an `export.pdb`; the largest fixture is 2.9 MB.
+const pdb_limit = std.Io.Limit.limited(1 << 26);
+
+/// A read-side handle to a Rekordbox device export on disk: the setting
+/// files and the pdb database, located through `Layout`. Files the export
+/// carries but the reader does not model are ignored by design:
+/// `djprofile.nxs` (undocumented), and `exportLibrary.db` until Phase O.
+pub const DeviceExportReader = struct {
+    /// The export's layout.
+    layout: Layout,
+
+    /// Points a reader at a device export on disk (a directory containing
+    /// `PIONEER`).
+    pub fn init(root_path: []const u8) DeviceExportReader {
+        return .{ .layout = .{ .root = root_path } };
+    }
+
+    /// The device root path.
+    pub fn root(r: DeviceExportReader) []const u8 {
+        return r.layout.root;
+    }
+
+    /// Loads the four `*SETTING.DAT` files in `dat_files` order, each
+    /// tolerantly (see `Settings`).
+    pub fn loadSettings(r: DeviceExportReader, io: std.Io, alloc: std.mem.Allocator) Settings {
+        var settings = Settings{};
+        inline for (dat_files) |dat| {
+            const payload = loadSettingFile(
+                SettingPayload(dat.kind),
+                io,
+                alloc,
+                r.layout,
+                dat.name,
+            );
+            if (payload) |data| {
+                @field(settings, @tagName(dat.kind)) = data;
+            }
+        }
+        return settings;
+    }
+
+    /// Reads `export.pdb` and parses it into memory; changes to the
+    /// returned database are never written back to disk.
+    pub fn openPdb(
+        r: DeviceExportReader,
+        io: std.Io,
+        alloc: std.mem.Allocator,
+    ) OpenPdbError!pdb.Database {
+        const path = r.layout.exportPdb(alloc) catch return error.OutOfMemory;
+        defer alloc.free(path);
+        const buf = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, pdb_limit);
+        defer alloc.free(buf);
+        return pdb.Database.parse(alloc, buf, .plain);
+    }
+};
+
+/// A playlist (leaf of the playlist tree).
+pub const Playlist = struct {
+    /// ID of this node in the playlist tree.
+    id: u32,
+    /// Name of the playlist.
+    name: []u8,
+};
+
+/// A playlist folder, grouping other nodes.
+pub const PlaylistFolder = struct {
+    /// ID of this node in the playlist tree.
+    id: u32,
+    /// Name of the playlist folder.
+    name: []u8,
+    /// Child nodes, in row order.
+    children: std.ArrayList(PlaylistNode),
+};
+
+/// Either a playlist folder or a playlist.
+pub const PlaylistNode = union(enum) {
+    /// A folder containing child `PlaylistNode`s.
+    folder: PlaylistFolder,
+    /// A playlist (leaf).
+    playlist: Playlist,
+
+    /// Frees the node's name and, for a folder, its children recursively.
+    pub fn deinit(node: *PlaylistNode, alloc: std.mem.Allocator) void {
+        switch (node.*) {
+            .folder => |*folder| {
+                for (folder.children.items) |*child| child.deinit(alloc);
+                folder.children.deinit(alloc);
+                alloc.free(folder.name);
+            },
+            .playlist => |*playlist| alloc.free(playlist.name),
+        }
+    }
+};
+
+/// Error of `getPlaylists`: the playlist-tree row iteration errors plus
+/// the string decode errors.
+pub const GetPlaylistsError = pdb.RowIterError || error{ InvalidEncoding, OutOfMemory };
+
+/// Playlist-tree rows grouped by their parent id.
+const PlaylistGroups = std.AutoHashMap(u32, std.ArrayList(*const pdb.PlaylistTreeNode));
+
+/// Frees the grouping map built by `getPlaylists`.
+fn deinitGroups(alloc: std.mem.Allocator, groups: *PlaylistGroups) void {
+    var it = groups.iterator();
+    while (it.next()) |entry| entry.value_ptr.deinit(alloc);
+    groups.deinit();
+}
+
+/// Appends the children of `parent` to `out`, in row order, recursing into
+/// folders.
+fn buildChildren(
+    alloc: std.mem.Allocator,
+    groups: *const PlaylistGroups,
+    parent: u32,
+    out: *std.ArrayList(PlaylistNode),
+) GetPlaylistsError!void {
+    const nodes = groups.get(parent) orelse return;
+    for (nodes.items) |node| {
+        const name = try node.name.utf8(alloc);
+        errdefer alloc.free(name);
+        if (node.isFolder()) {
+            var children = std.ArrayList(PlaylistNode).empty;
+            errdefer {
+                for (children.items) |*child| child.deinit(alloc);
+                children.deinit(alloc);
+            }
+            try buildChildren(alloc, groups, node.id, &children);
+            try out.append(alloc, .{ .folder = .{
+                .id = node.id,
+                .name = name,
+                .children = children,
+            } });
+        } else {
+            try out.append(alloc, .{ .playlist = .{ .id = node.id, .name = name } });
+        }
+    }
+}
+
+/// Builds the playlist tree from the database's playlist-tree rows: nodes
+/// parented to 0 form the top level, folders recurse into their children,
+/// and names are decoded to owned UTF-8. Nodes unreachable from the root
+/// (parented to a missing id) do not appear, as in rekordcrate.
+///
+/// The caller owns the returned list; free it by deinitializing every
+/// element and then the list itself:
+///
+///     var playlists = try device.getPlaylists(alloc, &db);
+///     defer {
+///         for (playlists.items) |*node| node.deinit(alloc);
+///         playlists.deinit(alloc);
+///     }
+pub fn getPlaylists(
+    alloc: std.mem.Allocator,
+    db: *const pdb.Database,
+) GetPlaylistsError!std.ArrayList(PlaylistNode) {
+    var groups = PlaylistGroups.init(alloc);
+    defer deinitGroups(alloc, &groups);
+
+    var it = try db.rows(.playlist_tree);
+    while (try it.next()) |row| switch (row.*) {
+        .playlist_tree_node => |node| {
+            const gop = try groups.getOrPut(node.parent_id);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(alloc, node);
+        },
+        else => {},
+    };
+
+    var roots = std.ArrayList(PlaylistNode).empty;
+    errdefer {
+        for (roots.items) |*node| node.deinit(alloc);
+        roots.deinit(alloc);
+    }
+    try buildChildren(alloc, &groups, 0, &roots);
+    return roots;
 }

@@ -4,6 +4,8 @@
 
 const std = @import("std");
 const device = @import("device");
+const pdb = @import("pdb");
+const testutil = @import("util.zig");
 
 const testing = std.testing;
 
@@ -186,4 +188,174 @@ test "artwork spec pins shard folders, file names, and resolutions" {
     try testing.expectEqual(@as(u16, 80), spec.thumbnail_resolution.height);
     try testing.expectEqual(@as(u16, 240), spec.medium_resolution.width);
     try testing.expectEqual(@as(u16, 240), spec.medium_resolution.height);
+}
+
+// --- device reader (D2) -------------------------------------------------------
+
+/// Fixture roots under `testdata`, with hand-checked track counts (the
+/// pdb's own rows) and playlist trees.
+const fixtures = [_]struct {
+    name: []const u8,
+    tracks: usize,
+    playlists: []const PlaylistExpectation,
+}{
+    .{ .name = "empty", .tracks = 0, .playlists = &.{} },
+    .{ .name = "demo_tracks", .tracks = 2, .playlists = &.{} },
+    .{
+        .name = "with_anlz",
+        .tracks = 2,
+        .playlists = &.{.{ .id = 1, .name = "aaaaa" }},
+    },
+};
+
+/// One expected top-level playlist leaf.
+const PlaylistExpectation = struct {
+    id: u32,
+    name: []const u8,
+};
+
+test "reader loads all four settings of every fixture" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    for (fixtures) |fixture| {
+        const path = try std.fmt.allocPrint(alloc, "testdata/complete_export/{s}", .{fixture.name});
+        defer alloc.free(path);
+        const reader = device.DeviceExportReader.init(path);
+        const settings = reader.loadSettings(io, alloc);
+        try testing.expect(settings.dev_setting != null);
+        try testing.expect(settings.djm_my_setting != null);
+        try testing.expect(settings.my_setting != null);
+        try testing.expect(settings.my_setting2 != null);
+    }
+}
+
+test "settings loading tolerates missing and invalid files" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    // One intact settings file, one corrupted, two absent.
+    const good = try testutil.readFixture(
+        alloc,
+        "complete_export/with_anlz/PIONEER/MYSETTING.DAT",
+        .limited(1 << 16),
+    );
+    defer alloc.free(good);
+    try tmp.dir.createDirPath(io, "PIONEER");
+    try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER/MYSETTING.DAT", .data = good });
+    try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER/DJMMYSETTING.DAT", .data = "garbage" });
+
+    const reader = device.DeviceExportReader.init(tmp_path);
+    const settings = reader.loadSettings(io, alloc);
+    try testing.expect(settings.my_setting != null);
+    try testing.expect(settings.djm_my_setting == null);
+    try testing.expect(settings.dev_setting == null);
+    try testing.expect(settings.my_setting2 == null);
+
+    // A root without any export content at all stays quiet and empty.
+    const empty_reader = device.DeviceExportReader.init(".zig-cache/definitely-not-here");
+    const empty_settings = empty_reader.loadSettings(io, alloc);
+    try testing.expect(empty_settings.dev_setting == null);
+    try testing.expect(empty_settings.djm_my_setting == null);
+    try testing.expect(empty_settings.my_setting == null);
+    try testing.expect(empty_settings.my_setting2 == null);
+}
+
+test "reader opens each fixture pdb and counts its tracks" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    for (fixtures) |fixture| {
+        const path = try std.fmt.allocPrint(alloc, "testdata/complete_export/{s}", .{fixture.name});
+        defer alloc.free(path);
+        const reader = device.DeviceExportReader.init(path);
+
+        var db = try reader.openPdb(io, alloc);
+        defer db.deinit();
+
+        var tracks: usize = 0;
+        var it = try db.rows(.tracks);
+        while (try it.next()) |row| switch (row.*) {
+            .track => tracks += 1,
+            else => {},
+        };
+        try testing.expectEqual(fixture.tracks, tracks);
+    }
+}
+
+test "playlist trees match the fixtures" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    for (fixtures) |fixture| {
+        const path = try std.fmt.allocPrint(alloc, "testdata/complete_export/{s}", .{fixture.name});
+        defer alloc.free(path);
+        const reader = device.DeviceExportReader.init(path);
+
+        var db = try reader.openPdb(io, alloc);
+        defer db.deinit();
+
+        var playlists = try device.getPlaylists(alloc, &db);
+        defer {
+            for (playlists.items) |*node| node.deinit(alloc);
+            playlists.deinit(alloc);
+        }
+        try testing.expectEqual(fixture.playlists.len, playlists.items.len);
+        for (fixture.playlists, playlists.items) |want, *node| switch (node.*) {
+            .playlist => |playlist| {
+                try testing.expectEqual(want.id, playlist.id);
+                try testing.expectEqualStrings(want.name, playlist.name);
+            },
+            .folder => try testing.expect(false),
+        };
+    }
+}
+
+test "playlist tree nests folders in row order" {
+    const alloc = testing.allocator;
+
+    const input = try testutil.readFixture(
+        alloc,
+        "complete_export/with_anlz/PIONEER/rekordbox/export.pdb",
+        .limited(1 << 22),
+    );
+    defer alloc.free(input);
+    var db = try pdb.Database.parse(alloc, input, .plain);
+    defer db.deinit();
+
+    // The fixture has no folders, so grow a tree through the modification
+    // layer: one folder under the root, two leaves under it — appended in
+    // an order that is not id order, pinning row order.
+    const a = db.arena.allocator();
+    const nodes = [_]pdb.PlaylistTreeNode{
+        .{ .id = 100, .node_is_folder = 1, .name = try pdb.DeviceSQLString.fromUtf8(a, "Folder") },
+        .{ .id = 101, .parent_id = 100, .name = try pdb.DeviceSQLString.fromUtf8(a, "Leaf B") },
+        .{ .id = 102, .parent_id = 100, .name = try pdb.DeviceSQLString.fromUtf8(a, "Leaf A") },
+    };
+    for (nodes) |node| {
+        const boxed = try a.create(pdb.PlaylistTreeNode);
+        boxed.* = node;
+        var row = pdb.Row{ .playlist_tree_node = boxed };
+        _ = try db.addRow(&row);
+    }
+
+    var playlists = try device.getPlaylists(alloc, &db);
+    defer {
+        for (playlists.items) |*node| node.deinit(alloc);
+        playlists.deinit(alloc);
+    }
+
+    try testing.expectEqual(@as(usize, 2), playlists.items.len);
+    try testing.expectEqual(@as(u32, 1), playlists.items[0].playlist.id);
+    try testing.expectEqualStrings("aaaaa", playlists.items[0].playlist.name);
+    const folder = playlists.items[1].folder;
+    try testing.expectEqual(@as(u32, 100), folder.id);
+    try testing.expectEqualStrings("Folder", folder.name);
+    try testing.expectEqual(@as(usize, 2), folder.children.items.len);
+    try testing.expectEqual(@as(u32, 101), folder.children.items[0].playlist.id);
+    try testing.expectEqualStrings("Leaf B", folder.children.items[0].playlist.name);
+    try testing.expectEqual(@as(u32, 102), folder.children.items[1].playlist.id);
+    try testing.expectEqualStrings("Leaf A", folder.children.items[1].playlist.name);
 }

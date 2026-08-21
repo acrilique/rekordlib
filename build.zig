@@ -56,6 +56,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/device.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "pdb", .module = pdb },
+            .{ .name = "setting", .module = setting },
+        },
     });
 
     const lib = b.addLibrary(.{
