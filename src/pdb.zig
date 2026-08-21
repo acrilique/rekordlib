@@ -447,16 +447,6 @@ pub fn Offsets(comptime n: usize) type {
     };
 }
 
-/// Serializes `value` — any type with an `encode(self, e)` method — into
-/// a scratch emitter and writes the finished bytes at `offset`,
-/// zero-filling any gap (see `bin.Emitter.putBytesAt`).
-fn putEncodedAt(e: *bin.Emitter, offset: usize, value: anytype) !void {
-    var sub = bin.Emitter.init(e.alloc);
-    defer sub.deinit();
-    try value.encode(&sub);
-    try e.putBytesAt(offset, sub.written());
-}
-
 /// An array of `n` offsets followed by the data at those offsets, the tail
 /// structure rows use to locate strings (and other heap objects) after
 /// their fixed fields: a magic sized by `OffsetSize`, the `n` offsets, and
@@ -1937,7 +1927,9 @@ pub const DataPageContent = struct {
 
         for (self.row_groups, 0..) |group, g| {
             const group_end = heap_end - row_group_size * g;
-            try putEncodedAt(e, group_end - row_group_size, group);
+            sub.clear();
+            try group.encode(&sub);
+            try e.putBytesAt(group_end - row_group_size, sub.written());
         }
         if (e.pos() < heap_end) try e.pad(heap_end - e.pos());
         if (e.pos() != heap_end) return error.UnexpectedValue; // overran the heap
