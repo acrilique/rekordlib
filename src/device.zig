@@ -18,8 +18,7 @@ const setting = @import("setting");
 /// Error of the layout functions that hash or format an audio path.
 pub const PathError = error{ OutOfMemory, InvalidUtf8 };
 
-/// Which settings payload a `*SETTING.DAT` file carries; identifies the
-/// parser for each entry of `dat_files`.
+/// Which settings payload a `*SETTING.DAT` file carries.
 pub const SettingKind = enum {
     dev_setting,
     djm_my_setting,
@@ -31,7 +30,6 @@ pub const SettingKind = enum {
 pub const DatFile = struct {
     /// File name under `PIONEER`.
     name: []const u8,
-    /// Which settings format the file carries.
     kind: SettingKind,
 };
 
@@ -54,37 +52,34 @@ pub const Layout = struct {
     /// The device root directory, as a host path.
     root: []const u8,
 
-    /// The `PIONEER` directory.
     pub fn pioneerDir(l: Layout, alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         return std.fs.path.join(alloc, &.{ l.root, "PIONEER" });
     }
 
-    /// The `PIONEER/rekordbox` directory holding the pdb files.
+    /// Directory holding the pdb files.
     pub fn rekordboxDir(l: Layout, alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         return std.fs.path.join(alloc, &.{ l.root, "PIONEER", "rekordbox" });
     }
 
-    /// Path to `export.pdb`.
     pub fn exportPdb(l: Layout, alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         return std.fs.path.join(alloc, &.{ l.root, "PIONEER", "rekordbox", "export.pdb" });
     }
 
-    /// Path to `exportExt.pdb`.
     pub fn exportExtPdb(l: Layout, alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         return std.fs.path.join(alloc, &.{ l.root, "PIONEER", "rekordbox", "exportExt.pdb" });
     }
 
-    /// The `PIONEER/USBANLZ` directory holding per-track analysis files.
+    /// Directory holding per-track analysis files.
     pub fn usbanlzDir(l: Layout, alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         return std.fs.path.join(alloc, &.{ l.root, "PIONEER", "USBANLZ" });
     }
 
-    /// The `Contents` directory holding audio files.
+    /// Directory holding audio files.
     pub fn contentsDir(l: Layout, alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         return std.fs.path.join(alloc, &.{ l.root, "Contents" });
     }
 
-    /// Path to a `*SETTING.DAT` file by name, under `PIONEER`.
+    /// Path to `filename` under `PIONEER`.
     pub fn datPath(
         l: Layout,
         alloc: std.mem.Allocator,
@@ -94,12 +89,8 @@ pub const Layout = struct {
     }
 
     /// Per-track analysis directory `PIONEER/USBANLZ/P{XXX}/{HHHHHHHH}`,
-    /// keyed by the audio file's device-relative path. Pioneer hardware
-    /// ignores the pdb `analyze_path` and recomputes this directory from the
-    /// on-drive path, so it must match the algorithm in `pathHash`.
-    ///
-    /// `audio_path` is the path relative to the drive root, starting with a
-    /// leading slash (e.g. `/Contents/Artist/Album/01 Title.mp3`).
+    /// computed from `audio_path`; see `pathHash` for the format
+    /// `audio_path` must have.
     pub fn anlzDir(l: Layout, alloc: std.mem.Allocator, audio_path: []const u8) PathError![]u8 {
         var p_folder: [4]u8 = undefined;
         var leaf_folder: [8]u8 = undefined;
@@ -159,19 +150,16 @@ pub const PathHash = struct {
     hash: u32,
 };
 
-/// Compute the Pioneer `(p_value, hash)` pair for an audio file's
-/// device-relative path.
+/// Compute the Pioneer `(p_value, hash)` pair for `audio_path`: the path
+/// relative to the drive root, starting with a leading slash (e.g.
+/// `/Contents/Artist/Album/01 Title.mp3`).
 ///
-/// `audio_path` is the path relative to the drive root, starting with a
-/// leading slash (e.g. `/Contents/Artist/Album/01 Title.mp3`). Pioneer
-/// CDJ/XDJ hardware ignores the pdb `analyze_path` and recomputes the
-/// analysis directory from this hash, so the on-disk layout must match it
-/// for waveforms to display. Algorithm reverse-engineered from rekordbox's
-/// `CreateAnlzFileFolderPath`: the path is hashed as UTF-16 code units with
-/// a custom rolling hash, reduced modulo 200 003 (prime), and a 7-bit P
-/// value is then extracted from scattered bits of the result. The same path
-/// always yields the same directory, so re-syncs address the same analysis
-/// folder.
+/// Pioneer CDJ/XDJ hardware ignores the pdb `analyze_path` and recomputes
+/// the analysis directory from this hash, so the on-disk layout must match
+/// it for waveforms to display. Algorithm reverse-engineered from
+/// rekordbox's `CreateAnlzFileFolderPath`: the path is hashed as UTF-16
+/// code units with a custom rolling hash, reduced modulo 200 003 (prime),
+/// and a 7-bit P value is then extracted from scattered bits of the result.
 ///
 /// Characters outside the BMP contribute only their low 16 bits instead of
 /// a proper surrogate pair; non-BMP paths therefore collide with unrelated
@@ -182,8 +170,6 @@ pub fn pathHash(audio_path: []const u8) error{InvalidUtf8}!PathHash {
 
     var it = (try std.unicode.Utf8View.init(audio_path)).iterator();
     while (it.nextCodepoint()) |c| {
-        // Each code point is masked to a single UTF-16 code unit instead of
-        // being encoded as a surrogate pair.
         const code_unit: u32 = c & 0xFFFF;
         const temp = hash *% 0x5BC9 +% code_unit;
         hash = temp *% 0x93B5 +% code_unit;
@@ -191,8 +177,6 @@ pub fn pathHash(audio_path: []const u8) error{InvalidUtf8}!PathHash {
 
     const hash_result = hash % 0x30D43; // modulo 200 003 (prime)
 
-    // The P value is assembled from non-contiguous bits of the hash, in the
-    // exact bit order the rekordbox disassembly extracts them.
     var p_value: u16 = 0;
     p_value |= @intCast(hash_result & 1); // bit 0  -> bit 0
     p_value |= @intCast((hash_result >> 1) & 2); // bit 2  -> bit 1
@@ -205,11 +189,9 @@ pub fn pathHash(audio_path: []const u8) error{InvalidUtf8}!PathHash {
     return .{ .p_value = p_value, .hash = hash_result };
 }
 
-/// Formats a path hash's two folder names — `P{XXX}` and `{HHHHHHHH}` —
-/// the single source of the USBANLZ naming scheme. The buffers exactly fit
-/// every value `pathHash` produces (`p_value` is 7 bits, `hash` is below
-/// 200 003), so the prints fill them completely and cannot fail; the
-/// returned slices point into the buffers.
+/// Formats a path hash's two folder names — `P{XXX}` and `{HHHHHHHH}`.
+/// The buffers exactly fit every value `pathHash` produces, so the prints
+/// cannot fail; the returned slices point into the buffers.
 fn anlzFolderNames(
     h: PathHash,
     p_folder: *[4]u8,
@@ -223,9 +205,8 @@ fn anlzFolderNames(
 
 /// Device-relative path stored in the pdb `analyze_path` column: the `.DAT`
 /// the player loads first; sibling `.EXT`/`.2EX` are found by extension
-/// substitution on the same stem. The path is keyed by the audio file's
-/// device-relative path (with a leading slash), matching what Pioneer
-/// hardware recomputes — see `pathHash`.
+/// substitution on the same stem. Computed from `audio_path` via
+/// `pathHash`.
 pub fn anlzDevicePath(alloc: std.mem.Allocator, audio_path: []const u8) PathError![]u8 {
     var p_folder: [4]u8 = undefined;
     var leaf_folder: [8]u8 = undefined;
@@ -237,8 +218,7 @@ pub fn anlzDevicePath(alloc: std.mem.Allocator, audio_path: []const u8) PathErro
     );
 }
 
-/// Image codec an artwork file must use (decision 5: the library delegates
-/// media decoding and conversion to the caller).
+/// Image codec an artwork file must use.
 pub const ArtworkCodec = enum {
     jpeg,
 };
@@ -259,11 +239,8 @@ pub const ArtworkSpec = struct {
     thumbnail_path: []u8,
     /// Device-root-absolute path of the 240x240 image `a{id}_m.jpg`.
     medium_path: []u8,
-    /// Codec both files must use.
     codec: ArtworkCodec,
-    /// Dimensions of `thumbnail_path`.
     thumbnail_resolution: Resolution,
-    /// Dimensions of `medium_path`.
     medium_resolution: Resolution,
 
     pub fn deinit(spec: *ArtworkSpec, alloc: std.mem.Allocator) void {
@@ -272,8 +249,7 @@ pub const ArtworkSpec = struct {
     }
 };
 
-/// Describe the artwork files for `id` (decision 5: the library never
-/// decodes or converts media; it only tells the caller what to write).
+/// Builds the `ArtworkSpec` for artwork row `id`.
 pub fn artworkSpec(alloc: std.mem.Allocator, id: u32) std.mem.Allocator.Error!ArtworkSpec {
     const folder = try artworkFolder(alloc, id);
     defer alloc.free(folder);
@@ -302,7 +278,6 @@ pub fn artworkFolder(alloc: std.mem.Allocator, id: u32) std.mem.Allocator.Error!
     return std.fmt.allocPrint(alloc, "{d:0>5}", .{id / 20 + 1});
 }
 
-/// The settings payload a `*SETTING.DAT` kind carries (see `dat_files`).
 pub fn SettingPayload(comptime kind: SettingKind) type {
     return switch (kind) {
         .dev_setting => setting.DevSetting,
@@ -314,11 +289,6 @@ pub fn SettingPayload(comptime kind: SettingKind) type {
 
 /// The parsed payloads of the four `*SETTING.DAT` files. A file that is
 /// missing, unreadable, or invalid leaves its field null.
-///
-/// rekordcrate instead flattens every individual setting into `Option`
-/// fields of one `Settings` struct; that shape exists for its `Display`
-/// impl, which the no-dump decision (roadmap decision 1) does not need —
-/// see `docs/DIVERGENCES.md`.
 pub const Settings = struct {
     dev_setting: ?setting.DevSetting = null,
     djm_my_setting: ?setting.DJMMySetting = null,
@@ -330,10 +300,7 @@ pub const Settings = struct {
 /// is a few hundred bytes.
 const dat_limit = std.Io.Limit.limited(1 << 16);
 
-/// Reads and parses one `*SETTING.DAT` file; a missing, unreadable, or
-/// invalid file is reported as null — unlike the oracle, which also
-/// `eprintln!`s a warning, the library stays silent and leaves reporting
-/// to the caller inspecting the null fields.
+/// Reads and parses one `*SETTING.DAT` file, returning null on any failure.
 fn loadSettingFile(
     comptime Payload: type,
     io: std.Io,
@@ -358,9 +325,8 @@ const pdb_limit = std.Io.Limit.limited(1 << 26);
 /// A read-side handle to a Rekordbox device export on disk: the setting
 /// files and the pdb database, located through `Layout`. Files the export
 /// carries but the reader does not model are ignored by design:
-/// `djprofile.nxs` (undocumented), and `exportLibrary.db` until Phase O.
+/// `djprofile.nxs` (undocumented) and `exportLibrary.db`.
 pub const DeviceExportReader = struct {
-    /// The export's layout.
     layout: Layout,
 
     /// Points a reader at a device export on disk (a directory containing
@@ -369,13 +335,11 @@ pub const DeviceExportReader = struct {
         return .{ .layout = .{ .root = root_path } };
     }
 
-    /// The device root path.
     pub fn root(r: DeviceExportReader) []const u8 {
         return r.layout.root;
     }
 
-    /// Loads the four `*SETTING.DAT` files in `dat_files` order, each
-    /// tolerantly (see `Settings`).
+    /// Loads the four `*SETTING.DAT` files in `dat_files` order.
     pub fn loadSettings(r: DeviceExportReader, io: std.Io, alloc: std.mem.Allocator) Settings {
         var settings = Settings{};
         inline for (dat_files) |dat| {
@@ -412,7 +376,6 @@ pub const DeviceExportReader = struct {
 pub const Playlist = struct {
     /// ID of this node in the playlist tree.
     id: u32,
-    /// Name of the playlist.
     name: []u8,
 };
 
@@ -420,7 +383,6 @@ pub const Playlist = struct {
 pub const PlaylistFolder = struct {
     /// ID of this node in the playlist tree.
     id: u32,
-    /// Name of the playlist folder.
     name: []u8,
     /// Child nodes, in row order.
     children: std.ArrayList(PlaylistNode),
@@ -428,9 +390,7 @@ pub const PlaylistFolder = struct {
 
 /// Either a playlist folder or a playlist.
 pub const PlaylistNode = union(enum) {
-    /// A folder containing child `PlaylistNode`s.
     folder: PlaylistFolder,
-    /// A playlist (leaf).
     playlist: Playlist,
 
     /// Frees the node's name and, for a folder, its children recursively.
@@ -446,8 +406,7 @@ pub const PlaylistNode = union(enum) {
     }
 };
 
-/// Error of `getPlaylists`: the playlist-tree row iteration errors plus
-/// the string decode errors.
+/// Error of `getPlaylists`.
 pub const GetPlaylistsError = pdb.RowIterError || error{ InvalidEncoding, OutOfMemory };
 
 /// Playlist-tree rows grouped by their parent id.
@@ -461,8 +420,7 @@ fn deinitGroups(alloc: std.mem.Allocator, groups: *PlaylistGroups) void {
 }
 
 /// Appends the children of `parent` to `out`, in row order, recursing into
-/// folders. A folder whose id is already in `visited` is skipped, so
-/// parent-id cycles in corrupt data cannot recurse forever.
+/// folders.
 fn buildChildren(
     alloc: std.mem.Allocator,
     groups: *const PlaylistGroups,
