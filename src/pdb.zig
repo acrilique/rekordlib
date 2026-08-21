@@ -972,6 +972,33 @@ fn isOffsetContainer(comptime T: type) bool {
     };
 }
 
+/// The field kinds the row walkers understand, classified in one place
+/// (see `rowFieldKind`).
+const RowFieldKind = enum {
+    int,
+    @"enum",
+    /// An inline `DeviceSQLString`.
+    string,
+    /// An `OffsetArrayContainer`.
+    offset_container,
+};
+
+/// Classifies a row field for the walkers (`fixedLen`, `decodeRow`,
+/// `encodeRow`, `rowHeapBytesRequired`, `rowEql`, `rowDeinit`): the single
+/// place a field type's kind is decided, so every walker handles every
+/// kind or fails to compile.
+fn rowFieldKind(comptime T: type) RowFieldKind {
+    return if (isOffsetContainer(T))
+        .offset_container
+    else if (T == DeviceSQLString)
+        .string
+    else switch (@typeInfo(T)) {
+        .int => .int,
+        .@"enum" => .@"enum",
+        else => @compileError("rowFieldKind: unsupported field type `" ++ @typeName(T) ++ "`"),
+    };
+}
+
 /// Compile-time contract of the row walkers: an offset-array container
 /// field must be preceded by the row's `subtype` field, which selects
 /// its offset width.
@@ -996,11 +1023,10 @@ fn fixedLen(comptime T: type) usize {
     return comptime blk: {
         var len: usize = 0;
         for (std.meta.fields(T)) |field| {
-            if (field.type == DeviceSQLString or isOffsetContainer(field.type)) continue;
-            switch (@typeInfo(field.type)) {
+            switch (rowFieldKind(field.type)) {
                 .int => len += @sizeOf(field.type),
-                .@"enum" => |en| len += @sizeOf(en.tag_type),
-                else => @compileError("fixedLen: unsupported field type `" ++ @typeName(field.type) ++ "`"),
+                .@"enum" => len += @sizeOf(@typeInfo(field.type).@"enum".tag_type),
+                .string, .offset_container => {},
             }
         }
         break :blk len;
@@ -1022,22 +1048,22 @@ pub fn decodeRow(comptime T: type, c: *bin.Cursor) RowDecodeError!T {
         if (c.alloc) |alloc| rowDeinit(T, &row, alloc);
     }
     inline for (std.meta.fields(T)) |field| {
-        if (comptime isOffsetContainer(field.type)) {
-            @field(row, field.name) = try field.type.decode(
-                c,
-                fixedLen(T),
-                OffsetSize.fromSubtype(row.subtype),
-            );
-        } else if (comptime field.type == DeviceSQLString) {
-            @field(row, field.name) = try DeviceSQLString.decode(c);
-        } else switch (@typeInfo(field.type)) {
+        switch (comptime rowFieldKind(field.type)) {
+            .offset_container => {
+                @field(row, field.name) = try field.type.decode(
+                    c,
+                    fixedLen(T),
+                    OffsetSize.fromSubtype(row.subtype),
+                );
+            },
+            .string => @field(row, field.name) = try DeviceSQLString.decode(c),
             .int => @field(row, field.name) = try c.takeInt(field.type, .little),
-            .@"enum" => |en| {
+            .@"enum" => {
+                const en = @typeInfo(field.type).@"enum";
                 if (en.is_exhaustive)
                     @compileError("decodeRow: enum fields must be non-exhaustive, `" ++ @typeName(field.type) ++ "` is not");
                 @field(row, field.name) = @enumFromInt(try c.takeInt(en.tag_type, .little));
             },
-            else => @compileError("decodeRow: unsupported field type `" ++ @typeName(field.type) ++ "`"),
         }
     }
     try bin.validateConstantFields(T, row);
@@ -1048,22 +1074,19 @@ pub fn decodeRow(comptime T: type, c: *bin.Cursor) RowDecodeError!T {
 /// the supported field types.
 pub fn encodeRow(comptime T: type, row: *const T, e: *bin.Emitter) RowEncodeError!void {
     inline for (std.meta.fields(T)) |field| {
-        if (comptime isOffsetContainer(field.type)) {
-            try @field(row.*, field.name).encode(
+        switch (comptime rowFieldKind(field.type)) {
+            .offset_container => try @field(row.*, field.name).encode(
                 e,
                 fixedLen(T),
                 OffsetSize.fromSubtype(@field(row.*, "subtype")),
-            );
-        } else if (comptime field.type == DeviceSQLString) {
-            try @field(row.*, field.name).encode(e);
-        } else switch (@typeInfo(field.type)) {
+            ),
+            .string => try @field(row.*, field.name).encode(e),
             .int => try e.putInt(field.type, @field(row.*, field.name), .little),
-            .@"enum" => |en| try e.putInt(
-                en.tag_type,
+            .@"enum" => try e.putInt(
+                @typeInfo(field.type).@"enum".tag_type,
                 @intFromEnum(@field(row.*, field.name)),
                 .little,
             ),
-            else => @compileError("encodeRow: unsupported field type `" ++ @typeName(field.type) ++ "`"),
         }
     }
 }
@@ -1074,12 +1097,12 @@ pub fn encodeRow(comptime T: type, row: *const T, e: *bin.Emitter) RowEncodeErro
 pub fn rowHeapBytesRequired(comptime T: type, row: *const T) u32 {
     var total: u32 = @intCast(fixedLen(T));
     inline for (std.meta.fields(T)) |field| {
-        if (comptime isOffsetContainer(field.type)) {
-            total += @field(row.*, field.name).heapBytesRequired(
+        switch (comptime rowFieldKind(field.type)) {
+            .offset_container => total += @field(row.*, field.name).heapBytesRequired(
                 OffsetSize.fromSubtype(@field(row.*, "subtype")),
-            );
-        } else if (comptime field.type == DeviceSQLString) {
-            total += @field(row.*, field.name).heapBytesRequired();
+            ),
+            .string => total += @field(row.*, field.name).heapBytesRequired(),
+            .int, .@"enum" => {},
         }
     }
     return total;
@@ -1089,9 +1112,14 @@ pub fn rowHeapBytesRequired(comptime T: type, row: *const T) u32 {
 /// their `eql`, everything else by value.
 pub fn rowEql(comptime T: type, a: *const T, b: *const T) bool {
     inline for (std.meta.fields(T)) |field| {
-        if (comptime isOffsetContainer(field.type) or field.type == DeviceSQLString) {
-            if (!@field(a.*, field.name).eql(@field(b.*, field.name))) return false;
-        } else if (@field(a.*, field.name) != @field(b.*, field.name)) return false;
+        switch (comptime rowFieldKind(field.type)) {
+            .offset_container, .string => {
+                if (!@field(a.*, field.name).eql(@field(b.*, field.name))) return false;
+            },
+            .int, .@"enum" => {
+                if (@field(a.*, field.name) != @field(b.*, field.name)) return false;
+            },
+        }
     }
     return true;
 }
@@ -1099,8 +1127,9 @@ pub fn rowEql(comptime T: type, a: *const T, b: *const T) bool {
 /// Frees the row's strings and offset-array containers.
 pub fn rowDeinit(comptime T: type, row: *T, alloc: std.mem.Allocator) void {
     inline for (std.meta.fields(T)) |field| {
-        if (comptime isOffsetContainer(field.type) or field.type == DeviceSQLString) {
-            @field(row.*, field.name).deinit(alloc);
+        switch (comptime rowFieldKind(field.type)) {
+            .offset_container, .string => @field(row.*, field.name).deinit(alloc),
+            .int, .@"enum" => {},
         }
     }
 }
