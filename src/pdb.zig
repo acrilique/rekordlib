@@ -2636,11 +2636,10 @@ pub const Database = struct {
             .page => |*page| page,
             .raw => return null,
         };
-        const row_offset = page.header.used_size;
         const ticket = (try page.allocRow(db.arena.allocator(), row_size)) orelse
             return null;
         try page.commitRow(db.arena.allocator(), ticket, row.*);
-        return .{ .page_index = page_index, .row_offset = row_offset };
+        return .{ .page_index = page_index, .row_offset = ticket.row_offset };
     }
 
     /// Points page `previous_page_index`'s `next_page` at
