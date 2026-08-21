@@ -160,16 +160,20 @@ fn addTrack(db: *pdb.Database, i: usize) !void {
         } },
     };
     try pdb.padTrackCommentToMinimum(&track, a);
-    var row = pdb.Row{ .track = track };
+    const boxed = try a.create(pdb.Track);
+    boxed.* = track;
+    var row = pdb.Row{ .track = boxed };
     _ = try db.addRow(&row);
 }
 
 fn addHistoryEntry(db: *pdb.Database, i: usize) !void {
-    var row = pdb.Row{ .history_entry = .{
+    const entry = try db.arena.allocator().create(pdb.HistoryEntry);
+    entry.* = .{
         .track_id = @intCast(i + 1),
         .playlist_id = 1,
         .entry_index = @intCast(i),
-    } };
+    };
+    var row = pdb.Row{ .history_entry = entry };
     _ = try db.addRow(&row);
 }
 

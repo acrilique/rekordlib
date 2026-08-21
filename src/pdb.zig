@@ -1552,53 +1552,65 @@ fn rowPageType(comptime T: type) PageType {
     return @enumFromInt(@intFromEnum(T.ext_page_type));
 }
 
-/// A table row: a field-declaration list serialized in declaration order
-/// by the generic row codec (`decodeRow` and siblings). Each variant
-/// declares its `page_type` (plain rows) or `ext_page_type` (ext rows),
-/// which selects it in `decode`; page types of the other database type
-/// and unknown values fail with `error.NotImplemented`.
+/// A table row: one of the row types below, boxed behind a pointer so the
+/// union costs a tag and a pointer instead of the size of its largest
+/// variant — pages full of twelve-byte entries must not pay `Track`'s
+/// 21 strings each. The payload is allocated by `decode` (with the
+/// cursor's allocator) or by the caller (with the database's arena, for
+/// rows moved into `addRow`), and freed by `deinit`. Each variant declares
+/// its `page_type` (plain rows) or `ext_page_type` (ext rows), which
+/// selects it in `decode`; page types of the other database type and
+/// unknown values fail with `error.NotImplemented`.
 pub const Row = union(enum) {
-    genre: Genre,
-    label: Label,
-    key: Key,
-    color: Color,
-    artwork: Artwork,
-    artist: Artist,
-    album: Album,
-    playlist_tree_node: PlaylistTreeNode,
-    track: Track,
-    history_playlist: HistoryPlaylist,
-    history_entry: HistoryEntry,
-    playlist_entry: PlaylistEntry,
-    history: History,
-    column_entry: ColumnEntry,
-    menu: Menu,
-    tag: TagOrCategory,
-    track_tag: TrackTag,
+    genre: *Genre,
+    label: *Label,
+    key: *Key,
+    color: *Color,
+    artwork: *Artwork,
+    artist: *Artist,
+    album: *Album,
+    playlist_tree_node: *PlaylistTreeNode,
+    track: *Track,
+    history_playlist: *HistoryPlaylist,
+    history_entry: *HistoryEntry,
+    playlist_entry: *PlaylistEntry,
+    history: *History,
+    column_entry: *ColumnEntry,
+    menu: *Menu,
+    tag: *TagOrCategory,
+    track_tag: *TrackTag,
 
     /// Reads the row for `page_type` from `c`, which starts at the row's
-    /// heap offset, dispatching per `rowMatchesPageType`.
+    /// heap offset, dispatching per `rowMatchesPageType` and boxing the
+    /// decoded payload — so `c` must carry an allocator (see
+    /// `bin.Cursor.initAlloc`) even for rows whose fields allocate
+    /// nothing.
     pub fn decode(
         c: *bin.Cursor,
         page_type: PageType,
         db_type: DatabaseType,
     ) RowDecodeError!Row {
+        const alloc = c.alloc orelse return bin.ReadError.OutOfMemory;
         return inline for (std.meta.fields(Row)) |field| {
-            if (rowMatchesPageType(field.type, page_type, db_type))
-                break @unionInit(Row, field.name, try decodeRow(field.type, c));
+            if (rowMatchesPageType(RowPayload(field.type), page_type, db_type)) {
+                const payload = try alloc.create(RowPayload(field.type));
+                errdefer alloc.destroy(payload);
+                payload.* = try decodeRow(RowPayload(field.type), c);
+                break @unionInit(Row, field.name, payload);
+            }
         } else error.NotImplemented;
     }
 
     pub fn encode(self: *const Row, e: *bin.Emitter) RowEncodeError!void {
         return switch (self.*) {
-            inline else => |*row| try encodeRow(@TypeOf(row.*), row, e),
+            inline else => |row| try encodeRow(@TypeOf(row.*), row, e),
         };
     }
 
     /// Page heap space in bytes the row occupies.
     pub fn heapBytesRequired(self: *const Row) u32 {
         return switch (self.*) {
-            inline else => |*row| rowHeapBytesRequired(@TypeOf(row.*), row),
+            inline else => |row| rowHeapBytesRequired(@TypeOf(row.*), row),
         };
     }
 
@@ -1607,25 +1619,35 @@ pub const Row = union(enum) {
     /// `DatabaseType`).
     pub fn pageType(self: Row) PageType {
         return switch (self) {
-            inline else => |row| comptime rowPageType(@TypeOf(row)),
+            inline else => |row| comptime rowPageType(@TypeOf(row.*)),
         };
     }
 
     pub fn eql(a: *const Row, b: *const Row) bool {
         if (std.meta.activeTag(a.*) != std.meta.activeTag(b.*)) return false;
         return switch (a.*) {
-            inline else => |*row, tag| rowEql(@TypeOf(row.*), row, &@field(b.*, @tagName(tag))),
+            inline else => |row, tag| rowEql(@TypeOf(row.*), row, @field(b.*, @tagName(tag))),
         };
     }
 
-    /// Frees the row's strings; rows parsed or built with `alloc` must be
-    /// deinit-ed with the same allocator.
+    /// Frees the row's strings and the boxed payload.
     pub fn deinit(self: *Row, alloc: std.mem.Allocator) void {
         switch (self.*) {
-            inline else => |*row| rowDeinit(@TypeOf(row.*), row, alloc),
+            inline else => |row| {
+                rowDeinit(@TypeOf(row.*), row, alloc);
+                alloc.destroy(row);
+            },
         }
     }
 };
+
+/// The payload type behind a boxed `Row` variant field.
+fn RowPayload(comptime boxed: type) type {
+    return switch (@typeInfo(boxed)) {
+        .pointer => |p| p.child,
+        else => boxed,
+    };
+}
 
 // Row types must declare pairwise distinct dispatch keys within each
 // database type: `Row.decode` dispatches on first match, so a duplicate
@@ -1633,18 +1655,20 @@ pub const Row = union(enum) {
 comptime {
     const fields = std.meta.fields(Row);
     for (fields, 0..) |a, i| {
+        const a_type = RowPayload(a.type);
         for (fields[i + 1 ..]) |b| {
+            const b_type = RowPayload(b.type);
             const clash =
-                if (@hasDecl(a.type, "page_type") and @hasDecl(b.type, "page_type"))
-                    a.type.page_type == b.type.page_type
-                else if (@hasDecl(a.type, "ext_page_type") and @hasDecl(b.type, "ext_page_type"))
-                    @intFromEnum(a.type.ext_page_type) == @intFromEnum(b.type.ext_page_type)
+                if (@hasDecl(a_type, "page_type") and @hasDecl(b_type, "page_type"))
+                    a_type.page_type == b_type.page_type
+                else if (@hasDecl(a_type, "ext_page_type") and @hasDecl(b_type, "ext_page_type"))
+                    @intFromEnum(a_type.ext_page_type) == @intFromEnum(b_type.ext_page_type)
                 else
                     false;
             if (clash)
                 @compileError(
-                    "row types " ++ @typeName(a.type) ++ " and " ++
-                        @typeName(b.type) ++ " declare the same page type",
+                    "row types " ++ @typeName(a_type) ++ " and " ++
+                        @typeName(b_type) ++ " declare the same page type",
                 );
         }
     }
@@ -2509,9 +2533,10 @@ pub const Database = struct {
 
     /// Appends `row` to the table holding its page type, allocating a new
     /// page when no existing one fits. On success the database owns the
-    /// row — build its strings with the database's arena
-    /// (`db.arena.allocator()`) and neither reuse nor free `row` after the
-    /// call; on error, ownership is unchanged.
+    /// row and its boxed payload — allocate the payload with the
+    /// database's arena (`db.arena.allocator()`) and build its strings
+    /// with it too, and neither reuse nor free `row` after the call; on
+    /// error, ownership is unchanged.
     ///
     /// The insert tries the table's tail page first, then its
     /// `empty_candidate` (when that is a parsed data page of the right
@@ -2519,7 +2544,7 @@ pub const Database = struct {
     /// relinking the chain onto it.
     pub fn addRow(db: *Database, row: *Row) DatabaseModifyError!RowRef {
         switch (row.*) {
-            .track => |*track| try validateTrackRowSize(track),
+            .track => |track| try validateTrackRowSize(track),
             else => {},
         }
 
@@ -2746,7 +2771,7 @@ pub const Database = struct {
             };
             switch (page.content) {
                 .data => |*content| for (content.rows) |*at| switch (at.row) {
-                    .track => |*track| try validateTrackRowSize(track),
+                    .track => |track| try validateTrackRowSize(track),
                     else => {},
                 },
                 .index => {},
@@ -2956,17 +2981,17 @@ const default_menus = [_]struct {
 pub fn insertDefaultColors(db: *Database) DatabaseModifyError!void {
     const a = db.arena.allocator();
     for (default_colors) |entry| {
-        var row = Row{
-            .color = .{
-                .unknown2 = entry.id,
-                .color = entry.color,
-                .name = DeviceSQLString.fromUtf8(a, entry.name) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    // The comptime-verified literals can be neither.
-                    error.TooLong, error.InvalidEncoding => unreachable,
-                },
+        const color = try a.create(Color);
+        color.* = .{
+            .unknown2 = entry.id,
+            .color = entry.color,
+            .name = DeviceSQLString.fromUtf8(a, entry.name) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                // The comptime-verified literals can be neither.
+                error.TooLong, error.InvalidEncoding => unreachable,
             },
         };
+        var row = Row{ .color = color };
         _ = try db.addRow(&row);
     }
 }
@@ -2974,27 +2999,32 @@ pub fn insertDefaultColors(db: *Database) DatabaseModifyError!void {
 pub fn insertDefaultColumns(db: *Database) DatabaseModifyError!void {
     const a = db.arena.allocator();
     for (default_columns) |entry| {
-        var row = Row{ .column_entry = .{
+        const column = try a.create(ColumnEntry);
+        column.* = .{
             .id = entry.id,
             .unknown0 = entry.unknown0,
             .column_name = DeviceSQLString.fromUtf8(a, entry.name) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.TooLong, error.InvalidEncoding => unreachable,
             },
-        } };
+        };
+        var row = Row{ .column_entry = column };
         _ = try db.addRow(&row);
     }
 }
 
 pub fn insertDefaultMenus(db: *Database) DatabaseModifyError!void {
+    const a = db.arena.allocator();
     for (default_menus) |entry| {
-        var row = Row{ .menu = .{
+        const menu = try a.create(Menu);
+        menu.* = .{
             .category_id = entry.category_id,
             .content_pointer = entry.content_pointer,
             .unknown = entry.unknown,
             .visibility = entry.visibility,
             .sort_order = entry.sort_order,
-        } };
+        };
+        var row = Row{ .menu = menu };
         _ = try db.addRow(&row);
     }
 }

@@ -2122,8 +2122,10 @@ test "data page roundtrips with heap bytes in unused row group slots" {
     try testing.expectEqual(@as(usize, 2), content.rows.len);
     try testing.expectEqual(@as(u16, 0), content.rows[0].offset);
     try testing.expectEqual(@as(u16, 8), content.rows[1].offset);
-    try testing.expect(content.rows[0].row.eql(&.{ .menu = .{ .category_id = 1, .unknown = 99 } }));
-    try testing.expect(content.rows[1].row.eql(&.{ .menu = .{ .category_id = 2, .content_pointer = 2 } }));
+    var expected_a = pdb.Menu{ .category_id = 1, .unknown = 99 };
+    var expected_b = pdb.Menu{ .category_id = 2, .content_pointer = 2 };
+    try testing.expect(content.rows[0].row.eql(&.{ .menu = &expected_a }));
+    try testing.expect(content.rows[1].row.eql(&.{ .menu = &expected_b }));
     try testing.expectEqual(@as(u16, 0x0101), content.row_groups[0].row_offsets[0]);
 
     const out = try roundtripPage(alloc, &page, .plain);
@@ -2133,12 +2135,13 @@ test "data page roundtrips with heap bytes in unused row group slots" {
 
 test "data page encode rejects rows that overlap or reach the row groups" {
     const alloc = testing.allocator;
+    var menu_row = pdb.Menu{};
 
     // Two 8-byte rows overlapping by four bytes.
     {
         var rows = [_]pdb.RowAtOffset{
-            .{ .offset = 0, .row = .{ .menu = .{} } },
-            .{ .offset = 4, .row = .{ .menu = .{} } },
+            .{ .offset = 0, .row = .{ .menu = &menu_row } },
+            .{ .offset = 4, .row = .{ .menu = &menu_row } },
         };
         var offsets: [pdb.row_group_max_rows]u16 = @splat(0);
         offsets[14] = 4;
@@ -2159,8 +2162,8 @@ test "data page encode rejects rows that overlap or reach the row groups" {
     // one byte further is rejected. Offsets are heap-relative.
     {
         var rows = [_]pdb.RowAtOffset{
-            .{ .offset = 4, .row = .{ .menu = .{} } },
-            .{ .offset = 12, .row = .{ .menu = .{} } }, // ends at 20, the limit
+            .{ .offset = 4, .row = .{ .menu = &menu_row } },
+            .{ .offset = 12, .row = .{ .menu = &menu_row } }, // ends at 20, the limit
         };
         var offsets: [pdb.row_group_max_rows]u16 = @splat(0);
         offsets[14] = 12;
@@ -2176,8 +2179,8 @@ test "data page encode rejects rows that overlap or reach the row groups" {
         try testing.expectEqual(@as(usize, 96 - 0x20), e.written().len);
 
         var late = [_]pdb.RowAtOffset{
-            .{ .offset = 4, .row = .{ .menu = .{} } },
-            .{ .offset = 13, .row = .{ .menu = .{} } }, // ends at 21, in the group
+            .{ .offset = 4, .row = .{ .menu = &menu_row } },
+            .{ .offset = 13, .row = .{ .menu = &menu_row } }, // ends at 21, in the group
         };
         const reaching = pdb.DataPageContent{ .row_groups = &groups, .rows = &late };
         var e2 = bin.Emitter.init(alloc);
@@ -2190,7 +2193,7 @@ test "data page encode rejects rows that overlap or reach the row groups" {
     // row ends exactly at the first used byte, 50.
     {
         var rows = [_]pdb.RowAtOffset{
-            .{ .offset = 42, .row = .{ .menu = .{} } }, // ends at 50, the limit
+            .{ .offset = 42, .row = .{ .menu = &menu_row } }, // ends at 50, the limit
         };
         var offsets: [pdb.row_group_max_rows]u16 = @splat(0);
         offsets[15] = 42;
@@ -2205,7 +2208,7 @@ test "data page encode rejects rows that overlap or reach the row groups" {
         try testing.expectEqual(@as(usize, 96 - 0x20), e.written().len);
 
         var over = [_]pdb.RowAtOffset{
-            .{ .offset = 43, .row = .{ .menu = .{} } }, // ends at 51, past it
+            .{ .offset = 43, .row = .{ .menu = &menu_row } }, // ends at 51, past it
         };
         const reaching = pdb.DataPageContent{ .row_groups = &groups, .rows = &over };
         var e2 = bin.Emitter.init(alloc);
@@ -2216,7 +2219,7 @@ test "data page encode rejects rows that overlap or reach the row groups" {
     // Without row groups the whole heap is available, but not beyond it.
     {
         var rows = [_]pdb.RowAtOffset{
-            .{ .offset = 56 - 8 + 1, .row = .{ .menu = .{} } },
+            .{ .offset = 56 - 8 + 1, .row = .{ .menu = &menu_row } },
         };
         const content = pdb.DataPageContent{ .rows = &rows };
         var e = bin.Emitter.init(alloc);
@@ -2230,9 +2233,11 @@ test "data page encode derives page layout from row groups" {
     var page = menuPageBytes(0);
     // The constructed content carries zeros in the unused leading slots.
     @memset(page[96 - pdb.row_group_size ..][0 .. 2 * 14], 0);
+    var menu_a = pdb.Menu{ .category_id = 1, .unknown = 99 };
+    var menu_b = pdb.Menu{ .category_id = 2, .content_pointer = 2 };
     var rows = [_]pdb.RowAtOffset{
-        .{ .offset = 0, .row = .{ .menu = .{ .category_id = 1, .unknown = 99 } } },
-        .{ .offset = 8, .row = .{ .menu = .{ .category_id = 2, .content_pointer = 2 } } },
+        .{ .offset = 0, .row = .{ .menu = &menu_a } },
+        .{ .offset = 8, .row = .{ .menu = &menu_b } },
     };
     var offsets: [pdb.row_group_max_rows]u16 = @splat(0);
     offsets[14] = 0x0008;
@@ -2376,14 +2381,16 @@ fn cloneRow(
     return pdb.Row.decode(&c, row.pageType(), db_type);
 }
 
-/// Builds a pdb.Key row with `id` duplicated into `id2`, for the allocate
-/// tests ported from rekordcrate's `test_modification.rs`.
+/// Builds a boxed pdb.Key row with `id` duplicated into `id2`, for the
+/// allocate tests ported from rekordcrate's `test_modification.rs`.
 fn testKeyRow(a: std.mem.Allocator, id: u32, name: []const u8) !pdb.Row {
-    return pdb.Row{ .key = .{
+    const key = try a.create(pdb.Key);
+    key.* = .{
         .id = id,
         .id2 = id,
         .name = try pdb.DeviceSQLString.fromUtf8(a, name),
-    } };
+    };
+    return pdb.Row{ .key = key };
 }
 
 /// A Keys data page holding one full row group of sixteen rows (the setup
@@ -2796,7 +2803,9 @@ test "addRow rejects undersized track rows" {
     var db = try pdb.Database.create(testing.allocator, .plain, &table_page_types);
     defer db.deinit();
 
-    var row = pdb.Row{ .track = track };
+    const boxed = try a.create(pdb.Track);
+    boxed.* = track;
+    var row = pdb.Row{ .track = boxed };
     try testing.expectError(error.TrackRowTooSmall, db.addRow(&row));
     // Nothing was inserted anywhere.
     try testing.expectEqual(@as(usize, 0), try countTableRows(&db, .tracks));
@@ -2898,7 +2907,7 @@ fn countTracks(db: *const pdb.Database, rating: u8) !usize {
         };
         switch (page.content) {
             .data => |*content| for (content.rows) |*at| switch (at.row) {
-                .track => |*track| {
+                .track => |track| {
                     if (track.rating == rating) count += 1;
                 },
                 else => {},
@@ -2924,7 +2933,7 @@ test "num_rows mutation: set all track ratings and round-trip" {
         const page = &db.pages[current - 1].page;
         switch (page.content) {
             .data => |*content| for (content.rows) |*at| switch (at.row) {
-                .track => |*track| track.rating = 5,
+                .track => |track| track.rating = 5,
                 else => {},
             },
             .index => {},
@@ -2962,7 +2971,7 @@ fn findTrack(db: *const pdb.Database, id: u32) !*const pdb.Track {
         };
         switch (page.content) {
             .data => |*content| for (content.rows) |*at| switch (at.row) {
-                .track => |*track| if (track.id == id) return track,
+                .track => |track| if (track.id == id) return track,
                 else => {},
             },
             .index => {},
@@ -3001,7 +3010,9 @@ test "num_rows append: track row with new strings via calculated offsets" {
     };
     try pdb.validateTrackRowSize(&track);
 
-    var row = pdb.Row{ .track = track };
+    const boxed = try a.create(pdb.Track);
+    boxed.* = track;
+    var row = pdb.Row{ .track = boxed };
     _ = try db.addRow(&row);
     try db.validateAllTrackRows();
 
