@@ -91,4 +91,23 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
+
+    const bench_mod = b.addModule("bench", .{
+        .root_source_file = b.path("bench/pdb_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "pdb", .module = pdb },
+        },
+    });
+
+    const bench_exe = b.addExecutable(.{
+        .name = "pdb_bench",
+        .root_module = bench_mod,
+    });
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |args| run_bench.addArgs(args);
+    const bench_step = b.step("bench", "Run pdb benchmarks (pass -Doptimize=ReleaseFast)");
+    bench_step.dependOn(&run_bench.step);
 }
