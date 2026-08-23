@@ -630,6 +630,49 @@ test "O3 mutate: numberOfContents maintenance on insert and delete" {
     try testing.expectEqual(@as(i64, 3), try w.nextId(dlp.Content));
 }
 
+test "O3 mutate: playlist append is dense and 1-based" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    defer alloc.free(db_path);
+    var w = try dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    defer w.db.close();
+
+    try w.insertContent(.{ .content_id = 1, .path = "/Contents/a.mp3" });
+    try w.insertContent(.{ .content_id = 2, .path = "/Contents/b.mp3" });
+
+    try w.insert(dlp.Playlist{
+        .playlist_id = try w.nextId(dlp.Playlist),
+        .sequenceNo = 0,
+        .name = "pl",
+        .attribute = 0,
+        .playlist_id_parent = 0,
+    });
+    try w.insert(dlp.Playlist{
+        .playlist_id = try w.nextId(dlp.Playlist),
+        .sequenceNo = 1,
+        .name = "other",
+        .attribute = 0,
+        .playlist_id_parent = 0,
+    });
+
+    // real exports number playlist entries from 1, dense per playlist
+    try testing.expectEqual(@as(i64, 1), try w.addContentToPlaylist(1, 1));
+    try testing.expectEqual(@as(i64, 2), try w.addContentToPlaylist(1, 2));
+    try testing.expectEqual(@as(i64, 1), try w.addContentToPlaylist(2, 1));
+
+    var lib = try dlp.Library.load(alloc, w.db);
+    defer lib.deinit();
+    try testing.expectEqual(@as(usize, 3), lib.playlist_contents.len);
+    const entries = lib.playlist_contents_by_playlist.get(1).?;
+    try testing.expectEqual(@as(i64, 1), lib.playlist_contents[entries[0]].sequenceNo.?);
+    try testing.expectEqual(@as(i64, 2), lib.playlist_contents[entries[1]].sequenceNo.?);
+}
+
 test "O3 create: keyed db is encrypted and reopens through the provider" {
     if (dlp.mode != .vendored) return;
     const alloc = testing.allocator;

@@ -1498,6 +1498,24 @@ pub const Writer = struct {
         return self.db.scalarInt("SELECT numberOfContents FROM property LIMIT 1;");
     }
 
+    /// Appends a track to a playlist, assigning the next dense 1-based
+    /// `sequenceNo` under that playlist (real exports number entries from
+    /// 1) and returning it. One atomic INSERT; the keys are not validated
+    /// (no FK in the schema — the caller owns tree semantics).
+    pub fn addContentToPlaylist(self: Writer, playlist_id: i64, content_id: i64) SqlError!i64 {
+        var stmt = try self.db.prepare(
+            "INSERT INTO playlist_content (playlist_id, content_id, sequenceNo) VALUES (?1, ?2, " ++
+                "(SELECT COALESCE(MAX(sequenceNo), 0) + 1 FROM playlist_content WHERE playlist_id = ?1)) " ++
+                "RETURNING sequenceNo;",
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, playlist_id);
+        try stmt.bindInt(2, content_id);
+        if ((try stmt.step()) != .row) return error.Sqlite;
+        const sequence_no = stmt.readInt(0);
+        if ((try stmt.step()) != .done) return error.Sqlite;
+        return sequence_no;
+    }
 };
 
 /// Count-derived `numberOfContents` maintenance (inside the caller's
