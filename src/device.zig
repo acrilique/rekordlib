@@ -493,6 +493,19 @@ pub const AddTrackError =
     pdb.DatabaseModifyError ||
     anlz.WriteError;
 
+/// One serialized ANLZ file waiting for the next `save`: the host path it
+/// lands at, plus its image. `addTrack` serializes eagerly so the
+/// caller's `AnlzInput` can go away and `save` only moves bytes.
+const PendingAnlz = struct {
+    path: []u8,
+    image: []u8,
+
+    fn deinit(file: *PendingAnlz, alloc: std.mem.Allocator) void {
+        alloc.free(file.path);
+        alloc.free(file.image);
+    }
+};
+
 /// A handle to a Rekordbox device export on disk: the setting files and
 /// the pdb database, located through `Layout`. `open` points the handle
 /// at an existing export (reading; the `openPdb` escape hatch edits),
@@ -517,6 +530,10 @@ pub const DeviceExport = struct {
     /// The writer's cached scan of the export — id counters and dedup
     /// maps — null until `writerState` builds it on first use.
     writer_state: ?WriterState = null,
+    /// Serialized ANLZ images queued by `addTrack`, written by the next
+    /// `save` — before `export.pdb`, so a crash leaves orphan analysis
+    /// files players ignore, not rows naming missing ones.
+    pending_anlz: std.ArrayList(PendingAnlz) = .empty,
 
     const PdbState = union(enum) {
         /// An export opened at `root`; the pdb parses on first touch.
@@ -600,6 +617,8 @@ pub const DeviceExport = struct {
             for (pending) |bytes| e.alloc.free(bytes);
         }
         if (e.writer_state) |*state| state.deinit(e.alloc);
+        for (e.pending_anlz.items) |*file| file.deinit(e.alloc);
+        e.pending_anlz.deinit(e.alloc);
     }
 
     pub fn root(e: *const DeviceExport) []const u8 {
@@ -692,6 +711,10 @@ pub const DeviceExport = struct {
 
         // The caller's data fails here or never: nothing below this point
         // is rolled back.
+        var anlz_files = try e.buildAnlzFiles(track);
+        errdefer for (&anlz_files) |*slot| {
+            if (slot.*) |*file| file.deinit(e.alloc);
+        };
         const row = try e.buildTrackRow(track, track.analysis != null);
 
         const artist_id = try e.getOrCreateArtist(track.artist);
@@ -720,6 +743,7 @@ pub const DeviceExport = struct {
 
         // Reserve everything the bookkeeping needs so the steps after the
         // insert cannot fail half-applied.
+        try e.pending_anlz.ensureUnusedCapacity(e.alloc, anlz_files.len);
         try state.track_ids.ensureUnusedCapacity(e.alloc, 1);
         var owned_path: ?[]u8 = null;
         errdefer if (owned_path) |path| e.alloc.free(path);
@@ -735,6 +759,8 @@ pub const DeviceExport = struct {
         state.next_track_id += 1;
         state.track_ids.putAssumeCapacity(track_id, {});
         if (owned_path) |path| state.tracks_by_path.putAssumeCapacity(path, track_id);
+        for (anlz_files) |slot| if (slot) |file|
+            e.pending_anlz.appendAssumeCapacity(file);
 
         return .{ .id = track_id, .is_new = true };
     }
@@ -804,6 +830,103 @@ pub const DeviceExport = struct {
         };
         try pdb.padTrackCommentToMinimum(boxed, a);
         return boxed;
+    }
+
+    /// Serializes the `ANLZ0000` images `track.analysis` asks for, gated
+    /// the way the oracle writes the siblings: `.DAT` only when it
+    /// carries a section beyond the leading path, `.EXT` when the
+    /// extended-cue list is non-empty or any of its optional column
+    /// groups is present (present-but-empty writes the file; null skips
+    /// it), `.2EX` when either 3-band group is present. Tracks without
+    /// analysis queue nothing.
+    fn buildAnlzFiles(e: *DeviceExport, track: TrackInput) AddTrackError![3]?PendingAnlz {
+        const input = track.analysis orelse return .{ null, null, null };
+        const a = e.alloc;
+
+        // Every analysis file starts with a PPTH section naming the
+        // audio file; the three siblings share it.
+        const path_str = try anlz.LenPrefixedWideString.fromUtf8(a, track.file_path);
+        defer a.free(path_str.raw);
+        const path_section = anlz.Content{ .path = .{ .path = path_str } };
+
+        var files: [3]?PendingAnlz = .{ null, null, null };
+        errdefer for (&files) |*slot| {
+            if (slot.*) |*file| file.deinit(a);
+        };
+
+        // `.DAT`: beats, plain cues, and the mono previews.
+        var dat = std.ArrayList(anlz.Content).empty;
+        defer dat.deinit(a);
+        try dat.append(a, path_section);
+        if (input.beats.len > 0)
+            try dat.append(a, .{ .beat_grid = .{ .beats = input.beats } });
+        if (input.cues.len > 0)
+            try dat.append(a, .{ .cue_list = .{
+                .list_type = input.cue_list_type,
+                .cues = input.cues,
+            } });
+        if (input.preview_mono.len > 0)
+            try dat.append(a, .{ .waveform_preview = .{ .data = input.preview_mono } });
+        if (input.tiny_preview.len > 0)
+            try dat.append(a, .{ .tiny_waveform_preview = .{ .data = input.tiny_preview } });
+        if (dat.items.len > 1)
+            files[0] = try e.serializeAnlz(track.file_path, .dat, dat.items);
+
+        // `.EXT`: extended cues plus the optional column groups.
+        const ext_has_data = input.cues_extended.len > 0 or input.detail_mono != null or
+            input.color_preview != null or input.color_detail != null;
+        if (ext_has_data) {
+            var ext = std.ArrayList(anlz.Content).empty;
+            defer ext.deinit(a);
+            try ext.append(a, path_section);
+            if (input.cues_extended.len > 0)
+                try ext.append(a, .{ .extended_cue_list = .{
+                    .list_type = input.cue_list_type,
+                    .cues = input.cues_extended,
+                } });
+            if (input.detail_mono) |cols|
+                try ext.append(a, .{ .waveform_detail = .{ .data = cols } });
+            if (input.color_preview) |cols|
+                try ext.append(a, .{ .waveform_color_preview = .{ .data = cols } });
+            if (input.color_detail) |cols|
+                try ext.append(a, .{ .waveform_color_detail = .{ .data = cols } });
+            files[1] = try e.serializeAnlz(track.file_path, .ext, ext.items);
+        }
+
+        // `.2EX`: the 3-band groups.
+        if (input.band3_preview != null or input.band3_detail != null) {
+            var two_ex = std.ArrayList(anlz.Content).empty;
+            defer two_ex.deinit(a);
+            try two_ex.append(a, path_section);
+            if (input.band3_preview) |cols|
+                try two_ex.append(a, .{ .waveform_3band_preview = .{ .data = cols } });
+            if (input.band3_detail) |cols|
+                try two_ex.append(a, .{ .waveform_3band_detail = .{ .data = cols } });
+            files[2] = try e.serializeAnlz(track.file_path, .two_ex, two_ex.items);
+        }
+
+        return files;
+    }
+
+    /// Which `ANLZ0000` sibling a serialized image is.
+    const AnlzSibling = enum { dat, ext, two_ex };
+
+    /// Serializes `sections` into the image for `sibling` of `file_path`,
+    /// paired with the host path it will land at.
+    fn serializeAnlz(
+        e: *DeviceExport,
+        file_path: []const u8,
+        sibling: AnlzSibling,
+        sections: []const anlz.Content,
+    ) AddTrackError!PendingAnlz {
+        const image = try anlz.serializeFile(e.alloc, &anlz.file_header_data, sections);
+        errdefer e.alloc.free(image);
+        const path = switch (sibling) {
+            .dat => try e.layout.anlzDatFile(e.alloc, file_path),
+            .ext => try e.layout.anlzExtFile(e.alloc, file_path),
+            .two_ex => try e.layout.anlz2exFile(e.alloc, file_path),
+        };
+        return .{ .path = path, .image = image };
     }
 
     /// Resolves `name` to an Artist row, inserting one when no scanned or
@@ -961,10 +1084,10 @@ pub const DeviceExport = struct {
     /// disk-writing call. Everything that can fail on the in-memory
     /// model — parsing, track-row validation, serialization — happens
     /// before the first write, so a failed `save` leaves the disk
-    /// untouched. Crash-safe write order: the default directory tree
-    /// and the four setting files, then `export.pdb` — the index
-    /// everything else is reached through — last, so a crash leaves
-    /// orphan files players ignore, not rows naming missing data.
+    /// untouched. Crash-safe write order: the default directory tree,
+    /// the four setting files, the queued ANLZ files, then `export.pdb`
+    /// — the index everything else is reached through — last, so a crash
+    /// leaves orphan files players ignore, not rows naming missing data.
     /// Every file lands through `writeFileAtomic`, so readers never
     /// see a torn one.
     pub fn save(e: *DeviceExport) SaveError!void {
@@ -974,10 +1097,26 @@ pub const DeviceExport = struct {
         defer e.alloc.free(image);
 
         if (e.pending_settings) |pending| try e.writePendingSettings(pending);
+        if (e.pending_anlz.items.len > 0) try e.writePendingAnlz();
 
         const pdb_path = try e.layout.exportPdb(e.alloc);
         defer e.alloc.free(pdb_path);
         try e.writeFileAtomic(pdb_path, image);
+    }
+
+    /// Writes every queued ANLZ file — creating its `USBANLZ` folder —
+    /// then releases the queue; a failure leaves the not-yet-written
+    /// entries queued for the next `save` (the images are fixed bytes,
+    /// so a retry rewrites the landed ones identically).
+    fn writePendingAnlz(
+        e: *DeviceExport,
+    ) (std.mem.Allocator.Error || std.Io.Dir.CreateDirPathError || AtomicWriteError)!void {
+        for (e.pending_anlz.items) |*file| {
+            try e.dir.createDirPath(e.io, std.fs.path.dirname(file.path) orelse ".");
+            try e.writeFileAtomic(file.path, file.image);
+        }
+        for (e.pending_anlz.items) |*file| file.deinit(e.alloc);
+        e.pending_anlz.clearRetainingCapacity();
     }
 
     /// Writes the default directory tree and the four pending setting

@@ -3,6 +3,7 @@
 // obtain one at https://mozilla.org/MPL/2.0/.
 
 const std = @import("std");
+const anlz = @import("anlz");
 const device = @import("device");
 const pdb = @import("pdb");
 const setting = @import("setting");
@@ -1304,4 +1305,95 @@ test "open then add does not duplicate a named row" {
             }
         }
     }
+}
+
+test "add track with analysis writes anlz files" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    // The oracle's vector: one beat, one mono preview column, a
+    // one-column color preview — enough for `.DAT` + `.EXT`, not `.2EX`.
+    // The `AnlzInput` slices are mutable, so the columns live in vars.
+    var beats = [1]anlz.Beat{.{ .beat_number = 1, .tempo = 12_800, .time = 0 }};
+    var preview_mono = [1]anlz.WaveformPreviewColumn{.{ .height = 1, .whiteness = 0 }};
+    var color_preview = [1]anlz.WaveformColorPreviewColumn{.{
+        .energy_bottom_half_freq = 10,
+        .energy_bottom_third_freq = 20,
+        .energy_mid_third_freq = 30,
+        .energy_top_third_freq = 40,
+    }};
+    const input = anlz.AnlzInput{
+        .beats = &beats,
+        .cue_list_type = .memory_cues,
+        .preview_mono = &preview_mono,
+        .color_preview = &color_preview,
+    };
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    const outcome = try ex.addTrack(.{
+        .title = "test",
+        .file_path = "/Contents/test.mp3",
+        .analysis = &input,
+    });
+    try testing.expect(outcome.is_new);
+    try ex.save();
+
+    // The analysis directory is keyed by the audio path exactly the way
+    // players recompute it (`pathHash`).
+    const audio_path = "/Contents/test.mp3";
+    const h = try device.pathHash(audio_path);
+    const dat_sub = try std.fmt.allocPrint(
+        alloc,
+        "PIONEER/USBANLZ/P{X:0>3}/{X:0>8}/ANLZ0000.DAT",
+        .{ h.p_value, h.hash },
+    );
+    defer alloc.free(dat_sub);
+    const dat = try tmp.dir.readFileAlloc(io, dat_sub, alloc, .limited(1 << 24));
+    defer alloc.free(dat);
+    var dat_parsed = try anlz.Anlz.parse(alloc, dat);
+    defer dat_parsed.deinit();
+    try testing.expect(dat_parsed.findSection(.path) != null);
+    try testing.expect(dat_parsed.findSection(.beat_grid) != null);
+    try testing.expect(dat_parsed.findSection(.waveform_preview) != null);
+    try testing.expect(dat_parsed.findSection(.cue_list) == null);
+
+    const ext_sub = try std.fmt.allocPrint(
+        alloc,
+        "PIONEER/USBANLZ/P{X:0>3}/{X:0>8}/ANLZ0000.EXT",
+        .{ h.p_value, h.hash },
+    );
+    defer alloc.free(ext_sub);
+    const ext = try tmp.dir.readFileAlloc(io, ext_sub, alloc, .limited(1 << 24));
+    defer alloc.free(ext);
+    var ext_parsed = try anlz.Anlz.parse(alloc, ext);
+    defer ext_parsed.deinit();
+    try testing.expect(ext_parsed.findSection(.path) != null);
+    try testing.expect(ext_parsed.findSection(.waveform_color_preview) != null);
+
+    // No 3-band data, no `.2EX`.
+    const two_ex_sub = try std.fmt.allocPrint(
+        alloc,
+        "PIONEER/USBANLZ/P{X:0>3}/{X:0>8}/ANLZ0000.2EX",
+        .{ h.p_value, h.hash },
+    );
+    defer alloc.free(two_ex_sub);
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, two_ex_sub, .{}));
+
+    // The row stores the device path of its `.DAT`, derived from the
+    // audio path.
+    var check = device.DeviceExport.open(tmp_path, io, alloc);
+    defer check.deinit();
+    var it = try (try check.openPdb()).rows(.tracks);
+    const track = (try it.next()).?.track;
+    const analyze_path = try track.offsets.inner.analyze_path.utf8(alloc);
+    defer alloc.free(analyze_path);
+    const want = try device.anlzDevicePath(alloc, audio_path);
+    defer alloc.free(want);
+    try testing.expectEqualStrings(want, analyze_path);
 }
