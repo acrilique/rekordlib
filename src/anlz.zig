@@ -1291,3 +1291,494 @@ pub const Anlz = struct {
         return null;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Building ANLZ files from scratch
+// ---------------------------------------------------------------------------
+
+pub const BuildError = error{ OutOfMemory, InvalidUtf8 };
+
+/// Detail section columns per second (PWV3/PWV5/PWV7). Pinned by the
+/// format: 75 frames/sec × 2.
+pub const DETAIL_HZ: f64 = 150.0;
+
+/// Preview section columns per second (PWAV/PWV2/PWV4/PWV6). Not pinned by
+/// the format; Rekordbox uses ~1 column per 150 ms. Heuristic, matches
+/// observed fixtures within a few percent.
+pub const PREVIEW_HZ: f64 = 6.667;
+
+/// Integer detail columns aggregated into one preview column.
+pub const DETAIL_PER_PREVIEW: usize = @intFromFloat(@round(DETAIL_HZ / PREVIEW_HZ));
+
+/// A marker of a sparse beatgrid: a beat number (possibly negative —
+/// Rekordbox grids start at -4) at a sample offset.
+pub const BeatMarker = struct {
+    /// Beat number, anchored so a grid starting at -4 still places bar
+    /// downbeats correctly.
+    index: i32,
+    /// Sample offset within the track.
+    sample_offset: f64,
+};
+
+/// One 150 Hz waveform detail column: peak band energies.
+pub const Band = struct {
+    /// Sound energy of the low frequency band (0-255).
+    low: u8 = 0,
+    /// Sound energy of the mid frequency band (0-255).
+    mid: u8 = 0,
+    /// Sound energy of the high frequency band (0-255).
+    high: u8 = 0,
+};
+
+/// A cue (point or loop) in sample units, before ANLZ encoding.
+pub const CueInput = struct {
+    /// Hot-cue slot, 1-based (1=A … 8=H). 0 = memory cue.
+    hot_cue: u32 = 0,
+    /// Point position in samples.
+    sample_offset: f64 = 0,
+    /// Loop end in samples; ignored when `is_loop` is false.
+    loop_end: ?f64 = null,
+    /// Whether this cue is a loop (uses `loop_end`) or a point cue.
+    is_loop: bool = false,
+    /// Label (only stored on the extended cue).
+    label: []const u8 = "",
+    /// Cue color components; alpha is dropped (ANLZ stores RGB plus a
+    /// palette index).
+    r: u8 = 0,
+    g: u8 = 0,
+    b: u8 = 0,
+};
+
+/// Format-agnostic performance data for one track, the single input of
+/// `buildAnlzInput`. All positions are sample offsets interpreted at
+/// `sample_rate`.
+///
+/// `waveform_bands` and `waveform_heights` must be sampled at exactly
+/// `DETAIL_HZ`: the preview waveforms aggregate `DETAIL_PER_PREVIEW`
+/// consecutive detail columns, so a different input rate silently stretches
+/// or squashes every output waveform. Callers holding columns at another
+/// rate must resample to 150 Hz first.
+pub const PerformanceData = struct {
+    /// Audio sample rate in Hz, used for sample→ms conversion. Zero makes
+    /// beat and cue times come out as zero.
+    sample_rate: u32,
+    /// Total number of samples in the track; clips beats past the end.
+    sample_count: u64,
+    /// Track tempo in BPM. When set, it is applied uniformly to every beat,
+    /// even for a variable-tempo grid (a Rekordbox-era simplification kept
+    /// from the oracle); `null` derives the tempo per grid segment.
+    bpm: ?f64 = null,
+    /// Sparse beatgrid markers, in any order.
+    beatgrid: []const BeatMarker = &.{},
+    /// Sample offset of the main (memory) cue; null = none. Prepended as a
+    /// colorless memory point cue.
+    main_cue: ?f64 = null,
+    /// Cues (memory or hot, point or loop).
+    cues: []const CueInput = &.{},
+    /// 3-band detail columns at `DETAIL_HZ`.
+    waveform_bands: []const Band = &.{},
+    /// Per-column peak height (0-31) at `DETAIL_HZ`, driving PWAV/PWV2/PWV3
+    /// and the PWV5 height. May be shorter than `waveform_bands`.
+    waveform_heights: []const u8 = &.{},
+};
+
+/// Caller-provided ANLZ content for a track, the output of
+/// `buildAnlzInput` and the input of the device writer: beats/cues go to
+/// `.DAT` (extended cues mirror to `.EXT`); the optional column groups
+/// select which sibling files are written — null skips that file, empty
+/// means the file is written without that section. All slices come from one
+/// allocator and are freed by `deinit`.
+pub const AnlzInput = struct {
+    /// Beat grid (caller-provided).
+    beats: []Beat = &.{},
+    /// Plain cues for the `.DAT` cue list.
+    cues: []Cue = &.{},
+    /// Extended cues for the `.EXT` cue list.
+    cues_extended: []ExtendedCue = &.{},
+    /// Cue list type shared by `cues` and `cues_extended`.
+    cue_list_type: CueListType = .memory_cues,
+    /// Fixed-width mono preview (`PWAV`).
+    preview_mono: []WaveformPreviewColumn = &.{},
+    /// Fixed-width tiny mono preview (`PWV2`).
+    tiny_preview: []TinyWaveformPreviewColumn = &.{},
+    /// Variable-width mono detail (`PWV3`, 150 Hz), in `.EXT`.
+    detail_mono: ?[]WaveformPreviewColumn = null,
+    /// Fixed-width color preview (`PWV4`), in `.EXT`.
+    color_preview: ?[]WaveformColorPreviewColumn = null,
+    /// Variable-width color detail (`PWV5`, 150 Hz), in `.EXT`.
+    color_detail: ?[]WaveformColorDetailColumn = null,
+    /// Fixed-width 3-band preview (`PWV6`), in `.2EX`.
+    band3_preview: ?[]Waveform3BandColumn = null,
+    /// Variable-width 3-band detail (`PWV7`, 150 Hz), in `.2EX`.
+    band3_detail: ?[]Waveform3BandColumn = null,
+
+    /// Frees every slice reachable from this instance.
+    pub fn deinit(input: *const AnlzInput, alloc: std.mem.Allocator) void {
+        freeExtendedCues(alloc, input.cues_extended);
+        alloc.free(input.beats);
+        alloc.free(input.cues);
+        alloc.free(input.cues_extended);
+        alloc.free(input.preview_mono);
+        alloc.free(input.tiny_preview);
+        if (input.detail_mono) |data| alloc.free(data);
+        if (input.color_preview) |data| alloc.free(data);
+        if (input.color_detail) |data| alloc.free(data);
+        if (input.band3_preview) |data| alloc.free(data);
+        if (input.band3_detail) |data| alloc.free(data);
+    }
+};
+
+/// The four band-derived column groups of `buildBandColumns`.
+pub const BandColumns = struct {
+    color_preview: []WaveformColorPreviewColumn = &.{},
+    color_detail: []WaveformColorDetailColumn = &.{},
+    band3_preview: []Waveform3BandColumn = &.{},
+    band3_detail: []Waveform3BandColumn = &.{},
+
+    pub fn deinit(columns: *const BandColumns, alloc: std.mem.Allocator) void {
+        alloc.free(columns.color_preview);
+        alloc.free(columns.color_detail);
+        alloc.free(columns.band3_preview);
+        alloc.free(columns.band3_detail);
+    }
+};
+
+/// The two preview column groups of `buildPreviewColumns`.
+pub const PreviewColumns = struct {
+    preview: []WaveformPreviewColumn = &.{},
+    tiny: []TinyWaveformPreviewColumn = &.{},
+
+    pub fn deinit(columns: *const PreviewColumns, alloc: std.mem.Allocator) void {
+        alloc.free(columns.preview);
+        alloc.free(columns.tiny);
+    }
+};
+
+/// Frees the comment payloads of the extended cues built by `buildCues`.
+fn freeExtendedCues(alloc: std.mem.Allocator, cues: []const ExtendedCue) void {
+    for (cues) |cue| alloc.free(cue.comment.raw);
+}
+
+/// The two cue lists of `buildCues`.
+pub const CueLists = struct {
+    cues: []Cue = &.{},
+    extended: []ExtendedCue = &.{},
+    list_type: CueListType = .memory_cues,
+
+    pub fn deinit(lists: *const CueLists, alloc: std.mem.Allocator) void {
+        freeExtendedCues(alloc, lists.extended);
+        alloc.free(lists.cues);
+        alloc.free(lists.extended);
+    }
+};
+
+/// Converts a sample offset to milliseconds at `sample_rate`, rounded;
+/// zero when `sample_rate` is zero.
+pub fn samplesToMs(samples: f64, sample_rate: u32) u32 {
+    if (sample_rate == 0) return 0;
+    const rate: f64 = @floatFromInt(sample_rate);
+    return std.math.lossyCast(u32, @round(samples / rate * 1000.0));
+}
+
+/// Rounds `bpm` to centi-BPM, saturating at the `u16` format ceiling of
+/// 655.35 BPM; non-finite or non-positive values become zero.
+fn centiBpm(bpm: f64) u16 {
+    if (std.math.isFinite(bpm) and bpm > 0.0) {
+        const centis = std.math.lossyCast(u64, @round(bpm * 100.0));
+        return @intCast(@min(centis, std.math.maxInt(u16)));
+    }
+    return 0;
+}
+
+/// Maps a (possibly negative) global beat index to its 1-4 position in the
+/// bar: `@mod` is the Euclidean remainder, so a grid starting at beat -4
+/// still places the first bar downbeat at position 1.
+fn barPosition(global_beat: i64) u16 {
+    return @intCast(@mod(global_beat - 1, 4) + 1);
+}
+
+/// Expands a sparse 2-marker beatgrid into one `Beat` per beat. The markers
+/// need not be sorted; the format requires ascending sample offsets, so they
+/// are sorted first. Assumes **constant tempo between markers** (linear
+/// interpolation of sample offsets): no rubato, no tempo curves, no
+/// time-signature changes. `bpm` seeds the `tempo` field (see
+/// `PerformanceData.bpm`); `sample_count` clips the tail — no beats are
+/// emitted past the track end or before its start. Markers sharing a
+/// sample offset are skipped.
+pub fn expandBeatgrid(
+    alloc: std.mem.Allocator,
+    markers: []const BeatMarker,
+    sample_rate: u32,
+    bpm: ?f64,
+    sample_count: u64,
+) BuildError![]Beat {
+    if (markers.len == 0 or sample_rate == 0) return &.{};
+
+    const sorted = try alloc.dupe(BeatMarker, markers);
+    defer alloc.free(sorted);
+    std.mem.sort(BeatMarker, sorted, {}, struct {
+        fn lessThan(_: void, a: BeatMarker, b: BeatMarker) bool {
+            return a.sample_offset < b.sample_offset;
+        }
+    }.lessThan);
+
+    const rate: f64 = @floatFromInt(sample_rate);
+    const limit: f64 = @floatFromInt(sample_count);
+    var beats: std.ArrayList(Beat) = .empty;
+    errdefer beats.deinit(alloc);
+
+    for (sorted[0 .. sorted.len - 1], sorted[1..]) |a, b| {
+        const index_a: i64 = a.index;
+        const beat_span: i64 = @max(@as(i64, b.index) - index_a, 1);
+        const span: f64 = @floatFromInt(beat_span);
+        const samples_per_beat = (b.sample_offset - a.sample_offset) / span;
+        if (samples_per_beat <= 0.0) continue;
+
+        const local_bpm = 60.0 * rate / samples_per_beat;
+        const tempo = centiBpm(bpm orelse local_bpm);
+        const ms_per_beat = samples_per_beat / rate * 1000.0;
+        const start_ms = a.sample_offset / rate * 1000.0;
+        for (0..@intCast(beat_span)) |k| {
+            const offset = a.sample_offset + @as(f64, @floatFromInt(k)) * samples_per_beat;
+            if (offset < 0.0) continue;
+            if (offset > limit) break;
+            try beats.append(alloc, .{
+                .beat_number = barPosition(index_a + @as(i64, @intCast(k))),
+                .tempo = tempo,
+                .time = std.math.lossyCast(u32, @round(start_ms + @as(f64, @floatFromInt(k)) * ms_per_beat)),
+            });
+        }
+    }
+    return beats.toOwnedSlice(alloc);
+}
+
+/// Consecutive `per`-entry window `w` of `columns`, the last possibly
+/// shorter; valid for `w` below `(columns.len + per - 1) / per`.
+fn window(comptime T: type, columns: []const T, per: usize, w: usize) []const T {
+    return columns[w * per .. @min(columns.len, (w + 1) * per)];
+}
+
+/// Builds the four band-derived column groups (PWV4 color preview, PWV5
+/// color detail, PWV6/PWV7 3-band) from a single 150 Hz 3-band detail
+/// vector. The PWV4 preview is the integer mean of the detail bands over
+/// each preview window; the 3-band columns reuse the band energies
+/// directly (field order mid, top, bottom). `heights` drives the PWV5
+/// height (see `colorDetailColumn` for the missing-entry fallback).
+///
+/// Whiteness and the PWV4 bottom-half band are guesses: Rekordbox's exact
+/// derivation is proprietary and undocumented — whiteness stays zero
+/// throughout this module and the bottom-half energy mirrors the
+/// bottom-third energy.
+pub fn buildBandColumns(
+    alloc: std.mem.Allocator,
+    bands: []const Band,
+    heights: []const u8,
+) BuildError!BandColumns {
+    const per_preview = @max(DETAIL_PER_PREVIEW, 1);
+    const n_windows = (bands.len + per_preview - 1) / per_preview;
+
+    const color_preview = try alloc.alloc(WaveformColorPreviewColumn, n_windows);
+    errdefer alloc.free(color_preview);
+    const color_detail = try alloc.alloc(WaveformColorDetailColumn, bands.len);
+    errdefer alloc.free(color_detail);
+    const band3_preview = try alloc.alloc(Waveform3BandColumn, n_windows);
+    errdefer alloc.free(band3_preview);
+    const band3_detail = try alloc.alloc(Waveform3BandColumn, bands.len);
+    errdefer alloc.free(band3_detail);
+
+    for (0..n_windows) |w| {
+        const chunk = window(Band, bands, per_preview, w);
+        var low: u32 = 0;
+        var mid: u32 = 0;
+        var high: u32 = 0;
+        for (chunk) |band| {
+            low += band.low;
+            mid += band.mid;
+            high += band.high;
+        }
+        const n: u32 = @intCast(chunk.len);
+        const mean = [3]u8{
+            @intCast(low / n),
+            @intCast(mid / n),
+            @intCast(high / n),
+        };
+        color_preview[w] = .{
+            .energy_bottom_half_freq = mean[0],
+            .energy_bottom_third_freq = mean[0],
+            .energy_mid_third_freq = mean[1],
+            .energy_top_third_freq = mean[2],
+        };
+        band3_preview[w] = .{
+            .energy_mid_third_freq = mean[1],
+            .energy_top_third_freq = mean[2],
+            .energy_bottom_third_freq = mean[0],
+        };
+    }
+    for (bands, 0..) |band, i| {
+        color_detail[i] = colorDetailColumn(
+            band.low,
+            band.mid,
+            band.high,
+            if (i < heights.len) heights[i] else null,
+        );
+        band3_detail[i] = .{
+            .energy_mid_third_freq = band.mid,
+            .energy_top_third_freq = band.high,
+            .energy_bottom_third_freq = band.low,
+        };
+    }
+    return .{
+        .color_preview = color_preview,
+        .color_detail = color_detail,
+        .band3_preview = band3_preview,
+        .band3_detail = band3_detail,
+    };
+}
+
+/// Quantizes one color-detail column. The RGB values pick the dominant band
+/// (high→blue, mid→green, low→red; ties break high, so silence renders
+/// blue); a caller-supplied height is clamped to 0-31, a missing one falls
+/// back to the scaled band maximum.
+fn colorDetailColumn(low: u8, mid: u8, high: u8, height: ?u8) WaveformColorDetailColumn {
+    const h: u8 = height orelse blk: {
+        const band_max: f32 = @floatFromInt(@max(@max(low, mid), high));
+        break :blk std.math.lossyCast(u8, @round(band_max / 255.0 * 31.0));
+    };
+    var red: u3 = 0;
+    var green: u3 = 0;
+    var blue: u3 = 0;
+    if (high >= mid and high >= low) {
+        blue = 7;
+    } else if (mid >= low) {
+        green = 7;
+    } else {
+        red = 7;
+    }
+    return .{ .height = @intCast(@min(h, 31)), .red = red, .green = green, .blue = blue };
+}
+
+/// Builds the preview and tiny mono columns (PWAV/PWV2) at `PREVIEW_HZ`
+/// from a per-column peak height vector. Each preview entry downsamples
+/// `DETAIL_PER_PREVIEW` detail columns by taking the max height, matching
+/// how a coarser view of the same peaks looks.
+pub fn buildPreviewColumns(
+    alloc: std.mem.Allocator,
+    heights: []const u8,
+) BuildError!PreviewColumns {
+    const per_preview = @max(DETAIL_PER_PREVIEW, 1);
+    const n_windows = (heights.len + per_preview - 1) / per_preview;
+
+    const preview = try alloc.alloc(WaveformPreviewColumn, n_windows);
+    errdefer alloc.free(preview);
+    const tiny = try alloc.alloc(TinyWaveformPreviewColumn, n_windows);
+    errdefer alloc.free(tiny);
+
+    for (0..n_windows) |w| {
+        const chunk = window(u8, heights, per_preview, w);
+        var peak: u8 = 0;
+        for (chunk) |h| peak = @max(peak, h);
+        peak = @min(peak, 31);
+        // PWV2 carries a 4-bit height (0-15); PWAV carries 5 bits (0-31).
+        preview[w] = .{ .height = @intCast(peak), .whiteness = 0 };
+        tiny[w] = .{ .height = @intCast(peak / 2) };
+    }
+    return .{ .preview = preview, .tiny = tiny };
+}
+
+/// Converts a caller-supplied per-column peak height vector (0-31) into the
+/// mono detail columns (PWV3, 150 Hz) used by `.EXT`.
+pub fn buildDetailMono(alloc: std.mem.Allocator, heights: []const u8) BuildError![]WaveformPreviewColumn {
+    const detail = try alloc.alloc(WaveformPreviewColumn, heights.len);
+    errdefer alloc.free(detail);
+    for (heights, 0..) |h, i| {
+        detail[i] = .{ .height = @intCast(@min(h, 31)), .whiteness = 0 };
+    }
+    return detail;
+}
+
+/// Builds the `.DAT` plain-cue list and the `.EXT` extended-cue list from
+/// one set of cues. Both lists share `list_type`: memory cues
+/// (`hot_cue == 0`) are emitted as memory lists, hot cues as hot lists —
+/// since the writer applies a single shared type to both lists, hot cues
+/// win whenever any is present. Memory-cue colors default to
+/// `ColorIndex.none` and hot-cue palette indices to zero (the RGBA→palette
+/// mapping is a known gap). A loop without `loop_end` keeps the
+/// `0xFFFF_FFFF` sentinel.
+pub fn buildCues(alloc: std.mem.Allocator, cues: []const CueInput, sample_rate: u32) BuildError!CueLists {
+    const has_hot_cue = for (cues) |cue| {
+        if (cue.hot_cue != 0) break true;
+    } else false;
+
+    const plain = try alloc.alloc(Cue, cues.len);
+    errdefer alloc.free(plain);
+    const extended = try alloc.alloc(ExtendedCue, cues.len);
+    var built: usize = 0;
+    errdefer {
+        freeExtendedCues(alloc, extended[0..built]);
+        alloc.free(extended);
+    }
+
+    for (cues, 0..) |*in, i| {
+        const cue_type: CueType = if (in.is_loop) .loop else .point;
+        const time = samplesToMs(in.sample_offset, sample_rate);
+        const loop_time = if (in.is_loop and in.loop_end != null)
+            samplesToMs(in.loop_end.?, sample_rate)
+        else
+            0xFFFF_FFFF;
+        plain[i] = .{
+            .hot_cue = in.hot_cue,
+            .cue_type = cue_type,
+            .time = time,
+            .loop_time = loop_time,
+        };
+        extended[i] = .{
+            .hot_cue = in.hot_cue,
+            .cue_type = cue_type,
+            .time = time,
+            .loop_time = loop_time,
+            .comment = try LenPrefixedWideString.fromUtf8(alloc, in.label),
+            .hot_cue_color_rgb = .{ in.r, in.g, in.b },
+        };
+        built = i + 1;
+    }
+    return .{ .cues = plain, .extended = extended, .list_type = if (has_hot_cue) .hot_cues else .memory_cues };
+}
+
+/// Assembles a complete `AnlzInput` from format-agnostic performance data:
+/// the single entry point for callers. Waveform columns for all seven
+/// sections are derived from `pd.waveform_bands`/`pd.waveform_heights` (see
+/// `PerformanceData` for the 150 Hz contract), the beatgrid is densified by
+/// `expandBeatgrid`, and `pd.main_cue` is prepended to `pd.cues` as a
+/// colorless memory point cue before `buildCues` sees one list. All output
+/// is owned by `alloc` and freed by `AnlzInput.deinit`.
+pub fn buildAnlzInput(alloc: std.mem.Allocator, pd: PerformanceData) BuildError!AnlzInput {
+    const bands = try buildBandColumns(alloc, pd.waveform_bands, pd.waveform_heights);
+    errdefer bands.deinit(alloc);
+    const previews = try buildPreviewColumns(alloc, pd.waveform_heights);
+    errdefer previews.deinit(alloc);
+    const detail_mono = try buildDetailMono(alloc, pd.waveform_heights);
+    errdefer alloc.free(detail_mono);
+    const beats = try expandBeatgrid(alloc, pd.beatgrid, pd.sample_rate, pd.bpm, pd.sample_count);
+    errdefer alloc.free(beats);
+
+    const lists = if (pd.main_cue) |main_cue| blk: {
+        const head = [1]CueInput{.{ .sample_offset = main_cue }};
+        const combined = try std.mem.concat(alloc, CueInput, &.{ &head, pd.cues });
+        defer alloc.free(combined);
+        break :blk try buildCues(alloc, combined, pd.sample_rate);
+    } else try buildCues(alloc, pd.cues, pd.sample_rate);
+
+    return .{
+        .beats = beats,
+        .cues = lists.cues,
+        .cues_extended = lists.extended,
+        .cue_list_type = lists.list_type,
+        .preview_mono = previews.preview,
+        .tiny_preview = previews.tiny,
+        .detail_mono = detail_mono,
+        .color_preview = bands.color_preview,
+        .color_detail = bands.color_detail,
+        .band3_preview = bands.band3_preview,
+        .band3_detail = bands.band3_detail,
+    };
+}

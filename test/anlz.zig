@@ -861,3 +861,330 @@ test "length-prefixed wide string through the struct walker" {
     try testing.expectEqualSlices(u8, ws.raw, s.text.raw);
     try testing.expectEqual(@as(u8, 2), s.suffix);
 }
+
+// ---------------------------------------------------------------------------
+// Performance-data construction (anlz_build port)
+// ---------------------------------------------------------------------------
+
+test "beatgrid expansion is constant tempo" {
+    // Port of rekordcrate's beatgrid_expansion_is_constant_tempo: a
+    // 2-marker grid at 120 BPM densifies to ~2 beats with cycling bar
+    // positions and ms offsets within ~1 sample.
+    const alloc = testing.allocator;
+    const sr: u32 = 44_100;
+    // 120 BPM -> 22050 samples per beat; two beats span 44100 samples (1 s).
+    const samples_per_beat = 60.0 / 120.0 * @as(f64, @floatFromInt(sr));
+    const markers = [_]anlz.BeatMarker{
+        .{ .index = 1, .sample_offset = 0.0 },
+        .{ .index = 3, .sample_offset = 2.0 * samples_per_beat },
+    };
+    const beats = try anlz.expandBeatgrid(alloc, &markers, sr, 120.0, std.math.maxInt(u64));
+    defer alloc.free(beats);
+    try testing.expectEqual(@as(usize, 2), beats.len);
+    try testing.expectEqualSlices(u16, &.{ 1, 2 }, &.{ beats[0].beat_number, beats[1].beat_number });
+    try testing.expectEqual(@as(u16, 12_000), beats[0].tempo);
+    try testing.expectEqual(@as(u32, 0), beats[0].time);
+    try testing.expect(@abs(@as(i64, beats[1].time) - 500) <= 1);
+
+    // Total count from duration: at 120 BPM, 1 s holds 2 beats.
+    const from_duration = try anlz.expandBeatgrid(alloc, &markers, sr, 120.0, sr);
+    defer alloc.free(from_duration);
+    try testing.expectEqual(@as(usize, 2), from_duration.len);
+}
+
+test "beatgrid negative index aligns bar" {
+    // Port of rekordcrate's beatgrid_negative_index_aligns_bar: bar
+    // positions cycle 1-4 with downbeats at global index 1 (mod 4), so a
+    // grid spanning beats -4..-1 yields [4, 1, 2, 3] — not [1, 2, 3, 4].
+    const alloc = testing.allocator;
+    const sr: u32 = 44_100;
+    const spb = 60.0 / 120.0 * @as(f64, @floatFromInt(sr));
+    const markers = [_]anlz.BeatMarker{
+        .{ .index = -4, .sample_offset = 0.0 },
+        .{ .index = 0, .sample_offset = 4.0 * spb },
+    };
+    const beats = try anlz.expandBeatgrid(alloc, &markers, sr, 120.0, std.math.maxInt(u64));
+    defer alloc.free(beats);
+    var positions: [4]u16 = undefined;
+    for (beats, 0..) |beat, i| positions[i] = beat.beat_number;
+    try testing.expectEqualSlices(u16, &.{ 4, 1, 2, 3 }, &positions);
+}
+
+test "beatgrid tempo derives from the grid and saturates" {
+    // Ours (no oracle counterpart): with `bpm` null the tempo comes from
+    // the grid segment, a set `bpm` overrides it uniformly, centi-BPM
+    // saturates at the format ceiling, and unsorted markers are sorted by
+    // sample offset before expansion.
+    const alloc = testing.allocator;
+    const sr: u32 = 44_100;
+    const spb = 60.0 / 120.0 * @as(f64, @floatFromInt(sr));
+    const markers = [_]anlz.BeatMarker{
+        .{ .index = 0, .sample_offset = 0.0 },
+        .{ .index = 2, .sample_offset = 2.0 * spb },
+    };
+    const derived = try anlz.expandBeatgrid(alloc, &markers, sr, null, std.math.maxInt(u64));
+    defer alloc.free(derived);
+    try testing.expectEqual(@as(u16, 12_000), derived[0].tempo);
+
+    const overridden = try anlz.expandBeatgrid(alloc, &markers, sr, 128.0, std.math.maxInt(u64));
+    defer alloc.free(overridden);
+    try testing.expectEqual(@as(u16, 12_800), overridden[0].tempo);
+
+    const saturated = try anlz.expandBeatgrid(alloc, &markers, sr, 700.0, std.math.maxInt(u64));
+    defer alloc.free(saturated);
+    try testing.expectEqual(@as(u16, 655_35), saturated[0].tempo);
+
+    const unsorted = [_]anlz.BeatMarker{ markers[1], markers[0] };
+    const sorted = try anlz.expandBeatgrid(alloc, &unsorted, sr, null, std.math.maxInt(u64));
+    defer alloc.free(sorted);
+    try testing.expectEqualSlices(anlz.Beat, derived, sorted);
+}
+
+test "preview downsample counts" {
+    // Port of rekordcrate's preview_downsample_count: 150 detail entries
+    // collapse to ~7 preview columns at 6.667 Hz (22 detail columns per
+    // preview column), plus spot checks pinning the band-to-column mapping.
+    const alloc = testing.allocator;
+    const bands = [_]anlz.Band{.{ .low = 10, .mid = 20, .high = 30 }} ** 150;
+    const heights = [_]u8{16} ** 150;
+
+    const columns = try anlz.buildBandColumns(alloc, &bands, &heights);
+    defer columns.deinit(alloc);
+    try testing.expectEqual(@as(usize, 7), columns.color_preview.len);
+    try testing.expectEqual(@as(usize, 7), columns.band3_preview.len);
+    try testing.expectEqual(@as(usize, 150), columns.color_detail.len);
+    try testing.expectEqual(@as(usize, 150), columns.band3_detail.len);
+    // Constant bands mean to themselves; the PWV4 bottom half mirrors the
+    // bottom third (documented guess) and whiteness stays zero.
+    try testing.expectEqual(anlz.WaveformColorPreviewColumn{
+        .energy_bottom_half_freq = 10,
+        .energy_bottom_third_freq = 10,
+        .energy_mid_third_freq = 20,
+        .energy_top_third_freq = 30,
+    }, columns.color_preview[0]);
+    // 3-band preview reuses the PWV4 window means.
+    try testing.expectEqual(anlz.Waveform3BandColumn{
+        .energy_mid_third_freq = 20,
+        .energy_top_third_freq = 30,
+        .energy_bottom_third_freq = 10,
+    }, columns.band3_preview[0]);
+    // 3-band detail reuses the band energies directly, field order mid,
+    // top, bottom.
+    try testing.expectEqual(anlz.Waveform3BandColumn{
+        .energy_mid_third_freq = 20,
+        .energy_top_third_freq = 30,
+        .energy_bottom_third_freq = 10,
+    }, columns.band3_detail[0]);
+    // The dominant band (high) colors PWV5 blue with the supplied height.
+    try testing.expectEqual(anlz.WaveformColorDetailColumn{
+        .height = 16,
+        .blue = 7,
+    }, columns.color_detail[0]);
+
+    const previews = try anlz.buildPreviewColumns(alloc, &heights);
+    defer previews.deinit(alloc);
+    try testing.expectEqual(@as(usize, 7), previews.preview.len);
+    try testing.expectEqual(@as(usize, 7), previews.tiny.len);
+    for (previews.preview) |column| try testing.expect(column.height <= 31);
+    for (previews.tiny) |column| try testing.expect(column.height <= 15);
+    try testing.expectEqual(@as(u5, 16), previews.preview[0].height);
+    try testing.expectEqual(@as(u4, 8), previews.tiny[0].height);
+
+    const detail = try anlz.buildDetailMono(alloc, &heights);
+    defer alloc.free(detail);
+    try testing.expectEqual(@as(usize, 150), detail.len);
+    try testing.expectEqual(@as(u5, 16), detail[0].height);
+}
+
+test "cue building point and loop" {
+    // Port of rekordcrate's cue_building_point_and_loop: cues encode point
+    // vs loop, convert sample offsets to milliseconds, and pick the hot-cue
+    // list type when a hot cue is present.
+    const alloc = testing.allocator;
+    const sr: u32 = 44_100;
+    const cues = [_]anlz.CueInput{
+        .{ .hot_cue = 1, .sample_offset = 44_100.0, .label = "Intro", .r = 255 },
+        .{ .hot_cue = 2, .sample_offset = 88_200.0, .loop_end = 132_300.0, .is_loop = true, .label = "Loop", .g = 255 },
+    };
+    const lists = try anlz.buildCues(alloc, &cues, sr);
+    defer lists.deinit(alloc);
+    try testing.expectEqual(anlz.CueListType.hot_cues, lists.list_type);
+    try testing.expectEqual(@as(usize, 2), lists.cues.len);
+    try testing.expectEqual(@as(u32, 1000), lists.cues[0].time);
+    try testing.expectEqual(anlz.CueType.point, lists.cues[0].cue_type);
+    try testing.expectEqual(anlz.CueType.loop, lists.cues[1].cue_type);
+    try testing.expectEqual(@as(u32, 3000), lists.cues[1].loop_time);
+    // A point cue ignores its `loop_end`... (none set here; the sentinel
+    // holds).
+    try testing.expectEqual(@as(u32, 0xFFFF_FFFF), lists.cues[0].loop_time);
+    try testing.expectEqual(@as(usize, 2), lists.extended.len);
+    try testing.expectEqual([3]u8{ 255, 0, 0 }, lists.extended[0].hot_cue_color_rgb);
+    const label = try lists.extended[0].comment.utf8(alloc);
+    defer alloc.free(label);
+    try testing.expectEqualStrings("Intro", label);
+
+    // Memory-only cue lists keep the memory type.
+    const memory = try anlz.buildCues(alloc, &.{.{ .sample_offset = 44_100.0 }}, sr);
+    defer memory.deinit(alloc);
+    try testing.expectEqual(anlz.CueListType.memory_cues, memory.list_type);
+}
+
+test "built anlz input assembles consistently" {
+    // Port of rekordcrate's build_anlz_input_assembles_consistently: a
+    // populated performance data yields a non-empty AnlzInput whose
+    // waveform sections are internally consistent (detail == height count,
+    // preview ~1/22) and whose main cue was prepended to the cue list.
+    const alloc = testing.allocator;
+    const sr: u32 = 44_100;
+    const bands = [_]anlz.Band{.{ .low = 50, .mid = 100, .high = 150 }} ** 150;
+    const heights = [_]u8{20} ** 150;
+    const markers = [_]anlz.BeatMarker{
+        .{ .index = 1, .sample_offset = 0.0 },
+        .{ .index = 5, .sample_offset = 60.0 / 120.0 * @as(f64, @floatFromInt(sr)) * 4.0 },
+    };
+    const input = try anlz.buildAnlzInput(alloc, .{
+        .sample_rate = sr,
+        .sample_count = sr,
+        .bpm = 120.0,
+        .beatgrid = &markers,
+        .main_cue = 0.0,
+        .cues = &.{.{ .hot_cue = 1, .sample_offset = @floatFromInt(sr), .label = "x" }},
+        .waveform_bands = &bands,
+        .waveform_heights = &heights,
+    });
+    defer input.deinit(alloc);
+    try testing.expect(input.beats.len > 0);
+    try testing.expectEqual(@as(usize, 2), input.cues.len);
+    try testing.expectEqual(@as(usize, 2), input.cues_extended.len);
+    try testing.expectEqual(anlz.CueListType.hot_cues, input.cue_list_type);
+    try testing.expectEqual(@as(usize, 150), input.detail_mono.?.len);
+    try testing.expectEqual(@as(usize, 150), input.color_detail.?.len);
+    try testing.expectEqual(@as(usize, 150), input.band3_detail.?.len);
+    try testing.expectEqual(@as(usize, 7), input.preview_mono.len);
+    try testing.expectEqual(@as(usize, 7), input.tiny_preview.len);
+}
+
+test "built anlz input serializes and re-parses" {
+    // Ours (no oracle counterpart): a built AnlzInput, assembled into the
+    // section sets the device writer will emit (.DAT/.EXT/.2EX, each led
+    // by a PPTH path section), serializes, re-parses with equal data, and
+    // roundtrips byte-identical — constructed output is valid ANLZ end to
+    // end.
+    const alloc = testing.allocator;
+    const sr: u32 = 44_100;
+    const bands = [_]anlz.Band{.{ .low = 50, .mid = 100, .high = 150 }} ** 150;
+    const heights = [_]u8{20} ** 150;
+    const markers = [_]anlz.BeatMarker{
+        .{ .index = 1, .sample_offset = 0.0 },
+        .{ .index = 5, .sample_offset = 60.0 / 120.0 * @as(f64, @floatFromInt(sr)) * 4.0 },
+    };
+    const input = try anlz.buildAnlzInput(alloc, .{
+        .sample_rate = sr,
+        .sample_count = sr,
+        .bpm = 120.0,
+        .beatgrid = &markers,
+        .main_cue = 0.0,
+        .cues = &.{.{ .hot_cue = 1, .sample_offset = @floatFromInt(sr), .label = "Brëak", .r = 0x4D, .b = 0xFF }},
+        .waveform_bands = &bands,
+        .waveform_heights = &heights,
+    });
+    defer input.deinit(alloc);
+
+    const track_path = try anlz.LenPrefixedWideString.fromUtf8(alloc, "/Contents/track.mp3");
+    defer alloc.free(track_path.raw);
+    const path_section = anlz.Content{ .path = .{ .path = track_path } };
+
+    // .DAT: beats, plain cues, mono previews.
+    const dat_sections = [_]anlz.Content{
+        path_section,
+        .{ .beat_grid = .{ .beats = input.beats } },
+        .{ .cue_list = .{ .list_type = input.cue_list_type, .cues = input.cues } },
+        .{ .waveform_preview = .{ .data = input.preview_mono } },
+        .{ .tiny_waveform_preview = .{ .data = input.tiny_preview } },
+    };
+    const dat = try anlz.serializeFile(alloc, &test_file_header_data, &dat_sections);
+    defer alloc.free(dat);
+    try expectRoundtripBytes(alloc, dat);
+
+    var dat_parsed = try anlz.Anlz.parse(alloc, dat);
+    defer dat_parsed.deinit();
+    try testing.expectEqual(@as(usize, 5), dat_parsed.sections.len);
+    try testing.expectEqualSlices(u8, track_path.raw, dat_parsed.findSection(.path).?.path.path.raw);
+    try testing.expectEqualSlices(anlz.Beat, input.beats, dat_parsed.findSection(.beat_grid).?.beat_grid.beats);
+    const dat_list = &dat_parsed.findSection(.cue_list).?.cue_list;
+    try testing.expectEqual(anlz.CueListType.hot_cues, dat_list.list_type);
+    try testing.expectEqual(@as(u32, 0xFFFF_FFFF), dat_list.memory_count);
+    try testing.expectEqualSlices(anlz.Cue, input.cues, dat_list.cues);
+    const preview = &dat_parsed.findSection(.waveform_preview).?.waveform_preview;
+    try testing.expectEqual(@as(usize, 7), preview.data.len);
+    try testing.expectEqual(@as(u5, 20), preview.data[0].height);
+    try testing.expectEqual(@as(u3, 0), preview.data[0].whiteness);
+    try testing.expectEqual(@as(usize, 7), dat_parsed.findSection(.tiny_waveform_preview).?.tiny_waveform_preview.data.len);
+
+    // .EXT: extended cues, mono detail, color preview/detail.
+    const ext_sections = [_]anlz.Content{
+        path_section,
+        .{ .extended_cue_list = .{ .list_type = input.cue_list_type, .cues = input.cues_extended } },
+        .{ .waveform_detail = .{ .data = input.detail_mono.? } },
+        .{ .waveform_color_preview = .{ .data = input.color_preview.? } },
+        .{ .waveform_color_detail = .{ .data = input.color_detail.? } },
+    };
+    const ext = try anlz.serializeFile(alloc, &test_file_header_data, &ext_sections);
+    defer alloc.free(ext);
+    try expectRoundtripBytes(alloc, ext);
+
+    var ext_parsed = try anlz.Anlz.parse(alloc, ext);
+    defer ext_parsed.deinit();
+    try testing.expectEqual(@as(usize, 5), ext_parsed.sections.len);
+    const ext_list = &ext_parsed.findSection(.extended_cue_list).?.extended_cue_list;
+    try testing.expectEqual(anlz.CueListType.hot_cues, ext_list.list_type);
+    try testing.expectEqual(@as(usize, 2), ext_list.cues.len);
+    try testing.expectEqual(@as(u32, 0), ext_list.cues[0].hot_cue);
+    const label = try ext_list.cues[1].comment.utf8(alloc);
+    defer alloc.free(label);
+    try testing.expectEqualStrings("Brëak", label);
+    try testing.expectEqual([3]u8{ 0x4D, 0, 0xFF }, ext_list.cues[1].hot_cue_color_rgb);
+    const detail = &ext_parsed.findSection(.waveform_detail).?.waveform_detail;
+    try testing.expectEqual(@as(usize, 150), detail.data.len);
+    try testing.expectEqual(@as(u5, 20), detail.data[0].height);
+    const color_preview = &ext_parsed.findSection(.waveform_color_preview).?.waveform_color_preview;
+    try testing.expectEqual(@as(usize, 7), color_preview.data.len);
+    try testing.expectEqual(anlz.WaveformColorPreviewColumn{
+        .energy_bottom_half_freq = 50,
+        .energy_bottom_third_freq = 50,
+        .energy_mid_third_freq = 100,
+        .energy_top_third_freq = 150,
+    }, color_preview.data[0]);
+    const color_detail = &ext_parsed.findSection(.waveform_color_detail).?.waveform_color_detail;
+    try testing.expectEqual(@as(usize, 150), color_detail.data.len);
+    try testing.expectEqual(@as(u3, 7), color_detail.data[0].blue);
+    try testing.expectEqual(@as(u5, 20), color_detail.data[0].height);
+
+    // .2EX: 3-band preview/detail.
+    const ex2_sections = [_]anlz.Content{
+        path_section,
+        .{ .waveform_3band_preview = .{ .data = input.band3_preview.? } },
+        .{ .waveform_3band_detail = .{ .data = input.band3_detail.? } },
+    };
+    const ex2 = try anlz.serializeFile(alloc, &test_file_header_data, &ex2_sections);
+    defer alloc.free(ex2);
+    try expectRoundtripBytes(alloc, ex2);
+
+    var ex2_parsed = try anlz.Anlz.parse(alloc, ex2);
+    defer ex2_parsed.deinit();
+    try testing.expectEqual(@as(usize, 3), ex2_parsed.sections.len);
+    const band3_preview = &ex2_parsed.findSection(.waveform_3band_preview).?.waveform_3band_preview;
+    try testing.expectEqual(@as(usize, 7), band3_preview.data.len);
+    const band3_detail = &ex2_parsed.findSection(.waveform_3band_detail).?.waveform_3band_detail;
+    try testing.expectEqual(@as(usize, 150), band3_detail.data.len);
+    try testing.expectEqual(anlz.Waveform3BandColumn{
+        .energy_mid_third_freq = 100,
+        .energy_top_third_freq = 150,
+        .energy_bottom_third_freq = 50,
+    }, band3_preview.data[0]);
+    try testing.expectEqual(anlz.Waveform3BandColumn{
+        .energy_mid_third_freq = 100,
+        .energy_top_third_freq = 150,
+        .energy_bottom_third_freq = 50,
+    }, band3_detail.data[0]);
+}
