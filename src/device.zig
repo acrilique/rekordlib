@@ -781,18 +781,19 @@ pub const DeviceExport = struct {
         };
         const row = try e.buildTrackRow(track, track.analysis != null);
 
-        const artist_id = try e.getOrCreateArtist(track.artist);
-        const album_id = try e.getOrCreateAlbum(track.album, artist_id);
-        const genre_id = try e.getOrCreateGenre(track.genre);
-        const key_id = try e.getOrCreateKey(track.key);
-        const label_id = try e.getOrCreateLabel(track.label);
-        const artwork_id = try e.getOrCreateArtwork(track.artwork_device_path);
+        const db = try e.openPdb();
+        const artist_id = try getOrCreateArtist(state, db, track.artist);
+        const album_id = try getOrCreateAlbum(state, db, track.album, artist_id);
+        const genre_id = try getOrCreateGenre(state, db, track.genre);
+        const key_id = try getOrCreateKey(state, db, track.key);
+        const label_id = try getOrCreateLabel(state, db, track.label);
+        const artwork_id = try getOrCreateArtwork(state, db, track.artwork_device_path);
         const composer_id =
-            if (track.composer.len == 0) 0 else try e.getOrCreateArtist(track.composer);
+            if (track.composer.len == 0) 0 else try getOrCreateArtist(state, db, track.composer);
         const orig_artist_id =
-            if (track.orig_artist.len == 0) 0 else try e.getOrCreateArtist(track.orig_artist);
+            if (track.orig_artist.len == 0) 0 else try getOrCreateArtist(state, db, track.orig_artist);
         const remixer_id =
-            if (track.remixer.len == 0) 0 else try e.getOrCreateArtist(track.remixer);
+            if (track.remixer.len == 0) 0 else try getOrCreateArtist(state, db, track.remixer);
 
         row.id = track_id;
         row.artist_id = artist_id;
@@ -818,7 +819,6 @@ pub const DeviceExport = struct {
             try state.tracks_by_path.ensureUnusedCapacity(sa, 1);
         }
 
-        const db = try e.openPdb();
         var row_union = pdb.Row{ .track = row };
         _ = try db.addRow(&row_union);
 
@@ -1000,23 +1000,60 @@ pub const DeviceExport = struct {
     /// Resolves `name` to an Artist row, inserting one when no scanned or
     /// previously created artist carries the name. Empty names resolve to
     /// the null id 0.
-    fn getOrCreateArtist(e: *DeviceExport, name: []const u8) AddTrackError!u32 {
-        const state = try e.writerState();
+    fn getOrCreateArtist(
+        state: *WriterState,
+        db: *pdb.Database,
+        name: []const u8,
+    ) AddTrackError!u32 {
+        return getOrCreateStringRow(
+            state,
+            db,
+            &state.artists_by_name,
+            &state.next_artist_id,
+            buildArtistRow,
+            name,
+        );
+    }
+
+    /// `getOrCreateStringRow` for Genre, Label, and Artwork rows.
+    fn getOrCreateGenre(state: *WriterState, db: *pdb.Database, name: []const u8) AddTrackError!u32 {
+        return getOrCreateStringRow(state, db, &state.genres_by_name, &state.next_genre_id, buildGenreRow, name);
+    }
+
+    fn getOrCreateLabel(state: *WriterState, db: *pdb.Database, name: []const u8) AddTrackError!u32 {
+        return getOrCreateStringRow(state, db, &state.labels_by_name, &state.next_label_id, buildLabelRow, name);
+    }
+
+    fn getOrCreateArtwork(state: *WriterState, db: *pdb.Database, path: []const u8) AddTrackError!u32 {
+        return getOrCreateStringRow(state, db, &state.artwork_by_path, &state.next_artwork_id, buildArtworkRow, path);
+    }
+
+    /// Resolves `name` through `map` to a row built by `build_row`,
+    /// inserting one under a fresh id when no scanned or previously
+    /// created row carries the name; `counter` is the table's id counter.
+    /// Empty names resolve to the null id 0.
+    fn getOrCreateStringRow(
+        state: *WriterState,
+        db: *pdb.Database,
+        map: *std.StringHashMapUnmanaged(u32),
+        counter: *u32,
+        comptime build_row: fn (
+            std.mem.Allocator,
+            u32,
+            []const u8,
+        ) error{ TooLong, InvalidEncoding, OutOfMemory }!pdb.Row,
+        name: []const u8,
+    ) AddTrackError!u32 {
         if (name.len == 0) return 0;
-        if (state.artists_by_name.get(name)) |id| return id;
+        if (map.get(name)) |id| return id;
 
-        const db = try e.openPdb();
-        const id = state.next_artist_id;
-        const a = db.arena.allocator();
-        const boxed = try a.create(pdb.Artist);
-        boxed.* = .{ .id = id, .offsets = .{ .inner = .{
-            .name = try pdb.DeviceSQLString.fromUtf8(a, name),
-        } } };
-        var row = pdb.Row{ .artist = boxed };
+        const id = counter.*;
+        var row = try build_row(db.arena.allocator(), id, name);
         _ = try db.addRow(&row);
-        state.next_artist_id += 1;
+        counter.* = id + 1;
 
-        try putIfAbsent(&state.artists_by_name, state.arena.allocator(), try state.arena.allocator().dupe(u8, name), id);
+        const sa = state.arena.allocator();
+        try putIfAbsent(map, sa, try sa.dupe(u8, name), id);
         return id;
     }
 
@@ -1024,16 +1061,15 @@ pub const DeviceExport = struct {
     /// needed — albums are per-artist. An empty name resolves to the null
     /// id 0.
     fn getOrCreateAlbum(
-        e: *DeviceExport,
+        state: *WriterState,
+        db: *pdb.Database,
         name: []const u8,
         artist_id: u32,
     ) AddTrackError!u32 {
-        const state = try e.writerState();
         if (name.len == 0) return 0;
         if (state.albums_by_artist_and_name.get(.{ .artist_id = artist_id, .name = name })) |id|
             return id;
 
-        const db = try e.openPdb();
         const id = state.next_album_id;
         const a = db.arena.allocator();
         const boxed = try a.create(pdb.Album);
@@ -1046,46 +1082,25 @@ pub const DeviceExport = struct {
         _ = try db.addRow(&row);
         state.next_album_id += 1;
 
+        const sa = state.arena.allocator();
         try putIfAbsent(
             &state.albums_by_artist_and_name,
-            state.arena.allocator(),
-            AlbumKey{ .artist_id = artist_id, .name = try state.arena.allocator().dupe(u8, name) },
+            sa,
+            AlbumKey{ .artist_id = artist_id, .name = try sa.dupe(u8, name) },
             id,
         );
-        return id;
-    }
-
-    /// Resolves `name` to a Genre row, inserting one when needed. Empty
-    /// names resolve to the null id 0.
-    fn getOrCreateGenre(e: *DeviceExport, name: []const u8) AddTrackError!u32 {
-        const state = try e.writerState();
-        if (name.len == 0) return 0;
-        if (state.genres_by_name.get(name)) |id| return id;
-
-        const db = try e.openPdb();
-        const id = state.next_genre_id;
-        const a = db.arena.allocator();
-        const boxed = try a.create(pdb.Genre);
-        boxed.* = .{ .id = id, .name = try pdb.DeviceSQLString.fromUtf8(a, name) };
-        var row = pdb.Row{ .genre = boxed };
-        _ = try db.addRow(&row);
-        state.next_genre_id += 1;
-
-        try putIfAbsent(&state.genres_by_name, state.arena.allocator(), try state.arena.allocator().dupe(u8, name), id);
         return id;
     }
 
     /// Resolves `name` — folded through `canonicalKeyName` — to a Key
     /// row, inserting one when no canonical spelling matches. Empty names
     /// resolve to the null id 0.
-    fn getOrCreateKey(e: *DeviceExport, name: []const u8) AddTrackError!u32 {
-        const state = try e.writerState();
+    fn getOrCreateKey(state: *WriterState, db: *pdb.Database, name: []const u8) AddTrackError!u32 {
         if (name.len == 0) return 0;
         const sa = state.arena.allocator();
         const canonical = try canonicalKeyName(sa, name);
         if (state.keys_by_canonical.get(canonical)) |id| return id;
 
-        const db = try e.openPdb();
         const id = state.next_key_id;
         const a = db.arena.allocator();
         // The row stores the canonical spelling so later lookups collide
@@ -1103,48 +1118,6 @@ pub const DeviceExport = struct {
         state.next_key_id += 1;
 
         try putIfAbsent(&state.keys_by_canonical, sa, canonical, id);
-        return id;
-    }
-
-    /// Resolves `name` to a Label row, inserting one when needed. Empty
-    /// names resolve to the null id 0.
-    fn getOrCreateLabel(e: *DeviceExport, name: []const u8) AddTrackError!u32 {
-        const state = try e.writerState();
-        if (name.len == 0) return 0;
-        if (state.labels_by_name.get(name)) |id| return id;
-
-        const db = try e.openPdb();
-        const id = state.next_label_id;
-        const a = db.arena.allocator();
-        const boxed = try a.create(pdb.Label);
-        boxed.* = .{ .id = id, .name = try pdb.DeviceSQLString.fromUtf8(a, name) };
-        var row = pdb.Row{ .label = boxed };
-        _ = try db.addRow(&row);
-        state.next_label_id += 1;
-
-        try putIfAbsent(&state.labels_by_name, state.arena.allocator(), try state.arena.allocator().dupe(u8, name), id);
-        return id;
-    }
-
-    /// Resolves `path` to an Artwork row, inserting one when no row
-    /// carries the path. The path lands in the row verbatim — the caller
-    /// owns placing the image files it names (decision 5; see
-    /// `artworkSpec`). An empty path resolves to the null id 0.
-    fn getOrCreateArtwork(e: *DeviceExport, path: []const u8) AddTrackError!u32 {
-        const state = try e.writerState();
-        if (path.len == 0) return 0;
-        if (state.artwork_by_path.get(path)) |id| return id;
-
-        const db = try e.openPdb();
-        const id = state.next_artwork_id;
-        const a = db.arena.allocator();
-        const boxed = try a.create(pdb.Artwork);
-        boxed.* = .{ .id = id, .path = try pdb.DeviceSQLString.fromUtf8(a, path) };
-        var row = pdb.Row{ .artwork = boxed };
-        _ = try db.addRow(&row);
-        state.next_artwork_id += 1;
-
-        try putIfAbsent(&state.artwork_by_path, state.arena.allocator(), try state.arena.allocator().dupe(u8, path), id);
         return id;
     }
 
@@ -1315,14 +1288,14 @@ pub const DeviceExport = struct {
         }
         if (kept.items.len == 0) return;
 
+        const ext_db = try e.extDb();
         for (kept.items) |label| {
-            const tag_id = try e.getOrCreateTag(category_id, label);
-            const db = try e.extDb();
-            const a = db.arena.allocator();
+            const tag_id = try getOrCreateTag(state, ext_db, category_id, label);
+            const a = ext_db.arena.allocator();
             const boxed = try a.create(pdb.TrackTag);
             boxed.* = .{ .track_id = track_id, .tag_id = tag_id };
             var row = pdb.Row{ .track_tag = boxed };
-            _ = try db.addRow(&row);
+            _ = try ext_db.addRow(&row);
         }
     }
 
@@ -1330,15 +1303,14 @@ pub const DeviceExport = struct {
     /// no scanned or previously created leaf matches. The id counter and
     /// `index_shift` row counter bump only after the insert.
     fn getOrCreateTag(
-        e: *DeviceExport,
+        state: *WriterState,
+        db: *pdb.Database,
         category_id: u32,
         label: []const u8,
     ) TagError!u32 {
-        const state = try e.writerState();
         if (state.tags_by_key.get(.{ .category_id = category_id, .label = label })) |id|
             return id;
 
-        const db = try e.extDb();
         const id = state.next_tag_id;
         const row_index = state.next_tag_row_index;
         const position = state.tag_leaf_counts.get(category_id) orelse 0;
@@ -1869,6 +1841,53 @@ fn putIfAbsent(
         gop.key_ptr.* = key;
         gop.value_ptr.* = value;
     }
+}
+
+/// Builds an Artist row in `a` — the caller's id, the name encoded.
+/// Nothing is inserted; see `getOrCreateStringRow`.
+fn buildArtistRow(
+    a: std.mem.Allocator,
+    id: u32,
+    name: []const u8,
+) error{ TooLong, InvalidEncoding, OutOfMemory }!pdb.Row {
+    const boxed = try a.create(pdb.Artist);
+    boxed.* = .{ .id = id, .offsets = .{ .inner = .{
+        .name = try pdb.DeviceSQLString.fromUtf8(a, name),
+    } } };
+    return .{ .artist = boxed };
+}
+
+/// Builds a Genre row in `a`; see `buildArtistRow`.
+fn buildGenreRow(
+    a: std.mem.Allocator,
+    id: u32,
+    name: []const u8,
+) error{ TooLong, InvalidEncoding, OutOfMemory }!pdb.Row {
+    const boxed = try a.create(pdb.Genre);
+    boxed.* = .{ .id = id, .name = try pdb.DeviceSQLString.fromUtf8(a, name) };
+    return .{ .genre = boxed };
+}
+
+/// Builds a Label row in `a`; see `buildArtistRow`.
+fn buildLabelRow(
+    a: std.mem.Allocator,
+    id: u32,
+    name: []const u8,
+) error{ TooLong, InvalidEncoding, OutOfMemory }!pdb.Row {
+    const boxed = try a.create(pdb.Label);
+    boxed.* = .{ .id = id, .name = try pdb.DeviceSQLString.fromUtf8(a, name) };
+    return .{ .label = boxed };
+}
+
+/// Builds an Artwork row in `a`; see `buildArtistRow`.
+fn buildArtworkRow(
+    a: std.mem.Allocator,
+    id: u32,
+    path: []const u8,
+) error{ TooLong, InvalidEncoding, OutOfMemory }!pdb.Row {
+    const boxed = try a.create(pdb.Artwork);
+    boxed.* = .{ .id = id, .path = try pdb.DeviceSQLString.fromUtf8(a, path) };
+    return .{ .artwork = boxed };
 }
 
 /// The writer-chosen fields of a Tag row; see `buildTagRow`.
