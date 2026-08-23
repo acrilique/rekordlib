@@ -222,7 +222,7 @@ test "reader loads all four settings of every fixture" {
         const path = try std.fmt.allocPrint(alloc, "testdata/complete_export/{s}", .{fixture.name});
         defer alloc.free(path);
         const ex = device.DeviceExport.open(path, io, alloc);
-        const settings = ex.loadSettings();
+        const settings = try ex.loadSettings();
         try testing.expect(settings.dev_setting != null);
         try testing.expect(settings.djm_my_setting != null);
         try testing.expect(settings.my_setting != null);
@@ -251,7 +251,7 @@ test "settings loading tolerates missing and invalid files" {
     try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER/DJMMYSETTING.DAT", .data = "garbage" });
 
     const ex = device.DeviceExport.open(tmp_path, io, alloc);
-    const settings = ex.loadSettings();
+    const settings = try ex.loadSettings();
     try testing.expect(settings.my_setting != null);
     try testing.expect(settings.djm_my_setting == null);
     try testing.expect(settings.dev_setting == null);
@@ -259,11 +259,32 @@ test "settings loading tolerates missing and invalid files" {
 
     // A root without any export content at all stays quiet and empty.
     const empty_ex = device.DeviceExport.open(".zig-cache/definitely-not-here", io, alloc);
-    const empty_settings = empty_ex.loadSettings();
+    const empty_settings = try empty_ex.loadSettings();
     try testing.expect(empty_settings.dev_setting == null);
     try testing.expect(empty_settings.djm_my_setting == null);
     try testing.expect(empty_settings.my_setting == null);
     try testing.expect(empty_settings.my_setting2 == null);
+}
+
+test "loadSettings propagates a file that is not absence-shaped" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    // A DEVSETTING.DAT over the read cap is present but unexaminable;
+    // it must surface, not silently read as a null field.
+    try tmp.dir.createDirPath(io, "PIONEER");
+    const big = try alloc.alloc(u8, (1 << 16) + 1);
+    defer alloc.free(big);
+    @memset(big, 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER/DEVSETTING.DAT", .data = big });
+
+    const ex = device.DeviceExport.open(tmp_path, io, alloc);
+    try testing.expectError(error.StreamTooLong, ex.loadSettings());
 }
 
 test "reader opens each fixture pdb and counts its tracks" {
@@ -501,7 +522,7 @@ test "create saves an export shaped like the empty fixture" {
 
     // All four settings landed, parse back, and re-serialize byte-equal —
     // the default constructors and checksums agree with a real export.
-    const settings = reread.loadSettings();
+    const settings = try reread.loadSettings();
     try testing.expect(settings.dev_setting != null);
     try testing.expect(settings.djm_my_setting != null);
     try testing.expect(settings.my_setting != null);
@@ -614,7 +635,7 @@ test "save is byte-stable" {
     try testing.expectEqualSlices(u8, first, second);
 
     // And the settings were not rewritten: still exactly four DATs.
-    const settings = ex.loadSettings();
+    const settings = try ex.loadSettings();
     try testing.expect(settings.my_setting != null);
 }
 

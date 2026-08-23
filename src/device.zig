@@ -289,8 +289,8 @@ pub fn SettingPayload(comptime kind: SettingKind) type {
     };
 }
 
-/// The parsed payloads of the four `*SETTING.DAT` files. A file that is
-/// missing, unreadable, or invalid leaves its field null.
+/// The parsed payloads of the four `*SETTING.DAT` files. A file that
+/// is missing or invalid leaves its field null.
 pub const Settings = struct {
     dev_setting: ?setting.DevSetting = null,
     djm_my_setting: ?setting.DJMMySetting = null,
@@ -302,7 +302,16 @@ pub const Settings = struct {
 /// is a few hundred bytes.
 const dat_limit = std.Io.Limit.limited(1 << 16);
 
-/// Reads and parses one `*SETTING.DAT` file, returning null on any failure.
+/// Error of `DeviceExport.loadSettings`: a setting file exists but could
+/// not be examined — unreadable, over the read cap, or memory ran out.
+/// A missing or invalid file is not an error; its field is simply null.
+pub const LoadSettingsError = std.Io.Dir.ReadFileAllocError;
+
+/// Reads and parses one `*SETTING.DAT` file. A missing file or one that
+/// fails to parse yields null — old exports genuinely lack files — while
+/// errors that say the file could not be examined (permissions, memory,
+/// a length over the read cap) propagate instead of masquerading as
+/// absence.
 fn loadSettingFile(
     comptime Payload: type,
     io: std.Io,
@@ -310,12 +319,18 @@ fn loadSettingFile(
     alloc: std.mem.Allocator,
     layout: Layout,
     filename: []const u8,
-) ?Payload {
-    const path = layout.datPath(alloc, filename) catch return null;
+) std.Io.Dir.ReadFileAllocError!?Payload {
+    const path = try layout.datPath(alloc, filename);
     defer alloc.free(path);
-    const buf = dir.readFileAlloc(io, path, alloc, dat_limit) catch return null;
+    const buf = dir.readFileAlloc(io, path, alloc, dat_limit) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
     defer alloc.free(buf);
-    const parsed = setting.Setting(Payload).parse(buf) catch return null;
+    const parsed = setting.Setting(Payload).parse(buf) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     return parsed.data;
 }
 
@@ -470,13 +485,14 @@ pub const DeviceExport = struct {
     }
 
     /// Loads the four `*SETTING.DAT` files in `dat_files` order. A file
-    /// that is missing, unreadable, or invalid leaves its field null —
-    /// settings loading is the tolerant side of the handle; pdb errors
-    /// are fatal.
-    pub fn loadSettings(e: *const DeviceExport) Settings {
+    /// that is missing or invalid leaves its field null — settings
+    /// loading is the tolerant side of the handle; pdb errors are fatal
+    /// — while errors that say the file could not be examined
+    /// (permissions, memory) propagate.
+    pub fn loadSettings(e: *const DeviceExport) LoadSettingsError!Settings {
         var settings = Settings{};
         inline for (dat_files) |dat| {
-            const payload = loadSettingFile(
+            const payload = try loadSettingFile(
                 SettingPayload(dat.kind),
                 e.io,
                 e.dir,
