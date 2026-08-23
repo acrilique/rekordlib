@@ -55,6 +55,7 @@ pub const Layout = struct {
     /// The device root directory, as a host path.
     root: []const u8,
 
+    /// The `PIONEER` directory itself.
     pub fn pioneerDir(l: Layout, alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         return std.fs.path.join(alloc, &.{ l.root, "PIONEER" });
     }
@@ -64,10 +65,12 @@ pub const Layout = struct {
         return std.fs.path.join(alloc, &.{ l.root, "PIONEER", "rekordbox" });
     }
 
+    /// Path to `export.pdb`, the main database.
     pub fn exportPdb(l: Layout, alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         return std.fs.path.join(alloc, &.{ l.root, "PIONEER", "rekordbox", "export.pdb" });
     }
 
+    /// Path to `exportExt.pdb`, the tag database.
     pub fn exportExtPdb(l: Layout, alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         return std.fs.path.join(alloc, &.{ l.root, "PIONEER", "rekordbox", "exportExt.pdb" });
     }
@@ -1614,6 +1617,7 @@ fn buildChildren(
 /// The caller owns the returned list; free it by deinitializing every
 /// element and then the list itself:
 ///
+///     const device = @import("device");
 ///     var playlists = try device.getPlaylistsDb(alloc, &db);
 ///     defer {
 ///         for (playlists.items) |*node| node.deinit(alloc);
