@@ -222,7 +222,7 @@ test "reader loads all four settings of every fixture" {
     for (fixtures) |fixture| {
         const path = try std.fmt.allocPrint(alloc, "testdata/complete_export/{s}", .{fixture.name});
         defer alloc.free(path);
-        const ex = device.DeviceExport.open(path, io, alloc);
+        var ex = device.DeviceExport.open(path, io, alloc);
         const settings = try ex.loadSettings();
         try testing.expect(settings.dev_setting != null);
         try testing.expect(settings.djm_my_setting != null);
@@ -251,7 +251,7 @@ test "settings loading tolerates missing and invalid files" {
     try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER/MYSETTING.DAT", .data = good });
     try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER/DJMMYSETTING.DAT", .data = "garbage" });
 
-    const ex = device.DeviceExport.open(tmp_path, io, alloc);
+    var ex = device.DeviceExport.open(tmp_path, io, alloc);
     const settings = try ex.loadSettings();
     try testing.expect(settings.my_setting != null);
     try testing.expect(settings.djm_my_setting == null);
@@ -259,7 +259,7 @@ test "settings loading tolerates missing and invalid files" {
     try testing.expect(settings.my_setting2 == null);
 
     // A root without any export content at all stays quiet and empty.
-    const empty_ex = device.DeviceExport.open(".zig-cache/definitely-not-here", io, alloc);
+    var empty_ex = device.DeviceExport.open(".zig-cache/definitely-not-here", io, alloc);
     const empty_settings = try empty_ex.loadSettings();
     try testing.expect(empty_settings.dev_setting == null);
     try testing.expect(empty_settings.djm_my_setting == null);
@@ -284,7 +284,7 @@ test "loadSettings propagates a file that is not absence-shaped" {
     @memset(big, 0);
     try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER/DEVSETTING.DAT", .data = big });
 
-    const ex = device.DeviceExport.open(tmp_path, io, alloc);
+    var ex = device.DeviceExport.open(tmp_path, io, alloc);
     try testing.expectError(error.StreamTooLong, ex.loadSettings());
 }
 
@@ -1862,4 +1862,48 @@ test "open preserves existing tags" {
     for (ids[1..], 0..) |value, i| try testing.expect(value != ids[i]);
     std.mem.sort(u16, &shifts, {}, std.sort.asc(u16));
     for (shifts[1..], 0..) |value, i| try testing.expect(value != shifts[i]);
+}
+
+test "a relative root stays pinned to the working directory of first use" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // The test moves the process cwd; restore it afterwards — the suite's
+    // other relative roots need it.
+    var orig_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const orig_len = std.os.linux.getcwd(&orig_buf, orig_buf.len);
+    if (std.os.linux.errno(orig_len) != .SUCCESS) return error.Unexpected;
+    // The raw syscall counts the trailing NUL it wrote.
+    const orig_cwd = orig_buf[0 .. orig_len - 1];
+    defer std.Io.Threaded.chdir(orig_cwd) catch {};
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "a");
+    try tmp.dir.createDirPath(io, "b");
+    // Absolute: the test chdirs more than once, so relative targets would
+    // resolve against whichever cwd is current.
+    const a = try std.fmt.allocPrint(alloc, "{s}/.zig-cache/tmp/{s}/a", .{ orig_cwd, &tmp.sub_path });
+    defer alloc.free(a);
+    const b = try std.fmt.allocPrint(alloc, "{s}/.zig-cache/tmp/{s}/b", .{ orig_cwd, &tmp.sub_path });
+    defer alloc.free(b);
+
+    // `create` runs with cwd "a" and pins it; `save` runs after the cwd
+    // moved and must still land the export under "a" — an unpinned
+    // AT_FDCWD would resolve "root" under "b".
+    try std.Io.Threaded.chdir(a);
+    var ex = try device.DeviceExport.create("root", io, alloc);
+    defer ex.deinit();
+    _ = try ex.addTrack(.{ .title = "Pinned" });
+
+    try std.Io.Threaded.chdir(b);
+    try ex.save();
+
+    try tmp.dir.access(io, "a/root/PIONEER/rekordbox/export.pdb", .{});
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(io, "b/root/PIONEER/rekordbox/export.pdb", .{}),
+    );
 }

@@ -303,9 +303,10 @@ pub const Settings = struct {
 /// is a few hundred bytes.
 const dat_limit = std.Io.Limit.limited(1 << 16);
 
-/// Error of `DeviceExport.loadSettings`: a setting file exists but could
-/// not be examined — unreadable, over the read cap, or memory ran out.
-pub const LoadSettingsError = std.Io.Dir.ReadFileAllocError;
+/// Error of `DeviceExport.loadSettings`: opening the pinned working
+/// directory, or a setting file that exists but could not be examined —
+/// unreadable, over the read cap, or memory ran out.
+pub const LoadSettingsError = std.Io.Dir.ReadFileAllocError || std.Io.Dir.OpenError;
 
 /// Reads and parses one `*SETTING.DAT` file. A missing file or one that
 /// fails to parse yields null — old exports genuinely lack files — while
@@ -334,19 +335,24 @@ fn loadSettingFile(
     return parsed.data;
 }
 
-/// Error of `DeviceExport.openPdb`: reading `export.pdb` off disk or
-/// parsing it.
-pub const OpenPdbError = std.Io.Dir.ReadFileAllocError || pdb.DatabaseDecodeError;
+/// Error of `DeviceExport.openPdb`: opening the pinned working directory,
+/// reading `export.pdb` off disk, or parsing it.
+pub const OpenPdbError =
+    std.Io.Dir.ReadFileAllocError ||
+    std.Io.Dir.OpenError ||
+    pdb.DatabaseDecodeError;
 
 /// Size cap when reading an `export.pdb`; the largest fixture is 2.9 MB.
 const pdb_limit = std.Io.Limit.limited(1 << 26);
 
 /// Error of `DeviceExport.create`: `ExportAlreadyExists` is the
 /// exists-guard refusing a root that already carries a
-/// `PIONEER/rekordbox/export.pdb`; the rest is building the in-memory
-/// database and setting images.
+/// `PIONEER/rekordbox/export.pdb`; the rest is opening the working
+/// directory to pin it, the exists-guard's access check, and building the
+/// in-memory database and setting images.
 pub const CreateError =
     std.Io.Dir.AccessError ||
+    std.Io.Dir.OpenError ||
     pdb.DatabaseModifyError ||
     bin.WriteError ||
     error{ExportAlreadyExists};
@@ -531,9 +537,11 @@ pub const DeviceExport = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
     /// Directory every path is resolved against — the process working
-    /// directory, captured once here so a mid-session cwd change cannot
-    /// reinterpret a relative root between calls.
-    dir: std.Io.Dir,
+    /// directory, opened as a real handle at the first I/O call (in
+    /// `create`, right away) so a later cwd change cannot reinterpret a
+    /// relative root between calls. Null until then: `open` is infallible
+    /// and opening the handle can fail. Closed by `deinit`.
+    dir: ?std.Io.Dir,
     /// The export's pdb, loaded on the first pdb-touching call — `open`
     /// stays cheap for settings-only sessions.
     pdb_state: PdbState = .unloaded,
@@ -575,15 +583,27 @@ pub const DeviceExport = struct {
 
     /// Points the handle at a device export on disk (a directory
     /// containing `PIONEER`). Cheap and infallible: nothing is read until
-    /// a pdb-touching call. The root path is borrowed; keep it alive
-    /// until `deinit`.
+    /// a pdb-touching call, and the working directory a relative root
+    /// resolves against is opened at the first I/O call, not here. The
+    /// root path is borrowed; keep it alive until `deinit`.
     pub fn open(root_path: []const u8, io: std.Io, alloc: std.mem.Allocator) DeviceExport {
         return .{
             .layout = .{ .root = root_path },
             .io = io,
             .alloc = alloc,
-            .dir = std.Io.Dir.cwd(),
+            .dir = null,
         };
+    }
+
+    /// The pinned working directory, opening it on first use. `Dir.cwd()`
+    /// is only an `AT_FDCWD` sentinel — every call resolves against the
+    /// process cwd as it is *then* — so a real handle is opened once and
+    /// reused, and the first I/O call fixes the directory every later
+    /// call resolves against. `open` cannot take it: opening can fail and
+    /// `open` is infallible.
+    fn dirHandle(e: *DeviceExport) std.Io.Dir.OpenError!std.Io.Dir {
+        if (e.dir == null) e.dir = try std.Io.Dir.cwd().openDir(e.io, ".", .{});
+        return e.dir.?;
     }
 
     /// Builds a fresh export in memory: a created pdb carrying the fixed
@@ -597,7 +617,9 @@ pub const DeviceExport = struct {
         alloc: std.mem.Allocator,
     ) CreateError!DeviceExport {
         const layout = Layout{ .root = root_path };
-        const dir = std.Io.Dir.cwd();
+        // Pin the working directory now: create is the export's first I/O.
+        const dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
+        errdefer dir.close(io);
 
         // Refuse to build over an existing export rather than orphan it.
         const pdb_path = try layout.exportPdb(alloc);
@@ -657,6 +679,7 @@ pub const DeviceExport = struct {
         if (e.writer_state) |*state| state.deinit(e.alloc);
         for (e.pending_anlz.items) |*file| file.deinit(e.alloc);
         e.pending_anlz.deinit(e.alloc);
+        if (e.dir) |dir| dir.close(e.io);
     }
 
     pub fn root(e: *const DeviceExport) []const u8 {
@@ -665,14 +688,16 @@ pub const DeviceExport = struct {
 
     /// Loads the four `*SETTING.DAT` files in `dat_files` order. A
     /// missing or invalid file leaves its field null; a file that
-    /// cannot be examined is an error.
-    pub fn loadSettings(e: *const DeviceExport) LoadSettingsError!Settings {
+    /// cannot be examined is an error. The first call also pins the
+    /// working directory a relative root resolves against.
+    pub fn loadSettings(e: *DeviceExport) LoadSettingsError!Settings {
+        const dir = try e.dirHandle();
         var settings = Settings{};
         inline for (dat_files) |dat| {
             const payload = try loadSettingFile(
                 SettingPayload(dat.kind),
                 e.io,
-                e.dir,
+                dir,
                 e.alloc,
                 e.layout,
                 dat.name,
@@ -693,7 +718,8 @@ pub const DeviceExport = struct {
             .unloaded => {
                 const path = try e.layout.exportPdb(e.alloc);
                 defer e.alloc.free(path);
-                const buf = try e.dir.readFileAlloc(e.io, path, e.alloc, pdb_limit);
+                const dir = try e.dirHandle();
+                const buf = try dir.readFileAlloc(e.io, path, e.alloc, pdb_limit);
                 defer e.alloc.free(buf);
                 e.pdb_state = .{ .loaded = try pdb.Database.parse(e.alloc, buf, .plain) };
                 return &e.pdb_state.loaded;
@@ -1370,7 +1396,8 @@ pub const DeviceExport = struct {
 
         const path = try e.layout.exportExtPdb(e.alloc);
         defer e.alloc.free(path);
-        const buf = e.dir.readFileAlloc(e.io, path, e.alloc, pdb_limit) catch |err| switch (err) {
+        const dir = try e.dirHandle();
+        const buf = dir.readFileAlloc(e.io, path, e.alloc, pdb_limit) catch |err| switch (err) {
             error.FileNotFound => {
                 e.ext_pdb_state = .absent;
                 return;
@@ -1406,18 +1433,19 @@ pub const DeviceExport = struct {
             ext_image = try e.ext_pdb_state.loaded.serialize(e.alloc);
         }
 
-        if (e.pending_settings) |pending| try e.writePendingSettings(pending);
-        if (e.pending_anlz.items.len > 0) try e.writePendingAnlz();
+        const dir = try e.dirHandle();
+        if (e.pending_settings) |pending| try e.writePendingSettings(dir, pending);
+        if (e.pending_anlz.items.len > 0) try e.writePendingAnlz(dir);
 
         if (ext_image) |bytes| {
             const ext_path = try e.layout.exportExtPdb(e.alloc);
             defer e.alloc.free(ext_path);
-            try e.writeFileAtomic(ext_path, bytes);
+            try e.writeFileAtomic(dir, ext_path, bytes);
         }
 
         const pdb_path = try e.layout.exportPdb(e.alloc);
         defer e.alloc.free(pdb_path);
-        try e.writeFileAtomic(pdb_path, image);
+        try e.writeFileAtomic(dir, pdb_path, image);
     }
 
     /// Writes every queued ANLZ file — creating its `USBANLZ` folder —
@@ -1426,10 +1454,11 @@ pub const DeviceExport = struct {
     /// so a retry rewrites the landed ones identically).
     fn writePendingAnlz(
         e: *DeviceExport,
+        dir: std.Io.Dir,
     ) (std.mem.Allocator.Error || std.Io.Dir.CreateDirPathError || AtomicWriteError)!void {
         for (e.pending_anlz.items) |*file| {
-            try e.dir.createDirPath(e.io, std.fs.path.dirname(file.path) orelse ".");
-            try e.writeFileAtomic(file.path, file.image);
+            try dir.createDirPath(e.io, std.fs.path.dirname(file.path) orelse ".");
+            try e.writeFileAtomic(dir, file.path, file.image);
         }
         for (e.pending_anlz.items) |*file| file.deinit(e.alloc);
         e.pending_anlz.clearRetainingCapacity();
@@ -1440,6 +1469,7 @@ pub const DeviceExport = struct {
     /// `pending_settings`, for `deinit` to reclaim.
     fn writePendingSettings(
         e: *DeviceExport,
+        dir: std.Io.Dir,
         pending: [dat_files.len][]u8,
     ) (std.mem.Allocator.Error || std.Io.Dir.CreateDirPathError || AtomicWriteError)!void {
         // Each path is freed before the next is built, so a failure
@@ -1453,15 +1483,15 @@ pub const DeviceExport = struct {
             Layout.contentsDir,
         };
         for (dir_fns) |dir_fn| {
-            const dir = try dir_fn(e.layout, e.alloc);
-            defer e.alloc.free(dir);
-            try e.dir.createDirPath(e.io, dir);
+            const dir_path = try dir_fn(e.layout, e.alloc);
+            defer e.alloc.free(dir_path);
+            try dir.createDirPath(e.io, dir_path);
         }
 
         inline for (dat_files, 0..) |dat, i| {
             const path = try e.layout.datPath(e.alloc, dat.name);
             defer e.alloc.free(path);
-            try e.writeFileAtomic(path, pending[i]);
+            try e.writeFileAtomic(dir, path, pending[i]);
         }
         for (pending) |bytes| e.alloc.free(bytes);
         e.pending_settings = null;
@@ -1469,8 +1499,13 @@ pub const DeviceExport = struct {
 
     /// Writes `bytes` to `path` through a same-directory temp file and an
     /// atomic rename.
-    fn writeFileAtomic(e: *DeviceExport, path: []const u8, bytes: []const u8) AtomicWriteError!void {
-        var af = try e.dir.createFileAtomic(e.io, path, .{ .replace = true });
+    fn writeFileAtomic(
+        e: *DeviceExport,
+        dir: std.Io.Dir,
+        path: []const u8,
+        bytes: []const u8,
+    ) AtomicWriteError!void {
+        var af = try dir.createFileAtomic(e.io, path, .{ .replace = true });
         defer af.deinit(e.io);
         try af.file.writeStreamingAll(e.io, bytes);
         try af.replace(e.io);
