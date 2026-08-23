@@ -91,9 +91,6 @@ const api = switch (mode) {
 // Crypto provider (SQLCIPHER_CRYPTO_CUSTOM over std.crypto)
 // ---------------------------------------------------------------------------
 
-const SQLITE_OK: c_int = 0;
-const SQLITE_ERROR: c_int = 1;
-
 const SQLCIPHER_DECRYPT: c_int = 0;
 const SQLCIPHER_ENCRYPT: c_int = 1;
 
@@ -150,9 +147,9 @@ fn providerHmac(
         SQLCIPHER_HMAC_SHA512 => mac(std.crypto.auth.hmac.sha2.HmacSha512, key, buf1, buf2, out.?),
         SQLCIPHER_HMAC_SHA256 => mac(std.crypto.auth.hmac.sha2.HmacSha256, key, buf1, buf2, out.?),
         SQLCIPHER_HMAC_SHA1 => mac(std.crypto.auth.hmac.HmacSha1, key, buf1, buf2, out.?),
-        else => return SQLITE_ERROR,
+        else => return c.SQLITE_ERROR,
     }
-    return SQLITE_OK;
+    return c.SQLITE_OK;
 }
 
 fn mac(comptime Hmac: type, key: []const u8, buf1: []const u8, buf2: []const u8, out: [*]u8) void {
@@ -165,8 +162,8 @@ fn mac(comptime Hmac: type, key: []const u8, buf1: []const u8, buf2: []const u8,
 }
 
 fn kdfPbkdf2(comptime Hash: type, password: []const u8, salt: []const u8, rounds: u32, out: []u8) c_int {
-    std.crypto.pwhash.pbkdf2(out, password, salt, rounds, std.crypto.auth.hmac.Hmac(Hash)) catch return SQLITE_ERROR;
-    return SQLITE_OK;
+    std.crypto.pwhash.pbkdf2(out, password, salt, rounds, std.crypto.auth.hmac.Hmac(Hash)) catch return c.SQLITE_ERROR;
+    return c.SQLITE_OK;
 }
 
 fn providerKdf(
@@ -190,7 +187,7 @@ fn providerKdf(
         2 => kdfPbkdf2(std.crypto.hash.sha2.Sha512, p, s, rounds, k),
         1 => kdfPbkdf2(std.crypto.hash.sha2.Sha256, p, s, rounds, k),
         0 => kdfPbkdf2(std.crypto.hash.Sha1, p, s, rounds, k),
-        else => SQLITE_ERROR,
+        else => c.SQLITE_ERROR,
     };
 }
 
@@ -206,8 +203,8 @@ fn providerCipher(
     out: ?[*]u8,
 ) callconv(.c) c_int {
     _ = ctx;
-    if (key_sz != 32) return SQLITE_ERROR;
-    if (@rem(in_sz, 16) != 0) return SQLITE_ERROR;
+    if (key_sz != 32) return c.SQLITE_ERROR;
+    if (@rem(in_sz, 16) != 0) return c.SQLITE_ERROR;
     const k: [32]u8 = key.?[0..32].*;
     const init_vec: [16]u8 = iv.?[0..16].*;
     const src = in.?[0..@intCast(in_sz)];
@@ -234,25 +231,25 @@ fn providerCipher(
             chain = src[i..][0..16].*;
         }
     }
-    return SQLITE_OK;
+    return c.SQLITE_OK;
 }
 
 fn providerAddRandom(ctx: ?*anyopaque, buffer: ?[*]const u8, length: c_int) callconv(.c) c_int {
     _ = ctx;
     _ = buffer;
     _ = length;
-    return SQLITE_OK;
+    return c.SQLITE_OK;
 }
 
 fn providerRandom(ctx: ?*anyopaque, buffer: ?[*]u8, length: c_int) callconv(.c) c_int {
     _ = ctx;
-    if (length < 0) return SQLITE_ERROR;
+    if (length < 0) return c.SQLITE_ERROR;
     const buf = buffer.?[0..@intCast(length)];
     if (io_source) |io| {
         io.random(buf);
-        return SQLITE_OK;
+        return c.SQLITE_OK;
     }
-    return SQLITE_ERROR;
+    return c.SQLITE_ERROR;
 }
 
 fn providerGetName(ctx: ?*anyopaque) callconv(.c) [*:0]const u8 {
@@ -292,12 +289,12 @@ fn providerGetHmacSz(ctx: ?*anyopaque, algorithm: c_int) callconv(.c) c_int {
 
 fn providerCtxInit(ctx: *?*anyopaque) callconv(.c) c_int {
     ctx.* = null;
-    return SQLITE_OK;
+    return c.SQLITE_OK;
 }
 
 fn providerCtxFree(ctx: *?*anyopaque) callconv(.c) c_int {
     ctx.* = null;
-    return SQLITE_OK;
+    return c.SQLITE_OK;
 }
 
 fn providerFipsStatus(ctx: ?*anyopaque) callconv(.c) c_int {
@@ -336,7 +333,7 @@ pub export fn rl_sqlcipher_zig_provider_setup(p: *Provider) c_int {
         .get_provider_version = providerGetVersion,
         .next = null,
     };
-    return SQLITE_OK;
+    return c.SQLITE_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -348,10 +345,6 @@ pub const passphrase = "r8gddnr4k847830ar6cqzbkk0el6qytmb3trbbx805jm74vez64i5o8f
 
 pub const SqlError = error{ Sqlite, OutOfMemory };
 
-const SQLITE_OK_RC: c_int = 0;
-const SQLITE_ROW: c_int = 100;
-const SQLITE_DONE: c_int = 101;
-
 pub const StepResult = enum { row, done };
 
 /// One prepared statement over an open `Db`. Borrowed: finalizing returns
@@ -361,8 +354,8 @@ pub const Stmt = struct {
 
     pub fn step(self: Stmt) SqlError!StepResult {
         return switch (api.step(self.handle)) {
-            SQLITE_ROW => .row,
-            SQLITE_DONE => .done,
+            c.SQLITE_ROW => .row,
+            c.SQLITE_DONE => .done,
             else => error.Sqlite,
         };
     }
@@ -372,7 +365,7 @@ pub const Stmt = struct {
     }
 
     pub fn reset(self: Stmt) SqlError!void {
-        if (api.reset(self.handle) != SQLITE_OK_RC) return error.Sqlite;
+        if (api.reset(self.handle) != c.SQLITE_OK) return error.Sqlite;
         _ = api.clear_bindings(self.handle);
     }
 
@@ -387,8 +380,7 @@ pub const Stmt = struct {
     }
 
     pub fn isNull(self: Stmt, i: usize) bool {
-        // SQLITE_NULL == 5
-        return api.column_type(self.handle, @intCast(i)) == 5;
+        return api.column_type(self.handle, @intCast(i)) == c.SQLITE_NULL;
     }
 
     pub fn readInt(self: Stmt, i: usize) i64 {
@@ -414,27 +406,27 @@ pub const Stmt = struct {
     }
 
     pub fn bindNull(self: Stmt, i: usize) SqlError!void {
-        if (api.bind_null(self.handle, @intCast(i)) != SQLITE_OK_RC) return error.Sqlite;
+        if (api.bind_null(self.handle, @intCast(i)) != c.SQLITE_OK) return error.Sqlite;
     }
 
     pub fn bindInt(self: Stmt, i: usize, v: i64) SqlError!void {
-        if (api.bind_int64(self.handle, @intCast(i), v) != SQLITE_OK_RC) return error.Sqlite;
+        if (api.bind_int64(self.handle, @intCast(i), v) != c.SQLITE_OK) return error.Sqlite;
     }
 
     pub fn bindFloat(self: Stmt, i: usize, v: f64) SqlError!void {
-        if (api.bind_double(self.handle, @intCast(i), v) != SQLITE_OK_RC) return error.Sqlite;
+        if (api.bind_double(self.handle, @intCast(i), v) != c.SQLITE_OK) return error.Sqlite;
     }
 
     /// `text` is copied by SQLite before the call returns (SQLITE_TRANSIENT).
     pub fn bindText(self: Stmt, i: usize, text: []const u8) SqlError!void {
         const rc = api.bind_text(self.handle, @intCast(i), text.ptr, @intCast(text.len), sqlite_transient());
-        if (rc != SQLITE_OK_RC) return error.Sqlite;
+        if (rc != c.SQLITE_OK) return error.Sqlite;
     }
 
     /// `blob` is copied by SQLite before the call returns (SQLITE_TRANSIENT).
     pub fn bindBlob(self: Stmt, i: usize, blob: []const u8) SqlError!void {
         const rc = api.bind_blob(self.handle, @intCast(i), blob.ptr, @intCast(blob.len), sqlite_transient());
-        if (rc != SQLITE_OK_RC) return error.Sqlite;
+        if (rc != c.SQLITE_OK) return error.Sqlite;
     }
 };
 
@@ -479,7 +471,7 @@ pub const Db = struct {
         io_source = io;
         var handle: ?*c.sqlite3 = null;
         const rc = api.open_v2(path.ptr, &handle, flags, null);
-        if (rc != SQLITE_OK_RC) {
+        if (rc != c.SQLITE_OK) {
             if (handle) |h| _ = api.close_v2(h);
             return error.Sqlite;
         }
@@ -503,13 +495,13 @@ pub const Db = struct {
     }
 
     pub fn exec(self: Db, sql: [:0]const u8) SqlError!void {
-        if (api.exec(self.handle, sql.ptr, null, null, null) != SQLITE_OK_RC) return error.Sqlite;
+        if (api.exec(self.handle, sql.ptr, null, null, null) != c.SQLITE_OK) return error.Sqlite;
     }
 
     pub fn prepare(self: Db, sql: [:0]const u8) SqlError!Stmt {
         var stmt: ?*cStmt = null;
         const rc = api.prepare_v2(self.handle, sql.ptr, -1, &stmt, null);
-        if (rc != SQLITE_OK_RC) return error.Sqlite;
+        if (rc != c.SQLITE_OK) return error.Sqlite;
         return .{ .handle = stmt.? };
     }
 
