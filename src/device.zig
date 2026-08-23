@@ -305,13 +305,14 @@ const dat_limit = std.Io.Limit.limited(1 << 16);
 fn loadSettingFile(
     comptime Payload: type,
     io: std.Io,
+    dir: std.Io.Dir,
     alloc: std.mem.Allocator,
     layout: Layout,
     filename: []const u8,
 ) ?Payload {
     const path = layout.datPath(alloc, filename) catch return null;
     defer alloc.free(path);
-    const buf = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, dat_limit) catch return null;
+    const buf = dir.readFileAlloc(io, path, alloc, dat_limit) catch return null;
     defer alloc.free(buf);
     const parsed = setting.Setting(Payload).parse(buf) catch return null;
     return parsed.data;
@@ -363,6 +364,10 @@ pub const DeviceExport = struct {
     layout: Layout,
     io: std.Io,
     alloc: std.mem.Allocator,
+    /// Directory every path is resolved against — the process working
+    /// directory, captured once here so a mid-session cwd change cannot
+    /// reinterpret a relative root between calls.
+    dir: std.Io.Dir,
     /// The export's pdb, loaded on the first pdb-touching call — `open`
     /// stays cheap for settings-only sessions.
     pdb_state: PdbState = .unloaded,
@@ -385,7 +390,12 @@ pub const DeviceExport = struct {
     /// a pdb-touching call. The root path is borrowed; keep it alive
     /// until `deinit`.
     pub fn open(root_path: []const u8, io: std.Io, alloc: std.mem.Allocator) DeviceExport {
-        return .{ .layout = .{ .root = root_path }, .io = io, .alloc = alloc };
+        return .{
+            .layout = .{ .root = root_path },
+            .io = io,
+            .alloc = alloc,
+            .dir = std.Io.Dir.cwd(),
+        };
     }
 
     /// Builds a fresh export in memory: a created pdb carrying the fixed
@@ -399,12 +409,13 @@ pub const DeviceExport = struct {
         alloc: std.mem.Allocator,
     ) CreateError!DeviceExport {
         const layout = Layout{ .root = root_path };
+        const dir = std.Io.Dir.cwd();
 
         // Exists-guard the oracle lacks: its `create_dir_all` silently
         // orphans an existing export instead of refusing.
         const pdb_path = try layout.exportPdb(alloc);
         defer alloc.free(pdb_path);
-        if (std.Io.Dir.cwd().access(io, pdb_path, .{})) |_| {
+        if (dir.access(io, pdb_path, .{})) |_| {
             return error.ExportAlreadyExists;
         } else |err| switch (err) {
             error.FileNotFound => {},
@@ -429,6 +440,7 @@ pub const DeviceExport = struct {
             .layout = layout,
             .io = io,
             .alloc = alloc,
+            .dir = dir,
             .pdb_state = .{ .loaded = db },
             .pending_settings = pending,
             // Fresh counters — id 0 is the null FK — and empty maps: the
@@ -466,6 +478,7 @@ pub const DeviceExport = struct {
             const payload = loadSettingFile(
                 SettingPayload(dat.kind),
                 e.io,
+                e.dir,
                 e.alloc,
                 e.layout,
                 dat.name,
@@ -487,7 +500,7 @@ pub const DeviceExport = struct {
             .unloaded => {
                 const path = try e.layout.exportPdb(e.alloc);
                 defer e.alloc.free(path);
-                const buf = try std.Io.Dir.cwd().readFileAlloc(e.io, path, e.alloc, pdb_limit);
+                const buf = try e.dir.readFileAlloc(e.io, path, e.alloc, pdb_limit);
                 defer e.alloc.free(buf);
                 e.pdb_state = .{ .loaded = try pdb.Database.parse(e.alloc, buf, .plain) };
                 return &e.pdb_state.loaded;
@@ -552,7 +565,6 @@ pub const DeviceExport = struct {
         e: *DeviceExport,
         pending: [dat_files.len][]u8,
     ) (std.mem.Allocator.Error || std.Io.Dir.CreateDirPathError || AtomicWriteError)!void {
-        const cwd = std.Io.Dir.cwd();
         // Each path is freed before the next is built, so a failure
         // between the creations leaks nothing.
         const dir_fns = [_]*const fn (
@@ -566,7 +578,7 @@ pub const DeviceExport = struct {
         for (dir_fns) |dir_fn| {
             const dir = try dir_fn(e.layout, e.alloc);
             defer e.alloc.free(dir);
-            try cwd.createDirPath(e.io, dir);
+            try e.dir.createDirPath(e.io, dir);
         }
 
         inline for (dat_files, 0..) |dat, i| {
@@ -581,7 +593,7 @@ pub const DeviceExport = struct {
     /// Writes `bytes` to `path` through a same-directory temp file and an
     /// atomic rename.
     fn writeFileAtomic(e: *DeviceExport, path: []const u8, bytes: []const u8) AtomicWriteError!void {
-        var af = try std.Io.Dir.cwd().createFileAtomic(e.io, path, .{ .replace = true });
+        var af = try e.dir.createFileAtomic(e.io, path, .{ .replace = true });
         defer af.deinit(e.io);
         try af.file.writeStreamingAll(e.io, bytes);
         try af.replace(e.io);
