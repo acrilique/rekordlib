@@ -1030,7 +1030,14 @@ fn loadTable(
         if (!std.mem.eql(u8, stmt.columnName(i), f.name)) return error.SchemaMismatch;
     }
 
+    // Exactly-sized: the arena cannot reclaim a grown buffer, so the row
+    // list is pre-sized from COUNT(*) rather than doubled through appends
+    // that would strand every previous buffer. If the db changed between
+    // the two queries, append still grows - correctness does not depend
+    // on the count.
+    const count = try db.scalarInt("SELECT COUNT(*) FROM " ++ table ++ ";");
     var rows: std.ArrayListUnmanaged(T) = .empty;
+    try rows.ensureTotalCapacity(a, @intCast(count));
     while ((try stmt.step()) == .row) {
         var row: T = undefined;
         inline for (fields, 0..) |f, i| {
@@ -1038,7 +1045,7 @@ fn loadTable(
         }
         try rows.append(a, row);
     }
-    out_rows.* = try rows.toOwnedSlice(a);
+    out_rows.* = rows.items;
 }
 
 /// Reads one column of one row into its model field: integers through
