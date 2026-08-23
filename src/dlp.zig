@@ -14,7 +14,10 @@
 //! * a thin SQLite wrapper over the symbol-renamed C API;
 //! * the read models (`Library`): every row of the 22 OneLibrary tables,
 //!   schema-pinned and arena-owned, with keyed access for the joins the
-//!   device reader needs.
+//!   device reader needs;
+//! * the write layer (`Writer`): creates a fresh export's db (the real
+//!   schema plus its seeded defaults) and closes in the on-disk shape of
+//!   rb's exports.
 //!
 //! Build modes (`-Ddlp=off|vendored|system`): `off` compiles this module's
 //! types away from the binary (every runtime entry point is guarded by a
@@ -468,6 +471,13 @@ pub const Db = struct {
     pub fn openPlaintext(io: std.Io, path: [:0]const u8) OpenError!Db {
         if (mode == .off) dlpDisabled();
         return openFlags(io, path, SQLITE_OPEN_READWRITE, false);
+    }
+
+    /// Creates or opens a plaintext db without applying the DLP
+    /// passphrase (`Writer.create` with `plaintext` writes such files).
+    pub fn openPlaintextReadWriteCreate(io: std.Io, path: [:0]const u8) OpenError!Db {
+        if (mode == .off) dlpDisabled();
+        return openFlags(io, path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, false);
     }
 
     fn openFlags(io: std.Io, path: [:0]const u8, flags: c_int, keyed: bool) OpenError!Db {
@@ -1154,5 +1164,278 @@ fn SeqOrder(comptime Rows: type, comptime field: []const u8) type {
             const sb = @field(self.rows[b], field) orelse std.math.maxInt(i64);
             return if (sa == sb) a < b else sa < sb;
         }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// OneLibrary write layer
+// ---------------------------------------------------------------------------
+
+/// The corrected schema: every CREATE statement of the real with_anlz
+/// `exportLibrary.db`, verbatim and in creation order — no FOREIGN KEY and
+/// no NOT NULL anywhere, `content.djPlayCount` present,
+/// `recommendedLike.createdDate` INTEGER, the real column spellings
+/// (`artist_id_originalArtist`, `OutFileOffsetInBlock`, `isComplation`),
+/// and the four indexes real files carry. rbox 0.1.5's migration drifts on
+/// every one of these points; the stored `sqlite_master.sql` text of a db
+/// this creates is byte-identical to the fixture's.
+const schema_sql =
+    \\CREATE TABLE content(content_id integer primary key, title varchar, titleForSearch varchar, subtitle varchar, bpmx100 integer, length integer, trackNo integer, discNo integer, artist_id_artist integer, artist_id_remixer integer, artist_id_originalArtist integer, artist_id_composer integer, artist_id_lyricist integer, album_id integer, genre_id integer, label_id integer, key_id integer, color_id integer, image_id integer, djComment varchar, rating integer, releaseYear integer, releaseDate varchar, dateCreated varchar, dateAdded varchar, path varchar, fileName varchar, fileSize integer, fileType integer, bitrate integer, bitDepth integer, samplingRate integer, isrc varchar, djPlayCount integer, isHotCueAutoLoadOn integer, isKuvoDeliverStatusOn integer, kuvoDeliveryComment varchar, masterDbId integer, masterContentId integer, analysisDataFilePath varchar, analysedBits integer, contentLink integer, hasModified integer, cueUpdateCount integer, analysisDataUpdateCount integer, informationUpdateCount integer);
+    \\CREATE TABLE genre(genre_id integer primary key, name varchar);
+    \\CREATE TABLE artist(artist_id integer primary key, name varchar, nameForSearch varchar);
+    \\CREATE TABLE album(album_id integer primary key, name varchar, artist_id integer, image_id integer, isComplation integer, nameForSearch varchar);
+    \\CREATE TABLE label(label_id integer primary key, name varchar);
+    \\CREATE TABLE key(key_id integer primary key, name varchar);
+    \\CREATE TABLE color(color_id integer primary key, name varchar);
+    \\CREATE TABLE playlist(playlist_id integer primary key, sequenceNo integer, name varchar, image_id integer, attribute integer, playlist_id_parent integer);
+    \\CREATE TABLE playlist_content(playlist_id integer, content_id integer, sequenceNo integer);
+    \\CREATE TABLE hotCueBankList(hotCueBankList_id integer primary key, sequenceNo integer, name varchar, image_id integer, attribute integer, hotCueBankList_id_parent integer);
+    \\CREATE TABLE hotCueBankList_cue(hotCueBankList_id integer, cue_id integer, sequenceNo integer);
+    \\CREATE TABLE history(history_id integer primary key, sequenceNo integer, name varchar, attribute integer, history_id_parent integer);
+    \\CREATE TABLE history_content(history_id integer, content_id integer, sequenceNo integer);
+    \\CREATE TABLE image(image_id integer primary key, path varchar);
+    \\CREATE TABLE cue(cue_id integer primary key, content_id integer, kind integer, colorTableIndex integer, cueComment varchar, isActiveLoop integer, beatLoopNumerator integer, beatLoopDenominator integer, inUsec integer, outUsec integer, in150FramePerSec integer, out150FramePerSec integer, inMpegFrameNumber integer, outMpegFrameNumber integer, inMpegAbs integer, outMpegAbs integer, inDecodingStartFramePosition integer, outDecodingStartFramePosition integer, inFileOffsetInBlock integer, OutFileOffsetInBlock integer, inNumberOfSampleInBlock integer, outNumberOfSampleInBlock integer);
+    \\CREATE TABLE menuItem(menuItem_id integer primary key, kind integer, name varchar);
+    \\CREATE TABLE category(category_id integer primary key, menuItem_id integer, sequenceNo integer, isVisible integer);
+    \\CREATE TABLE sort(sort_id integer primary key, menuItem_id integer, sequenceNo integer, isVisible integer, isSelectedAsSubColumn integer);
+    \\CREATE TABLE property(deviceName varchar, dbVersion varchar, numberOfContents integer, createdDate varchar, backGroundColorType integer, myTagMasterDBID integer);
+    \\CREATE TABLE recommendedLike(content_id_1 integer, content_id_2 integer, rating integer, createdDate integer);
+    \\CREATE TABLE myTag(myTag_id integer primary key, sequenceNo integer, name varchar, attribute integer, myTag_id_parent integer);
+    \\CREATE TABLE myTag_content(myTag_id integer, content_id integer);
+    \\CREATE INDEX index_playlist_content_playlist_id on playlist_content(playlist_id);
+    \\CREATE INDEX index_myTag_content_myTag_id on myTag_content(myTag_id);
+    \\CREATE INDEX index_myTag_content_content_id on myTag_content(content_id);
+    \\CREATE INDEX index_hotCueBankList_cue_hotCueBankList_id on hotCueBankList_cue(hotCueBankList_id);
+;
+
+/// The eight fixed track colors a fresh export carries (rbox's migration
+/// inserts the same rows).
+const default_colors = [_]Color{
+    .{ .color_id = 1, .name = "Pink" },
+    .{ .color_id = 2, .name = "Red" },
+    .{ .color_id = 3, .name = "Orange" },
+    .{ .color_id = 4, .name = "Yellow" },
+    .{ .color_id = 5, .name = "Green" },
+    .{ .color_id = 6, .name = "Aqua" },
+    .{ .color_id = 7, .name = "Blue" },
+    .{ .color_id = 8, .name = "Purple" },
+};
+
+/// The 27 browse-column headers a fresh export carries, named with the
+/// same `\u{fffa}`/`\u{fffb}` interlinear-annotation wrapping as pdb Menu
+/// rows.
+const default_menu_items = [_]MenuItem{
+    .{ .menuItem_id = 1, .kind = 128, .name = "\u{fffa}GENRE\u{fffb}" },
+    .{ .menuItem_id = 2, .kind = 129, .name = "\u{fffa}ARTIST\u{fffb}" },
+    .{ .menuItem_id = 3, .kind = 130, .name = "\u{fffa}ALBUM\u{fffb}" },
+    .{ .menuItem_id = 4, .kind = 131, .name = "\u{fffa}TRACK\u{fffb}" },
+    .{ .menuItem_id = 5, .kind = 133, .name = "\u{fffa}BPM\u{fffb}" },
+    .{ .menuItem_id = 6, .kind = 134, .name = "\u{fffa}RATING\u{fffb}" },
+    .{ .menuItem_id = 7, .kind = 135, .name = "\u{fffa}YEAR\u{fffb}" },
+    .{ .menuItem_id = 8, .kind = 136, .name = "\u{fffa}REMIXER\u{fffb}" },
+    .{ .menuItem_id = 9, .kind = 137, .name = "\u{fffa}LABEL\u{fffb}" },
+    .{ .menuItem_id = 10, .kind = 138, .name = "\u{fffa}ORIGINAL ARTIST\u{fffb}" },
+    .{ .menuItem_id = 11, .kind = 139, .name = "\u{fffa}KEY\u{fffb}" },
+    .{ .menuItem_id = 12, .kind = 141, .name = "\u{fffa}CUE\u{fffb}" },
+    .{ .menuItem_id = 13, .kind = 142, .name = "\u{fffa}COLOR\u{fffb}" },
+    .{ .menuItem_id = 14, .kind = 146, .name = "\u{fffa}TIME\u{fffb}" },
+    .{ .menuItem_id = 15, .kind = 147, .name = "\u{fffa}BITRATE\u{fffb}" },
+    .{ .menuItem_id = 16, .kind = 148, .name = "\u{fffa}FILE NAME\u{fffb}" },
+    .{ .menuItem_id = 17, .kind = 132, .name = "\u{fffa}PLAYLIST\u{fffb}" },
+    .{ .menuItem_id = 18, .kind = 152, .name = "\u{fffa}HOT CUE BANK\u{fffb}" },
+    .{ .menuItem_id = 19, .kind = 149, .name = "\u{fffa}HISTORY\u{fffb}" },
+    .{ .menuItem_id = 20, .kind = 145, .name = "\u{fffa}SEARCH\u{fffb}" },
+    .{ .menuItem_id = 21, .kind = 150, .name = "\u{fffa}COMMENTS\u{fffb}" },
+    .{ .menuItem_id = 22, .kind = 140, .name = "\u{fffa}DATE ADDED\u{fffb}" },
+    .{ .menuItem_id = 23, .kind = 151, .name = "\u{fffa}DJ PLAY COUNT\u{fffb}" },
+    .{ .menuItem_id = 24, .kind = 144, .name = "\u{fffa}FOLDER\u{fffb}" },
+    .{ .menuItem_id = 25, .kind = 161, .name = "\u{fffa}DEFAULT\u{fffb}" },
+    .{ .menuItem_id = 26, .kind = 162, .name = "\u{fffa}ALPHABET\u{fffb}" },
+    .{ .menuItem_id = 27, .kind = 170, .name = "\u{fffa}MATCHING\u{fffb}" },
+};
+
+/// The browse-category layout over `menuItem` a fresh export carries.
+/// Row 23 — the `HOT CUE BANK` column — is seeded `(0, 0)` as in the real
+/// file; rbox's migration inserts `(11, 1)` there (a drift, like its DDL).
+const default_categories = [_]Category{
+    .{ .category_id = 1, .menuItem_id = 1, .sequenceNo = 0, .isVisible = 0 },
+    .{ .category_id = 2, .menuItem_id = 2, .sequenceNo = 1, .isVisible = 1 },
+    .{ .category_id = 3, .menuItem_id = 3, .sequenceNo = 2, .isVisible = 1 },
+    .{ .category_id = 4, .menuItem_id = 4, .sequenceNo = 3, .isVisible = 1 },
+    .{ .category_id = 5, .menuItem_id = 17, .sequenceNo = 5, .isVisible = 1 },
+    .{ .category_id = 6, .menuItem_id = 5, .sequenceNo = 0, .isVisible = 0 },
+    .{ .category_id = 7, .menuItem_id = 6, .sequenceNo = 0, .isVisible = 0 },
+    .{ .category_id = 8, .menuItem_id = 7, .sequenceNo = 0, .isVisible = 0 },
+    .{ .category_id = 9, .menuItem_id = 8, .sequenceNo = 0, .isVisible = 0 },
+    .{ .category_id = 10, .menuItem_id = 9, .sequenceNo = 0, .isVisible = 0 },
+    .{ .category_id = 11, .menuItem_id = 10, .sequenceNo = 0, .isVisible = 0 },
+    .{ .category_id = 12, .menuItem_id = 11, .sequenceNo = 4, .isVisible = 1 },
+    .{ .category_id = 15, .menuItem_id = 13, .sequenceNo = 0, .isVisible = 0 },
+    .{ .category_id = 17, .menuItem_id = 24, .sequenceNo = 9, .isVisible = 1 },
+    .{ .category_id = 18, .menuItem_id = 20, .sequenceNo = 7, .isVisible = 1 },
+    .{ .category_id = 19, .menuItem_id = 14, .sequenceNo = 0, .isVisible = 0 },
+    .{ .category_id = 20, .menuItem_id = 15, .sequenceNo = 0, .isVisible = 0 },
+    .{ .category_id = 21, .menuItem_id = 16, .sequenceNo = 0, .isVisible = 0 },
+    .{ .category_id = 22, .menuItem_id = 19, .sequenceNo = 6, .isVisible = 1 },
+    .{ .category_id = 23, .menuItem_id = 18, .sequenceNo = 0, .isVisible = 0 },
+    .{ .category_id = 26, .menuItem_id = 27, .sequenceNo = 8, .isVisible = 1 },
+    .{ .category_id = 27, .menuItem_id = 22, .sequenceNo = 10, .isVisible = 1 },
+};
+
+/// The track-list column layout over `menuItem` a fresh export carries
+/// (`sort_id` is 0-based; ids 14 and 24/25 are absent in real files too).
+const default_sorts = [_]Sort{
+    .{ .sort_id = 0, .menuItem_id = 25, .sequenceNo = 1, .isVisible = 1, .isSelectedAsSubColumn = 0 },
+    .{ .sort_id = 1, .menuItem_id = 26, .sequenceNo = 2, .isVisible = 1, .isSelectedAsSubColumn = 0 },
+    .{ .sort_id = 2, .menuItem_id = 2, .sequenceNo = 3, .isVisible = 1, .isSelectedAsSubColumn = 0 },
+    .{ .sort_id = 3, .menuItem_id = 3, .sequenceNo = 4, .isVisible = 1, .isSelectedAsSubColumn = 0 },
+    .{ .sort_id = 4, .menuItem_id = 5, .sequenceNo = 5, .isVisible = 1, .isSelectedAsSubColumn = 0 },
+    .{ .sort_id = 5, .menuItem_id = 6, .sequenceNo = 6, .isVisible = 1, .isSelectedAsSubColumn = 0 },
+    .{ .sort_id = 6, .menuItem_id = 1, .sequenceNo = 0, .isVisible = 0, .isSelectedAsSubColumn = 0 },
+    .{ .sort_id = 7, .menuItem_id = 21, .sequenceNo = 0, .isVisible = 0, .isSelectedAsSubColumn = 0 },
+    .{ .sort_id = 8, .menuItem_id = 14, .sequenceNo = 0, .isVisible = 0, .isSelectedAsSubColumn = 0 },
+    .{ .sort_id = 9, .menuItem_id = 8, .sequenceNo = 0, .isVisible = 0, .isSelectedAsSubColumn = 0 },
+    .{ .sort_id = 10, .menuItem_id = 9, .sequenceNo = 0, .isVisible = 0, .isSelectedAsSubColumn = 0 },
+    .{ .sort_id = 11, .menuItem_id = 10, .sequenceNo = 0, .isVisible = 0, .isSelectedAsSubColumn = 0 },
+    .{ .sort_id = 12, .menuItem_id = 11, .sequenceNo = 7, .isVisible = 1, .isSelectedAsSubColumn = 0 },
+    .{ .sort_id = 13, .menuItem_id = 15, .sequenceNo = 0, .isVisible = 0, .isSelectedAsSubColumn = 0 },
+    .{ .sort_id = 15, .menuItem_id = 13, .sequenceNo = 0, .isVisible = 0, .isSelectedAsSubColumn = 0 },
+    .{ .sort_id = 16, .menuItem_id = 23, .sequenceNo = 0, .isVisible = 0, .isSelectedAsSubColumn = 0 },
+    .{ .sort_id = 17, .menuItem_id = 22, .sequenceNo = 0, .isVisible = 0, .isSelectedAsSubColumn = 0 },
+};
+
+/// Options of `Writer.create`.
+pub const CreateOptions = struct {
+    /// Writes the db without the DLP passphrase — the plaintext side of
+    /// `Db.openPlaintext` (fixtures and plain-SQLite consumers).
+    plaintext: bool = false,
+    /// Written to `property.createdDate` (`'YYYY-MM-DD'` in real
+    /// exports). The library reads no clock; the caller supplies the date.
+    created_date: []const u8,
+    /// Written to `property.myTagMasterDBID` — derived from the master db
+    /// in real exports; writers may leave 0 (rbox does).
+    my_tag_master_dbid: i64 = 0,
+};
+
+/// A OneLibrary db opened for writing: `create` builds a fresh export's
+/// db (schema, seeded defaults, the property singleton), `open` attaches
+/// to an existing one, and `close` lands the on-disk shape of rb's
+/// exports. The schema carries no foreign keys, so no method validates
+/// ids — tree and junction semantics belong to the caller (the O4
+/// device writer).
+pub const Writer = struct {
+    db: Db,
+
+    /// Error of `create`: `LibraryAlreadyExists` is the exists-guard
+    /// refusing to build over an existing file; the rest is the guard's
+    /// directory access and the SQLite calls.
+    pub const CreateError = SqlError ||
+        std.Io.Dir.OpenError ||
+        std.Io.Dir.AccessError ||
+        error{LibraryAlreadyExists};
+
+    /// Creates a fresh OneLibrary db at `path`: the real schema (see
+    /// `schema_sql`), the four seeded tables' default rows, and the
+    /// property singleton with `dbVersion` `'10000'`. The db is keyed
+    /// with the DLP passphrase unless `plaintext` is set, and starts in
+    /// WAL journal mode like rb's exports.
+    pub fn create(io: std.Io, path: [:0]const u8, options: CreateOptions) CreateError!Writer {
+        // Refuse to build over an existing db rather than corrupt it.
+        const dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
+        defer dir.close(io);
+        if (dir.access(io, path, .{})) |_| {
+            return error.LibraryAlreadyExists;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+
+        const db = if (options.plaintext)
+            try Db.openPlaintextReadWriteCreate(io, path)
+        else
+            try Db.openReadWriteCreate(io, path);
+        errdefer db.close();
+
+        try db.exec("PRAGMA journal_mode = WAL;");
+        try db.exec(schema_sql);
+        for (default_colors) |row| try insertRow(db, "color", row);
+        for (default_menu_items) |row| try insertRow(db, "menuItem", row);
+        for (default_categories) |row| try insertRow(db, "category", row);
+        for (default_sorts) |row| try insertRow(db, "sort", row);
+
+        // rbox's migration seeds dbVersion 1000 as an INTEGER; real
+        // exports carry the varchar '10000'.
+        var property = try db.prepare(
+            "INSERT INTO property (deviceName, dbVersion, numberOfContents, createdDate, backGroundColorType, myTagMasterDBID) " ++
+                "VALUES ('', '10000', 0, ?1, 0, ?2);",
+        );
+        defer property.finalize();
+        try property.bindText(1, options.created_date);
+        try property.bindInt(2, options.my_tag_master_dbid);
+        if ((try property.step()) != .done) return error.Sqlite;
+
+        return .{ .db = db };
+    }
+
+    /// Opens an existing OneLibrary db (keyed, read-write).
+    pub fn open(io: std.Io, path: [:0]const u8) SqlError!Writer {
+        return .{ .db = try Db.open(io, path) };
+    }
+
+    /// Folds the WAL back into the main file and truncates it, landing a
+    /// complete db without closing the handle (the O4 save hook).
+    pub fn checkpoint(self: Writer) SqlError!void {
+        try self.db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+
+    /// Checkpoints and closes. The file keeps its WAL-mode header flag —
+    /// exactly the shape of rb's exports — and closing the last
+    /// connection removes the sidecar files.
+    pub fn close(self: Writer) SqlError!void {
+        const folded = self.checkpoint();
+        self.db.close();
+        try folded;
+    }
+};
+
+/// One INSERT, built and bound from the row's comptime layout — the
+/// write-side mirror of `decodeRow`: null fields bind NULL (one of the
+/// fixture's unset conventions), empty strings bind as themselves (the
+/// other), and SQLite copies text before the call returns.
+fn insertRow(db: Db, comptime table: []const u8, row: anytype) SqlError!void {
+    const T = @TypeOf(row);
+    const sql = comptime insertSql(table, T);
+    var stmt = try db.prepare(sql);
+    defer stmt.finalize();
+    inline for (@typeInfo(T).@"struct".fields, 1..) |f, i|
+        try bindCell(stmt, i, @field(row, f.name));
+    if ((try stmt.step()) != .done) return error.Sqlite;
+}
+
+fn insertSql(comptime table: []const u8, comptime T: type) [:0]const u8 {
+    comptime {
+        // content's 47 columns push the concatenation past the default quota
+        @setEvalBranchQuota(100_000);
+        var sql: []const u8 = "INSERT INTO " ++ table ++ " (";
+        for (@typeInfo(T).@"struct".fields, 0..) |f, i| {
+            if (i > 0) sql = sql ++ ", ";
+            sql = sql ++ f.name;
+        }
+        sql = sql ++ ") VALUES (";
+        for (@typeInfo(T).@"struct".fields, 0..) |_, i| {
+            if (i > 0) sql = sql ++ ", ";
+            sql = sql ++ std.fmt.comptimePrint("?{d}", .{i + 1});
+        }
+        return sql ++ ");";
+    }
+}
+
+fn bindCell(stmt: Stmt, i: usize, cell: anytype) SqlError!void {
+    return switch (@TypeOf(cell)) {
+        i64 => stmt.bindInt(i, cell),
+        ?i64 => if (cell) |v| stmt.bindInt(i, v) else stmt.bindNull(i),
+        []const u8 => stmt.bindText(i, cell),
+        ?[]const u8 => if (cell) |v| stmt.bindText(i, v) else stmt.bindNull(i),
+        else => @compileError("unsupported OneLibrary column type: " ++ @typeName(@TypeOf(cell))),
     };
 }

@@ -385,3 +385,180 @@ test "O2 keyed: junction groupings order, skip, and first-win" {
         ).?.content_id,
     );
 }
+
+// ---------------------------------------------------------------------------
+// O3 write layer
+// ---------------------------------------------------------------------------
+
+/// The cwd-relative, NUL-terminated path of a file inside `tmp`.
+fn tmpDbPath(tmp: *testing.TmpDir, alloc: std.mem.Allocator, name: []const u8) ![:0]u8 {
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+    return std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ tmp_path, name }, 0);
+}
+
+/// Compares two schemas as name-ordered (type, name, sql) triples — the
+/// O3 acceptance's "schema diff empty modulo data".
+fn expectSchemaEql(a: dlp.Db, b: dlp.Db) !void {
+    const sql = "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name;";
+    var sa = try a.prepare(sql);
+    defer sa.finalize();
+    var sb = try b.prepare(sql);
+    defer sb.finalize();
+    while (true) {
+        const ra = try sa.step();
+        const rb = try sb.step();
+        try testing.expectEqual(ra, rb);
+        if (ra == .done) break;
+        for (0..3) |i| try testing.expectEqualStrings(sa.readText(i), sb.readText(i));
+    }
+}
+
+/// Row-for-row, field-for-field equality of two loaded tables.
+fn expectTableEql(comptime T: type, expected: []const T, actual: []const T) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |*e, *a| {
+        inline for (@typeInfo(T).@"struct".fields) |f| {
+            const ev = @field(e, f.name);
+            const av = @field(a, f.name);
+            switch (f.type) {
+                i64, ?i64 => try testing.expectEqual(ev, av),
+                ?[]const u8 => if (ev) |s| {
+                    try testing.expect(av != null);
+                    try testing.expectEqualStrings(s, av.?);
+                } else try testing.expect(av == null),
+                else => @compileError("unexpected column type"),
+            }
+        }
+    }
+}
+
+test "O3 create: schema diff vs the real fixture is empty" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    defer alloc.free(db_path);
+    var w = try dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    defer w.db.close();
+
+    var fix_tmp = testing.tmpDir(.{});
+    defer fix_tmp.cleanup();
+    var fixture = try openPlaintextFixtureDb(io, &fix_tmp, alloc);
+    defer fixture.close();
+
+    try expectSchemaEql(w.db, fixture);
+}
+
+test "O3 create: seeded defaults and the property row" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    defer alloc.free(db_path);
+    var w = try dlp.Writer.create(io, db_path, .{
+        .plaintext = true,
+        .created_date = "2026-07-16",
+        .my_tag_master_dbid = 3168300669,
+    });
+    defer w.db.close();
+
+    var lib = try dlp.Library.load(alloc, w.db);
+    defer lib.deinit();
+
+    var fix_tmp = testing.tmpDir(.{});
+    defer fix_tmp.cleanup();
+    var fixture = try openPlaintextFixtureDb(io, &fix_tmp, alloc);
+    defer fixture.close();
+    var fix_lib = try dlp.Library.load(alloc, fixture);
+    defer fix_lib.deinit();
+
+    try expectTableEql(dlp.Color, fix_lib.colors, lib.colors);
+    try expectTableEql(dlp.MenuItem, fix_lib.menu_items, lib.menu_items);
+    try expectTableEql(dlp.Category, fix_lib.categories, lib.categories);
+    try expectTableEql(dlp.Sort, fix_lib.sorts, lib.sorts);
+
+    // everything a fresh export leaves empty is empty
+    try testing.expectEqual(@as(usize, 0), lib.contents.len);
+    try testing.expectEqual(@as(usize, 0), lib.genres.len);
+    try testing.expectEqual(@as(usize, 0), lib.artists.len);
+    try testing.expectEqual(@as(usize, 0), lib.albums.len);
+    try testing.expectEqual(@as(usize, 0), lib.playlists.len);
+    try testing.expectEqual(@as(usize, 0), lib.my_tags.len);
+
+    // the property singleton, fixture values in
+    try testing.expectEqual(
+        @as(i64, 0),
+        try w.db.scalarInt("SELECT numberOfContents FROM property;"),
+    );
+    const p = lib.property.?;
+    try testing.expectEqualStrings("", p.deviceName.?);
+    try testing.expectEqualStrings("10000", p.dbVersion.?);
+    try testing.expectEqual(@as(i64, 0), p.numberOfContents.?);
+    try testing.expectEqualStrings("2026-07-16", p.createdDate.?);
+    try testing.expectEqual(@as(i64, 0), p.backGroundColorType.?);
+    try testing.expectEqual(@as(i64, 3168300669), p.myTagMasterDBID.?);
+}
+
+test "O3 create: refuses to build over an existing db" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    defer alloc.free(db_path);
+    var w = try dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    try w.close();
+
+    try testing.expectError(
+        error.LibraryAlreadyExists,
+        dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" }),
+    );
+}
+
+test "O3 close: WAL header flag like rb exports, no sidecars left" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    defer alloc.free(db_path);
+    var w = try dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    // one written row, so the checkpoint has WAL frames to fold
+    try w.db.exec("INSERT INTO content (content_id, path) VALUES (1, '/Contents/a.mp3');");
+    try w.close();
+
+    // the persisted WAL flag (header bytes 18/19: 2 = WAL, 1 = rollback)
+    const raw = try tmp.dir.readFileAlloc(io, "ol.db", alloc, .limited(1 << 20));
+    defer alloc.free(raw);
+    try testing.expect(raw.len >= 100);
+    try testing.expectEqual(@as(u8, 2), raw[18]);
+    try testing.expectEqual(@as(u8, 2), raw[19]);
+
+    // rb's exports carry no sidecars
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "ol.db-wal", .{}));
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "ol.db-shm", .{}));
+
+    // and the db reopens without a recovery dance
+    var db = try dlp.Db.openPlaintext(io, db_path);
+    defer db.close();
+    try testing.expectEqual(@as(i64, 1), try db.scalarInt("SELECT COUNT(*) FROM content;"));
+    try testing.expectEqualStrings("ok", try integrityCheck(db));
+}
+
+fn integrityCheck(db: dlp.Db) ![]const u8 {
+    var stmt = try db.prepare("PRAGMA integrity_check;");
+    defer stmt.finalize();
+    try testing.expectEqual(.row, try stmt.step());
+    return stmt.readText(0);
+}
