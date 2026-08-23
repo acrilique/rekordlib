@@ -493,6 +493,16 @@ pub const AddTrackError =
     pdb.DatabaseModifyError ||
     anlz.WriteError;
 
+/// Error of the playlist methods: building the writer state, loading or
+/// creating `exportExt.pdb`, encoding a name (too long, or invalid UTF-8
+/// where a format string requires it), a foreign key that names no
+/// existing row, or inserting the rows.
+pub const PlaylistError =
+    WriterStateError ||
+    OpenPdbError ||
+    error{ UnknownForeignKey, TooLong, InvalidEncoding } ||
+    pdb.DatabaseModifyError;
+
 /// One serialized ANLZ file waiting for the next `save`: the host path it
 /// lands at, plus its image. `addTrack` serializes eagerly so the
 /// caller's `AnlzInput` can go away and `save` only moves bytes.
@@ -1078,6 +1088,101 @@ pub const DeviceExport = struct {
 
         try putStringIfAbsent(&state.artwork_by_path, e.alloc, try e.alloc.dupe(u8, path), id);
         return id;
+    }
+
+    /// Creates a playlist folder — a node that groups other folders and
+    /// playlists — and returns its id. `parent_id` is 0 (the tree root)
+    /// or the id of an existing folder (one this method or a scanned
+    /// export created); anything else, including a playlist's id, is
+    /// `UnknownForeignKey`.
+    pub fn createPlaylistFolder(
+        e: *DeviceExport,
+        name: []const u8,
+        parent_id: u32,
+    ) PlaylistError!u32 {
+        return e.createPlaylistNode(name, parent_id, true);
+    }
+
+    /// Creates a playlist — a leaf node holding tracks through
+    /// `addTrackToPlaylist` — under `parent_id` (same rule as
+    /// `createPlaylistFolder`) and returns its id.
+    pub fn createPlaylist(
+        e: *DeviceExport,
+        name: []const u8,
+        parent_id: u32,
+    ) PlaylistError!u32 {
+        return e.createPlaylistNode(name, parent_id, false);
+    }
+
+    /// Inserts the node row and records it in the writer state. The name
+    /// encodes before any id is taken, so a name too long to encode
+    /// leaves the export untouched; the id counter bumps only after the
+    /// insert, so a failed call cannot mint a duplicate id.
+    fn createPlaylistNode(
+        e: *DeviceExport,
+        name: []const u8,
+        parent_id: u32,
+        is_folder: bool,
+    ) PlaylistError!u32 {
+        const state = try e.writerState();
+        // The root (id 0) is always a valid parent; any other id must
+        // name an existing folder — a playlist cannot hold children.
+        if (parent_id != 0) {
+            const parent_is_folder = state.playlist_nodes.get(parent_id) orelse false;
+            if (!parent_is_folder) return error.UnknownForeignKey;
+        }
+
+        const db = try e.openPdb();
+        const id = state.next_playlist_node_id;
+        const a = db.arena.allocator();
+        const boxed = try a.create(pdb.PlaylistTreeNode);
+        boxed.* = .{
+            .parent_id = parent_id,
+            .id = id,
+            .node_is_folder = if (is_folder) 1 else 0,
+            .name = try pdb.DeviceSQLString.fromUtf8(a, name),
+        };
+        try state.playlist_nodes.ensureUnusedCapacity(e.alloc, 1);
+        var row = pdb.Row{ .playlist_tree_node = boxed };
+        _ = try db.addRow(&row);
+
+        state.next_playlist_node_id = id + 1;
+        state.playlist_nodes.putAssumeCapacity(id, is_folder);
+        return id;
+    }
+
+    /// Appends a track to the end of a playlist; the entry position is
+    /// assigned automatically, dense from 0 and continuing across save
+    /// and reopen. `playlist_id` must name an existing *playlist* (a
+    /// folder id is rejected — tracks go into playlists only) and
+    /// `track_id` an existing track, else `UnknownForeignKey`.
+    pub fn addTrackToPlaylist(
+        e: *DeviceExport,
+        playlist_id: u32,
+        track_id: u32,
+    ) PlaylistError!void {
+        const state = try e.writerState();
+        const node_is_folder = state.playlist_nodes.get(playlist_id) orelse
+            return error.UnknownForeignKey;
+        if (node_is_folder) return error.UnknownForeignKey;
+        if (!state.track_ids.contains(track_id)) return error.UnknownForeignKey;
+
+        const entry_index = state.playlist_entry_counts.get(playlist_id) orelse 0;
+
+        const db = try e.openPdb();
+        const a = db.arena.allocator();
+        const boxed = try a.create(pdb.PlaylistEntry);
+        boxed.* = .{
+            .entry_index = entry_index,
+            .track_id = track_id,
+            .playlist_id = playlist_id,
+        };
+        try state.playlist_entry_counts.ensureUnusedCapacity(e.alloc, 1);
+        var row = pdb.Row{ .playlist_entry = boxed };
+        _ = try db.addRow(&row);
+
+        const gop = state.playlist_entry_counts.getOrPutAssumeCapacity(playlist_id);
+        gop.value_ptr.* = entry_index + 1;
     }
 
     /// Writes the buffered export to disk — the handle's only

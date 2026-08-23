@@ -1397,3 +1397,146 @@ test "add track with analysis writes anlz files" {
     defer alloc.free(want);
     try testing.expectEqualStrings(want, analyze_path);
 }
+
+// --- D7: playlists + tags --------------------------------------------------------
+
+test "playlist methods reject unknown foreign keys" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+
+    // The root (0) is always a valid parent; a folder groups a playlist.
+    // Fresh counters start at 1: id 0 is the null foreign key.
+    const folder = try ex.createPlaylistFolder("Folder", 0);
+    const playlist = try ex.createPlaylist("Playlist", folder);
+    try testing.expectEqual(@as(u32, 1), folder);
+    try testing.expectEqual(@as(u32, 2), playlist);
+
+    // Unknown parent: 999 was never created.
+    try testing.expectError(error.UnknownForeignKey, ex.createPlaylist("Orphan", 999));
+
+    // A valid track so the membership check has something to find.
+    const track = (try ex.addTrack(.{
+        .title = "song",
+        .filename = "song.mp3",
+        .file_path = "/Contents/song.mp3",
+    })).id;
+
+    // Unknown playlist id, unknown track id.
+    try testing.expectError(error.UnknownForeignKey, ex.addTrackToPlaylist(999, track));
+    try testing.expectError(error.UnknownForeignKey, ex.addTrackToPlaylist(playlist, 999));
+
+    // The happy path still works.
+    try ex.addTrackToPlaylist(playlist, track);
+}
+
+test "playlist tree enforces folder vs playlist roles" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    const folder = try ex.createPlaylistFolder("Folder", 0);
+    const playlist = try ex.createPlaylist("Playlist", folder);
+
+    // The playlist exists, but it's a leaf, not a folder.
+    try testing.expectError(error.UnknownForeignKey, ex.createPlaylist("Child", playlist));
+
+    // The folder exists, but tracks go into playlists only.
+    const track = (try ex.addTrack(.{
+        .title = "song",
+        .filename = "song.mp3",
+        .file_path = "/Contents/song.mp3",
+    })).id;
+    try testing.expectError(error.UnknownForeignKey, ex.addTrackToPlaylist(folder, track));
+
+    // End to end: the saved export reads back as a folder nesting the
+    // playlist, so `node_is_folder` was written the way the reader (and
+    // players) interpret it.
+    try ex.save();
+    var check = device.DeviceExport.open(tmp_path, io, alloc);
+    defer check.deinit();
+    var playlists = try check.getPlaylists();
+    defer {
+        for (playlists.items) |*node| node.deinit(alloc);
+        playlists.deinit(alloc);
+    }
+    try testing.expectEqual(@as(usize, 1), playlists.items.len);
+    const saved_folder = &playlists.items[0].folder;
+    try testing.expectEqual(folder, saved_folder.id);
+    try testing.expectEqualStrings("Folder", saved_folder.name);
+    try testing.expectEqual(@as(usize, 1), saved_folder.children.items.len);
+    const saved_playlist = &saved_folder.children.items[0].playlist;
+    try testing.expectEqual(playlist, saved_playlist.id);
+    try testing.expectEqualStrings("Playlist", saved_playlist.name);
+}
+
+test "add track to playlist auto-indexes" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    const playlist = try ex.createPlaylist("P", 0);
+    const t0 = (try ex.addTrack(.{
+        .title = "song0",
+        .filename = "song0.mp3",
+        .file_path = "/Contents/song0.mp3",
+    })).id;
+    const t1 = (try ex.addTrack(.{
+        .title = "song1",
+        .filename = "song1.mp3",
+        .file_path = "/Contents/song1.mp3",
+    })).id;
+    const t2 = (try ex.addTrack(.{
+        .title = "song2",
+        .filename = "song2.mp3",
+        .file_path = "/Contents/song2.mp3",
+    })).id;
+    try ex.addTrackToPlaylist(playlist, t0);
+    try ex.addTrackToPlaylist(playlist, t1);
+    try ex.addTrackToPlaylist(playlist, t2);
+    try ex.save();
+
+    // After a save/open the entry counter is rebuilt from the rows, so
+    // one more append lands at index 3.
+    var reopened = device.DeviceExport.open(tmp_path, io, alloc);
+    defer reopened.deinit();
+    const t3 = (try reopened.addTrack(.{
+        .title = "song3",
+        .filename = "song3.mp3",
+        .file_path = "/Contents/song3.mp3",
+    })).id;
+    try reopened.addTrackToPlaylist(playlist, t3);
+    try reopened.save();
+
+    var check = device.DeviceExport.open(tmp_path, io, alloc);
+    defer check.deinit();
+    var indices: [4]u32 = undefined;
+    var count: usize = 0;
+    var it = try (try check.openPdb()).rows(.playlist_entries);
+    while (try it.next()) |row| {
+        indices[count] = row.playlist_entry.entry_index;
+        count += 1;
+    }
+    try testing.expectEqual(@as(usize, 4), count);
+    std.mem.sort(u32, &indices, {}, std.sort.asc(u32));
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, &indices);
+}
