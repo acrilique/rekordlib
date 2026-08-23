@@ -1124,3 +1124,68 @@ pub fn scanWriterState(
 
     return state;
 }
+
+/// `putStringIfAbsent` for the leaf-tag map, which owns only the key's
+/// `label` slice.
+fn putTagKeyIfAbsent(
+    map: *TagsByKey,
+    alloc: std.mem.Allocator,
+    key: TagKey,
+    value: u32,
+) std.mem.Allocator.Error!void {
+    const gop = map.getOrPut(alloc, key) catch |err| {
+        alloc.free(key.label);
+        return err;
+    };
+    if (gop.found_existing) {
+        alloc.free(key.label);
+    } else {
+        gop.key_ptr.* = key;
+        gop.value_ptr.* = value;
+    }
+}
+
+/// Extends a `WriterState` with the tag state recovered from an ext
+/// database, so later tag calls append instead of colliding or
+/// truncating: counters past every Tag row's id and `index_shift`, the
+/// category set, and the leaf dedup map. TrackTag junction rows carry no
+/// state the writer tracks — their ids reference tag rows already
+/// counted here — so they are not scanned. On error the state keeps
+/// whatever was merged so far; callers treat a failed scan as fatal for
+/// the session.
+pub fn scanExtTags(
+    alloc: std.mem.Allocator,
+    ext_db: *const pdb.Database,
+    state: *WriterState,
+) ScanError!void {
+    // PageType 3 means albums in a plain database and Tag pages in an
+    // ext one; tables are looked up by raw value, so the ext table is
+    // found by passing the colliding value.
+    var it = try rowsOrEmpty(ext_db, @enumFromInt(@intFromEnum(pdb.ExtPageType.tag)));
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const tag = row.tag;
+            state.next_tag_id = @max(state.next_tag_id, tag.id +| 1);
+            state.next_tag_row_index = @max(
+                state.next_tag_row_index,
+                @as(u32, tag.index_shift) / 0x20 +| 1,
+            );
+            if (tag.raw_is_category != 0) {
+                try state.tag_categories.put(alloc, tag.id, {});
+                state.next_category_position = @max(state.next_category_position, tag.position +| 1);
+            } else {
+                if (try decodeOrSkip(tag.offsets.inner.name, alloc)) |label| {
+                    try putTagKeyIfAbsent(
+                        &state.tags_by_key,
+                        alloc,
+                        .{ .category_id = tag.parent_id, .label = label },
+                        tag.id,
+                    );
+                }
+                const gop = try state.tag_leaf_counts.getOrPut(alloc, tag.parent_id);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* = @max(gop.value_ptr.*, tag.position +| 1);
+            }
+        }
+    }
+}

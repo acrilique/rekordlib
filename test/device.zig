@@ -884,3 +884,109 @@ test "writer state scans num_rows at scale" {
     try testing.expectEqual(@as(usize, 3886), state.track_ids.count());
     try testing.expect(state.next_track_id > 3886);
 }
+
+/// Builds a boxed TagOrCategory row on `a`, for the ext-scan tests.
+fn testTagRow(
+    a: std.mem.Allocator,
+    parent_id: u32,
+    position: u32,
+    id: u32,
+    is_category: bool,
+    row_index: u32,
+    name: []const u8,
+) !pdb.Row {
+    const tag = try a.create(pdb.TagOrCategory);
+    tag.* = .{
+        .parent_id = parent_id,
+        .position = position,
+        .id = id,
+        .raw_is_category = if (is_category) 1 << 24 else 0,
+        .index_shift = @intCast(row_index * 0x20),
+        .offsets = .{ .inner = .{ .name = try pdb.DeviceSQLString.fromUtf8(a, name) } },
+    };
+    return pdb.Row{ .tag = tag };
+}
+
+test "ext tag scan recovers a built ext database" {
+    const alloc = testing.allocator;
+    var db = try pdb.Database.create(alloc, .ext, &[_]pdb.PageType{
+        @enumFromInt(@intFromEnum(pdb.ExtPageType.tag)),
+        @enumFromInt(@intFromEnum(pdb.ExtPageType.track_tag)),
+    });
+    defer db.deinit();
+
+    const a = db.arena.allocator();
+    var category = try testTagRow(a, 0, 0, 7, true, 0, "My Tags");
+    _ = try db.addRow(&category);
+    var techno = try testTagRow(a, 7, 0, 9, false, 1, "Techno");
+    _ = try db.addRow(&techno);
+    var dub = try testTagRow(a, 7, 1, 12, false, 2, "Dub");
+    _ = try db.addRow(&dub);
+    // A duplicate label under the same category: the scan keeps the
+    // first row's id (the oracle's `or_insert`).
+    var techno_dup = try testTagRow(a, 7, 2, 20, false, 3, "Techno");
+    _ = try db.addRow(&techno_dup);
+
+    var state = device.WriterState{};
+    defer state.deinit(alloc);
+    try device.scanExtTags(alloc, &db, &state);
+
+    try testing.expectEqual(@as(u32, 21), state.next_tag_id);
+    try testing.expectEqual(@as(u32, 4), state.next_tag_row_index);
+    try testing.expect(state.tag_categories.contains(7));
+    try testing.expectEqual(@as(u32, 1), state.next_category_position);
+    try testing.expectEqual(@as(u32, 2), state.tags_by_key.count());
+    try testing.expectEqual(@as(u32, 9), state.tags_by_key.get(.{
+        .category_id = 7,
+        .label = "Techno",
+    }).?);
+    try testing.expectEqual(@as(u32, 12), state.tags_by_key.get(.{
+        .category_id = 7,
+        .label = "Dub",
+    }).?);
+    try testing.expectEqual(@as(u32, 3), state.tag_leaf_counts.get(7).?);
+}
+
+test "ext tag scan recovers the with_anlz fixture" {
+    const alloc = testing.allocator;
+    const input = try testutil.readFixture(
+        alloc,
+        "complete_export/with_anlz/PIONEER/rekordbox/exportExt.pdb",
+        .limited(1 << 20),
+    );
+    defer alloc.free(input);
+    var db = try pdb.Database.parse(alloc, input, .ext);
+    defer db.deinit();
+
+    var state = device.WriterState{};
+    defer state.deinit(alloc);
+    try device.scanExtTags(alloc, &db, &state);
+
+    // Hand-checked against the fixture (2026-08-23): 4 categories —
+    // Genre, Components, Situation, Untitled Column (ids 1-4, positions
+    // 0-3) — holding 7/8/8/1 leaves; 28 Tag rows stepping index_shift by
+    // 0x20; leaf ids are random-looking u32s (the max is Acid House's
+    // 4275955888), mirroring the OL db's 28 myTag rows.
+    try testing.expectEqual(@as(u32, 4275955889), state.next_tag_id);
+    try testing.expectEqual(@as(u32, 28), state.next_tag_row_index);
+    try testing.expectEqual(@as(u32, 4), state.next_category_position);
+    try testing.expectEqual(@as(usize, 4), state.tag_categories.count());
+    for ([_]u32{ 1, 2, 3, 4 }) |id| try testing.expect(state.tag_categories.contains(id));
+    try testing.expectEqual(@as(u32, 4275955888), state.tags_by_key.get(.{
+        .category_id = 1,
+        .label = "Acid House",
+    }).?);
+    try testing.expectEqual(@as(u32, 3139558292), state.tags_by_key.get(.{
+        .category_id = 1,
+        .label = "Techno",
+    }).?);
+    try testing.expectEqual(@as(u32, 3662875339), state.tags_by_key.get(.{
+        .category_id = 4,
+        .label = "My Comment",
+    }).?);
+    try testing.expectEqual(@as(usize, 24), state.tags_by_key.count());
+    try testing.expectEqual(@as(u32, 7), state.tag_leaf_counts.get(1).?);
+    try testing.expectEqual(@as(u32, 8), state.tag_leaf_counts.get(2).?);
+    try testing.expectEqual(@as(u32, 8), state.tag_leaf_counts.get(3).?);
+    try testing.expectEqual(@as(u32, 1), state.tag_leaf_counts.get(4).?);
+}
