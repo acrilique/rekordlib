@@ -1042,3 +1042,266 @@ test "ext tag scan recovers the with_anlz fixture" {
     try testing.expectEqual(@as(u32, 8), state.tag_leaf_counts.get(3).?);
     try testing.expectEqual(@as(u32, 1), state.tag_leaf_counts.get(4).?);
 }
+
+// --- writer: add_track (D6) ----------------------------------------------------
+
+/// Copies a fixture's `export.pdb` into a temp-dir export root — enough
+/// of the export for `open` + `addTrack` + `save` sessions.
+fn copyFixturePdb(
+    tmp: *testing.TmpDir,
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    fixture: []const u8,
+) !void {
+    try tmp.dir.createDirPath(io, "PIONEER/rekordbox");
+    const src = try std.fmt.allocPrint(
+        alloc,
+        "complete_export/{s}/PIONEER/rekordbox/export.pdb",
+        .{fixture},
+    );
+    defer alloc.free(src);
+    const image = try testutil.readFixture(alloc, src, .limited(1 << 22));
+    defer alloc.free(image);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "PIONEER/rekordbox/export.pdb",
+        .data = image,
+    });
+}
+
+/// Counts Artist rows whose name decodes to exactly `name`.
+fn countArtistsNamed(db: *const pdb.Database, name: []const u8) !usize {
+    var count: usize = 0;
+    var it = try db.rows(.artists);
+    while (try it.next()) |row| {
+        const got = try row.artist.offsets.inner.name.utf8(testing.allocator);
+        defer testing.allocator.free(got);
+        if (std.mem.eql(u8, got, name)) count += 1;
+    }
+    return count;
+}
+
+test "add track dedups on file path" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    const song = device.TrackInput{
+        .title = "song",
+        .filename = "song.mp3",
+        .file_path = "/Contents/song.mp3",
+    };
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    const first = try ex.addTrack(song);
+    const second = try ex.addTrack(song);
+    try testing.expectEqual(first.id, second.id);
+    try testing.expect(first.is_new);
+    try testing.expect(!second.is_new);
+    try ex.save();
+
+    // Across save/open: the scan reads the path back, so re-adding still
+    // dedups instead of inserting a second row.
+    var reopened = device.DeviceExport.open(tmp_path, io, alloc);
+    defer reopened.deinit();
+    const third = try reopened.addTrack(song);
+    try testing.expectEqual(first.id, third.id);
+    try testing.expect(!third.is_new);
+    try reopened.save();
+
+    var check = device.DeviceExport.open(tmp_path, io, alloc);
+    defer check.deinit();
+    try testing.expectEqual(@as(usize, 1), try countTableRows(try check.openPdb(), .tracks));
+}
+
+test "add track auto-pads under the minimum row size" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    const outcome = try ex.addTrack(.{
+        .title = "tiny",
+        .file_path = "/Contents/tiny.mp3",
+    });
+    try testing.expect(outcome.is_new);
+    try ex.save();
+
+    var check = device.DeviceExport.open(tmp_path, io, alloc);
+    defer check.deinit();
+    var it = try (try check.openPdb()).rows(.tracks);
+    const track = (try it.next()).?.track;
+    const comment = try track.offsets.inner.comment.utf8(alloc);
+    defer alloc.free(comment);
+    try testing.expect(comment.len > 0);
+    for (comment) |c| try testing.expect(c == ' ');
+}
+
+test "a string that fails to encode leaves the export untouched" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+
+    // One byte over the long-form body cap: encoding fails before any id
+    // is taken or row inserted.
+    const long_title = try alloc.alloc(u8, 32_768);
+    defer alloc.free(long_title);
+    @memset(long_title, 'a');
+    try testing.expectError(
+        error.TooLong,
+        ex.addTrack(.{ .title = long_title, .artist = "X", .file_path = "/Contents/x.mp3" }),
+    );
+    try testing.expectEqual(@as(usize, 0), try countTableRows(try ex.openPdb(), .tracks));
+    try testing.expectEqual(@as(usize, 0), try countTableRows(try ex.openPdb(), .artists));
+    try testing.expectEqual(@as(u32, 1), (try ex.writerState()).next_track_id);
+
+    // The export still accepts the next, valid track — with id 1.
+    const outcome = try ex.addTrack(.{ .title = "ok", .file_path = "/Contents/ok.mp3" });
+    try testing.expect(outcome.is_new);
+    try testing.expectEqual(@as(u32, 1), outcome.id);
+    try testing.expectEqual(@as(usize, 1), try countTableRows(try ex.openPdb(), .tracks));
+    try testing.expectEqual(@as(usize, 0), try countTableRows(try ex.openPdb(), .artists));
+}
+
+test "add track stores the caller artwork path verbatim" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    const caller_path = "/PIONEER/Artwork/00007/a137.jpg";
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    _ = try ex.addTrack(.{
+        .title = "song",
+        .filename = "song.mp3",
+        .file_path = "/Contents/song.mp3",
+        .artwork_device_path = caller_path,
+    });
+    // A second track sharing the artwork dedups onto the same row.
+    _ = try ex.addTrack(.{
+        .title = "song2",
+        .filename = "song2.mp3",
+        .file_path = "/Contents/song2.mp3",
+        .artwork_device_path = caller_path,
+    });
+    try ex.save();
+
+    // No image files are written — the caller owns them (decision 5).
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "PIONEER/Artwork", .{}));
+
+    var check = device.DeviceExport.open(tmp_path, io, alloc);
+    defer check.deinit();
+    const db = try check.openPdb();
+    try testing.expectEqual(@as(usize, 1), try countTableRows(db, .artwork));
+    var it = try db.rows(.artwork);
+    const artwork = (try it.next()).?.artwork;
+    const path = try artwork.path.utf8(alloc);
+    defer alloc.free(path);
+    try testing.expectEqualStrings(caller_path, path);
+
+    var tracks = try db.rows(.tracks);
+    var artwork_ids: [2]u32 = undefined;
+    var i: usize = 0;
+    while (try tracks.next()) |row| : (i += 1) artwork_ids[i] = row.track.artwork_id;
+    try testing.expect(artwork_ids[0] != 0);
+    try testing.expectEqual(artwork_ids[0], artwork_ids[1]);
+    try testing.expectEqual(artwork.id, artwork_ids[0]);
+}
+
+test "open then add does not duplicate a named row" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Created export: create → add → save, reopen → add again — the
+    // artist must be deduped through the save/reopen round trip.
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+        defer alloc.free(tmp_path);
+
+        const song = device.TrackInput{
+            .title = "song",
+            .artist = "Dup Artist",
+            .album = "Dup Album",
+            .genre = "Dup Genre",
+            .filename = "song.mp3",
+            .file_path = "/Contents/song.mp3",
+        };
+        var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+        defer ex.deinit();
+        _ = try ex.addTrack(song);
+        try ex.save();
+
+        var reopened = device.DeviceExport.open(tmp_path, io, alloc);
+        defer reopened.deinit();
+        _ = try reopened.addTrack(song);
+        try reopened.save();
+
+        var check = device.DeviceExport.open(tmp_path, io, alloc);
+        defer check.deinit();
+        try testing.expectEqual(
+            @as(usize, 1),
+            try countArtistsNamed(try check.openPdb(), "Dup Artist"),
+        );
+    }
+
+    // Opened real exports: an artist the fixture already carries is
+    // reused, never duplicated.
+    const named = [_]struct { name: []const u8, artist: []const u8, tracks: usize }{
+        .{ .name = "demo_tracks", .artist = "Loopmasters", .tracks = 2 },
+        .{ .name = "with_anlz", .artist = "Reboot", .tracks = 2 },
+    };
+    for (named) |fixture| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+        defer alloc.free(tmp_path);
+        try copyFixturePdb(&tmp, io, alloc, fixture.name);
+
+        var ex = device.DeviceExport.open(tmp_path, io, alloc);
+        defer ex.deinit();
+        const outcome = try ex.addTrack(.{
+            .title = "new song",
+            .artist = fixture.artist,
+            .filename = "new song.mp3",
+            .file_path = "/Contents/new song.mp3",
+        });
+        try testing.expect(outcome.is_new);
+        try ex.save();
+
+        var check = device.DeviceExport.open(tmp_path, io, alloc);
+        defer check.deinit();
+        const db = try check.openPdb();
+        try testing.expectEqual(@as(usize, 1), try countArtistsNamed(db, fixture.artist));
+        try testing.expectEqual(fixture.tracks + 1, try countTableRows(db, .tracks));
+
+        // The new track points at the pre-existing artist row.
+        var it = try db.rows(.tracks);
+        while (try it.next()) |row| {
+            if (row.track.id == outcome.id) {
+                try testing.expectEqual(@as(u32, 1), row.track.artist_id);
+            }
+        }
+    }
+}

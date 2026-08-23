@@ -13,8 +13,10 @@
 
 const std = @import("std");
 const bin = @import("bin");
+const anlz = @import("anlz");
 const pdb = @import("pdb");
 const setting = @import("setting");
+const util = @import("util");
 
 /// Error of the layout functions that hash or format an audio path.
 pub const PathError = error{ OutOfMemory, InvalidUtf8 };
@@ -367,6 +369,130 @@ pub const SaveError =
 /// `export.pdb`, or scanning it.
 pub const WriterStateError = OpenPdbError || ScanError;
 
+/// Reverse-engineered `bitmask` constant observed on fresh Rekordbox
+/// Track rows (`0x000c0700`). The OneLibrary db mirrors it as
+/// `contentLink`. Device-derived — copy exactly.
+const track_bitmask: u32 = 788_224;
+
+/// Reverse-engineered `unknown5` constant observed on fresh Rekordbox
+/// Track rows. The OneLibrary db mirrors it as `analysedBits`.
+/// Device-derived — copy exactly.
+const track_unknown5: u16 = 41;
+
+/// A track as a user thinks of it: plain UTF-8 string slices and scalars,
+/// no foreign-key ids. Input to `DeviceExport.addTrack`, which resolves
+/// artists/albums/genres/keys/labels/artwork into deduplicated rows and
+/// handles format quirks (the 221-byte minimum row size, centi-BPM
+/// tempo). Every slice is borrowed for the call only. Experts needing
+/// fields not exposed here should build a `pdb.Track` row directly
+/// through `openPdb`.
+pub const TrackInput = struct {
+    /// Track title.
+    title: []const u8 = "",
+    /// Performing artist name.
+    artist: []const u8 = "",
+    /// Album name.
+    album: []const u8 = "",
+    /// Genre name.
+    genre: []const u8 = "",
+    /// Musical key name (e.g. "Cmaj", "D♭min"); folded to a canonical
+    /// form for dedup.
+    key: []const u8 = "",
+    /// Record label name.
+    label: []const u8 = "",
+    /// Composer name.
+    composer: []const u8 = "",
+    /// Remixer name.
+    remixer: []const u8 = "",
+    /// Original performer, distinct from `artist` (covers/reworks).
+    orig_artist: []const u8 = "",
+    /// Free-text comment; also the auto-pad target when the row falls
+    /// under the 221-byte minimum.
+    comment: []const u8 = "",
+    /// ISRC, in rekordbox's mangled format.
+    isrc: []const u8 = "",
+    /// Lyricist name.
+    lyricist: []const u8 = "",
+    /// Remix/mix name.
+    mix_name: []const u8 = "",
+    /// Free text; Rekordbox writes strict `YYYY-MM-DD` or empty, this
+    /// field passes through verbatim so callers can probe hardware
+    /// behavior with anything.
+    release_date: []const u8 = "",
+    /// Free text, commonly `YYYY-MM-DD` (see `release_date`).
+    date_added: []const u8 = "",
+    /// Device-relative file path (e.g. `/Contents/Artist - Title.mp3`).
+    /// Dedup key when non-empty; tracks with an empty path are always
+    /// inserted.
+    file_path: []const u8 = "",
+    /// File name without path.
+    filename: []const u8 = "",
+    /// Device path stored verbatim in the Artwork row; empty = none. The
+    /// caller owns placing the image files it names (see `artworkSpec`
+    /// for the required format).
+    artwork_device_path: []const u8 = "",
+    /// Track "message" field shown in Rekordbox.
+    message: []const u8 = "",
+    /// Tempo in BPM; encoded to centi-BPM (× 100) in the pdb.
+    tempo: f32 = 0,
+    /// Bitrate in kbps.
+    bitrate: u32 = 0,
+    /// Sample rate in Hz.
+    sample_rate: u32 = 0,
+    /// Bits per sample of the audio file.
+    sample_depth: u16 = 0,
+    /// Playback duration in seconds. The pdb field is `u16` (ceiling
+    /// ~18.2 h).
+    duration_secs: u16 = 0,
+    /// File size in bytes.
+    file_size: u32 = 0,
+    /// Track number within the album.
+    track_number: u32 = 0,
+    /// Disc number.
+    disc_number: u16 = 0,
+    /// Release year.
+    year: u16 = 0,
+    /// Number of times the track was played.
+    play_count: u16 = 0,
+    /// Star rating, 0-5; stored raw — the pdb byte, not the XML's
+    /// `0/51/102/153/204/255` scale.
+    rating: u8 = 0,
+    /// Color label.
+    color: util.ColorIndex = .none,
+    /// Audio file format.
+    file_type: pdb.FileType = .unknown,
+    /// Whether stored hotcues auto-load on a CDJ; maps to the pdb string
+    /// `"ON"` / empty.
+    autoload_hotcues: bool = false,
+    /// Pre-computed ANLZ content. When set, the writer queues the
+    /// `ANLZ0000` files for `save` (each sibling only when its section
+    /// set carries data) and stores the device `.DAT` path in
+    /// `analyze_path`. Beats and cues are always caller-provided — the
+    /// library does not do beat detection; see `anlz.buildAnlzInput` for
+    /// assembling one from performance data.
+    analysis: ?*const anlz.AnlzInput = null,
+};
+
+/// The outcome of `DeviceExport.addTrack`: a freshly inserted track, or
+/// an existing one returned because its `file_path` was already present.
+pub const AddTrackOutcome = struct {
+    /// The track id in the export.
+    id: u32,
+    /// True if a new row was inserted; false if an existing track was
+    /// returned unchanged.
+    is_new: bool,
+};
+
+/// Error of `DeviceExport.addTrack`: building the writer state, encoding
+/// the track's strings (too long, or invalid UTF-8 where a format string
+/// requires it), deriving its ANLZ paths, or inserting the rows.
+pub const AddTrackError =
+    WriterStateError ||
+    PathError ||
+    error{ TooLong, InvalidEncoding, InvalidUtf8 } ||
+    pdb.DatabaseModifyError ||
+    anlz.WriteError;
+
 /// A handle to a Rekordbox device export on disk: the setting files and
 /// the pdb database, located through `Layout`. `open` points the handle
 /// at an existing export (reading; the `openPdb` escape hatch edits),
@@ -537,6 +663,298 @@ pub const DeviceExport = struct {
             e.writer_state = try scanWriterState(e.alloc, db);
         }
         return &e.writer_state.?;
+    }
+
+    /// Adds a track to the export. Resolves — creating where needed —
+    /// the Artist, Album, Genre, Key, Label, and Artwork rows, then
+    /// inserts a Track row pointing at them by id.
+    ///
+    /// Idempotent on a non-empty `file_path`: if a track with that path
+    /// was already added (this session, or read back by the writer-state
+    /// scan of an opened export), the existing id is returned and nothing
+    /// is inserted; `AddTrackOutcome.is_new` tells the cases apart.
+    ///
+    /// Everything that can fail on the caller's data — string encoding,
+    /// ANLZ serialization — happens before any id is taken or row
+    /// inserted, so a bad string leaves the export untouched. A failure
+    /// between the dimension-row inserts and the Track row (allocation
+    /// failure, or a database counters inconsistency) can still leave
+    /// orphaned dimension rows — unreachable from any track, ignored by
+    /// players, not recovered automatically (the oracle's documented
+    /// residual risk).
+    pub fn addTrack(e: *DeviceExport, track: TrackInput) AddTrackError!AddTrackOutcome {
+        const state = try e.writerState();
+        if (track.file_path.len > 0) {
+            if (state.tracks_by_path.get(track.file_path)) |id|
+                return .{ .id = id, .is_new = false };
+        }
+        const track_id = state.next_track_id;
+
+        // The caller's data fails here or never: nothing below this point
+        // is rolled back.
+        const row = try e.buildTrackRow(track, track.analysis != null);
+
+        const artist_id = try e.getOrCreateArtist(track.artist);
+        const album_id = try e.getOrCreateAlbum(track.album, artist_id);
+        const genre_id = try e.getOrCreateGenre(track.genre);
+        const key_id = try e.getOrCreateKey(track.key);
+        const label_id = try e.getOrCreateLabel(track.label);
+        const artwork_id = try e.getOrCreateArtwork(track.artwork_device_path);
+        const composer_id =
+            if (track.composer.len == 0) 0 else try e.getOrCreateArtist(track.composer);
+        const orig_artist_id =
+            if (track.orig_artist.len == 0) 0 else try e.getOrCreateArtist(track.orig_artist);
+        const remixer_id =
+            if (track.remixer.len == 0) 0 else try e.getOrCreateArtist(track.remixer);
+
+        row.id = track_id;
+        row.artist_id = artist_id;
+        row.album_id = album_id;
+        row.genre_id = genre_id;
+        row.key_id = key_id;
+        row.label_id = label_id;
+        row.artwork_id = artwork_id;
+        row.composer_id = composer_id;
+        row.orig_artist_id = orig_artist_id;
+        row.remixer_id = remixer_id;
+
+        // Reserve everything the bookkeeping needs so the steps after the
+        // insert cannot fail half-applied.
+        try state.track_ids.ensureUnusedCapacity(e.alloc, 1);
+        var owned_path: ?[]u8 = null;
+        errdefer if (owned_path) |path| e.alloc.free(path);
+        if (track.file_path.len > 0) {
+            owned_path = try e.alloc.dupe(u8, track.file_path);
+            try state.tracks_by_path.ensureUnusedCapacity(e.alloc, 1);
+        }
+
+        const db = try e.openPdb();
+        var row_union = pdb.Row{ .track = row };
+        _ = try db.addRow(&row_union);
+
+        state.next_track_id += 1;
+        state.track_ids.putAssumeCapacity(track_id, {});
+        if (owned_path) |path| state.tracks_by_path.putAssumeCapacity(path, track_id);
+
+        return .{ .id = track_id, .is_new = true };
+    }
+
+    /// Builds the Track row for `track` in the database's arena — every
+    /// string encoded, the device-derived constants set, and `comment`
+    /// grown past the 221-byte CDJ minimum — allocating no ids and
+    /// inserting nothing. `has_analysis` selects whether `analyze_path`
+    /// is populated.
+    fn buildTrackRow(
+        e: *DeviceExport,
+        track: TrackInput,
+        has_analysis: bool,
+    ) AddTrackError!*pdb.Track {
+        const a = (try e.openPdb()).arena.allocator();
+
+        // The device path of the track's ANLZ `.DAT`, derived from
+        // `file_path` the way players recompute it. Everything stays in
+        // the database arena, reclaimed with it.
+        const analyze_path = if (has_analysis) blk: {
+            const device_path = try anlzDevicePath(a, track.file_path);
+            break :blk try pdb.DeviceSQLString.fromUtf8(a, device_path);
+        } else pdb.DeviceSQLString.empty();
+
+        // Only `comment` is re-encoded after this, by the padding pass;
+        // every other string is encoded exactly once.
+        const boxed = try a.create(pdb.Track);
+        boxed.* = .{
+            .bitmask = track_bitmask,
+            .unknown5 = track_unknown5,
+            .sample_rate = track.sample_rate,
+            .sample_depth = track.sample_depth,
+            .bitrate = track.bitrate,
+            .duration = track.duration_secs,
+            .file_size = track.file_size,
+            // The pdb stores centi-BPM: a negative or non-finite tempo
+            // encodes as zero, an oversized one saturates.
+            .tempo = std.math.lossyCast(u32, @round(track.tempo * 100.0)),
+            .file_type = track.file_type,
+            .track_number = track.track_number,
+            .disc_number = track.disc_number,
+            .year = track.year,
+            .play_count = track.play_count,
+            .rating = track.rating,
+            .color = track.color,
+            .offsets = .{ .inner = .{
+                .isrc = try pdb.DeviceSQLString.fromUtf8(a, track.isrc),
+                .lyricist = try pdb.DeviceSQLString.fromUtf8(a, track.lyricist),
+                // Rekordbox writes "1" in both on fresh rows.
+                .unknown_string2 = try pdb.DeviceSQLString.fromUtf8(a, "1"),
+                .unknown_string3 = try pdb.DeviceSQLString.fromUtf8(a, "1"),
+                .message = try pdb.DeviceSQLString.fromUtf8(a, track.message),
+                .publish_track_information = try pdb.DeviceSQLString.fromUtf8(a, "ON"),
+                .autoload_hotcues = if (track.autoload_hotcues)
+                    try pdb.DeviceSQLString.fromUtf8(a, "ON")
+                else
+                    pdb.DeviceSQLString.empty(),
+                .date_added = try pdb.DeviceSQLString.fromUtf8(a, track.date_added),
+                .release_date = try pdb.DeviceSQLString.fromUtf8(a, track.release_date),
+                .mix_name = try pdb.DeviceSQLString.fromUtf8(a, track.mix_name),
+                .analyze_path = analyze_path,
+                .comment = try pdb.DeviceSQLString.fromUtf8(a, track.comment),
+                .title = try pdb.DeviceSQLString.fromUtf8(a, track.title),
+                .filename = try pdb.DeviceSQLString.fromUtf8(a, track.filename),
+                .file_path = try pdb.DeviceSQLString.fromUtf8(a, track.file_path),
+            } },
+        };
+        try pdb.padTrackCommentToMinimum(boxed, a);
+        return boxed;
+    }
+
+    /// Resolves `name` to an Artist row, inserting one when no scanned or
+    /// previously created artist carries the name. Empty names resolve to
+    /// the null id 0.
+    fn getOrCreateArtist(e: *DeviceExport, name: []const u8) AddTrackError!u32 {
+        const state = try e.writerState();
+        if (name.len == 0) return 0;
+        if (state.artists_by_name.get(name)) |id| return id;
+
+        const db = try e.openPdb();
+        const id = state.next_artist_id;
+        const a = db.arena.allocator();
+        const boxed = try a.create(pdb.Artist);
+        boxed.* = .{ .id = id, .offsets = .{ .inner = .{
+            .name = try pdb.DeviceSQLString.fromUtf8(a, name),
+        } } };
+        var row = pdb.Row{ .artist = boxed };
+        _ = try db.addRow(&row);
+        state.next_artist_id += 1;
+
+        try putStringIfAbsent(&state.artists_by_name, e.alloc, try e.alloc.dupe(u8, name), id);
+        return id;
+    }
+
+    /// Resolves `(artist_id, name)` to an Album row, inserting one when
+    /// needed — albums are per-artist. An empty name resolves to the null
+    /// id 0.
+    fn getOrCreateAlbum(
+        e: *DeviceExport,
+        name: []const u8,
+        artist_id: u32,
+    ) AddTrackError!u32 {
+        const state = try e.writerState();
+        if (name.len == 0) return 0;
+        if (state.albums_by_artist_and_name.get(.{ .artist_id = artist_id, .name = name })) |id|
+            return id;
+
+        const db = try e.openPdb();
+        const id = state.next_album_id;
+        const a = db.arena.allocator();
+        const boxed = try a.create(pdb.Album);
+        boxed.* = .{
+            .artist_id = artist_id,
+            .id = id,
+            .offsets = .{ .inner = .{ .name = try pdb.DeviceSQLString.fromUtf8(a, name) } },
+        };
+        var row = pdb.Row{ .album = boxed };
+        _ = try db.addRow(&row);
+        state.next_album_id += 1;
+
+        try putAlbumIfAbsent(
+            &state.albums_by_artist_and_name,
+            e.alloc,
+            .{ .artist_id = artist_id, .name = try e.alloc.dupe(u8, name) },
+            id,
+        );
+        return id;
+    }
+
+    /// Resolves `name` to a Genre row, inserting one when needed. Empty
+    /// names resolve to the null id 0.
+    fn getOrCreateGenre(e: *DeviceExport, name: []const u8) AddTrackError!u32 {
+        const state = try e.writerState();
+        if (name.len == 0) return 0;
+        if (state.genres_by_name.get(name)) |id| return id;
+
+        const db = try e.openPdb();
+        const id = state.next_genre_id;
+        const a = db.arena.allocator();
+        const boxed = try a.create(pdb.Genre);
+        boxed.* = .{ .id = id, .name = try pdb.DeviceSQLString.fromUtf8(a, name) };
+        var row = pdb.Row{ .genre = boxed };
+        _ = try db.addRow(&row);
+        state.next_genre_id += 1;
+
+        try putStringIfAbsent(&state.genres_by_name, e.alloc, try e.alloc.dupe(u8, name), id);
+        return id;
+    }
+
+    /// Resolves `name` — folded through `canonicalKeyName` — to a Key
+    /// row, inserting one when no canonical spelling matches. Empty names
+    /// resolve to the null id 0.
+    fn getOrCreateKey(e: *DeviceExport, name: []const u8) AddTrackError!u32 {
+        const state = try e.writerState();
+        if (name.len == 0) return 0;
+        const canonical = try canonicalKeyName(e.alloc, name);
+        defer e.alloc.free(canonical);
+        if (state.keys_by_canonical.get(canonical)) |id| return id;
+
+        const db = try e.openPdb();
+        const id = state.next_key_id;
+        const a = db.arena.allocator();
+        // The row stores the canonical spelling so later lookups collide
+        // across spellings; a name that folds to nothing (whitespace
+        // only) keeps the original.
+        const stored = if (canonical.len == 0) name else canonical;
+        const boxed = try a.create(pdb.Key);
+        boxed.* = .{
+            .id = id,
+            .id2 = id,
+            .name = try pdb.DeviceSQLString.fromUtf8(a, stored),
+        };
+        var row = pdb.Row{ .key = boxed };
+        _ = try db.addRow(&row);
+        state.next_key_id += 1;
+
+        try putStringIfAbsent(&state.keys_by_canonical, e.alloc, try e.alloc.dupe(u8, canonical), id);
+        return id;
+    }
+
+    /// Resolves `name` to a Label row, inserting one when needed. Empty
+    /// names resolve to the null id 0.
+    fn getOrCreateLabel(e: *DeviceExport, name: []const u8) AddTrackError!u32 {
+        const state = try e.writerState();
+        if (name.len == 0) return 0;
+        if (state.labels_by_name.get(name)) |id| return id;
+
+        const db = try e.openPdb();
+        const id = state.next_label_id;
+        const a = db.arena.allocator();
+        const boxed = try a.create(pdb.Label);
+        boxed.* = .{ .id = id, .name = try pdb.DeviceSQLString.fromUtf8(a, name) };
+        var row = pdb.Row{ .label = boxed };
+        _ = try db.addRow(&row);
+        state.next_label_id += 1;
+
+        try putStringIfAbsent(&state.labels_by_name, e.alloc, try e.alloc.dupe(u8, name), id);
+        return id;
+    }
+
+    /// Resolves `path` to an Artwork row, inserting one when no row
+    /// carries the path. The path lands in the row verbatim — the caller
+    /// owns placing the image files it names (decision 5; see
+    /// `artworkSpec`). An empty path resolves to the null id 0.
+    fn getOrCreateArtwork(e: *DeviceExport, path: []const u8) AddTrackError!u32 {
+        const state = try e.writerState();
+        if (path.len == 0) return 0;
+        if (state.artwork_by_path.get(path)) |id| return id;
+
+        const db = try e.openPdb();
+        const id = state.next_artwork_id;
+        const a = db.arena.allocator();
+        const boxed = try a.create(pdb.Artwork);
+        boxed.* = .{ .id = id, .path = try pdb.DeviceSQLString.fromUtf8(a, path) };
+        var row = pdb.Row{ .artwork = boxed };
+        _ = try db.addRow(&row);
+        state.next_artwork_id += 1;
+
+        try putStringIfAbsent(&state.artwork_by_path, e.alloc, try e.alloc.dupe(u8, path), id);
+        return id;
     }
 
     /// Writes the buffered export to disk — the handle's only
