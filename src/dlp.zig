@@ -1038,26 +1038,53 @@ fn loadTable(
     const count = try db.scalarInt("SELECT COUNT(*) FROM " ++ table ++ ";");
     var rows: std.ArrayListUnmanaged(T) = .empty;
     try rows.ensureTotalCapacity(a, @intCast(count));
-    while ((try stmt.step()) == .row) {
-        var row: T = undefined;
-        inline for (fields, 0..) |f, i| {
-            @field(row, f.name) = try decodeCell(f.type, a, stmt, i);
-        }
-        try rows.append(a, row);
-    }
+    while ((try stmt.step()) == .row) try rows.append(a, try decodeRow(T, a, stmt));
     out_rows.* = rows.items;
 }
 
-/// Reads one column of one row into its model field: integers through
-/// SQLite's numeric conversion, text copied into the library's arena.
-/// Nullable columns read NULL as null (non-null text is copied even when
-/// empty — the fixture's `isrc` is `''`, not NULL).
-fn decodeCell(comptime F: type, a: std.mem.Allocator, stmt: Stmt, i: usize) LoadError!F {
-    if (F == i64) return stmt.readInt(i);
-    if (F == ?i64) return if (stmt.isNull(i)) null else stmt.readInt(i);
-    if (F == []const u8) return try a.dupe(u8, stmt.readText(i));
-    if (F == ?[]const u8) return if (stmt.isNull(i)) null else try a.dupe(u8, stmt.readText(i));
-    @compileError("unsupported OneLibrary column type: " ++ @typeName(F));
+/// Decodes one row into `T` in two passes over the comptime field list:
+/// integers through SQLite's numeric conversion, text first borrowed from
+/// the statement (valid until the next step) and then copied into one
+/// arena allocation holding all of the row's strings contiguously. The
+/// per-row pool replaces one allocation per text cell. Nullable columns
+/// read NULL as null (non-null text is copied even when empty — the
+/// fixture's `isrc` is `''`, not NULL).
+fn decodeRow(comptime T: type, a: std.mem.Allocator, stmt: Stmt) LoadError!T {
+    const fields = @typeInfo(T).@"struct".fields;
+    var row: T = undefined;
+    var texts: [fields.len]?[]const u8 = undefined;
+    var len: usize = 0;
+    inline for (fields, 0..) |f, i| {
+        switch (f.type) {
+            i64 => @field(row, f.name) = stmt.readInt(i),
+            ?i64 => @field(row, f.name) = if (stmt.isNull(i)) null else stmt.readInt(i),
+            []const u8, ?[]const u8 => {
+                texts[i] = if (f.type == ?[]const u8 and stmt.isNull(i))
+                    null
+                else
+                    stmt.readText(i);
+                if (texts[i]) |t| len += t.len;
+            },
+            else => @compileError("unsupported OneLibrary column type: " ++ @typeName(f.type)),
+        }
+    }
+    const buf = try a.alloc(u8, len);
+    var off: usize = 0;
+    inline for (fields, 0..) |f, i| {
+        switch (f.type) {
+            []const u8, ?[]const u8 => {
+                if (texts[i]) |t| {
+                    @memcpy(buf[off..][0..t.len], t);
+                    @field(row, f.name) = buf[off..][0..t.len];
+                    off += t.len;
+                } else if (f.type == ?[]const u8) {
+                    @field(row, f.name) = null;
+                }
+            },
+            else => {},
+        }
+    }
+    return row;
 }
 
 /// Field-wise equality of one row pair (`Library.eql`'s inner loop).
@@ -1069,14 +1096,15 @@ fn rowEql(comptime T: type, a: *const T, b: *const T) bool {
 }
 
 fn cellEql(comptime F: type, a: F, b: F) bool {
-    if (F == i64) return a == b;
-    if (F == []const u8) return std.mem.eql(u8, a, b);
-    if (F == ?i64) return (a == null and b == null) or (a != null and b != null and a.? == b.?);
-    if (F == ?[]const u8) {
-        return (a == null and b == null) or
-            (a != null and b != null and std.mem.eql(u8, a.?, b.?));
-    }
-    @compileError("unsupported OneLibrary column type: " ++ @typeName(F));
+    return switch (F) {
+        i64, ?i64 => a == b,
+        []const u8 => std.mem.eql(u8, a, b),
+        ?[]const u8 => if (a) |x|
+            (b != null and std.mem.eql(u8, x, b.?))
+        else
+            b == null,
+        else => @compileError("unsupported OneLibrary column type: " ++ @typeName(F)),
+    };
 }
 
 /// Builds one id → row-index map (see `id_tables`); SQLite's PK
