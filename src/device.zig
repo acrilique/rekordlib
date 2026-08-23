@@ -1910,6 +1910,19 @@ fn buildTagRow(
     return boxed;
 }
 
+/// Walks every row of `db`'s `page_type` table in row order, handing
+/// each to `visit(ctx, row)`; a table the database doesn't carry walks
+/// nothing (see `rowsOrEmpty`).
+fn forEachRow(
+    db: *const pdb.Database,
+    page_type: pdb.PageType,
+    ctx: anytype,
+    comptime visit: anytype,
+) ScanError!void {
+    var it = (try rowsOrEmpty(db, page_type)) orelse return;
+    while (try it.next()) |row| try visit(ctx, row);
+}
+
 /// Scans `tracks`: every id into `track_ids` (playlist-membership FK
 /// checks), every non-empty file path into `tracks_by_path`, and the
 /// id counter past the highest track id.
@@ -1918,17 +1931,16 @@ fn scanTracks(
     db: *const pdb.Database,
     state: *WriterState,
 ) ScanError!void {
-    var it = try rowsOrEmpty(db, .tracks);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const track = row.track;
-            try state.track_ids.put(alloc, track.id, {});
-            state.next_track_id = @max(state.next_track_id, track.id +| 1);
-            if (try decodeOrSkip(track.offsets.inner.file_path, alloc)) |path| {
-                if (path.len > 0)
-                    try putIfAbsent(&state.tracks_by_path, alloc, path, track.id);
-            }
-        }
+    try forEachRow(db, .tracks, .{ .alloc = alloc, .state = state }, visitTrack);
+}
+
+fn visitTrack(ctx: anytype, row: *const pdb.Row) ScanError!void {
+    const track = row.track;
+    try ctx.state.track_ids.put(ctx.alloc, track.id, {});
+    ctx.state.next_track_id = @max(ctx.state.next_track_id, track.id +| 1);
+    if (try decodeOrSkip(track.offsets.inner.file_path, ctx.alloc)) |path| {
+        if (path.len > 0)
+            try putIfAbsent(&ctx.state.tracks_by_path, ctx.alloc, path, track.id);
     }
 }
 
@@ -1939,15 +1951,14 @@ fn scanArtists(
     db: *const pdb.Database,
     state: *WriterState,
 ) ScanError!void {
-    var it = try rowsOrEmpty(db, .artists);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const artist = row.artist;
-            state.next_artist_id = @max(state.next_artist_id, artist.id +| 1);
-            if (try decodeOrSkip(artist.offsets.inner.name, alloc)) |name| {
-                try putIfAbsent(&state.artists_by_name, alloc, name, artist.id);
-            }
-        }
+    try forEachRow(db, .artists, .{ .alloc = alloc, .state = state }, visitArtist);
+}
+
+fn visitArtist(ctx: anytype, row: *const pdb.Row) ScanError!void {
+    const artist = row.artist;
+    ctx.state.next_artist_id = @max(ctx.state.next_artist_id, artist.id +| 1);
+    if (try decodeOrSkip(artist.offsets.inner.name, ctx.alloc)) |name| {
+        try putIfAbsent(&ctx.state.artists_by_name, ctx.alloc, name, artist.id);
     }
 }
 
@@ -1959,20 +1970,19 @@ fn scanAlbums(
     db: *const pdb.Database,
     state: *WriterState,
 ) ScanError!void {
-    var it = try rowsOrEmpty(db, .albums);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const album = row.album;
-            state.next_album_id = @max(state.next_album_id, album.id +| 1);
-            if (try decodeOrSkip(album.offsets.inner.name, alloc)) |name| {
-                try putIfAbsent(
-                    &state.albums_by_artist_and_name,
-                    alloc,
-                    AlbumKey{ .artist_id = album.artist_id, .name = name },
-                    album.id,
-                );
-            }
-        }
+    try forEachRow(db, .albums, .{ .alloc = alloc, .state = state }, visitAlbum);
+}
+
+fn visitAlbum(ctx: anytype, row: *const pdb.Row) ScanError!void {
+    const album = row.album;
+    ctx.state.next_album_id = @max(ctx.state.next_album_id, album.id +| 1);
+    if (try decodeOrSkip(album.offsets.inner.name, ctx.alloc)) |name| {
+        try putIfAbsent(
+            &ctx.state.albums_by_artist_and_name,
+            ctx.alloc,
+            AlbumKey{ .artist_id = album.artist_id, .name = name },
+            album.id,
+        );
     }
 }
 
@@ -1983,15 +1993,14 @@ fn scanGenres(
     db: *const pdb.Database,
     state: *WriterState,
 ) ScanError!void {
-    var it = try rowsOrEmpty(db, .genres);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const genre = row.genre;
-            state.next_genre_id = @max(state.next_genre_id, genre.id +| 1);
-            if (try decodeOrSkip(genre.name, alloc)) |name| {
-                try putIfAbsent(&state.genres_by_name, alloc, name, genre.id);
-            }
-        }
+    try forEachRow(db, .genres, .{ .alloc = alloc, .state = state }, visitGenre);
+}
+
+fn visitGenre(ctx: anytype, row: *const pdb.Row) ScanError!void {
+    const genre = row.genre;
+    ctx.state.next_genre_id = @max(ctx.state.next_genre_id, genre.id +| 1);
+    if (try decodeOrSkip(genre.name, ctx.alloc)) |name| {
+        try putIfAbsent(&ctx.state.genres_by_name, ctx.alloc, name, genre.id);
     }
 }
 
@@ -2003,16 +2012,15 @@ fn scanKeys(
     db: *const pdb.Database,
     state: *WriterState,
 ) ScanError!void {
-    var it = try rowsOrEmpty(db, .keys);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const key = row.key;
-            state.next_key_id = @max(state.next_key_id, key.id +| 1);
-            if (try decodeOrSkip(key.name, alloc)) |name| {
-                const canonical = try canonicalKeyName(alloc, name);
-                try putIfAbsent(&state.keys_by_canonical, alloc, canonical, key.id);
-            }
-        }
+    try forEachRow(db, .keys, .{ .alloc = alloc, .state = state }, visitKey);
+}
+
+fn visitKey(ctx: anytype, row: *const pdb.Row) ScanError!void {
+    const key = row.key;
+    ctx.state.next_key_id = @max(ctx.state.next_key_id, key.id +| 1);
+    if (try decodeOrSkip(key.name, ctx.alloc)) |name| {
+        const canonical = try canonicalKeyName(ctx.alloc, name);
+        try putIfAbsent(&ctx.state.keys_by_canonical, ctx.alloc, canonical, key.id);
     }
 }
 
@@ -2023,15 +2031,14 @@ fn scanLabels(
     db: *const pdb.Database,
     state: *WriterState,
 ) ScanError!void {
-    var it = try rowsOrEmpty(db, .labels);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const label = row.label;
-            state.next_label_id = @max(state.next_label_id, label.id +| 1);
-            if (try decodeOrSkip(label.name, alloc)) |name| {
-                try putIfAbsent(&state.labels_by_name, alloc, name, label.id);
-            }
-        }
+    try forEachRow(db, .labels, .{ .alloc = alloc, .state = state }, visitLabel);
+}
+
+fn visitLabel(ctx: anytype, row: *const pdb.Row) ScanError!void {
+    const label = row.label;
+    ctx.state.next_label_id = @max(ctx.state.next_label_id, label.id +| 1);
+    if (try decodeOrSkip(label.name, ctx.alloc)) |name| {
+        try putIfAbsent(&ctx.state.labels_by_name, ctx.alloc, name, label.id);
     }
 }
 
@@ -2042,15 +2049,14 @@ fn scanArtwork(
     db: *const pdb.Database,
     state: *WriterState,
 ) ScanError!void {
-    var it = try rowsOrEmpty(db, .artwork);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const artwork = row.artwork;
-            state.next_artwork_id = @max(state.next_artwork_id, artwork.id +| 1);
-            if (try decodeOrSkip(artwork.path, alloc)) |path| {
-                try putIfAbsent(&state.artwork_by_path, alloc, path, artwork.id);
-            }
-        }
+    try forEachRow(db, .artwork, .{ .alloc = alloc, .state = state }, visitArtwork);
+}
+
+fn visitArtwork(ctx: anytype, row: *const pdb.Row) ScanError!void {
+    const artwork = row.artwork;
+    ctx.state.next_artwork_id = @max(ctx.state.next_artwork_id, artwork.id +| 1);
+    if (try decodeOrSkip(artwork.path, ctx.alloc)) |path| {
+        try putIfAbsent(&ctx.state.artwork_by_path, ctx.alloc, path, artwork.id);
     }
 }
 
@@ -2061,14 +2067,13 @@ fn scanPlaylistTree(
     db: *const pdb.Database,
     state: *WriterState,
 ) ScanError!void {
-    var it = try rowsOrEmpty(db, .playlist_tree);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const node = row.playlist_tree_node;
-            state.next_playlist_node_id = @max(state.next_playlist_node_id, node.id +| 1);
-            try state.playlist_nodes.put(alloc, node.id, node.isFolder());
-        }
-    }
+    try forEachRow(db, .playlist_tree, .{ .alloc = alloc, .state = state }, visitPlaylistTreeNode);
+}
+
+fn visitPlaylistTreeNode(ctx: anytype, row: *const pdb.Row) ScanError!void {
+    const node = row.playlist_tree_node;
+    ctx.state.next_playlist_node_id = @max(ctx.state.next_playlist_node_id, node.id +| 1);
+    try ctx.state.playlist_nodes.put(ctx.alloc, node.id, node.isFolder());
 }
 
 /// Scans `playlist_entries`: per-playlist `entry_index` high-water
@@ -2078,15 +2083,14 @@ fn scanPlaylistEntries(
     db: *const pdb.Database,
     state: *WriterState,
 ) ScanError!void {
-    var it = try rowsOrEmpty(db, .playlist_entries);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const entry = row.playlist_entry;
-            const gop = try state.playlist_entry_counts.getOrPut(alloc, entry.playlist_id);
-            if (!gop.found_existing) gop.value_ptr.* = 0;
-            gop.value_ptr.* = @max(gop.value_ptr.*, entry.entry_index +| 1);
-        }
-    }
+    try forEachRow(db, .playlist_entries, .{ .alloc = alloc, .state = state }, visitPlaylistEntry);
+}
+
+fn visitPlaylistEntry(ctx: anytype, row: *const pdb.Row) ScanError!void {
+    const entry = row.playlist_entry;
+    const gop = try ctx.state.playlist_entry_counts.getOrPut(ctx.alloc, entry.playlist_id);
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    gop.value_ptr.* = @max(gop.value_ptr.*, entry.entry_index +| 1);
 }
 
 /// Scans a plain database into a fresh `WriterState`: one pass per
@@ -2132,31 +2136,31 @@ pub fn scanExtTags(
     // PageType 3 means albums in a plain database and Tag pages in an
     // ext one; tables are looked up by raw value, so the ext table is
     // found by passing the colliding value.
-    var it = try rowsOrEmpty(ext_db, @enumFromInt(@intFromEnum(pdb.ExtPageType.tag)));
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const tag = row.tag;
-            state.next_tag_id = @max(state.next_tag_id, tag.id +| 1);
-            state.next_tag_row_index = @max(
-                state.next_tag_row_index,
-                @as(u32, tag.index_shift) / 0x20 +| 1,
+    const page_type: pdb.PageType = @enumFromInt(@intFromEnum(pdb.ExtPageType.tag));
+    try forEachRow(ext_db, page_type, .{ .alloc = alloc, .state = state }, visitTag);
+}
+
+fn visitTag(ctx: anytype, row: *const pdb.Row) ScanError!void {
+    const tag = row.tag;
+    ctx.state.next_tag_id = @max(ctx.state.next_tag_id, tag.id +| 1);
+    ctx.state.next_tag_row_index = @max(
+        ctx.state.next_tag_row_index,
+        @as(u32, tag.index_shift) / 0x20 +| 1,
+    );
+    if (tag.raw_is_category != 0) {
+        try ctx.state.tag_categories.put(ctx.alloc, tag.id, {});
+        ctx.state.next_category_position = @max(ctx.state.next_category_position, tag.position +| 1);
+    } else {
+        if (try decodeOrSkip(tag.offsets.inner.name, ctx.alloc)) |label| {
+            try putIfAbsent(
+                &ctx.state.tags_by_key,
+                ctx.alloc,
+                TagKey{ .category_id = tag.parent_id, .label = label },
+                tag.id,
             );
-            if (tag.raw_is_category != 0) {
-                try state.tag_categories.put(alloc, tag.id, {});
-                state.next_category_position = @max(state.next_category_position, tag.position +| 1);
-            } else {
-                if (try decodeOrSkip(tag.offsets.inner.name, alloc)) |label| {
-                    try putIfAbsent(
-                        &state.tags_by_key,
-                        alloc,
-                        TagKey{ .category_id = tag.parent_id, .label = label },
-                        tag.id,
-                    );
-                }
-                const gop = try state.tag_leaf_counts.getOrPut(alloc, tag.parent_id);
-                if (!gop.found_existing) gop.value_ptr.* = 0;
-                gop.value_ptr.* = @max(gop.value_ptr.*, tag.position +| 1);
-            }
         }
+        const gop = try ctx.state.tag_leaf_counts.getOrPut(ctx.alloc, tag.parent_id);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* = @max(gop.value_ptr.*, tag.position +| 1);
     }
 }
