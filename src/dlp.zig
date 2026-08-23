@@ -386,7 +386,10 @@ pub const Stmt = struct {
         _ = api.finalize(self.handle);
     }
 
-    pub fn reset(self: Stmt) SqlError!void {
+    /// Resets the statement and clears every binding: the rebind-everything
+    /// reuse discipline. (SQLite separates the two so callers can keep
+    /// bindings across a reset; nothing here needs that yet.)
+    pub fn resetAndClear(self: Stmt) SqlError!void {
         if (api.reset(self.handle) != c.SQLITE_OK) return error.Sqlite;
         _ = api.clear_bindings(self.handle);
     }
