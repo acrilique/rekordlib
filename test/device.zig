@@ -631,3 +631,44 @@ test "opened export edits persist through save" {
     const db2 = try check.openPdb();
     try testing.expectEqual(@as(usize, 1), try countTableRows(db2, .genres));
 }
+
+// --- writer: lazy scan (D5) ----------------------------------------------------
+
+/// Asserts `canonicalKeyName(in) == want`, freeing the owned result.
+fn expectCanonical(in: []const u8, want: []const u8) !void {
+    const alloc = testing.allocator;
+    const got = try device.canonicalKeyName(alloc, in);
+    defer alloc.free(got);
+    try testing.expectEqualStrings(want, got);
+}
+
+test "canonical key name folds major forms" {
+    try expectCanonical("C Major", "Cmaj");
+    try expectCanonical("Cmaj", "Cmaj");
+    try expectCanonical("C MAJOR", "Cmaj");
+    try expectCanonical("Cmajor", "Cmaj");
+    // The note letter's case is preserved as given.
+    try expectCanonical("c MAJOR", "cmaj");
+}
+
+test "canonical key name folds minor forms" {
+    try expectCanonical("A Minor", "Amin");
+    try expectCanonical("Amin", "Amin");
+    try expectCanonical("A MINOR", "Amin");
+    // Bare 'm' suffix is minor.
+    try expectCanonical("Am", "Amin");
+}
+
+test "canonical key name folds accidentals" {
+    // Unicode ♭/♯ and the words flat/sharp all collapse to ascii.
+    try expectCanonical("B\u{266d}m", "Bbmin");
+    try expectCanonical("B flat minor", "Bbmin");
+    try expectCanonical("F\u{266f}m", "F#min");
+    try expectCanonical("F sharp Minor", "F#min");
+}
+
+test "canonical key name dedups equivalent spellings" {
+    // The whole point: these must all collide so they share one pdb Key row.
+    try expectCanonical("D Major", "Dmaj");
+    try expectCanonical("", "");
+}

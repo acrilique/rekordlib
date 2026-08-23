@@ -667,3 +667,85 @@ pub fn getPlaylistsDb(
     try buildChildren(alloc, &groups, &visited, 0, &roots);
     return roots;
 }
+
+// --- writer state (D5) ---------------------------------------------------------
+
+/// Folds a musical key name to a canonical form for deduplication
+/// (`C Major`/`Cmaj`/`C MAJOR`/`Cmajor` → `Cmaj`), so different spellings
+/// of one key share a single pdb Key row. The note letter keeps its case.
+///
+/// String-equality only: enharmonic equivalents (`B♭m` ≠ `A#m`), Camelot,
+/// and Open Key notation are not resolved — different pitch spellings
+/// still create distinct rows.
+///
+/// The walk matches tokens on the original text with ASCII case folding;
+/// the oracle lowercases a copy first and indexes back into the original
+/// per character, which misaligns whenever lowercasing changes byte
+/// length (e.g. `İ`). Output is identical on every input where the
+/// oracle's indexing holds, and total here.
+pub fn canonicalKeyName(alloc: std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]u8 {
+    const trimmed = std.mem.trim(u8, name, &std.ascii.whitespace);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(alloc);
+
+    var i: usize = 0;
+    while (i < trimmed.len) {
+        // Order matters: longest tokens first, so `major` folds as one
+        // token instead of matching `maj` and leaking the rest.
+        const folded = [_]struct { token: []const u8, emit: []const u8 }{
+            .{ .token = "major", .emit = "maj" },
+            .{ .token = "minor", .emit = "min" },
+            .{ .token = "flat", .emit = "b" },
+            .{ .token = "sharp", .emit = "#" },
+            .{ .token = "maj", .emit = "maj" },
+            .{ .token = "min", .emit = "min" },
+        };
+        var matched = false;
+        for (folded) |f| {
+            if (asciiStartsWithIgnoreCase(trimmed[i..], f.token)) {
+                try out.appendSlice(alloc, f.emit);
+                i += f.token.len;
+                matched = true;
+                break;
+            }
+        }
+        if (matched) continue;
+
+        // Not a recognized token: copy one codepoint through, folding the
+        // unicode accidentals and dropping spaces on the way. The oracle
+        // folds both in a second pass; folding while copying is
+        // equivalent because tokens are pure ASCII and can never span a
+        // folded character.
+        const cp_len = std.unicode.utf8ByteSequenceLength(trimmed[i]) catch 1;
+        const end = @min(i + cp_len, trimmed.len);
+        const codepoint = trimmed[i..end];
+        if (std.mem.eql(u8, codepoint, "♭")) {
+            try out.append(alloc, 'b');
+        } else if (std.mem.eql(u8, codepoint, "♯")) {
+            try out.append(alloc, '#');
+        } else if (codepoint.len != 1 or codepoint[0] != ' ') {
+            try out.appendSlice(alloc, codepoint);
+        }
+        i = end;
+    }
+
+    // Bare trailing 'm' is minor ("Cm" → "Cmin"). 'm', "min" and "maj"
+    // are ASCII, so the suffix checks cannot land inside a multi-byte
+    // codepoint.
+    if (out.items.len > 0 and out.items[out.items.len - 1] == 'm' and
+        !std.mem.endsWith(u8, out.items, "min") and !std.mem.endsWith(u8, out.items, "maj"))
+    {
+        try out.appendSlice(alloc, "in");
+    }
+
+    return out.toOwnedSlice(alloc);
+}
+
+/// Whether `s` starts with the (lowercase) `token`, ignoring ASCII case.
+fn asciiStartsWithIgnoreCase(s: []const u8, token: []const u8) bool {
+    if (s.len < token.len) return false;
+    for (s[0..token.len], token) |a, b| {
+        if (std.ascii.toLower(a) != b) return false;
+    }
+    return true;
+}
