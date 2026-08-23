@@ -745,7 +745,7 @@ pub fn canonicalKeyName(alloc: std.mem.Allocator, name: []const u8) std.mem.Allo
         };
         var matched = false;
         for (folded) |f| {
-            if (asciiStartsWithIgnoreCase(trimmed[i..], f.token)) {
+            if (std.ascii.startsWithIgnoreCase(trimmed[i..], f.token)) {
                 try out.appendSlice(alloc, f.emit);
                 i += f.token.len;
                 matched = true;
@@ -782,15 +782,6 @@ pub fn canonicalKeyName(alloc: std.mem.Allocator, name: []const u8) std.mem.Allo
     }
 
     return out.toOwnedSlice(alloc);
-}
-
-/// Whether `s` starts with the (lowercase) `token`, ignoring ASCII case.
-fn asciiStartsWithIgnoreCase(s: []const u8, token: []const u8) bool {
-    if (s.len < token.len) return false;
-    for (s[0..token.len], token) |a, b| {
-        if (std.ascii.toLower(a) != b) return false;
-    }
-    return true;
 }
 
 /// Dedup key of an Album row: albums are per-artist.
