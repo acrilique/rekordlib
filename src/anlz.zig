@@ -1198,6 +1198,14 @@ fn writeSection(content: Content, e: *bin.Emitter) WriteError!void {
     }
 }
 
+/// The 16-byte preamble following the 12-byte `PMAI` prefix, observed on
+/// every known file. Meaning unknown; Rekordbox writes this exact
+/// sequence, and the device writer emits it for the files it builds.
+pub const file_header_data = [16]u8{
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
 /// Writes a whole file: the `PMAI` header, `header_data`, and the sections,
 /// with every size derived from the content. The file header's `total_size`
 /// is patched in after the sections, since only then is it known.

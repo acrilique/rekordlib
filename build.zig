@@ -58,6 +58,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "bin", .module = bin },
+            .{ .name = "util", .module = util },
+            .{ .name = "anlz", .module = anlz },
             .{ .name = "pdb", .module = pdb },
             .{ .name = "setting", .module = setting },
         },
