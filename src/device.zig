@@ -495,7 +495,7 @@ pub const AddTrackOutcome = struct {
 pub const AddTrackError =
     WriterStateError ||
     PathError ||
-    error{ TooLong, InvalidEncoding, InvalidUtf8 } ||
+    error{ TooLong, InvalidEncoding } ||
     pdb.DatabaseModifyError ||
     anlz.WriteError;
 
