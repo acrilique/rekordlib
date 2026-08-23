@@ -1031,7 +1031,11 @@ pub const DeviceExport = struct {
     /// Resolves `name` through `map` to a row built by `build_row`,
     /// inserting one under a fresh id when no scanned or previously
     /// created row carries the name; `counter` is the table's id counter.
-    /// Empty names resolve to the null id 0.
+    /// Empty names resolve to the null id 0. The map key is duped and its
+    /// capacity reserved before the insert, so the bookkeeping after it
+    /// cannot fail half-applied (the same discipline as `addTrack` and
+    /// `getOrCreateTag`: a failure can orphan a row, never leave the map
+    /// missing one).
     fn getOrCreateStringRow(
         state: *WriterState,
         db: *pdb.Database,
@@ -1048,12 +1052,13 @@ pub const DeviceExport = struct {
         if (map.get(name)) |id| return id;
 
         const id = counter.*;
+        const sa = state.arena.allocator();
+        const owned = try sa.dupe(u8, name);
+        try map.ensureUnusedCapacity(sa, 1);
         var row = try build_row(db.arena.allocator(), id, name);
         _ = try db.addRow(&row);
         counter.* = id + 1;
-
-        const sa = state.arena.allocator();
-        try putIfAbsent(map, sa, try sa.dupe(u8, name), id);
+        map.putAssumeCapacity(owned, id);
         return id;
     }
 
@@ -1071,6 +1076,9 @@ pub const DeviceExport = struct {
             return id;
 
         const id = state.next_album_id;
+        const sa = state.arena.allocator();
+        const owned = try sa.dupe(u8, name);
+        try state.albums_by_artist_and_name.ensureUnusedCapacity(sa, 1);
         const a = db.arena.allocator();
         const boxed = try a.create(pdb.Album);
         boxed.* = .{
@@ -1081,12 +1089,8 @@ pub const DeviceExport = struct {
         var row = pdb.Row{ .album = boxed };
         _ = try db.addRow(&row);
         state.next_album_id += 1;
-
-        const sa = state.arena.allocator();
-        try putIfAbsent(
-            &state.albums_by_artist_and_name,
-            sa,
-            AlbumKey{ .artist_id = artist_id, .name = try sa.dupe(u8, name) },
+        state.albums_by_artist_and_name.putAssumeCapacity(
+            AlbumKey{ .artist_id = artist_id, .name = owned },
             id,
         );
         return id;
@@ -1102,6 +1106,7 @@ pub const DeviceExport = struct {
         if (state.keys_by_canonical.get(canonical)) |id| return id;
 
         const id = state.next_key_id;
+        try state.keys_by_canonical.ensureUnusedCapacity(sa, 1);
         const a = db.arena.allocator();
         // The row stores the canonical spelling so later lookups collide
         // across spellings; a name that folds to nothing (whitespace
@@ -1116,8 +1121,7 @@ pub const DeviceExport = struct {
         var row = pdb.Row{ .key = boxed };
         _ = try db.addRow(&row);
         state.next_key_id += 1;
-
-        try putIfAbsent(&state.keys_by_canonical, sa, canonical, id);
+        state.keys_by_canonical.putAssumeCapacity(canonical, id);
         return id;
     }
 
