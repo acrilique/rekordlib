@@ -36,8 +36,7 @@ pub const DatFile = struct {
     kind: SettingKind,
 };
 
-/// The `*SETTING.DAT` files in a device export, in the order Rekordbox
-/// writes them.
+/// The `*SETTING.DAT` files in a device export
 pub const dat_files = [_]DatFile{
     .{ .name = "DEVSETTING.DAT", .kind = .dev_setting },
     .{ .name = "DJMMYSETTING.DAT", .kind = .djm_my_setting },
@@ -238,8 +237,7 @@ pub const Resolution = struct {
 
 /// What a caller must create on the device for an artwork row with `id`:
 /// two JPEG files under the `PIONEER/Artwork` shard folder. The caller
-/// writes the files and stores `thumbnail_path` in the pdb Artwork row, as
-/// Rekordbox does.
+/// writes the files and stores `thumbnail_path` in the pdb Artwork row.
 pub const ArtworkSpec = struct {
     /// Device-root-absolute path of the 80x80 thumbnail `a{id}.jpg` — the
     /// path stored in the pdb Artwork row.
@@ -311,11 +309,10 @@ const dat_limit = std.Io.Limit.limited(1 << 16);
 /// unreadable, over the read cap, or memory ran out.
 pub const LoadSettingsError = std.Io.Dir.ReadFileAllocError || std.Io.Dir.OpenError;
 
-/// Reads and parses one `*SETTING.DAT` file. A missing file or one that
-/// fails to parse yields null — old exports genuinely lack files — while
-/// errors that say the file could not be examined (permissions, memory,
-/// a length over the read cap) propagate instead of masquerading as
-/// absence.
+/// Reads and parses one `*SETTING.DAT` file. A missing or unparseable
+/// file yields null — old exports genuinely lack files — while errors
+/// examining it (permissions, memory, a length over the read cap)
+/// propagate.
 fn loadSettingFile(
     comptime Payload: type,
     io: std.Io,
@@ -378,14 +375,12 @@ pub const SaveError =
 /// `export.pdb`, or scanning it.
 pub const WriterStateError = OpenPdbError || ScanError;
 
-/// Reverse-engineered `bitmask` constant observed on fresh Rekordbox
-/// Track rows (`0x000c0700`). The OneLibrary db mirrors it as
-/// `contentLink`. Device-derived — copy exactly.
+/// `bitmask` value on fresh Rekordbox Track rows (`0x000c0700`); the
+/// OneLibrary db mirrors it as `contentLink`. Copy exactly.
 const track_bitmask: u32 = 788_224;
 
-/// Reverse-engineered `unknown5` constant observed on fresh Rekordbox
-/// Track rows. The OneLibrary db mirrors it as `analysedBits`.
-/// Device-derived — copy exactly.
+/// `unknown5` value on fresh Rekordbox Track rows; the OneLibrary db
+/// mirrors it as `analysedBits`. Copy exactly.
 const track_unknown5: u16 = 41;
 
 /// A track as a user thinks of it: plain UTF-8 string slices and scalars,
@@ -570,8 +565,7 @@ pub const DeviceExport = struct {
     };
 
     /// Lifecycle of the tag database. A created export starts `absent`
-    /// (the oracle's `create` never reads a leftover `exportExt.pdb`
-    /// either — its first tag write starts fresh); an opened one starts
+    /// (its first tag write starts fresh); an opened one starts
     /// `unloaded` and examines the disk at the first tag call.
     const ExtPdbState = union(enum) {
         /// Not examined yet; the first tag call checks the disk.
@@ -585,10 +579,9 @@ pub const DeviceExport = struct {
     };
 
     /// Points the handle at a device export on disk (a directory
-    /// containing `PIONEER`). Cheap and infallible: nothing is read until
-    /// a pdb-touching call, and the working directory a relative root
-    /// resolves against is opened at the first I/O call, not here. The
-    /// root path is borrowed; keep it alive until `deinit`.
+    /// containing `PIONEER`). Cheap and infallible: nothing is opened or
+    /// read until the first I/O call. The root path is borrowed; keep it
+    /// alive until `deinit`.
     pub fn open(root_path: []const u8, io: std.Io, alloc: std.mem.Allocator) DeviceExport {
         return .{
             .layout = .{ .root = root_path },
@@ -601,9 +594,7 @@ pub const DeviceExport = struct {
     /// The pinned working directory, opening it on first use. `Dir.cwd()`
     /// is only an `AT_FDCWD` sentinel — every call resolves against the
     /// process cwd as it is *then* — so a real handle is opened once and
-    /// reused, and the first I/O call fixes the directory every later
-    /// call resolves against. `open` cannot take it: opening can fail and
-    /// `open` is infallible.
+    /// reused.
     fn dirHandle(e: *DeviceExport) std.Io.Dir.OpenError!std.Io.Dir {
         if (e.dir == null) e.dir = try std.Io.Dir.cwd().openDir(e.io, ".", .{});
         return e.dir.?;
@@ -658,15 +649,14 @@ pub const DeviceExport = struct {
             // Fresh counters and empty maps: the default color/column/menu
             // rows live in tables the writer doesn't track.
             .writer_state = .{ .arena = std.heap.ArenaAllocator.init(alloc) },
-            // Tags start empty — even over a root carrying a leftover
-            // `exportExt.pdb`, which `save` then overwrites.
+            // Absent, not unloaded: create never reads a leftover
+            // `exportExt.pdb`.
             .ext_pdb_state = .absent,
         };
     }
 
     /// Frees everything the handle holds. Unsaved state is discarded —
-    /// there is no implicit flush; a created export that never called
-    /// `save` leaves nothing on disk.
+    /// there is no implicit flush.
     pub fn deinit(e: *DeviceExport) void {
         switch (e.pdb_state) {
             .loaded => |*db| db.deinit(),
@@ -691,8 +681,7 @@ pub const DeviceExport = struct {
 
     /// Loads the four `*SETTING.DAT` files in `dat_files` order. A
     /// missing or invalid file leaves its field null; a file that
-    /// cannot be examined is an error. The first call also pins the
-    /// working directory a relative root resolves against.
+    /// cannot be examined is an error.
     pub fn loadSettings(e: *DeviceExport) LoadSettingsError!Settings {
         const dir = try e.dirHandle();
         var settings = Settings{};
@@ -766,8 +755,7 @@ pub const DeviceExport = struct {
     /// between the dimension-row inserts and the Track row (allocation
     /// failure, or a database counters inconsistency) can still leave
     /// orphaned dimension rows — unreachable from any track, ignored by
-    /// players, not recovered automatically (the oracle's documented
-    /// residual risk).
+    /// players, not recovered automatically.
     pub fn addTrack(e: *DeviceExport, track: TrackInput) AddTrackError!AddTrackOutcome {
         const state = try e.writerState();
         if (track.file_path.len > 0) {
@@ -847,8 +835,7 @@ pub const DeviceExport = struct {
         const a = (try e.openPdb()).arena.allocator();
 
         // The device path of the track's ANLZ `.DAT`, derived from
-        // `file_path` the way players recompute it. Everything stays in
-        // the database arena, reclaimed with it.
+        // `file_path` the way players recompute it.
         const analyze_path = if (has_analysis) blk: {
             const device_path = try anlzDevicePath(a, track.file_path);
             break :blk try pdb.DeviceSQLString.fromUtf8(a, device_path);
@@ -903,9 +890,9 @@ pub const DeviceExport = struct {
         return boxed;
     }
 
-    /// Serializes the `ANLZ0000` images `track.analysis` asks for, gated
-    /// the way the oracle writes the siblings: `.DAT` only when it
-    /// carries a section beyond the leading path, `.EXT` when the
+    /// Serializes the `ANLZ0000` images `track.analysis` asks for:
+    /// `.DAT` only when it carries a section beyond the leading path,
+    /// `.EXT` when the
     /// extended-cue list is non-empty or any of its optional column
     /// groups is present (present-but-empty writes the file; null skips
     /// it), `.2EX` when either 3-band group is present. Tracks without
@@ -949,9 +936,7 @@ pub const DeviceExport = struct {
                 null,
         });
 
-        // `.EXT`: extended cues plus the optional column groups — a
-        // present-but-empty column group writes the file (its section is
-        // appended), a null one skips it.
+        // `.EXT`: extended cues plus the optional column groups.
         files[1] = try e.serializeAnlzGroup(track.file_path, .ext, &.{
             path_section,
             if (input.cues_extended.len > 0)
@@ -991,11 +976,9 @@ pub const DeviceExport = struct {
         return files;
     }
 
-    /// Serializes the non-null of `sections` — the leading path section
-    /// plus whichever optional groups `track.analysis` carried — into
-    /// one sibling's image, paired with the host path it lands at. Only
-    /// the path section present means the sibling carries no data, and
-    /// nothing is queued for it.
+    /// Serializes the non-null `sections` into one sibling's image,
+    /// paired with the host path it lands at. If only the path section
+    /// is present, the sibling carries no data and nothing is queued.
     fn serializeAnlzGroup(
         e: *DeviceExport,
         file_path: []const u8,
@@ -1040,9 +1023,7 @@ pub const DeviceExport = struct {
         return .{ .path = path, .image = image };
     }
 
-    /// Resolves `name` to an Artist row, inserting one when no scanned or
-    /// previously created artist carries the name. Empty names resolve to
-    /// the null id 0.
+    /// `getOrCreateStringRow` for Artist rows.
     fn getOrCreateArtist(
         state: *WriterState,
         db: *pdb.Database,
@@ -1058,15 +1039,17 @@ pub const DeviceExport = struct {
         );
     }
 
-    /// `getOrCreateStringRow` for Genre, Label, and Artwork rows.
+    /// `getOrCreateStringRow` for Genre rows.
     fn getOrCreateGenre(state: *WriterState, db: *pdb.Database, name: []const u8) AddTrackError!u32 {
         return getOrCreateStringRow(state, db, &state.genres_by_name, &state.next_genre_id, buildGenreRow, name);
     }
 
+    /// `getOrCreateStringRow` for Label rows.
     fn getOrCreateLabel(state: *WriterState, db: *pdb.Database, name: []const u8) AddTrackError!u32 {
         return getOrCreateStringRow(state, db, &state.labels_by_name, &state.next_label_id, buildLabelRow, name);
     }
 
+    /// `getOrCreateStringRow` for Artwork rows.
     fn getOrCreateArtwork(state: *WriterState, db: *pdb.Database, path: []const u8) AddTrackError!u32 {
         return getOrCreateStringRow(state, db, &state.artwork_by_path, &state.next_artwork_id, buildArtworkRow, path);
     }
@@ -1193,9 +1176,9 @@ pub const DeviceExport = struct {
     }
 
     /// Inserts the node row and records it in the writer state. The name
-    /// encodes before any id is taken, so a name too long to encode
-    /// leaves the export untouched; the id counter bumps only after the
-    /// insert, so a failed call cannot mint a duplicate id.
+    /// encodes before anything is inserted, so a too-long name leaves
+    /// the export untouched; the id counter bumps only after the insert,
+    /// so a failed call mints no id.
     fn createPlaylistNode(
         e: *DeviceExport,
         name: []const u8,
@@ -1265,10 +1248,8 @@ pub const DeviceExport = struct {
 
     /// Creates a top-level tag category (e.g. "My Tags") in the tag
     /// database and returns its id. Leaf tags attach under a category
-    /// through `addTagsToTrack`. The tag database is the export's
-    /// `exportExt.pdb`, loaded lazily on first use — prior categories,
-    /// leaves, and junctions survive, and nothing lands on disk before
-    /// `save`.
+    /// through `addTagsToTrack`. The tag database (`exportExt.pdb`) loads
+    /// lazily on first use; nothing lands on disk before `save`.
     pub fn createTagCategory(e: *DeviceExport, name: []const u8) TagError!u32 {
         const state = try e.writerState();
         const db = try e.extDb();
@@ -1302,10 +1283,10 @@ pub const DeviceExport = struct {
     /// writer state, so recovery cannot see them). `track_id` must name
     /// an existing track and `category_id` a category this handle knows
     /// (one returned by `createTagCategory`, or one recovered from the
-    /// opened `exportExt.pdb`), else `UnknownForeignKey`. A failure between leaf rows leaves the
-    /// earlier ones inserted — unreachable junctions are ignored by
-    /// players, not recovered automatically (the same residual risk as
-    /// `addTrack`'s dimension rows).
+    /// opened `exportExt.pdb`), else `UnknownForeignKey`. A failure
+    /// between leaf rows leaves the earlier ones inserted — unreachable
+    /// junctions are ignored by players, not recovered automatically
+    /// (the same residual risk as `addTrack`'s dimension rows).
     pub fn addTagsToTrack(
         e: *DeviceExport,
         track_id: u32,
@@ -1408,10 +1389,9 @@ pub const DeviceExport = struct {
     }
 
     /// Examines `exportExt.pdb` once: present, it parses into the state
-    /// and its tag rows extend the writer state, so later tag calls
-    /// append instead of colliding; absent, the state is only marked so
-    /// the first tag write builds a fresh database in memory. A failure
-    /// leaves the state `unloaded` — a retry re-reads the file.
+    /// and its tag rows extend the writer state; absent, the state is
+    /// only marked. A failure leaves the state `unloaded` — a retry
+    /// re-reads the file.
     fn ensureExtLoaded(e: *DeviceExport) WriterStateError!void {
         if (e.ext_pdb_state != .unloaded) return;
 
@@ -1568,7 +1548,7 @@ pub const PlaylistTreeError = pdb.RowIterError || error{ InvalidEncoding, OutOfM
 /// Playlist-tree rows grouped by their parent id.
 const PlaylistGroups = std.AutoHashMap(u32, std.ArrayList(*const pdb.PlaylistTreeNode));
 
-/// Frees the grouping map built by `getPlaylists`.
+/// Frees the grouping map built by `getPlaylistsDb`.
 fn deinitGroups(alloc: std.mem.Allocator, groups: *PlaylistGroups) void {
     var it = groups.iterator();
     while (it.next()) |entry| entry.value_ptr.deinit(alloc);
@@ -1610,9 +1590,9 @@ fn buildChildren(
 /// Builds the playlist tree from a database's playlist-tree rows: nodes
 /// parented to 0 form the top level, folders recurse into their children,
 /// and names are decoded to owned UTF-8. Nodes unreachable from the root
-/// (parented to a missing id) do not appear; a folder id
-/// is expanded at most once, so parent-id cycles in corrupt data cannot
-/// recurse forever.
+/// (parented to a missing id) do not appear; a folder id is expanded at
+/// most once, so parent-id cycles in corrupt data cannot recurse
+/// forever.
 ///
 /// The caller owns the returned list; free it by deinitializing every
 /// element and then the list itself:
@@ -1654,13 +1634,6 @@ pub fn getPlaylistsDb(
 
 // --- writer state ---------------------------------------------------------------
 
-/// Folds a musical key name to a canonical form for deduplication
-/// (`C Major`/`Cmaj`/`C MAJOR`/`Cmajor` → `Cmaj`), so different spellings
-/// of one key share a single pdb Key row. The note letter keeps its case.
-///
-/// String-equality only: enharmonic equivalents (`B♭m` ≠ `A#m`), Camelot,
-/// and Open Key notation are not resolved — different pitch spellings
-/// still create distinct rows.
 /// Fold tokens for `canonicalKeyName`, longest first so `major` folds as
 /// one token instead of matching `maj` and leaking the rest.
 const key_name_folds = [_]struct { token: []const u8, emit: []const u8 }{
@@ -1672,6 +1645,13 @@ const key_name_folds = [_]struct { token: []const u8, emit: []const u8 }{
     .{ .token = "min", .emit = "min" },
 };
 
+/// Folds a musical key name to a canonical form for deduplication
+/// (`C Major`/`Cmaj`/`C MAJOR`/`Cmajor` → `Cmaj`), so different spellings
+/// of one key share a single pdb Key row. The note letter keeps its case.
+///
+/// String-equality only: enharmonic equivalents (`B♭m` ≠ `A#m`), Camelot,
+/// and Open Key notation are not resolved — different pitch spellings
+/// still create distinct rows.
 pub fn canonicalKeyName(alloc: std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]u8 {
     const trimmed = std.mem.trim(u8, name, &std.ascii.whitespace);
     var out = std.ArrayList(u8).empty;
@@ -1811,7 +1791,7 @@ pub const WriterState = struct {
     /// row count, so a reopened export with sparse indices doesn't
     /// collide.
     playlist_entry_counts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
-    /// Track ids by device file path (non-empty paths only; `add_track`
+    /// Track ids by device file path (non-empty paths only; `addTrack`
     /// dedups on this key).
     tracks_by_path: std.StringHashMapUnmanaged(u32) = .empty,
     artists_by_name: std.StringHashMapUnmanaged(u32) = .empty,
@@ -1943,14 +1923,13 @@ const TagRowInput = struct {
 };
 
 /// Builds a category or leaf Tag row in `a`, the tag database's arena —
-/// nothing is inserted and no counter is consumed. Device-derived
-/// constants, confirmed against real Rekordbox exports (device-derived —
-/// copy exactly): `subtype` `0x0680`, `raw_is_category` `1 << 24` for a
-/// category and `0` for a leaf, `index_shift` `row_index * 0x20` (0x20
-/// per row, truncated to the field's u16 as the oracle's `as` cast
-/// does). Leaf ids are sequential here, not the large random 32-bit
-/// values Rekordbox writes — unknown whether players care; revisit if
-/// round-trip fidelity is needed (oracle note).
+/// nothing is inserted and no counter is consumed. Constants observed
+/// on real Rekordbox exports, copy exactly: `subtype` `0x0680`,
+/// `raw_is_category` `1 << 24` for a category and `0` for a leaf,
+/// `index_shift` `row_index * 0x20`, truncated to the field's u16. Leaf
+/// ids are sequential here, not the large random 32-bit values Rekordbox
+/// writes — unknown whether players care; revisit if round-trip
+/// fidelity is needed.
 fn buildTagRow(
     a: std.mem.Allocator,
     input: TagRowInput,
