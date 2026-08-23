@@ -16,8 +16,8 @@
 //!   schema-pinned and arena-owned, with keyed access for the joins the
 //!   device reader needs;
 //! * the write layer (`Writer`): creates a fresh export's db (the real
-//!   schema plus its seeded defaults) and closes in the on-disk shape of
-//!   rb's exports.
+//!   schema plus its seeded defaults), inserts rows over the O2 models,
+//!   and closes in the on-disk shape of rb's exports.
 //!
 //! Build modes (`-Ddlp=off|vendored|system`): `off` compiles this module's
 //! types away from the binary (every runtime entry point is guarded by a
@@ -553,33 +553,33 @@ pub const LoadError = SqlError || error{SchemaMismatch};
 /// from the real schema.
 pub const Album = struct {
     album_id: i64,
-    name: ?[]const u8,
-    artist_id: ?i64,
-    image_id: ?i64,
-    isComplation: ?i64,
-    nameForSearch: ?[]const u8,
+    name: ?[]const u8 = null,
+    artist_id: ?i64 = null,
+    image_id: ?i64 = null,
+    isComplation: ?i64 = null,
+    nameForSearch: ?[]const u8 = null,
 };
 
 /// An `artist` row; shared by the five content artist roles through the
 /// `artist_id_<role>` foreign keys.
 pub const Artist = struct {
     artist_id: i64,
-    name: ?[]const u8,
-    nameForSearch: ?[]const u8,
+    name: ?[]const u8 = null,
+    nameForSearch: ?[]const u8 = null,
 };
 
 /// A `category` row: links a browse category to its `menuItem` column.
 pub const Category = struct {
     category_id: i64,
-    menuItem_id: ?i64,
-    sequenceNo: ?i64,
-    isVisible: ?i64,
+    menuItem_id: ?i64 = null,
+    sequenceNo: ?i64 = null,
+    isVisible: ?i64 = null,
 };
 
 /// A `color` row: the eight fixed track colors.
 pub const Color = struct {
     color_id: i64,
-    name: ?[]const u8,
+    name: ?[]const u8 = null,
 };
 
 /// A `content` row: one track. The central table of the db — every other
@@ -593,51 +593,51 @@ pub const Color = struct {
 /// `artist_id_originalArtist` are missing from the rbox 0.1.5 model).
 pub const Content = struct {
     content_id: i64,
-    title: ?[]const u8,
-    titleForSearch: ?[]const u8,
-    subtitle: ?[]const u8,
-    bpmx100: ?i64,
-    length: ?i64,
-    trackNo: ?i64,
-    discNo: ?i64,
-    artist_id_artist: ?i64,
-    artist_id_remixer: ?i64,
-    artist_id_originalArtist: ?i64,
-    artist_id_composer: ?i64,
-    artist_id_lyricist: ?i64,
-    album_id: ?i64,
-    genre_id: ?i64,
-    label_id: ?i64,
-    key_id: ?i64,
-    color_id: ?i64,
-    image_id: ?i64,
-    djComment: ?[]const u8,
-    rating: ?i64,
-    releaseYear: ?i64,
-    releaseDate: ?[]const u8,
-    dateCreated: ?[]const u8,
-    dateAdded: ?[]const u8,
-    path: ?[]const u8,
-    fileName: ?[]const u8,
-    fileSize: ?i64,
-    fileType: ?i64,
-    bitrate: ?i64,
-    bitDepth: ?i64,
-    samplingRate: ?i64,
-    isrc: ?[]const u8,
-    djPlayCount: ?i64,
-    isHotCueAutoLoadOn: ?i64,
-    isKuvoDeliverStatusOn: ?i64,
-    kuvoDeliveryComment: ?[]const u8,
-    masterDbId: ?i64,
-    masterContentId: ?i64,
-    analysisDataFilePath: ?[]const u8,
-    analysedBits: ?i64,
-    contentLink: ?i64,
-    hasModified: ?i64,
-    cueUpdateCount: ?i64,
-    analysisDataUpdateCount: ?i64,
-    informationUpdateCount: ?i64,
+    title: ?[]const u8 = null,
+    titleForSearch: ?[]const u8 = null,
+    subtitle: ?[]const u8 = null,
+    bpmx100: ?i64 = null,
+    length: ?i64 = null,
+    trackNo: ?i64 = null,
+    discNo: ?i64 = null,
+    artist_id_artist: ?i64 = null,
+    artist_id_remixer: ?i64 = null,
+    artist_id_originalArtist: ?i64 = null,
+    artist_id_composer: ?i64 = null,
+    artist_id_lyricist: ?i64 = null,
+    album_id: ?i64 = null,
+    genre_id: ?i64 = null,
+    label_id: ?i64 = null,
+    key_id: ?i64 = null,
+    color_id: ?i64 = null,
+    image_id: ?i64 = null,
+    djComment: ?[]const u8 = null,
+    rating: ?i64 = null,
+    releaseYear: ?i64 = null,
+    releaseDate: ?[]const u8 = null,
+    dateCreated: ?[]const u8 = null,
+    dateAdded: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    fileName: ?[]const u8 = null,
+    fileSize: ?i64 = null,
+    fileType: ?i64 = null,
+    bitrate: ?i64 = null,
+    bitDepth: ?i64 = null,
+    samplingRate: ?i64 = null,
+    isrc: ?[]const u8 = null,
+    djPlayCount: ?i64 = null,
+    isHotCueAutoLoadOn: ?i64 = null,
+    isKuvoDeliverStatusOn: ?i64 = null,
+    kuvoDeliveryComment: ?[]const u8 = null,
+    masterDbId: ?i64 = null,
+    masterContentId: ?i64 = null,
+    analysisDataFilePath: ?[]const u8 = null,
+    analysedBits: ?i64 = null,
+    contentLink: ?i64 = null,
+    hasModified: ?i64 = null,
+    cueUpdateCount: ?i64 = null,
+    analysisDataUpdateCount: ?i64 = null,
+    informationUpdateCount: ?i64 = null,
 };
 
 /// A `cue` row: one point or loop of one track (`content_id`), or of a hot
@@ -648,68 +648,68 @@ pub const Content = struct {
 /// no cue rows.
 pub const Cue = struct {
     cue_id: i64,
-    content_id: ?i64,
-    kind: ?i64,
-    colorTableIndex: ?i64,
-    cueComment: ?[]const u8,
-    isActiveLoop: ?i64,
-    beatLoopNumerator: ?i64,
-    beatLoopDenominator: ?i64,
-    inUsec: ?i64,
-    outUsec: ?i64,
-    in150FramePerSec: ?i64,
-    out150FramePerSec: ?i64,
-    inMpegFrameNumber: ?i64,
-    outMpegFrameNumber: ?i64,
-    inMpegAbs: ?i64,
-    outMpegAbs: ?i64,
-    inDecodingStartFramePosition: ?i64,
-    outDecodingStartFramePosition: ?i64,
-    inFileOffsetInBlock: ?i64,
-    OutFileOffsetInBlock: ?i64,
-    inNumberOfSampleInBlock: ?i64,
-    outNumberOfSampleInBlock: ?i64,
+    content_id: ?i64 = null,
+    kind: ?i64 = null,
+    colorTableIndex: ?i64 = null,
+    cueComment: ?[]const u8 = null,
+    isActiveLoop: ?i64 = null,
+    beatLoopNumerator: ?i64 = null,
+    beatLoopDenominator: ?i64 = null,
+    inUsec: ?i64 = null,
+    outUsec: ?i64 = null,
+    in150FramePerSec: ?i64 = null,
+    out150FramePerSec: ?i64 = null,
+    inMpegFrameNumber: ?i64 = null,
+    outMpegFrameNumber: ?i64 = null,
+    inMpegAbs: ?i64 = null,
+    outMpegAbs: ?i64 = null,
+    inDecodingStartFramePosition: ?i64 = null,
+    outDecodingStartFramePosition: ?i64 = null,
+    inFileOffsetInBlock: ?i64 = null,
+    OutFileOffsetInBlock: ?i64 = null,
+    inNumberOfSampleInBlock: ?i64 = null,
+    outNumberOfSampleInBlock: ?i64 = null,
 };
 
 /// A `genre` row: the db's copy of the pdb genre table.
 pub const Genre = struct {
     genre_id: i64,
-    name: ?[]const u8,
+    name: ?[]const u8 = null,
 };
 
 /// A `history` row: one play-history session (parent 0 = root). Empty in
 /// fresh exports; entries live in `history_content`.
 pub const History = struct {
     history_id: i64,
-    sequenceNo: ?i64,
-    name: ?[]const u8,
-    attribute: ?i64,
-    history_id_parent: ?i64,
+    sequenceNo: ?i64 = null,
+    name: ?[]const u8 = null,
+    attribute: ?i64 = null,
+    history_id_parent: ?i64 = null,
 };
 
 /// A `history_content` row: one track of one history session.
 pub const HistoryContent = struct {
-    history_id: ?i64,
-    content_id: ?i64,
-    sequenceNo: ?i64,
+    history_id: ?i64 = null,
+    content_id: ?i64 = null,
+    sequenceNo: ?i64 = null,
 };
 
 /// A `hotCueBankList` row: one hot cue bank (parent 0 = root); its cues
 /// link through `hotCueBankList_cue`. Empty in fresh exports.
 pub const HotCueBankList = struct {
     hotCueBankList_id: i64,
-    sequenceNo: ?i64,
-    name: ?[]const u8,
-    image_id: ?i64,
-    attribute: ?i64,
-    hotCueBankList_id_parent: ?i64,
+    sequenceNo: ?i64 = null,
+    name: ?[]const u8 = null,
+    image_id: ?i64 = null,
+    attribute: ?i64 = null,
+    hotCueBankList_id_parent: ?i64 = null,
 };
 
 /// A `hotCueBankList_cue` row: one cue of one bank.
 pub const HotCueBankListCue = struct {
-    hotCueBankList_id: ?i64,
-    cue_id: ?i64,
-    sequenceNo: ?i64,
+    hotCueBankList_id: ?i64 = null,
+    cue_id: ?i64 = null,
+    sequenceNo: ?i64 = null,
 };
 
 /// An `image` row: artwork referenced by content, playlist, and album
@@ -717,7 +717,7 @@ pub const HotCueBankListCue = struct {
 /// `{id/20+1:05}` shard as the pdb's `a{id}.jpg` thumbnails.
 pub const Image = struct {
     image_id: i64,
-    path: ?[]const u8,
+    path: ?[]const u8 = null,
 };
 
 /// A `key` row: a musical key name; id 0 = no key (the port's FK
@@ -725,13 +725,13 @@ pub const Image = struct {
 /// `key_id` 0.
 pub const Key = struct {
     key_id: i64,
-    name: ?[]const u8,
+    name: ?[]const u8 = null,
 };
 
 /// A `label` row.
 pub const Label = struct {
     label_id: i64,
-    name: ?[]const u8,
+    name: ?[]const u8 = null,
 };
 
 /// A `menuItem` row: a browse column header (27 in the fixture), named
@@ -739,8 +739,8 @@ pub const Label = struct {
 /// the pdb Menu rows.
 pub const MenuItem = struct {
     menuItem_id: i64,
-    kind: ?i64,
-    name: ?[]const u8,
+    kind: ?i64 = null,
+    name: ?[]const u8 = null,
 };
 
 /// A `myTag` row: the db's copy of the my-tag tree mirrored in
@@ -749,17 +749,17 @@ pub const MenuItem = struct {
 /// parent 0 = root; ids are random-looking u32s like ext tag ids.
 pub const MyTag = struct {
     myTag_id: i64,
-    sequenceNo: ?i64,
-    name: ?[]const u8,
-    attribute: ?i64,
-    myTag_id_parent: ?i64,
+    sequenceNo: ?i64 = null,
+    name: ?[]const u8 = null,
+    attribute: ?i64 = null,
+    myTag_id_parent: ?i64 = null,
 };
 
 /// A `myTag_content` row: track-to-tag junction; unlike the other
 /// junctions it carries no `sequenceNo`.
 pub const MyTagContent = struct {
-    myTag_id: ?i64,
-    content_id: ?i64,
+    myTag_id: ?i64 = null,
+    content_id: ?i64 = null,
 };
 
 /// A `playlist` row: one node of the playlist tree mirrored in the pdb
@@ -767,19 +767,19 @@ pub const MyTagContent = struct {
 /// `attribute` 0).
 pub const Playlist = struct {
     playlist_id: i64,
-    sequenceNo: ?i64,
-    name: ?[]const u8,
-    image_id: ?i64,
-    attribute: ?i64,
-    playlist_id_parent: ?i64,
+    sequenceNo: ?i64 = null,
+    name: ?[]const u8 = null,
+    image_id: ?i64 = null,
+    attribute: ?i64 = null,
+    playlist_id_parent: ?i64 = null,
 };
 
 /// A `playlist_content` row: playlist membership; `sequenceNo` is dense
 /// and 1-based in the fixture.
 pub const PlaylistContent = struct {
-    playlist_id: ?i64,
-    content_id: ?i64,
-    sequenceNo: ?i64,
+    playlist_id: ?i64 = null,
+    content_id: ?i64 = null,
+    sequenceNo: ?i64 = null,
 };
 
 /// The `property` row — a singleton; real exports carry exactly one.
@@ -788,31 +788,31 @@ pub const PlaylistContent = struct {
 /// `myTagMasterDBID` derives from the master db and writers may leave 0.
 /// and writers may leave 0.
 pub const Property = struct {
-    deviceName: ?[]const u8,
-    dbVersion: ?[]const u8,
-    numberOfContents: ?i64,
-    createdDate: ?[]const u8,
-    backGroundColorType: ?i64,
-    myTagMasterDBID: ?i64,
+    deviceName: ?[]const u8 = null,
+    dbVersion: ?[]const u8 = null,
+    numberOfContents: ?i64 = null,
+    createdDate: ?[]const u8 = null,
+    backGroundColorType: ?i64 = null,
+    myTagMasterDBID: ?i64 = null,
 };
 
 /// A `recommendedLike` row: a liked-track relation between two contents.
 /// `createdDate` is an INTEGER here (rbox models TEXT).
 pub const RecommendedLike = struct {
-    content_id_1: ?i64,
-    content_id_2: ?i64,
-    rating: ?i64,
-    createdDate: ?i64,
+    content_id_1: ?i64 = null,
+    content_id_2: ?i64 = null,
+    rating: ?i64 = null,
+    createdDate: ?i64 = null,
 };
 
 /// A `sort` row: the track-list column layout over `menuItem_id`.
 /// `sort_id` is 0-based (fixture rows run 0..16).
 pub const Sort = struct {
     sort_id: i64,
-    menuItem_id: ?i64,
-    sequenceNo: ?i64,
-    isVisible: ?i64,
-    isSelectedAsSubColumn: ?i64,
+    menuItem_id: ?i64 = null,
+    sequenceNo: ?i64 = null,
+    isVisible: ?i64 = null,
+    isSelectedAsSubColumn: ?i64 = null,
 };
 
 /// Every loaded table except `property` (a singleton loaded by hand):
@@ -868,7 +868,8 @@ const id_tables = .{
 /// schema order, and every non-primary-key column optional, because the
 /// real schema carries no NOT NULL anywhere; the fixture writes NULL
 /// for unset foreign keys (`artist_id_remixer`) and empty strings
-/// elsewhere (`isrc`), and both survive verbatim.
+/// elsewhere (`isrc`), and both survive verbatim. Optional fields default
+/// to null, so `Writer` input literals only name what they set.
 /// Integer columns are read through SQLite's numeric conversion; there
 /// are no enums — the reader layer interprets raw values.
 pub const Library = struct {
@@ -1304,6 +1305,51 @@ const default_sorts = [_]Sort{
     .{ .sort_id = 17, .menuItem_id = 22, .sequenceNo = 0, .isVisible = 0, .isSelectedAsSubColumn = 0 },
 };
 
+/// One explicit transaction: `deinit` rolls back unless `commit` ran, so
+/// `var tx = try Tx.begin(db); errdefer tx.deinit();` is the whole
+/// failure protocol of a multi-statement mutation.
+const Tx = struct {
+    db: Db,
+    spent: bool = false,
+
+    fn begin(db: Db) SqlError!Tx {
+        try db.exec("BEGIN IMMEDIATE;");
+        return .{ .db = db };
+    }
+
+    fn commit(tx: *Tx) SqlError!void {
+        try tx.db.exec("COMMIT;");
+        tx.spent = true;
+    }
+
+    /// Rolls the transaction back unless it was committed; a rollback
+    /// failure is swallowed — there is nothing left to do but leave the
+    /// connection to `close`.
+    fn deinit(tx: *Tx) void {
+        if (!tx.spent) tx.db.exec("ROLLBACK;") catch {};
+        tx.spent = true;
+    }
+};
+
+/// The row types `Writer.insert` accepts, with their SQL table names: the
+/// entity families a device writer mirrors (dimensions, content through
+/// `insertContent`, playlists, my-tags). Cue, history, and hot-cue-bank
+/// authoring is absent on purpose — fresh exports carry no rows there and
+/// rbox offers no inserts for them either.
+const write_tables = .{
+    .{ .row = Album, .table = "album" },
+    .{ .row = Artist, .table = "artist" },
+    .{ .row = Content, .table = "content" },
+    .{ .row = Genre, .table = "genre" },
+    .{ .row = Image, .table = "image" },
+    .{ .row = Key, .table = "key" },
+    .{ .row = Label, .table = "label" },
+    .{ .row = MyTag, .table = "myTag" },
+    .{ .row = MyTagContent, .table = "myTag_content" },
+    .{ .row = Playlist, .table = "playlist" },
+    .{ .row = PlaylistContent, .table = "playlist_content" },
+};
+
 /// Options of `Writer.create`.
 pub const CreateOptions = struct {
     /// Writes the db without the DLP passphrase — the plaintext side of
@@ -1319,10 +1365,12 @@ pub const CreateOptions = struct {
 
 /// A OneLibrary db opened for writing: `create` builds a fresh export's
 /// db (schema, seeded defaults, the property singleton), `open` attaches
-/// to an existing one, and `close` lands the on-disk shape of rb's
-/// exports. The schema carries no foreign keys, so no method validates
-/// ids — tree and junction semantics belong to the caller (the O4
-/// device writer).
+/// to an existing one, and both write through prepared SQL over the O2
+/// row models — inserts bind NULL for null fields and copy text before
+/// returning, so borrowed input is fine. First-class mutation is
+/// append-only, mirroring the device writer's stance; there is no update.
+/// The schema carries no foreign keys, so no method validates ids — tree
+/// and junction semantics belong to the caller (the O4 device writer).
 pub const Writer = struct {
     db: Db,
 
@@ -1396,7 +1444,86 @@ pub const Writer = struct {
         self.db.close();
         try folded;
     }
+
+    /// Inserts one row of any `write_tables` family, primary key
+    /// included: ids are the caller's to mint (`nextId`, or an ext tag's
+    /// id when mirroring my-tags). A duplicate key fails with
+    /// `error.Sqlite` and inserts nothing.
+    pub fn insert(self: Writer, row: anytype) SqlError!void {
+        const T = @TypeOf(row);
+        if (T == Content)
+            @compileError("insertContent maintains property.numberOfContents; use it for content rows");
+        return insertRow(self.db, comptime tableOf(T), row);
+    }
+
+    /// Inserts one `content` row and keeps `property.numberOfContents`
+    /// equal to the table count — both atomically, so a failure leaves
+    /// the count consistent. Dimension and junction rows are separate
+    /// `insert` calls (their orphaning risk is documented on the device
+    /// writer's `addTrack`, which drives this).
+    pub fn insertContent(self: Writer, row: Content) SqlError!void {
+        var tx = try Tx.begin(self.db);
+        errdefer tx.deinit();
+        try insertRow(self.db, "content", row);
+        try maintainNumberOfContents(tx.db);
+        try tx.commit();
+    }
+
+    /// Deletes the `content` row with `content_id` and maintains
+    /// `property.numberOfContents`. Junction rows referencing the track
+    /// are left in place — the schema carries no FK, and rbox's delete
+    /// leaves them too.
+    pub fn deleteContent(self: Writer, content_id: i64) SqlError!void {
+        var tx = try Tx.begin(self.db);
+        errdefer tx.deinit();
+        var stmt = try self.db.prepare("DELETE FROM content WHERE content_id = ?1;");
+        defer stmt.finalize();
+        try stmt.bindInt(1, content_id);
+        if ((try stmt.step()) != .done) return error.Sqlite;
+        try maintainNumberOfContents(tx.db);
+        try tx.commit();
+    }
+
+    /// `max(primary key) + 1` over `T`'s table — 1 when the table is
+    /// empty, since id 0 is the null foreign key. Count-based, not
+    /// monotonic: it reuses the id of a deleted last row, exactly like
+    /// SQLite's own rowid assignment.
+    pub fn nextId(self: Writer, comptime T: type) SqlError!i64 {
+        const sql = comptime "SELECT COALESCE(MAX(" ++ pkOf(T) ++ "), 0) + 1 FROM " ++ tableOf(T) ++ ";";
+        return self.db.scalarInt(sql);
+    }
+
+    /// The singleton property row's track count.
+    pub fn numberOfContents(self: Writer) SqlError!i64 {
+        return self.db.scalarInt("SELECT numberOfContents FROM property LIMIT 1;");
+    }
+
 };
+
+/// Count-derived `numberOfContents` maintenance (inside the caller's
+/// transaction): always equal to `SELECT COUNT(*) FROM content`, never a
+/// value a caller could pass stale.
+fn maintainNumberOfContents(db: Db) SqlError!void {
+    try db.exec("UPDATE property SET numberOfContents = (SELECT COUNT(*) FROM content);");
+}
+
+/// The SQL table behind a writable row type.
+fn tableOf(comptime T: type) []const u8 {
+    inline for (write_tables) |t| {
+        if (T == t.row) return t.table;
+    }
+    @compileError("Writer does not write " ++ @typeName(T));
+}
+
+/// The primary-key column of a row type — the first field, which every
+/// keyed model declares first (schema order). Junction rows fail the
+/// check: their first column is nullable.
+fn pkOf(comptime T: type) []const u8 {
+    const field = @typeInfo(T).@"struct".fields[0];
+    if (field.type != i64)
+        @compileError(@typeName(T) ++ " has no primary-key first column");
+    return field.name;
+}
 
 /// One INSERT, built and bound from the row's comptime layout — the
 /// write-side mirror of `decodeRow`: null fields bind NULL (one of the

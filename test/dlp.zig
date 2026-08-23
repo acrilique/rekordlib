@@ -493,10 +493,7 @@ test "O3 create: seeded defaults and the property row" {
     try testing.expectEqual(@as(usize, 0), lib.my_tags.len);
 
     // the property singleton, fixture values in
-    try testing.expectEqual(
-        @as(i64, 0),
-        try w.db.scalarInt("SELECT numberOfContents FROM property;"),
-    );
+    try testing.expectEqual(@as(i64, 0), try w.numberOfContents());
     const p = lib.property.?;
     try testing.expectEqualStrings("", p.deviceName.?);
     try testing.expectEqualStrings("10000", p.dbVersion.?);
@@ -561,4 +558,101 @@ fn integrityCheck(db: dlp.Db) ![]const u8 {
     defer stmt.finalize();
     try testing.expectEqual(.row, try stmt.step());
     return stmt.readText(0);
+}
+
+test "O3 round-trip: fixture models re-written into a fresh db are eql" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var fix_tmp = testing.tmpDir(.{});
+    defer fix_tmp.cleanup();
+    var fixture = try openPlaintextFixtureDb(io, &fix_tmp, alloc);
+    defer fixture.close();
+    var src = try dlp.Library.load(alloc, fixture);
+    defer src.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    defer alloc.free(db_path);
+    var w = try dlp.Writer.create(io, db_path, .{
+        .plaintext = true,
+        .created_date = "2026-07-16",
+        .my_tag_master_dbid = 3168300669,
+    });
+    for (src.genres) |row| try w.insert(row);
+    for (src.artists) |row| try w.insert(row);
+    for (src.albums) |row| try w.insert(row);
+    for (src.labels) |row| try w.insert(row);
+    for (src.images) |row| try w.insert(row);
+    for (src.playlists) |row| try w.insert(row);
+    for (src.my_tags) |row| try w.insert(row);
+    for (src.playlist_contents) |row| try w.insert(row);
+    for (src.my_tag_contents) |row| try w.insert(row);
+    for (src.contents) |row| try w.insertContent(row);
+    try w.close();
+
+    var db = try dlp.Db.openPlaintext(io, db_path);
+    defer db.close();
+    try testing.expectEqualStrings("ok", try integrityCheck(db));
+    var dst = try dlp.Library.load(alloc, db);
+    defer dst.deinit();
+    try testing.expect(src.eql(&dst));
+}
+
+test "O3 mutate: numberOfContents maintenance on insert and delete" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    defer alloc.free(db_path);
+    var w = try dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    defer w.db.close();
+
+    try testing.expectEqual(@as(i64, 0), try w.numberOfContents());
+    try testing.expectEqual(@as(i64, 1), try w.nextId(dlp.Content));
+
+    try w.insertContent(.{ .content_id = 1, .path = "/Contents/a.mp3" });
+    try w.insertContent(.{ .content_id = 2, .path = "/Contents/b.mp3", .rating = 3 });
+    try testing.expectEqual(@as(i64, 2), try w.numberOfContents());
+    try testing.expectEqual(@as(i64, 3), try w.nextId(dlp.Content));
+
+    try w.deleteContent(1);
+    try testing.expectEqual(@as(i64, 1), try w.numberOfContents());
+    try testing.expectEqual(@as(i64, 1), try w.db.scalarInt("SELECT COUNT(*) FROM content;"));
+    // count-derived: matches the table, and the property stays a singleton
+    try testing.expectEqual(@as(i64, 1), try w.db.scalarInt("SELECT COUNT(*) FROM property;"));
+    // MAX+1 reuses a deleted last id, like SQLite's own rowid assignment
+    try testing.expectEqual(@as(i64, 3), try w.nextId(dlp.Content));
+}
+
+test "O3 create: keyed db is encrypted and reopens through the provider" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    defer alloc.free(db_path);
+    {
+        var w = try dlp.Writer.create(io, db_path, .{ .created_date = "2026-08-23" });
+        try w.insertContent(.{ .content_id = 1, .path = "/Contents/a.mp3" });
+        try w.close();
+    }
+
+    // page 1 starts with the plaintext salt, never the SQLite magic
+    const raw = try tmp.dir.readFileAlloc(io, "ol.db", alloc, .limited(1 << 20));
+    defer alloc.free(raw);
+    try testing.expect(raw.len >= 4096);
+    try testing.expect(!std.mem.eql(u8, raw[0..16], "SQLite format 3\x00"));
+
+    var w = try dlp.Writer.open(io, db_path);
+    defer w.db.close();
+    try testing.expectEqual(@as(i64, 1), try w.numberOfContents());
+    try testing.expectEqualStrings("ok", try integrityCheck(w.db));
 }
