@@ -5,13 +5,14 @@
 //! On-disk layout of a Rekordbox device export: where `export.pdb`,
 //! `exportExt.pdb`, the `*SETTING.DAT` files and the `PIONEER`/`USBANLZ`/
 //! `Contents` directories live relative to the device root, plus the
-//! read-side handle that opens an export's settings and database through
-//! that layout.
+//! handle that opens an export's settings and database through that
+//! layout, and builds fresh ones.
 //!
 //! Ported from rekordcrate's `src/device/layout.rs` and
-//! `src/device/reader.rs`.
+//! `src/device/reader.rs`/`writer.rs`.
 
 const std = @import("std");
+const bin = @import("bin");
 const pdb = @import("pdb");
 const setting = @import("setting");
 
@@ -316,38 +317,145 @@ fn loadSettingFile(
     return parsed.data;
 }
 
-/// Error of `DeviceExportReader.openPdb`.
+/// Error of `DeviceExport.openPdb`: reading `export.pdb` off disk or
+/// parsing it.
 pub const OpenPdbError = std.Io.Dir.ReadFileAllocError || pdb.DatabaseDecodeError;
 
 /// Size cap when reading an `export.pdb`; the largest fixture is 2.9 MB.
 const pdb_limit = std.Io.Limit.limited(1 << 26);
 
-/// A read-side handle to a Rekordbox device export on disk: the setting
-/// files and the pdb database, located through `Layout`. Files the export
-/// carries but the reader does not model are ignored by design:
+/// Error of `DeviceExport.create`: `ExportAlreadyExists` is the
+/// exists-guard refusing a root that already carries a
+/// `PIONEER/rekordbox/export.pdb`; the rest is building the in-memory
+/// database and setting images.
+pub const CreateError =
+    std.Io.Dir.AccessError ||
+    pdb.DatabaseModifyError ||
+    bin.WriteError ||
+    error{ExportAlreadyExists};
+
+/// Error of the temp-file-then-rename write `save` performs per file.
+pub const AtomicWriteError =
+    std.Io.Dir.CreateFileAtomicError ||
+    std.Io.File.Writer.Error ||
+    std.Io.Dir.RenameError;
+
+/// Error of `DeviceExport.save`.
+pub const SaveError =
+    OpenPdbError ||
+    pdb.DatabaseEncodeError ||
+    pdb.ValidateAllTrackRowsError ||
+    std.Io.Dir.CreateDirPathError ||
+    AtomicWriteError;
+
+/// A handle to a Rekordbox device export on disk: the setting files and
+/// the pdb database, located through `Layout`. `open` points the handle
+/// at an existing export (reading; the `openPdb` escape hatch edits),
+/// `create` builds a fresh one in memory. `save` is the only call that
+/// writes; `deinit` discards whatever was never saved. Files the export
+/// carries but the handle does not model are ignored by design:
 /// `djprofile.nxs` (undocumented) and `exportLibrary.db`.
-pub const DeviceExportReader = struct {
+pub const DeviceExport = struct {
     layout: Layout,
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    /// The export's pdb, loaded on the first pdb-touching call — `open`
+    /// stays cheap for settings-only sessions.
+    pdb_state: PdbState = .unloaded,
+    /// Serialized default `*SETTING.DAT` images waiting for the first
+    /// `save` of a created export; always null for opened ones.
+    pending_settings: ?[dat_files.len][]u8 = null,
 
-    /// Points a reader at a device export on disk (a directory containing
-    /// `PIONEER`).
-    pub fn init(root_path: []const u8) DeviceExportReader {
-        return .{ .layout = .{ .root = root_path } };
+    const PdbState = union(enum) {
+        /// An export opened at `root`; the pdb parses on first touch.
+        unloaded,
+        /// In memory — parsed from disk or built by `create`.
+        loaded: pdb.Database,
+    };
+
+    /// Points the handle at a device export on disk (a directory
+    /// containing `PIONEER`). Cheap and infallible: nothing is read until
+    /// a pdb-touching call. The root path is borrowed; keep it alive
+    /// until `deinit`.
+    pub fn open(root_path: []const u8, io: std.Io, alloc: std.mem.Allocator) DeviceExport {
+        return .{ .layout = .{ .root = root_path }, .io = io, .alloc = alloc };
     }
 
-    pub fn root(r: DeviceExportReader) []const u8 {
-        return r.layout.root;
+    /// Builds a fresh export in memory: a created pdb carrying the fixed
+    /// 20-table layout (the `Unknown` slots must stay in place or CDJ
+    /// players crash) with the default color, column, and menu rows, plus
+    /// the four default setting files. Nothing touches the disk until
+    /// `save`, so a `deinit` without one leaves nothing behind.
+    pub fn create(
+        root_path: []const u8,
+        io: std.Io,
+        alloc: std.mem.Allocator,
+    ) CreateError!DeviceExport {
+        const layout = Layout{ .root = root_path };
+
+        // Exists-guard the oracle lacks: its `create_dir_all` silently
+        // orphans an existing export instead of refusing.
+        const pdb_path = try layout.exportPdb(alloc);
+        defer alloc.free(pdb_path);
+        if (std.Io.Dir.cwd().access(io, pdb_path, .{})) |_| {
+            return error.ExportAlreadyExists;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+
+        var db = try pdb.Database.create(alloc, .plain, &pdb.standard_table_page_types);
+        errdefer db.deinit();
+        try pdb.insertDefaultColors(&db);
+        try pdb.insertDefaultColumns(&db);
+        try pdb.insertDefaultMenus(&db);
+
+        var pending: [dat_files.len][]u8 = undefined;
+        var pending_filled: usize = 0;
+        errdefer for (pending[0..pending_filled]) |bytes| alloc.free(bytes);
+        inline for (dat_files) |dat| {
+            pending[pending_filled] = try setting.Setting(SettingPayload(dat.kind)).default().serialize(alloc);
+            pending_filled += 1;
+        }
+
+        return .{
+            .layout = layout,
+            .io = io,
+            .alloc = alloc,
+            .pdb_state = .{ .loaded = db },
+            .pending_settings = pending,
+        };
     }
 
-    /// Loads the four `*SETTING.DAT` files in `dat_files` order.
-    pub fn loadSettings(r: DeviceExportReader, io: std.Io, alloc: std.mem.Allocator) Settings {
+    /// Frees everything the handle holds. Unsaved state is discarded —
+    /// there is no implicit flush; a created export that never called
+    /// `save` leaves nothing on disk.
+    pub fn deinit(e: *DeviceExport) void {
+        switch (e.pdb_state) {
+            .loaded => |*db| db.deinit(),
+            .unloaded => {},
+        }
+        if (e.pending_settings) |pending| {
+            for (pending) |bytes| e.alloc.free(bytes);
+        }
+    }
+
+    pub fn root(e: *const DeviceExport) []const u8 {
+        return e.layout.root;
+    }
+
+    /// Loads the four `*SETTING.DAT` files in `dat_files` order. A file
+    /// that is missing, unreadable, or invalid leaves its field null —
+    /// settings loading is the tolerant side of the handle; pdb errors
+    /// are fatal.
+    pub fn loadSettings(e: *const DeviceExport) Settings {
         var settings = Settings{};
         inline for (dat_files) |dat| {
             const payload = loadSettingFile(
                 SettingPayload(dat.kind),
-                io,
-                alloc,
-                r.layout,
+                e.io,
+                e.alloc,
+                e.layout,
                 dat.name,
             );
             if (payload) |data| {
@@ -357,18 +465,83 @@ pub const DeviceExportReader = struct {
         return settings;
     }
 
-    /// Reads `export.pdb` and parses it into memory; changes to the
-    /// returned database are never written back to disk.
-    pub fn openPdb(
-        r: DeviceExportReader,
-        io: std.Io,
-        alloc: std.mem.Allocator,
-    ) OpenPdbError!pdb.Database {
-        const path = r.layout.exportPdb(alloc) catch return error.OutOfMemory;
-        defer alloc.free(path);
-        const buf = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, pdb_limit);
-        defer alloc.free(buf);
-        return pdb.Database.parse(alloc, buf, .plain);
+    /// The export's database, parsing it off disk on first call. Also the
+    /// escape hatch for row surgery: edits made here bypass the writer's
+    /// id counters and dedup maps (which scan once, at the first
+    /// first-class mutating call) and reach the disk at the next `save`.
+    pub fn openPdb(e: *DeviceExport) OpenPdbError!*pdb.Database {
+        switch (e.pdb_state) {
+            .loaded => |*db| return db,
+            .unloaded => {
+                const path = try e.layout.exportPdb(e.alloc);
+                defer e.alloc.free(path);
+                const buf = try std.Io.Dir.cwd().readFileAlloc(e.io, path, e.alloc, pdb_limit);
+                defer e.alloc.free(buf);
+                e.pdb_state = .{ .loaded = try pdb.Database.parse(e.alloc, buf, .plain) };
+                return &e.pdb_state.loaded;
+            },
+        }
+    }
+
+    /// The export's playlist tree (see `getPlaylistsDb` for the shape and
+    /// ownership rules).
+    pub fn getPlaylists(
+        e: *DeviceExport,
+    ) (OpenPdbError || PlaylistTreeError)!std.ArrayList(PlaylistNode) {
+        return getPlaylistsDb(e.alloc, try e.openPdb());
+    }
+
+    /// Writes the buffered export to disk — the handle's only
+    /// disk-writing call. Crash-safe order: the default directory tree
+    /// and the four setting files (a created export's first `save` only;
+    /// DATs are never rewritten later, and opened exports never write
+    /// them), then the other files the writer owns, and `export.pdb` —
+    /// the index everything else is reached through — last, so a crash
+    /// leaves orphan files players ignore, not rows naming missing data.
+    /// Every file lands through a same-directory temp file and an atomic
+    /// rename: readers see the old or the new file, never a torn one, and
+    /// a second `save` is byte-stable.
+    pub fn save(e: *DeviceExport) SaveError!void {
+        if (e.pending_settings) |pending| {
+            const cwd = std.Io.Dir.cwd();
+            const dirs = [_][]const u8{
+                try e.layout.rekordboxDir(e.alloc),
+                try e.layout.usbanlzDir(e.alloc),
+                try e.layout.contentsDir(e.alloc),
+            };
+            defer {
+                for (dirs) |dir| e.alloc.free(dir);
+            }
+            for (dirs) |dir| try cwd.createDirPath(e.io, dir);
+
+            // A failed write leaves every image owned by
+            // `pending_settings`, so `deinit` reclaims them; they are
+            // freed only once all four have landed.
+            inline for (dat_files, 0..) |dat, i| {
+                const path = try e.layout.datPath(e.alloc, dat.name);
+                defer e.alloc.free(path);
+                try e.writeFileAtomic(path, pending[i]);
+            }
+            for (pending) |bytes| e.alloc.free(bytes);
+            e.pending_settings = null;
+        }
+
+        const db = try e.openPdb();
+        try db.validateAllTrackRows();
+        const image = try db.serialize(e.alloc);
+        defer e.alloc.free(image);
+        const pdb_path = try e.layout.exportPdb(e.alloc);
+        defer e.alloc.free(pdb_path);
+        try e.writeFileAtomic(pdb_path, image);
+    }
+
+    /// Writes `bytes` to `path` through a same-directory temp file and an
+    /// atomic rename.
+    fn writeFileAtomic(e: *DeviceExport, path: []const u8, bytes: []const u8) AtomicWriteError!void {
+        var af = try std.Io.Dir.cwd().createFileAtomic(e.io, path, .{ .replace = true });
+        defer af.deinit(e.io);
+        try af.file.writeStreamingAll(e.io, bytes);
+        try af.replace(e.io);
     }
 };
 
@@ -406,8 +579,8 @@ pub const PlaylistNode = union(enum) {
     }
 };
 
-/// Error of `getPlaylists`.
-pub const GetPlaylistsError = pdb.RowIterError || error{ InvalidEncoding, OutOfMemory };
+/// Error of the playlist-tree walk.
+pub const PlaylistTreeError = pdb.RowIterError || error{ InvalidEncoding, OutOfMemory };
 
 /// Playlist-tree rows grouped by their parent id.
 const PlaylistGroups = std.AutoHashMap(u32, std.ArrayList(*const pdb.PlaylistTreeNode));
@@ -427,7 +600,7 @@ fn buildChildren(
     visited: *std.AutoHashMap(u32, void),
     parent: u32,
     out: *std.ArrayList(PlaylistNode),
-) GetPlaylistsError!void {
+) PlaylistTreeError!void {
     const nodes = groups.get(parent) orelse return;
     for (nodes.items) |node| {
         if (node.isFolder() and (try visited.getOrPut(node.id)).found_existing) continue;
@@ -451,7 +624,7 @@ fn buildChildren(
     }
 }
 
-/// Builds the playlist tree from the database's playlist-tree rows: nodes
+/// Builds the playlist tree from a database's playlist-tree rows: nodes
 /// parented to 0 form the top level, folders recurse into their children,
 /// and names are decoded to owned UTF-8. Nodes unreachable from the root
 /// (parented to a missing id) do not appear, as in rekordcrate; a folder id
@@ -461,15 +634,15 @@ fn buildChildren(
 /// The caller owns the returned list; free it by deinitializing every
 /// element and then the list itself:
 ///
-///     var playlists = try device.getPlaylists(alloc, &db);
+///     var playlists = try device.getPlaylistsDb(alloc, &db);
 ///     defer {
 ///         for (playlists.items) |*node| node.deinit(alloc);
 ///         playlists.deinit(alloc);
 ///     }
-pub fn getPlaylists(
+pub fn getPlaylistsDb(
     alloc: std.mem.Allocator,
     db: *const pdb.Database,
-) GetPlaylistsError!std.ArrayList(PlaylistNode) {
+) PlaylistTreeError!std.ArrayList(PlaylistNode) {
     var groups = PlaylistGroups.init(alloc);
     defer deinitGroups(alloc, &groups);
 

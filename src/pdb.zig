@@ -2788,9 +2788,7 @@ pub const Database = struct {
     /// tracks table and pass trivially. rekordcrate runs this on every
     /// flush; the device writer calls it before serializing, the
     /// whole-image model's equivalent moment.
-    pub fn validateAllTrackRows(
-        db: *const Database,
-    ) error{ TableTypeNotFound, TrackRowTooSmall, TrackRowTooLarge, UnexpectedValue }!void {
+    pub fn validateAllTrackRows(db: *const Database) ValidateAllTrackRowsError!void {
         if (db.db_type != .plain) return;
         const table = db.header.findTable(.tracks) orelse
             return error.TableTypeNotFound;
@@ -2902,6 +2900,14 @@ fn parsePage(
 /// of chain-final pages, and the exclusive upper bound of representable
 /// page indexes.
 pub const page_chain_end: u32 = 0x03FF_FFFF;
+
+/// Error of `Database.validateAllTrackRows`.
+pub const ValidateAllTrackRowsError = error{
+    TableTypeNotFound,
+    TrackRowTooSmall,
+    TrackRowTooLarge,
+    UnexpectedValue,
+};
 
 /// Page size of a created database.
 const default_page_size: u32 = 4096;

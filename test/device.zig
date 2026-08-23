@@ -5,6 +5,7 @@
 const std = @import("std");
 const device = @import("device");
 const pdb = @import("pdb");
+const setting = @import("setting");
 const testutil = @import("util.zig");
 
 const testing = std.testing;
@@ -220,8 +221,8 @@ test "reader loads all four settings of every fixture" {
     for (fixtures) |fixture| {
         const path = try std.fmt.allocPrint(alloc, "testdata/complete_export/{s}", .{fixture.name});
         defer alloc.free(path);
-        const reader = device.DeviceExportReader.init(path);
-        const settings = reader.loadSettings(io, alloc);
+        const ex = device.DeviceExport.open(path, io, alloc);
+        const settings = ex.loadSettings();
         try testing.expect(settings.dev_setting != null);
         try testing.expect(settings.djm_my_setting != null);
         try testing.expect(settings.my_setting != null);
@@ -249,16 +250,16 @@ test "settings loading tolerates missing and invalid files" {
     try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER/MYSETTING.DAT", .data = good });
     try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER/DJMMYSETTING.DAT", .data = "garbage" });
 
-    const reader = device.DeviceExportReader.init(tmp_path);
-    const settings = reader.loadSettings(io, alloc);
+    const ex = device.DeviceExport.open(tmp_path, io, alloc);
+    const settings = ex.loadSettings();
     try testing.expect(settings.my_setting != null);
     try testing.expect(settings.djm_my_setting == null);
     try testing.expect(settings.dev_setting == null);
     try testing.expect(settings.my_setting2 == null);
 
     // A root without any export content at all stays quiet and empty.
-    const empty_reader = device.DeviceExportReader.init(".zig-cache/definitely-not-here");
-    const empty_settings = empty_reader.loadSettings(io, alloc);
+    const empty_ex = device.DeviceExport.open(".zig-cache/definitely-not-here", io, alloc);
+    const empty_settings = empty_ex.loadSettings();
     try testing.expect(empty_settings.dev_setting == null);
     try testing.expect(empty_settings.djm_my_setting == null);
     try testing.expect(empty_settings.my_setting == null);
@@ -271,10 +272,10 @@ test "reader opens each fixture pdb and counts its tracks" {
     for (fixtures) |fixture| {
         const path = try std.fmt.allocPrint(alloc, "testdata/complete_export/{s}", .{fixture.name});
         defer alloc.free(path);
-        const reader = device.DeviceExportReader.init(path);
+        var ex = device.DeviceExport.open(path, io, alloc);
+        defer ex.deinit();
 
-        var db = try reader.openPdb(io, alloc);
-        defer db.deinit();
+        const db = try ex.openPdb();
 
         var tracks: usize = 0;
         var it = try db.rows(.tracks);
@@ -292,12 +293,10 @@ test "playlist trees match the fixtures" {
     for (fixtures) |fixture| {
         const path = try std.fmt.allocPrint(alloc, "testdata/complete_export/{s}", .{fixture.name});
         defer alloc.free(path);
-        const reader = device.DeviceExportReader.init(path);
+        var ex = device.DeviceExport.open(path, io, alloc);
+        defer ex.deinit();
 
-        var db = try reader.openPdb(io, alloc);
-        defer db.deinit();
-
-        var playlists = try device.getPlaylists(alloc, &db);
+        var playlists = try ex.getPlaylists();
         defer {
             for (playlists.items) |*node| node.deinit(alloc);
             playlists.deinit(alloc);
@@ -341,7 +340,7 @@ test "playlist tree nests folders in row order" {
         _ = try db.addRow(&row);
     }
 
-    var playlists = try device.getPlaylists(alloc, &db);
+    var playlists = try device.getPlaylistsDb(alloc, &db);
     defer {
         for (playlists.items) |*node| node.deinit(alloc);
         playlists.deinit(alloc);
@@ -389,7 +388,7 @@ test "playlist tree cuts parent-id cycles" {
         _ = try db.addRow(&row);
     }
 
-    var playlists = try device.getPlaylists(alloc, &db);
+    var playlists = try device.getPlaylistsDb(alloc, &db);
     defer {
         for (playlists.items) |*node| node.deinit(alloc);
         playlists.deinit(alloc);
@@ -407,4 +406,228 @@ test "playlist tree cuts parent-id cycles" {
     const inner = root_cycle.children.items[1].folder;
     try testing.expectEqual(@as(u32, 5), inner.id);
     try testing.expectEqual(@as(usize, 0), inner.children.items.len);
+}
+
+/// Counts the rows of one table through its page chain.
+fn countTableRows(db: *const pdb.Database, page_type: pdb.PageType) !usize {
+    var it = try db.rows(page_type);
+    var count: usize = 0;
+    while (try it.next()) |_| count += 1;
+    return count;
+}
+
+/// Copies the `empty` fixture's setting files and `export.pdb` into a
+/// temp-dir export root.
+fn copyEmptyFixture(tmp: *testing.TmpDir, io: std.Io, alloc: std.mem.Allocator) !void {
+    try tmp.dir.createDirPath(io, "PIONEER/rekordbox");
+    const pdb_image = try testutil.readFixture(
+        alloc,
+        "complete_export/empty/PIONEER/rekordbox/export.pdb",
+        .limited(1 << 22),
+    );
+    defer alloc.free(pdb_image);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "PIONEER/rekordbox/export.pdb",
+        .data = pdb_image,
+    });
+    for (device.dat_files) |dat| {
+        const src = try std.fmt.allocPrint(
+            alloc,
+            "complete_export/empty/PIONEER/{s}",
+            .{dat.name},
+        );
+        defer alloc.free(src);
+        const image = try testutil.readFixture(alloc, src, .limited(1 << 16));
+        defer alloc.free(image);
+        const dst = try std.fmt.allocPrint(alloc, "PIONEER/{s}", .{dat.name});
+        defer alloc.free(dst);
+        try tmp.dir.writeFile(io, .{ .sub_path = dst, .data = image });
+    }
+}
+
+test "create saves an export shaped like the empty fixture" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    try ex.save();
+
+    var reread = device.DeviceExport.open(tmp_path, io, alloc);
+    defer reread.deinit();
+    const db = try reread.openPdb();
+
+    const empty_image = try testutil.readFixture(
+        alloc,
+        "complete_export/empty/PIONEER/rekordbox/export.pdb",
+        .limited(1 << 22),
+    );
+    defer alloc.free(empty_image);
+    var empty = try pdb.Database.parse(alloc, empty_image, .plain);
+    defer empty.deinit();
+
+    // The fixed 20-table structure, in order.
+    try testing.expectEqual(empty.header.tables.len, db.header.tables.len);
+    for (empty.header.tables, db.header.tables) |want, got| {
+        try testing.expectEqual(want.page_type, got.page_type);
+    }
+
+    // Same rows as the real export in every content and defaults table.
+    // The one difference: rb writes a History row (the sync record) when
+    // it creates an export; the oracle's `create` — and ours — starts
+    // that table empty, so it is asserted as zero instead.
+    const table_types = [_]pdb.PageType{
+        .tracks,   .genres,           .artists,  .albums,
+        .labels,   .keys,             .colors,   .playlist_tree,
+        .playlist_entries, .history_playlists, .history_entries,
+        .artwork,  .columns,          .menu,
+    };
+    inline for (table_types) |page_type| {
+        try testing.expectEqual(
+            try countTableRows(&empty, page_type),
+            try countTableRows(db, page_type),
+        );
+    }
+    try testing.expectEqual(@as(usize, 1), try countTableRows(&empty, .history));
+    try testing.expectEqual(@as(usize, 0), try countTableRows(db, .history));
+    try testing.expectEqual(@as(usize, 8), try countTableRows(db, .colors));
+    try testing.expectEqual(@as(usize, 27), try countTableRows(db, .columns));
+    try testing.expectEqual(@as(usize, 22), try countTableRows(db, .menu));
+
+    // All four settings landed, parse back, and re-serialize byte-equal —
+    // the default constructors and checksums agree with a real export.
+    const settings = reread.loadSettings();
+    try testing.expect(settings.dev_setting != null);
+    try testing.expect(settings.djm_my_setting != null);
+    try testing.expect(settings.my_setting != null);
+    try testing.expect(settings.my_setting2 != null);
+    const dat = try tmp.dir.readFileAlloc(io, "PIONEER/DEVSETTING.DAT", alloc, .limited(1 << 16));
+    defer alloc.free(dat);
+    const reserialized = try (try setting.Setting(setting.DevSetting).parse(dat)).serialize(alloc);
+    defer alloc.free(reserialized);
+    try testing.expectEqualSlices(u8, dat, reserialized);
+
+    // The scaffolding of a created export.
+    try tmp.dir.access(io, "PIONEER/USBANLZ", .{});
+    try tmp.dir.access(io, "Contents", .{});
+}
+
+test "create without save leaves nothing on disk" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    ex.deinit();
+
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "PIONEER", .{}));
+}
+
+test "create refuses a root that already has an export" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    try copyEmptyFixture(&tmp, io, alloc);
+
+    try testing.expectError(
+        error.ExportAlreadyExists,
+        device.DeviceExport.create(tmp_path, io, alloc),
+    );
+}
+
+test "save is byte-stable" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    try ex.save();
+
+    const first = try tmp.dir.readFileAlloc(
+        io,
+        "PIONEER/rekordbox/export.pdb",
+        alloc,
+        .limited(1 << 26),
+    );
+    defer alloc.free(first);
+
+    // The second save rewrites the pdb only; the fresh-write model makes
+    // it byte-identical.
+    try ex.save();
+    const second = try tmp.dir.readFileAlloc(
+        io,
+        "PIONEER/rekordbox/export.pdb",
+        alloc,
+        .limited(1 << 26),
+    );
+    defer alloc.free(second);
+    try testing.expectEqualSlices(u8, first, second);
+
+    // And the settings were not rewritten: still exactly four DATs.
+    const settings = ex.loadSettings();
+    try testing.expect(settings.my_setting != null);
+}
+
+test "opened export edits persist through save" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+    try copyEmptyFixture(&tmp, io, alloc);
+
+    var ex = device.DeviceExport.open(tmp_path, io, alloc);
+    defer ex.deinit();
+    const db = try ex.openPdb();
+
+    // Escape-hatch surgery: a genre row through the modification layer.
+    const a = db.arena.allocator();
+    const genre = try a.create(pdb.Genre);
+    genre.* = .{ .id = 1, .name = try pdb.DeviceSQLString.fromUtf8(a, "Techno") };
+    var row = pdb.Row{ .genre = genre };
+    _ = try db.addRow(&row);
+
+    // An opened export never rewrites its setting files.
+    const dat_before = try tmp.dir.readFileAlloc(
+        io,
+        "PIONEER/MYSETTING.DAT",
+        alloc,
+        .limited(1 << 16),
+    );
+    defer alloc.free(dat_before);
+    try ex.save();
+    const dat_after = try tmp.dir.readFileAlloc(
+        io,
+        "PIONEER/MYSETTING.DAT",
+        alloc,
+        .limited(1 << 16),
+    );
+    defer alloc.free(dat_after);
+    try testing.expectEqualSlices(u8, dat_before, dat_after);
+
+    var check = device.DeviceExport.open(tmp_path, io, alloc);
+    defer check.deinit();
+    const db2 = try check.openPdb();
+    try testing.expectEqual(@as(usize, 1), try countTableRows(db2, .genres));
 }
