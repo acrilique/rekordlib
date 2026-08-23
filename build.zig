@@ -57,6 +57,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "bin", .module = bin },
             .{ .name = "pdb", .module = pdb },
             .{ .name = "setting", .module = setting },
         },
@@ -81,6 +82,14 @@ pub fn build(b: *std.Build) void {
     });
 
     b.installArtifact(lib);
+
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = lib.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    const docs_step = b.step("docs", "Generate API documentation");
+    docs_step.dependOn(&install_docs.step);
 
     const test_mod = b.addModule("test", .{
         .root_source_file = b.path("test/root.zig"),
