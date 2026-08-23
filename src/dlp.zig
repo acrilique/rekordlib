@@ -34,65 +34,56 @@ fn dlpDisabled() noreturn {
     @compileError("rekordlib was built with -Ddlp=off; rebuild with -Ddlp=vendored (or =system) to use the OneLibrary store");
 }
 
-/// The symbols differ per mode: the vendored build renames every export to
-/// `rl_sqlite3_*`/`rl_sqlcipher_*` (decision 10), the system build links the
-/// consumer's own unprefixed SQLCipher. The dead branch of this comptime
-/// switch is not analyzed, so only the referenced set is emitted.
+/// The symbols differ per mode: the vendored build renames every
+/// `sqlite3_*`/`sqlcipher_*` export to `rl_sqlite3_*` (decision 10) —
+/// including the `sqlite3_stmt` typedef — the system build binds the
+/// consumer's own unprefixed SQLCipher, and `off` translates the renamed
+/// header without compiling any C. One comptime prefix resolves every
+/// binding through both headers; the dead branch of the mode switch is
+/// not analyzed, so only the referenced set is emitted.
+const prefix: []const u8 = switch (mode) {
+    .system => "",
+    .off, .vendored => "rl_",
+};
+
+/// Declaration lookup under the mode's prefix: `cfn("sqlite3_open_v2")`
+/// resolves `rl_sqlite3_open_v2` in off/vendored builds and
+/// `sqlite3_open_v2` in system builds.
+fn cfn(comptime name: []const u8) @TypeOf(@field(c, prefix ++ name)) {
+    return @field(c, prefix ++ name);
+}
+
+/// The statement handle type, renamed in the vendored header.
+const cStmt = @field(c, prefix ++ "sqlite3_stmt");
+
 const api = switch (mode) {
     .off => {},
-    .system => struct {
-        const open_v2 = c.sqlite3_open_v2;
-        const close_v2 = c.sqlite3_close_v2;
-        const errmsg = c.sqlite3_errmsg;
-        const exec = c.sqlite3_exec;
-        const prepare_v2 = c.sqlite3_prepare_v2;
-        const finalize = c.sqlite3_finalize;
-        const step = c.sqlite3_step;
-        const reset = c.sqlite3_reset;
-        const clear_bindings = c.sqlite3_clear_bindings;
-        const column_count = c.sqlite3_column_count;
-        const column_name = c.sqlite3_column_name;
-        const column_type = c.sqlite3_column_type;
-        const column_int64 = c.sqlite3_column_int64;
-        const column_double = c.sqlite3_column_double;
-        const column_text = c.sqlite3_column_text;
-        const column_blob = c.sqlite3_column_blob;
-        const column_bytes = c.sqlite3_column_bytes;
-        const bind_null = c.sqlite3_bind_null;
-        const bind_int64 = c.sqlite3_bind_int64;
-        const bind_double = c.sqlite3_bind_double;
-        const bind_text = c.sqlite3_bind_text;
-        const bind_blob = c.sqlite3_bind_blob;
-        const last_insert_rowid = c.sqlite3_last_insert_rowid;
-        const changes = c.sqlite3_changes;
-        const libversion = c.sqlite3_libversion;
-    },
-    .vendored => struct {
-        const open_v2 = c.rl_sqlite3_open_v2;
-        const close_v2 = c.rl_sqlite3_close_v2;
-        const errmsg = c.rl_sqlite3_errmsg;
-        const exec = c.rl_sqlite3_exec;
-        const prepare_v2 = c.rl_sqlite3_prepare_v2;
-        const finalize = c.rl_sqlite3_finalize;
-        const step = c.rl_sqlite3_step;
-        const reset = c.rl_sqlite3_reset;
-        const clear_bindings = c.rl_sqlite3_clear_bindings;
-        const column_count = c.rl_sqlite3_column_count;
-        const column_name = c.rl_sqlite3_column_name;
-        const column_type = c.rl_sqlite3_column_type;
-        const column_int64 = c.rl_sqlite3_column_int64;
-        const column_double = c.rl_sqlite3_column_double;
-        const column_text = c.rl_sqlite3_column_text;
-        const column_blob = c.rl_sqlite3_column_blob;
-        const column_bytes = c.rl_sqlite3_column_bytes;
-        const bind_null = c.rl_sqlite3_bind_null;
-        const bind_int64 = c.rl_sqlite3_bind_int64;
-        const bind_double = c.rl_sqlite3_bind_double;
-        const bind_text = c.rl_sqlite3_bind_text;
-        const bind_blob = c.rl_sqlite3_bind_blob;
-        const last_insert_rowid = c.rl_sqlite3_last_insert_rowid;
-        const changes = c.rl_sqlite3_changes;
-        const libversion = c.rl_sqlite3_libversion;
+    else => struct {
+        const open_v2 = cfn("sqlite3_open_v2");
+        const close_v2 = cfn("sqlite3_close_v2");
+        const errmsg = cfn("sqlite3_errmsg");
+        const exec = cfn("sqlite3_exec");
+        const prepare_v2 = cfn("sqlite3_prepare_v2");
+        const finalize = cfn("sqlite3_finalize");
+        const step = cfn("sqlite3_step");
+        const reset = cfn("sqlite3_reset");
+        const clear_bindings = cfn("sqlite3_clear_bindings");
+        const column_count = cfn("sqlite3_column_count");
+        const column_name = cfn("sqlite3_column_name");
+        const column_type = cfn("sqlite3_column_type");
+        const column_int64 = cfn("sqlite3_column_int64");
+        const column_double = cfn("sqlite3_column_double");
+        const column_text = cfn("sqlite3_column_text");
+        const column_blob = cfn("sqlite3_column_blob");
+        const column_bytes = cfn("sqlite3_column_bytes");
+        const bind_null = cfn("sqlite3_bind_null");
+        const bind_int64 = cfn("sqlite3_bind_int64");
+        const bind_double = cfn("sqlite3_bind_double");
+        const bind_text = cfn("sqlite3_bind_text");
+        const bind_blob = cfn("sqlite3_bind_blob");
+        const last_insert_rowid = cfn("sqlite3_last_insert_rowid");
+        const changes = cfn("sqlite3_changes");
+        const libversion = cfn("sqlite3_libversion");
     },
 };
 
@@ -366,7 +357,7 @@ pub const StepResult = enum { row, done };
 /// One prepared statement over an open `Db`. Borrowed: finalizing returns
 /// it to the caller's discipline (the `deinit`-style call is `finalize`).
 pub const Stmt = struct {
-    handle: *c.rl_sqlite3_stmt,
+    handle: *cStmt,
 
     pub fn step(self: Stmt) SqlError!StepResult {
         return switch (api.step(self.handle)) {
@@ -517,7 +508,7 @@ pub const Db = struct {
     }
 
     pub fn prepare(self: Db, sql: [:0]const u8) SqlError!Stmt {
-        var stmt: ?*c.rl_sqlite3_stmt = null;
+        var stmt: ?*cStmt = null;
         const rc = api.prepare_v2(self.handle, sql.ptr, -1, &stmt, null);
         if (rc != SQLITE_OK_RC) return error.Sqlite;
         return .{ .handle = stmt.? };
