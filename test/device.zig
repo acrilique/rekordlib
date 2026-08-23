@@ -672,3 +672,215 @@ test "canonical key name dedups equivalent spellings" {
     try expectCanonical("D Major", "Dmaj");
     try expectCanonical("", "");
 }
+
+/// Hand-checked writer-state expectations for the complete exports,
+/// probed from the fixtures once (2026-08-23): counters are max id + 1
+/// per table, map keys exactly as the rows carry them.
+const scan_expectations = [_]struct {
+    name: []const u8,
+    next_track_id: u32 = 1,
+    next_artist_id: u32 = 1,
+    next_album_id: u32 = 1,
+    next_genre_id: u32 = 1,
+    next_key_id: u32 = 1,
+    next_label_id: u32 = 1,
+    next_artwork_id: u32 = 1,
+    next_playlist_node_id: u32 = 1,
+    track_ids: usize = 0,
+    tracks_by_path: []const []const u8 = &.{},
+    artists: []const NameId = &.{},
+    genres: []const NameId = &.{},
+    keys_canonical: []const NameId = &.{},
+    labels: []const NameId = &.{},
+    artwork: []const NameId = &.{},
+    playlists: usize = 0,
+}{
+    .{
+        .name = "with_anlz",
+        .next_track_id = 3,
+        .next_artist_id = 2,
+        .next_album_id = 2,
+        .next_genre_id = 3,
+        .next_label_id = 2,
+        .next_artwork_id = 3,
+        .next_playlist_node_id = 2,
+        .track_ids = 2,
+        .tracks_by_path = &.{
+            "/Contents/Reboot/www.electronicfresh.com/01. Reboot - Bako (Original Mix).mp3",
+            "/Contents/Reboot/www.electronicfresh.com/03. Reboot - Assign The Source (Remaster).mp3",
+        },
+        .artists = &.{.{ .name = "Reboot", .id = 1 }},
+        .genres = &.{ .{ .name = "Minimal / Deep Tech", .id = 1 }, .{ .name = "Tech House", .id = 2 } },
+        .labels = &.{.{ .name = "Cecille", .id = 1 }},
+        .artwork = &.{
+            .{ .name = "/PIONEER/Artwork/00001/a1.jpg", .id = 1 },
+            .{ .name = "/PIONEER/Artwork/00001/a2.jpg", .id = 2 },
+        },
+        .playlists = 1,
+    },
+    .{
+        .name = "demo_tracks",
+        .next_track_id = 3,
+        .next_artist_id = 2,
+        .next_key_id = 6,
+        .next_label_id = 2,
+        .track_ids = 2,
+        .tracks_by_path = &.{
+            "/Contents/Loopmasters/UnknownAlbum/Demo Track 1.mp3",
+            "/Contents/Loopmasters/UnknownAlbum/Demo Track 2.mp3",
+        },
+        .artists = &.{.{ .name = "Loopmasters", .id = 1 }},
+        .keys_canonical = &.{
+            .{ .name = "Dmin", .id = 1 },
+            .{ .name = "Amin", .id = 2 },
+            .{ .name = "E", .id = 3 },
+            .{ .name = "D", .id = 4 },
+            .{ .name = "Fmin", .id = 5 },
+        },
+        .labels = &.{.{ .name = "Loopmasters", .id = 1 }},
+    },
+    .{ .name = "empty" },
+};
+
+/// One expected `(name, id)` entry of a string-keyed dedup map.
+const NameId = struct {
+    name: []const u8,
+    id: u32,
+};
+
+/// Asserts `entries` is exactly the map's contents.
+fn expectStringMapEntries(
+    map: *const std.StringHashMapUnmanaged(u32),
+    entries: []const NameId,
+) !void {
+    try testing.expectEqual(entries.len, map.count());
+    for (entries) |entry| {
+        try testing.expectEqual(entry.id, map.get(entry.name) orelse {
+            std.debug.print("missing key: {s}\n", .{entry.name});
+            return error.TestUnexpectedResult;
+        });
+    }
+}
+
+test "writer state scans each fixture" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    for (scan_expectations) |want| {
+        const path = try std.fmt.allocPrint(alloc, "testdata/complete_export/{s}", .{want.name});
+        defer alloc.free(path);
+        var ex = device.DeviceExport.open(path, io, alloc);
+        defer ex.deinit();
+        const ws = try ex.writerState();
+
+        try testing.expectEqual(want.next_track_id, ws.next_track_id);
+        try testing.expectEqual(want.next_artist_id, ws.next_artist_id);
+        try testing.expectEqual(want.next_album_id, ws.next_album_id);
+        try testing.expectEqual(want.next_genre_id, ws.next_genre_id);
+        try testing.expectEqual(want.next_key_id, ws.next_key_id);
+        try testing.expectEqual(want.next_label_id, ws.next_label_id);
+        try testing.expectEqual(want.next_artwork_id, ws.next_artwork_id);
+        try testing.expectEqual(want.next_playlist_node_id, ws.next_playlist_node_id);
+
+        try testing.expectEqual(want.track_ids, ws.track_ids.count());
+        try testing.expectEqual(want.tracks_by_path.len, ws.tracks_by_path.count());
+        for (want.tracks_by_path) |p| try testing.expect(ws.tracks_by_path.contains(p));
+        try expectStringMapEntries(&ws.artists_by_name, want.artists);
+        try expectStringMapEntries(&ws.genres_by_name, want.genres);
+        try expectStringMapEntries(&ws.keys_by_canonical, want.keys_canonical);
+        try expectStringMapEntries(&ws.labels_by_name, want.labels);
+        try expectStringMapEntries(&ws.artwork_by_path, want.artwork);
+        try testing.expectEqual(want.playlists, ws.playlist_nodes.count());
+        try testing.expectEqual(want.playlists, ws.playlist_entry_counts.count());
+    }
+}
+
+test "writer state pins with_anlz relationships" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var ex = device.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
+    defer ex.deinit();
+    const ws = try ex.writerState();
+
+    // Track ids resolved through their paths (row ids 2 and 1).
+    try testing.expectEqual(@as(u32, 2), ws.tracks_by_path.get(
+        "/Contents/Reboot/www.electronicfresh.com/01. Reboot - Bako (Original Mix).mp3",
+    ).?);
+    try testing.expectEqual(@as(u32, 1), ws.tracks_by_path.get(
+        "/Contents/Reboot/www.electronicfresh.com/03. Reboot - Assign The Source (Remaster).mp3",
+    ).?);
+
+    // The album row carries artist_id 0 (the null FK) even though artist
+    // 1 exists — and its name genuinely starts with a space in the
+    // fixture (short-ASCII body " www.electronicfresh.com", 24 bytes):
+    // keyed exactly as the row says.
+    try testing.expectEqual(@as(u32, 1), ws.albums_by_artist_and_name.get(.{
+        .artist_id = 0,
+        .name = " www.electronicfresh.com",
+    }).?);
+    try testing.expectEqual(@as(u32, 1), ws.albums_by_artist_and_name.count());
+
+    // One top-level leaf playlist holding entries up to index 2
+    // (max entry_index + 1 = 3, not the row count).
+    try testing.expectEqual(false, ws.playlist_nodes.get(1).?);
+    try testing.expectEqual(@as(u32, 3), ws.playlist_entry_counts.get(1).?);
+}
+
+test "writer state ignores dead-row remnants" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var ex = device.DeviceExport.open("testdata/complete_export/demo_tracks", io, alloc);
+    defer ex.deinit();
+    const ws = try ex.writerState();
+
+    // The demo_tracks page heaps carry four deleted-track paths
+    // (`/Contents/UnknownArtist/UnknownAlbum/*.wav`, P7's dead-space
+    // finding) — the scan walks present rows only, so they must not
+    // resolve.
+    try testing.expect(ws.tracks_by_path.get(
+        "/Contents/UnknownArtist/UnknownAlbum/NOISE.wav",
+    ) == null);
+    try testing.expectEqual(@as(usize, 2), ws.tracks_by_path.count());
+}
+
+test "writer state is lazy, cached, and pre-built by create" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var ex = device.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
+    defer ex.deinit();
+    try testing.expect(ex.writer_state == null);
+    const ws = try ex.writerState();
+    try testing.expect(ws == try ex.writerState());
+    try testing.expect(ex.pdb_state == .loaded);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+    var created = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer created.deinit();
+    const fresh = try created.writerState();
+    // Fresh counters — id 0 is the null FK — and empty maps; the default
+    // color/column/menu rows live in tables the writer doesn't track.
+    try testing.expectEqual(@as(u32, 1), fresh.next_track_id);
+    try testing.expectEqual(@as(u32, 1), fresh.next_artist_id);
+    try testing.expectEqual(@as(u32, 1), fresh.next_tag_id);
+    try testing.expectEqual(@as(u32, 0), fresh.next_category_position);
+    try testing.expectEqual(@as(u32, 0), fresh.next_tag_row_index);
+    try testing.expectEqual(@as(usize, 0), fresh.track_ids.count());
+    try testing.expectEqual(@as(usize, 0), fresh.tracks_by_path.count());
+}
+
+test "writer state scans num_rows at scale" {
+    const alloc = testing.allocator;
+    const input = try testutil.readFixture(alloc, "pdb/num_rows/export.pdb", .limited(1 << 22));
+    defer alloc.free(input);
+    var db = try pdb.Database.parse(alloc, input, .plain);
+    defer db.deinit();
+
+    var state = try device.scanWriterState(alloc, &db);
+    defer state.deinit(alloc);
+
+    try testing.expectEqual(@as(usize, 3886), state.track_ids.count());
+    try testing.expect(state.next_track_id > 3886);
+}

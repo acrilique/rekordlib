@@ -348,6 +348,10 @@ pub const SaveError =
     std.Io.Dir.CreateDirPathError ||
     AtomicWriteError;
 
+/// Error of `DeviceExport.writerState`: reading or parsing
+/// `export.pdb`, or scanning it.
+pub const WriterStateError = OpenPdbError || ScanError;
+
 /// A handle to a Rekordbox device export on disk: the setting files and
 /// the pdb database, located through `Layout`. `open` points the handle
 /// at an existing export (reading; the `openPdb` escape hatch edits),
@@ -365,6 +369,9 @@ pub const DeviceExport = struct {
     /// Serialized default `*SETTING.DAT` images waiting for the first
     /// `save` of a created export; always null for opened ones.
     pending_settings: ?[dat_files.len][]u8 = null,
+    /// The writer's cached scan of the export — id counters and dedup
+    /// maps — null until `writerState` builds it on first use.
+    writer_state: ?WriterState = null,
 
     const PdbState = union(enum) {
         /// An export opened at `root`; the pdb parses on first touch.
@@ -424,6 +431,10 @@ pub const DeviceExport = struct {
             .alloc = alloc,
             .pdb_state = .{ .loaded = db },
             .pending_settings = pending,
+            // Fresh counters — id 0 is the null FK — and empty maps: the
+            // default color/column/menu rows live in tables the writer
+            // doesn't track.
+            .writer_state = .{},
         };
     }
 
@@ -438,6 +449,7 @@ pub const DeviceExport = struct {
         if (e.pending_settings) |pending| {
             for (pending) |bytes| e.alloc.free(bytes);
         }
+        if (e.writer_state) |*state| state.deinit(e.alloc);
     }
 
     pub fn root(e: *const DeviceExport) []const u8 {
@@ -489,6 +501,21 @@ pub const DeviceExport = struct {
         e: *DeviceExport,
     ) (OpenPdbError || PlaylistTreeError)!std.ArrayList(PlaylistNode) {
         return getPlaylistsDb(e.alloc, try e.openPdb());
+    }
+
+    /// The writer's cached scan of the export: id counters and dedup
+    /// maps, rebuilt from the database on the first call (loading the
+    /// pdb first if needed). The mutating methods call this before they
+    /// touch the database, so read-only sessions never pay for it;
+    /// calling it directly only warms the cache early. Rows added
+    /// through the `openPdb` escape hatch after the state was built are
+    /// invisible to it.
+    pub fn writerState(e: *DeviceExport) WriterStateError!*WriterState {
+        if (e.writer_state == null) {
+            const db = try e.openPdb();
+            e.writer_state = try scanWriterState(e.alloc, db);
+        }
+        return &e.writer_state.?;
     }
 
     /// Writes the buffered export to disk — the handle's only
@@ -748,4 +775,352 @@ fn asciiStartsWithIgnoreCase(s: []const u8, token: []const u8) bool {
         if (std.ascii.toLower(a) != b) return false;
     }
     return true;
+}
+
+/// Dedup key of an Album row: albums are per-artist.
+pub const AlbumKey = struct {
+    artist_id: u32,
+    name: []const u8,
+};
+
+/// Content hash over `AlbumKey` — never the slice pointer.
+const AlbumKeyContext = struct {
+    pub fn hash(_: AlbumKeyContext, key: AlbumKey) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&key.artist_id));
+        h.update(key.name);
+        return h.final();
+    }
+
+    pub fn eql(_: AlbumKeyContext, a: AlbumKey, b: AlbumKey) bool {
+        return a.artist_id == b.artist_id and std.mem.eql(u8, a.name, b.name);
+    }
+};
+
+/// Albums keyed by `(owning artist, name)`.
+pub const AlbumsByArtistAndName = std.HashMapUnmanaged(
+    AlbumKey,
+    u32,
+    AlbumKeyContext,
+    std.hash_map.default_max_load_percentage,
+);
+
+/// Dedup key of a leaf tag: the category it lives under plus its label.
+pub const TagKey = struct {
+    category_id: u32,
+    label: []const u8,
+};
+
+const TagKeyContext = struct {
+    pub fn hash(_: TagKeyContext, key: TagKey) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&key.category_id));
+        h.update(key.label);
+        return h.final();
+    }
+
+    pub fn eql(_: TagKeyContext, a: TagKey, b: TagKey) bool {
+        return a.category_id == b.category_id and std.mem.eql(u8, a.label, b.label);
+    }
+};
+
+/// Leaf tags keyed by `(category, label)`.
+pub const TagsByKey = std.HashMapUnmanaged(
+    TagKey,
+    u32,
+    TagKeyContext,
+    std.hash_map.default_max_load_percentage,
+);
+
+/// The writer's cached view of an export: one `next_*` id counter per
+/// table it appends to, plus the dedup maps that let later inserts reuse
+/// an existing row instead of duplicating it. Rebuilt from a plain
+/// database by `scanWriterState` and extended over an ext database's tag
+/// rows by `scanExtTags`; every string key is owned by the state and
+/// freed by `deinit`.
+pub const WriterState = struct {
+    /// Next free id per table. Id 0 is the null foreign key, so the
+    /// counters start at 1 and a scan leaves each one past the highest
+    /// id that table carries.
+    next_track_id: u32 = 1,
+    next_artist_id: u32 = 1,
+    next_album_id: u32 = 1,
+    next_genre_id: u32 = 1,
+    next_key_id: u32 = 1,
+    next_label_id: u32 = 1,
+    next_artwork_id: u32 = 1,
+    next_playlist_node_id: u32 = 1,
+    /// Shared id space for tag categories and leaf tags (0 = null FK).
+    next_tag_id: u32 = 1,
+    /// Next `position` for a top-level category (0-based, as on real
+    /// exports).
+    next_category_position: u32 = 0,
+    /// Per-row monotonic counter driving tag `index_shift` (`0x20` per
+    /// row, as observed on real exports).
+    next_tag_row_index: u32 = 0,
+
+    /// Known track ids, for playlist-membership FK checks.
+    track_ids: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// `id -> is_folder`. Root (id 0) is implicit — always a valid
+    /// parent, always a folder.
+    playlist_nodes: std.AutoHashMapUnmanaged(u32, bool) = .empty,
+    /// Next `entry_index` per playlist: `max(entry_index) + 1`, not the
+    /// row count, so a reopened export with sparse indices doesn't
+    /// collide.
+    playlist_entry_counts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// Track ids by device file path (non-empty paths only; `add_track`
+    /// dedups on this key).
+    tracks_by_path: std.StringHashMapUnmanaged(u32) = .empty,
+    artists_by_name: std.StringHashMapUnmanaged(u32) = .empty,
+    albums_by_artist_and_name: AlbumsByArtistAndName = .empty,
+    genres_by_name: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Key names indexed under their canonical form (`canonicalKeyName`)
+    /// so later lookups collide across spellings.
+    keys_by_canonical: std.StringHashMapUnmanaged(u32) = .empty,
+    labels_by_name: std.StringHashMapUnmanaged(u32) = .empty,
+    artwork_by_path: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Tag category ids, for leaf FK validation.
+    tag_categories: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// `(category, label) -> tag id` leaf dedup.
+    tags_by_key: TagsByKey = .empty,
+    /// `category -> next leaf position` (dense from 0 within a
+    /// category).
+    tag_leaf_counts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+
+    pub fn deinit(state: *WriterState, alloc: std.mem.Allocator) void {
+        const string_maps = .{
+            &state.tracks_by_path,
+            &state.artists_by_name,
+            &state.genres_by_name,
+            &state.keys_by_canonical,
+            &state.labels_by_name,
+            &state.artwork_by_path,
+        };
+        inline for (string_maps) |map| {
+            var it = map.iterator();
+            while (it.next()) |entry| alloc.free(entry.key_ptr.*);
+            map.deinit(alloc);
+        }
+        {
+            var it = state.albums_by_artist_and_name.iterator();
+            while (it.next()) |entry| alloc.free(entry.key_ptr.name);
+            state.albums_by_artist_and_name.deinit(alloc);
+        }
+        {
+            var it = state.tags_by_key.iterator();
+            while (it.next()) |entry| alloc.free(entry.key_ptr.label);
+            state.tags_by_key.deinit(alloc);
+        }
+        const id_maps = .{
+            &state.track_ids,
+            &state.playlist_nodes,
+            &state.playlist_entry_counts,
+            &state.tag_categories,
+            &state.tag_leaf_counts,
+        };
+        inline for (id_maps) |map| map.deinit(alloc);
+    }
+};
+
+/// Error of the writer-state scans: walking a table's page chain hit
+/// structural corruption, or an allocation failed. A table the database
+/// doesn't carry is not an error — `rowsOrEmpty` resolves tables up
+/// front and scans them as empty; `NoTable` is only in the set because
+/// `RowIterator` shares one.
+pub const ScanError = error{
+    OutOfMemory,
+    NoTable,
+    PageNotPresent,
+    PageOrderViolation,
+    UnparsedPage,
+};
+
+/// `Database.rows`, treating a table the database doesn't carry as empty
+/// (standard exports carry all 20 tables; this keeps the scan total over
+/// hand-built databases).
+fn rowsOrEmpty(db: *const pdb.Database, page_type: pdb.PageType) ScanError!?pdb.RowIterator {
+    return db.rows(page_type) catch |err| switch (err) {
+        error.NoTable => null,
+        else => |e| return e,
+    };
+}
+
+/// Decodes a row string, treating invalid encoding as null — the row
+/// still counts toward the id counters, only its map entry is skipped
+/// (the oracle's `if let Ok(..)`).
+fn decodeOrSkip(
+    s: pdb.DeviceSQLString,
+    alloc: std.mem.Allocator,
+) ScanError!?[]u8 {
+    return s.utf8(alloc) catch |err| switch (err) {
+        error.InvalidEncoding => null,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+/// Inserts `key -> value` unless `key` is already present — first row
+/// wins, the oracle's `or_insert`. The caller-owned `key` is freed
+/// immediately when it duplicates an existing entry, and owned by the
+/// map afterwards.
+fn putStringIfAbsent(
+    map: *std.StringHashMapUnmanaged(u32),
+    alloc: std.mem.Allocator,
+    key: []u8,
+    value: u32,
+) std.mem.Allocator.Error!void {
+    const gop = map.getOrPut(alloc, key) catch |err| {
+        alloc.free(key);
+        return err;
+    };
+    if (gop.found_existing) {
+        alloc.free(key);
+    } else {
+        gop.key_ptr.* = key;
+        gop.value_ptr.* = value;
+    }
+}
+
+/// `putStringIfAbsent` for the album map, which owns only the key's
+/// `name` slice.
+fn putAlbumIfAbsent(
+    map: *AlbumsByArtistAndName,
+    alloc: std.mem.Allocator,
+    key: AlbumKey,
+    value: u32,
+) std.mem.Allocator.Error!void {
+    const gop = map.getOrPut(alloc, key) catch |err| {
+        alloc.free(key.name);
+        return err;
+    };
+    if (gop.found_existing) {
+        alloc.free(key.name);
+    } else {
+        gop.key_ptr.* = key;
+        gop.value_ptr.* = value;
+    }
+}
+
+/// Scans a plain database into a fresh `WriterState`: one pass per
+/// table, rebuilding the id counters (max id + 1) and the dedup maps the
+/// writer consults before inserting. First row wins on duplicate map
+/// keys, except `playlist_nodes`, where the last row wins (the oracle's
+/// `or_insert` vs `insert`). Rows are walked through the page chain, so
+/// deleted-row remnants in page heaps are invisible, exactly as to
+/// readers.
+pub fn scanWriterState(
+    alloc: std.mem.Allocator,
+    db: *const pdb.Database,
+) ScanError!WriterState {
+    var state = WriterState{};
+    errdefer state.deinit(alloc);
+
+    var it = try rowsOrEmpty(db, .tracks);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const track = row.track;
+            try state.track_ids.put(alloc, track.id, {});
+            state.next_track_id = @max(state.next_track_id, track.id +| 1);
+            if (try decodeOrSkip(track.offsets.inner.file_path, alloc)) |path| {
+                if (path.len > 0) {
+                    try putStringIfAbsent(&state.tracks_by_path, alloc, path, track.id);
+                } else {
+                    alloc.free(path);
+                }
+            }
+        }
+    }
+
+    it = try rowsOrEmpty(db, .artists);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const artist = row.artist;
+            state.next_artist_id = @max(state.next_artist_id, artist.id +| 1);
+            if (try decodeOrSkip(artist.offsets.inner.name, alloc)) |name| {
+                try putStringIfAbsent(&state.artists_by_name, alloc, name, artist.id);
+            }
+        }
+    }
+
+    it = try rowsOrEmpty(db, .albums);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const album = row.album;
+            state.next_album_id = @max(state.next_album_id, album.id +| 1);
+            if (try decodeOrSkip(album.offsets.inner.name, alloc)) |name| {
+                try putAlbumIfAbsent(
+                    &state.albums_by_artist_and_name,
+                    alloc,
+                    .{ .artist_id = album.artist_id, .name = name },
+                    album.id,
+                );
+            }
+        }
+    }
+
+    it = try rowsOrEmpty(db, .genres);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const genre = row.genre;
+            state.next_genre_id = @max(state.next_genre_id, genre.id +| 1);
+            if (try decodeOrSkip(genre.name, alloc)) |name| {
+                try putStringIfAbsent(&state.genres_by_name, alloc, name, genre.id);
+            }
+        }
+    }
+
+    it = try rowsOrEmpty(db, .keys);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const key = row.key;
+            state.next_key_id = @max(state.next_key_id, key.id +| 1);
+            if (try decodeOrSkip(key.name, alloc)) |name| {
+                const canonical = try canonicalKeyName(alloc, name);
+                alloc.free(name);
+                try putStringIfAbsent(&state.keys_by_canonical, alloc, canonical, key.id);
+            }
+        }
+    }
+
+    it = try rowsOrEmpty(db, .labels);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const label = row.label;
+            state.next_label_id = @max(state.next_label_id, label.id +| 1);
+            if (try decodeOrSkip(label.name, alloc)) |name| {
+                try putStringIfAbsent(&state.labels_by_name, alloc, name, label.id);
+            }
+        }
+    }
+
+    it = try rowsOrEmpty(db, .artwork);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const artwork = row.artwork;
+            state.next_artwork_id = @max(state.next_artwork_id, artwork.id +| 1);
+            if (try decodeOrSkip(artwork.path, alloc)) |path| {
+                try putStringIfAbsent(&state.artwork_by_path, alloc, path, artwork.id);
+            }
+        }
+    }
+
+    it = try rowsOrEmpty(db, .playlist_tree);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const node = row.playlist_tree_node;
+            state.next_playlist_node_id = @max(state.next_playlist_node_id, node.id +| 1);
+            try state.playlist_nodes.put(alloc, node.id, node.isFolder());
+        }
+    }
+
+    it = try rowsOrEmpty(db, .playlist_entries);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const entry = row.playlist_entry;
+            const gop = try state.playlist_entry_counts.getOrPut(alloc, entry.playlist_id);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* = @max(gop.value_ptr.*, entry.entry_index +| 1);
+        }
+    }
+
+    return state;
 }
