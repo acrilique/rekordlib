@@ -923,57 +923,97 @@ pub const DeviceExport = struct {
         };
 
         // `.DAT`: beats, plain cues, and the mono previews.
-        var dat = std.ArrayList(anlz.Content).empty;
-        defer dat.deinit(a);
-        try dat.append(a, path_section);
-        if (input.beats.len > 0)
-            try dat.append(a, .{ .beat_grid = .{ .beats = input.beats } });
-        if (input.cues.len > 0)
-            try dat.append(a, .{ .cue_list = .{
-                .list_type = input.cue_list_type,
-                .cues = input.cues,
-            } });
-        if (input.preview_mono.len > 0)
-            try dat.append(a, .{ .waveform_preview = .{ .data = input.preview_mono } });
-        if (input.tiny_preview.len > 0)
-            try dat.append(a, .{ .tiny_waveform_preview = .{ .data = input.tiny_preview } });
-        if (dat.items.len > 1)
-            files[0] = try e.serializeAnlz(track.file_path, .dat, dat.items);
+        files[0] = try e.serializeAnlzGroup(track.file_path, .dat, &.{
+            path_section,
+            if (input.beats.len > 0)
+                anlz.Content{ .beat_grid = .{ .beats = input.beats } }
+            else
+                null,
+            if (input.cues.len > 0)
+                anlz.Content{ .cue_list = .{
+                    .list_type = input.cue_list_type,
+                    .cues = input.cues,
+                } }
+            else
+                null,
+            if (input.preview_mono.len > 0)
+                anlz.Content{ .waveform_preview = .{ .data = input.preview_mono } }
+            else
+                null,
+            if (input.tiny_preview.len > 0)
+                anlz.Content{ .tiny_waveform_preview = .{ .data = input.tiny_preview } }
+            else
+                null,
+        });
 
-        // `.EXT`: extended cues plus the optional column groups.
-        const ext_has_data = input.cues_extended.len > 0 or input.detail_mono != null or
-            input.color_preview != null or input.color_detail != null;
-        if (ext_has_data) {
-            var ext = std.ArrayList(anlz.Content).empty;
-            defer ext.deinit(a);
-            try ext.append(a, path_section);
+        // `.EXT`: extended cues plus the optional column groups — a
+        // present-but-empty column group writes the file (its section is
+        // appended), a null one skips it.
+        files[1] = try e.serializeAnlzGroup(track.file_path, .ext, &.{
+            path_section,
             if (input.cues_extended.len > 0)
-                try ext.append(a, .{ .extended_cue_list = .{
+                anlz.Content{ .extended_cue_list = .{
                     .list_type = input.cue_list_type,
                     .cues = input.cues_extended,
-                } });
+                } }
+            else
+                null,
             if (input.detail_mono) |cols|
-                try ext.append(a, .{ .waveform_detail = .{ .data = cols } });
+                anlz.Content{ .waveform_detail = .{ .data = cols } }
+            else
+                null,
             if (input.color_preview) |cols|
-                try ext.append(a, .{ .waveform_color_preview = .{ .data = cols } });
+                anlz.Content{ .waveform_color_preview = .{ .data = cols } }
+            else
+                null,
             if (input.color_detail) |cols|
-                try ext.append(a, .{ .waveform_color_detail = .{ .data = cols } });
-            files[1] = try e.serializeAnlz(track.file_path, .ext, ext.items);
-        }
+                anlz.Content{ .waveform_color_detail = .{ .data = cols } }
+            else
+                null,
+        });
 
         // `.2EX`: the 3-band groups.
-        if (input.band3_preview != null or input.band3_detail != null) {
-            var two_ex = std.ArrayList(anlz.Content).empty;
-            defer two_ex.deinit(a);
-            try two_ex.append(a, path_section);
+        files[2] = try e.serializeAnlzGroup(track.file_path, .two_ex, &.{
+            path_section,
             if (input.band3_preview) |cols|
-                try two_ex.append(a, .{ .waveform_3band_preview = .{ .data = cols } });
+                anlz.Content{ .waveform_3band_preview = .{ .data = cols } }
+            else
+                null,
             if (input.band3_detail) |cols|
-                try two_ex.append(a, .{ .waveform_3band_detail = .{ .data = cols } });
-            files[2] = try e.serializeAnlz(track.file_path, .two_ex, two_ex.items);
-        }
+                anlz.Content{ .waveform_3band_detail = .{ .data = cols } }
+            else
+                null,
+        });
 
         return files;
+    }
+
+    /// Serializes the non-null of `sections` — the leading path section
+    /// plus whichever optional groups `track.analysis` carried — into
+    /// one sibling's image, paired with the host path it lands at. Only
+    /// the path section present means the sibling carries no data, and
+    /// nothing is queued for it.
+    fn serializeAnlzGroup(
+        e: *DeviceExport,
+        file_path: []const u8,
+        sibling: AnlzSibling,
+        sections: []const ?anlz.Content,
+    ) AddTrackError!?PendingAnlz {
+        var n: usize = 0;
+        for (sections) |section| {
+            if (section != null) n += 1;
+        }
+        if (n <= 1) return null;
+
+        var compact: [5]anlz.Content = undefined;
+        var i: usize = 0;
+        for (sections) |section| {
+            if (section) |content| {
+                compact[i] = content;
+                i += 1;
+            }
+        }
+        return try e.serializeAnlz(file_path, sibling, compact[0..n]);
     }
 
     /// Which `ANLZ0000` sibling a serialized image is.
