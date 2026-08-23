@@ -141,6 +141,8 @@ fn providerHmac(
     out: ?[*]u8,
 ) callconv(.c) c_int {
     _ = ctx;
+    if (hmac_key == null or out == null) return c.SQLITE_ERROR;
+    if (key_sz < 0 or in_sz < 0 or in2_sz < 0) return c.SQLITE_ERROR;
     const key = hmac_key.?[0..@intCast(key_sz)];
     const buf1 = if (in) |p| p[0..@intCast(in_sz)] else &[_]u8{};
     const buf2 = if (in2) |p| p[0..@intCast(in2_sz)] else &[_]u8{};
@@ -181,6 +183,8 @@ fn providerKdf(
     key: ?[*]u8,
 ) callconv(.c) c_int {
     _ = ctx;
+    if (pass == null or salt == null or key == null) return c.SQLITE_ERROR;
+    if (pass_sz < 0 or salt_sz < 0 or key_sz <= 0 or workfactor <= 0) return c.SQLITE_ERROR;
     const p = pass.?[0..@intCast(pass_sz)];
     const s = salt.?[0..@intCast(salt_sz)];
     const k = key.?[0..@intCast(key_sz)];
