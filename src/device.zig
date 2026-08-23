@@ -519,47 +519,63 @@ pub const DeviceExport = struct {
     }
 
     /// Writes the buffered export to disk — the handle's only
-    /// disk-writing call. Crash-safe order: the default directory tree
+    /// disk-writing call. Everything that can fail on the in-memory
+    /// model — parsing, track-row validation, serialization — happens
+    /// before the first write, so a failed `save` leaves the disk
+    /// untouched. Crash-safe write order: the default directory tree
     /// and the four setting files (a created export's first `save` only;
     /// DATs are never rewritten later, and opened exports never write
-    /// them), then the other files the writer owns, and `export.pdb` —
-    /// the index everything else is reached through — last, so a crash
-    /// leaves orphan files players ignore, not rows naming missing data.
-    /// Every file lands through a same-directory temp file and an atomic
-    /// rename: readers see the old or the new file, never a torn one, and
-    /// a second `save` is byte-stable.
+    /// them), then `export.pdb` — the index everything else is reached
+    /// through — last, so a crash leaves orphan files players ignore,
+    /// not rows naming missing data. Every file lands through a
+    /// same-directory temp file and an atomic rename: readers see the
+    /// old or the new file, never a torn one, and a second `save` is
+    /// byte-stable.
     pub fn save(e: *DeviceExport) SaveError!void {
-        if (e.pending_settings) |pending| {
-            const cwd = std.Io.Dir.cwd();
-            const dirs = [_][]const u8{
-                try e.layout.rekordboxDir(e.alloc),
-                try e.layout.usbanlzDir(e.alloc),
-                try e.layout.contentsDir(e.alloc),
-            };
-            defer {
-                for (dirs) |dir| e.alloc.free(dir);
-            }
-            for (dirs) |dir| try cwd.createDirPath(e.io, dir);
-
-            // A failed write leaves every image owned by
-            // `pending_settings`, so `deinit` reclaims them; they are
-            // freed only once all four have landed.
-            inline for (dat_files, 0..) |dat, i| {
-                const path = try e.layout.datPath(e.alloc, dat.name);
-                defer e.alloc.free(path);
-                try e.writeFileAtomic(path, pending[i]);
-            }
-            for (pending) |bytes| e.alloc.free(bytes);
-            e.pending_settings = null;
-        }
-
         const db = try e.openPdb();
         try db.validateAllTrackRows();
         const image = try db.serialize(e.alloc);
         defer e.alloc.free(image);
+
+        if (e.pending_settings) |pending| try e.writePendingSettings(pending);
+
         const pdb_path = try e.layout.exportPdb(e.alloc);
         defer e.alloc.free(pdb_path);
         try e.writeFileAtomic(pdb_path, image);
+    }
+
+    /// Writes the default directory tree and the four pending setting
+    /// images, the created export's first `save` only. A failed write
+    /// leaves every image owned by `pending_settings`, so `deinit`
+    /// reclaims them; they are freed only once all four have landed.
+    fn writePendingSettings(
+        e: *DeviceExport,
+        pending: [dat_files.len][]u8,
+    ) (std.mem.Allocator.Error || std.Io.Dir.CreateDirPathError || AtomicWriteError)!void {
+        const cwd = std.Io.Dir.cwd();
+        // Each path is freed before the next is built, so a failure
+        // between the creations leaks nothing.
+        const dir_fns = [_]*const fn (
+            Layout,
+            std.mem.Allocator,
+        ) std.mem.Allocator.Error![]u8{
+            Layout.rekordboxDir,
+            Layout.usbanlzDir,
+            Layout.contentsDir,
+        };
+        for (dir_fns) |dir_fn| {
+            const dir = try dir_fn(e.layout, e.alloc);
+            defer e.alloc.free(dir);
+            try cwd.createDirPath(e.io, dir);
+        }
+
+        inline for (dat_files, 0..) |dat, i| {
+            const path = try e.layout.datPath(e.alloc, dat.name);
+            defer e.alloc.free(path);
+            try e.writeFileAtomic(path, pending[i]);
+        }
+        for (pending) |bytes| e.alloc.free(bytes);
+        e.pending_settings = null;
     }
 
     /// Writes `bytes` to `path` through a same-directory temp file and an

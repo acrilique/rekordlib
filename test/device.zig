@@ -532,6 +532,37 @@ test "create without save leaves nothing on disk" {
     try testing.expectError(error.FileNotFound, tmp.dir.access(io, "PIONEER", .{}));
 }
 
+test "a save that fails validation leaves nothing on disk" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    const db = try ex.openPdb();
+
+    // Escape-hatch surgery: a track row padded to the CDJ minimum,
+    // then shrunk below it, so `save` must fail validation — before it
+    // has written anything.
+    const a = db.arena.allocator();
+    const boxed = try a.create(pdb.Track);
+    boxed.* = .{ .id = 1, .offsets = .{ .inner = .{
+        .title = try pdb.DeviceSQLString.fromUtf8(a, "Music"),
+    } } };
+    try pdb.padTrackCommentToMinimum(boxed, a);
+    var row = pdb.Row{ .track = boxed };
+    _ = try db.addRow(&row);
+    // `addRow` stored the box itself, so this edits the database's row.
+    boxed.offsets.inner.comment = pdb.DeviceSQLString.empty();
+
+    try testing.expectError(error.TrackRowTooSmall, ex.save());
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "PIONEER", .{}));
+}
+
 test "create refuses a root that already has an export" {
     const alloc = testing.allocator;
     const io = testing.io;
