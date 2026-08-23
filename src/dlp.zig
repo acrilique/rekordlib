@@ -120,11 +120,14 @@ pub const Provider = extern struct {
     next: ?*Provider = null,
 };
 
-/// OS entropy source for salt/IV generation. The C provider callback carries
-/// no context pointer we control, so the wrapper installs its `std.Io` here
-/// (`Db.open` does it); the bundled SQLCipher providers solve this the same
-/// way with global state behind SQLCIPHER_MUTEX_PROVIDER_RAND.
-var io_source: ?std.Io = null;
+/// OS entropy source seed for salt/IV generation. SQLCipher passes the
+/// ctx it asks the provider to build (`ctx_init`) as the first argument
+/// to every callback, but gives `ctx_init` no input, so the wrapper parks
+/// its Io in this seed (`Db.open` does it); `providerCtxInit` copies the
+/// seed into each provider ctx, and callbacks then read their Io from
+/// there - an open db pins its own Io instead of racing on whatever
+/// `Db.open` ran last.
+var io_seed: ?std.Io = null;
 
 fn providerHmac(
     ctx: ?*anyopaque,
@@ -251,14 +254,10 @@ fn providerAddRandom(ctx: ?*anyopaque, buffer: ?[*]const u8, length: c_int) call
 }
 
 fn providerRandom(ctx: ?*anyopaque, buffer: ?[*]u8, length: c_int) callconv(.c) c_int {
-    _ = ctx;
-    if (length < 0) return c.SQLITE_ERROR;
-    const buf = buffer.?[0..@intCast(length)];
-    if (io_source) |io| {
-        io.random(buf);
-        return c.SQLITE_OK;
-    }
-    return c.SQLITE_ERROR;
+    if (ctx == null or buffer == null or length < 0) return c.SQLITE_ERROR;
+    const io: *std.Io = @ptrCast(@alignCast(ctx.?));
+    io.random(buffer.?[0..@intCast(length)]);
+    return c.SQLITE_OK;
 }
 
 fn providerGetName(ctx: ?*anyopaque) callconv(.c) [*:0]const u8 {
@@ -296,12 +295,22 @@ fn providerGetHmacSz(ctx: ?*anyopaque, algorithm: c_int) callconv(.c) c_int {
     };
 }
 
+/// Snapshots the seed Io into the provider ctx sqlcipher will hand back
+/// to every callback. No allocation happens before the first open parks
+/// an Io (sqlcipher's library init also comes through here): the ctx
+/// stays null then, and `providerRandom` refuses like it always did.
 fn providerCtxInit(ctx: *?*anyopaque) callconv(.c) c_int {
     ctx.* = null;
+    if (io_seed) |io| {
+        const holder = std.heap.page_allocator.create(std.Io) catch return c.SQLITE_ERROR;
+        holder.* = io;
+        ctx.* = holder;
+    }
     return c.SQLITE_OK;
 }
 
 fn providerCtxFree(ctx: *?*anyopaque) callconv(.c) c_int {
+    if (ctx.*) |p| std.heap.page_allocator.destroy(@as(*std.Io, @ptrCast(@alignCast(p))));
     ctx.* = null;
     return c.SQLITE_OK;
 }
@@ -477,7 +486,7 @@ pub const Db = struct {
 
     fn openFlags(io: std.Io, path: [:0]const u8, flags: c_int, keyed: bool) OpenError!Db {
         if (mode == .off) dlpDisabled();
-        io_source = io;
+        io_seed = io;
         var handle: ?*c.sqlite3 = null;
         const rc = api.open_v2(path.ptr, &handle, flags, null);
         if (rc != c.SQLITE_OK) {
