@@ -488,8 +488,7 @@ pub const Db = struct {
         if (!keyed) return db;
         // key before any page read; the WAL-persisted fixture needs the
         // read-write open above to recover without sidecar files present
-        var buf: [256]u8 = undefined;
-        const key_sql = std.fmt.bufPrintZ(&buf, "PRAGMA key = '{s}';", .{passphrase}) catch return error.OutOfMemory;
+        const key_sql = "PRAGMA key = '" ++ passphrase ++ "';";
         try db.exec(key_sql);
         return db;
     }
@@ -1029,8 +1028,7 @@ fn loadTable(
     db: Db,
     out_rows: *[]const T,
 ) LoadError!void {
-    var sql_buf: [64]u8 = undefined;
-    const sql = std.fmt.bufPrintZ(&sql_buf, "SELECT * FROM {s};", .{table}) catch unreachable;
+    const sql = "SELECT * FROM " ++ table ++ ";";
     var stmt = try db.prepare(sql);
     defer stmt.finalize();
 
