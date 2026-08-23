@@ -126,6 +126,36 @@ test "sqliteVersion is reachable" {
     try testing.expect(std.mem.startsWith(u8, dlp.sqliteVersion(), "3."));
 }
 
+test "cbc matches NIST SP 800-38A F.2.5 (AES-256-CBC)" {
+    // pure std.crypto - runs in every build mode, no sqlcipher needed
+    const key = hex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+    const iv = hex("000102030405060708090a0b0c0d0e0f");
+    const pt = hex(
+        "6bc1bee22e409f96e93d7e117393172a" ++
+            "ae2d8a571e03ac9c9eb76fac45af8e51" ++
+            "30c81c46a35ce411e5fbc1191a0a52ef" ++
+            "f69f2445df4f9b17ad2b417be66c3710",
+    );
+    const ct = hex(
+        "f58c4c04d6e5f1ba779eabfb5f7bfbd6" ++
+            "9cfc4e967edb808d679f777bc6702c7d" ++
+            "39f23369a9d9bacfa530e26304231461" ++
+            "b2eb05e2c39be9fcda6c19078c6a9d1b",
+    );
+
+    var buf: [64]u8 = undefined;
+    dlp.cbc(true, key, iv, &buf, &pt);
+    try testing.expectEqualSlices(u8, &ct, buf[0..pt.len]);
+    dlp.cbc(false, key, iv, &buf, &ct);
+    try testing.expectEqualSlices(u8, &pt, buf[0..ct.len]);
+}
+
+fn hex(comptime s: []const u8) [s.len / 2]u8 {
+    var out: [s.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
+    return out;
+}
+
 test "O2 load: every table with the fixture's row counts" {
     if (dlp.mode != .vendored) return;
     const alloc = testing.allocator;

@@ -192,6 +192,35 @@ fn providerKdf(
 }
 
 /// AES-256-CBC over a whole number of 16-byte blocks (pages are).
+/// std.crypto ships no CBC mode (0.16's modes.zig carries only CTR), so
+/// the chain is implemented here. Public because it is the honest core -
+/// no C types, directly testable against published vectors - under the
+/// provider shell that owns the SQLCipher ABI.
+pub fn cbc(comptime encrypt: bool, key: [32]u8, iv: [16]u8, dst: []u8, src: []const u8) void {
+    std.debug.assert(dst.len >= src.len);
+    const aes = if (encrypt)
+        std.crypto.core.aes.Aes256.initEnc(key)
+    else
+        std.crypto.core.aes.Aes256.initDec(key);
+    var chain = iv;
+    var i: usize = 0;
+    while (i < src.len) : (i += 16) {
+        if (encrypt) {
+            var block: [16]u8 = undefined;
+            for (0..16) |j| block[j] = src[i + j] ^ chain[j];
+            aes.encrypt(dst[i..][0..16], &block);
+            chain = dst[i..][0..16].*;
+        } else {
+            var plain: [16]u8 = undefined;
+            aes.decrypt(&plain, src[i..][0..16]);
+            for (0..16) |j| dst[i + j] = plain[j] ^ chain[j];
+            chain = src[i..][0..16].*;
+        }
+    }
+}
+
+/// The cipher provider callback: a thin dishonest shell unwrapping the C
+/// arguments around `cbc`.
 fn providerCipher(
     ctx: ?*anyopaque,
     enc: c_int,
@@ -203,34 +232,14 @@ fn providerCipher(
     out: ?[*]u8,
 ) callconv(.c) c_int {
     _ = ctx;
+    if (key == null or iv == null or in == null or out == null) return c.SQLITE_ERROR;
     if (key_sz != 32) return c.SQLITE_ERROR;
-    if (@rem(in_sz, 16) != 0) return c.SQLITE_ERROR;
-    const k: [32]u8 = key.?[0..32].*;
-    const init_vec: [16]u8 = iv.?[0..16].*;
-    const src = in.?[0..@intCast(in_sz)];
-    const dst = out.?[0..@intCast(in_sz)];
-
-    if (enc == SQLCIPHER_ENCRYPT) {
-        const aes = std.crypto.core.aes.Aes256.initEnc(k);
-        var chain = init_vec;
-        var i: usize = 0;
-        while (i < src.len) : (i += 16) {
-            var block: [16]u8 = undefined;
-            for (0..16) |j| block[j] = src[i + j] ^ chain[j];
-            aes.encrypt(dst[i..][0..16], &block);
-            chain = dst[i..][0..16].*;
-        }
-    } else {
-        const aes = std.crypto.core.aes.Aes256.initDec(k);
-        var chain = init_vec;
-        var i: usize = 0;
-        while (i < src.len) : (i += 16) {
-            var plain: [16]u8 = undefined;
-            aes.decrypt(&plain, src[i..][0..16]);
-            for (0..16) |j| dst[i + j] = plain[j] ^ chain[j];
-            chain = src[i..][0..16].*;
-        }
-    }
+    if (in_sz < 0 or @rem(in_sz, 16) != 0) return c.SQLITE_ERROR;
+    const n: usize = @intCast(in_sz);
+    if (enc == SQLCIPHER_ENCRYPT)
+        cbc(true, key.?[0..32].*, iv.?[0..16].*, out.?[0..n], in.?[0..n])
+    else
+        cbc(false, key.?[0..32].*, iv.?[0..16].*, out.?[0..n], in.?[0..n]);
     return c.SQLITE_OK;
 }
 
