@@ -1274,11 +1274,13 @@ pub const DeviceExport = struct {
     /// Associates `labels` with `track_id` under `category_id` in the tag
     /// database. Empty labels are dropped and duplicates — within this
     /// call or already existing under the category — collapse to one leaf
-    /// row, so each `(category, label)` pair produces at most one
-    /// junction row per track. `track_id` must name an existing track and
-    /// `category_id` a category this handle knows (one returned by
-    /// `createTagCategory`, or one recovered from the opened
-    /// `exportExt.pdb`), else `UnknownForeignKey`. A failure between leaf rows leaves the
+    /// row. The junction rows themselves are not deduplicated: each call
+    /// inserts one junction per kept label, so repeating a label in a
+    /// later call stacks a duplicate junction (junction rows carry no
+    /// writer state, so recovery cannot see them). `track_id` must name
+    /// an existing track and `category_id` a category this handle knows
+    /// (one returned by `createTagCategory`, or one recovered from the
+    /// opened `exportExt.pdb`), else `UnknownForeignKey`. A failure between leaf rows leaves the
     /// earlier ones inserted — unreachable junctions are ignored by
     /// players, not recovered automatically (the same residual risk as
     /// `addTrack`'s dimension rows).
