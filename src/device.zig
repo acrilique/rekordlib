@@ -1657,6 +1657,17 @@ pub fn getPlaylistsDb(
 /// String-equality only: enharmonic equivalents (`B♭m` ≠ `A#m`), Camelot,
 /// and Open Key notation are not resolved — different pitch spellings
 /// still create distinct rows.
+/// Fold tokens for `canonicalKeyName`, longest first so `major` folds as
+/// one token instead of matching `maj` and leaking the rest.
+const key_name_folds = [_]struct { token: []const u8, emit: []const u8 }{
+    .{ .token = "major", .emit = "maj" },
+    .{ .token = "minor", .emit = "min" },
+    .{ .token = "flat", .emit = "b" },
+    .{ .token = "sharp", .emit = "#" },
+    .{ .token = "maj", .emit = "maj" },
+    .{ .token = "min", .emit = "min" },
+};
+
 pub fn canonicalKeyName(alloc: std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]u8 {
     const trimmed = std.mem.trim(u8, name, &std.ascii.whitespace);
     var out = std.ArrayList(u8).empty;
@@ -1664,18 +1675,8 @@ pub fn canonicalKeyName(alloc: std.mem.Allocator, name: []const u8) std.mem.Allo
 
     var i: usize = 0;
     while (i < trimmed.len) {
-        // Order matters: longest tokens first, so `major` folds as one
-        // token instead of matching `maj` and leaking the rest.
-        const folded = [_]struct { token: []const u8, emit: []const u8 }{
-            .{ .token = "major", .emit = "maj" },
-            .{ .token = "minor", .emit = "min" },
-            .{ .token = "flat", .emit = "b" },
-            .{ .token = "sharp", .emit = "#" },
-            .{ .token = "maj", .emit = "maj" },
-            .{ .token = "min", .emit = "min" },
-        };
         var matched = false;
-        for (folded) |f| {
+        for (key_name_folds) |f| {
             if (std.ascii.startsWithIgnoreCase(trimmed[i..], f.token)) {
                 try out.appendSlice(alloc, f.emit);
                 i += f.token.len;
