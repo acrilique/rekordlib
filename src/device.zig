@@ -1000,131 +1000,6 @@ fn putAlbumIfAbsent(
     }
 }
 
-/// Scans a plain database into a fresh `WriterState`: one pass per
-/// table, rebuilding the id counters (max id + 1) and the dedup maps the
-/// writer consults before inserting. First row wins on duplicate map
-/// keys, except `playlist_nodes`, where the last row wins (the oracle's
-/// `or_insert` vs `insert`). Rows are walked through the page chain, so
-/// deleted-row remnants in page heaps are invisible, exactly as to
-/// readers.
-pub fn scanWriterState(
-    alloc: std.mem.Allocator,
-    db: *const pdb.Database,
-) ScanError!WriterState {
-    var state = WriterState{};
-    errdefer state.deinit(alloc);
-
-    var it = try rowsOrEmpty(db, .tracks);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const track = row.track;
-            try state.track_ids.put(alloc, track.id, {});
-            state.next_track_id = @max(state.next_track_id, track.id +| 1);
-            if (try decodeOrSkip(track.offsets.inner.file_path, alloc)) |path| {
-                if (path.len > 0) {
-                    try putStringIfAbsent(&state.tracks_by_path, alloc, path, track.id);
-                } else {
-                    alloc.free(path);
-                }
-            }
-        }
-    }
-
-    it = try rowsOrEmpty(db, .artists);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const artist = row.artist;
-            state.next_artist_id = @max(state.next_artist_id, artist.id +| 1);
-            if (try decodeOrSkip(artist.offsets.inner.name, alloc)) |name| {
-                try putStringIfAbsent(&state.artists_by_name, alloc, name, artist.id);
-            }
-        }
-    }
-
-    it = try rowsOrEmpty(db, .albums);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const album = row.album;
-            state.next_album_id = @max(state.next_album_id, album.id +| 1);
-            if (try decodeOrSkip(album.offsets.inner.name, alloc)) |name| {
-                try putAlbumIfAbsent(
-                    &state.albums_by_artist_and_name,
-                    alloc,
-                    .{ .artist_id = album.artist_id, .name = name },
-                    album.id,
-                );
-            }
-        }
-    }
-
-    it = try rowsOrEmpty(db, .genres);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const genre = row.genre;
-            state.next_genre_id = @max(state.next_genre_id, genre.id +| 1);
-            if (try decodeOrSkip(genre.name, alloc)) |name| {
-                try putStringIfAbsent(&state.genres_by_name, alloc, name, genre.id);
-            }
-        }
-    }
-
-    it = try rowsOrEmpty(db, .keys);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const key = row.key;
-            state.next_key_id = @max(state.next_key_id, key.id +| 1);
-            if (try decodeOrSkip(key.name, alloc)) |name| {
-                const canonical = try canonicalKeyName(alloc, name);
-                alloc.free(name);
-                try putStringIfAbsent(&state.keys_by_canonical, alloc, canonical, key.id);
-            }
-        }
-    }
-
-    it = try rowsOrEmpty(db, .labels);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const label = row.label;
-            state.next_label_id = @max(state.next_label_id, label.id +| 1);
-            if (try decodeOrSkip(label.name, alloc)) |name| {
-                try putStringIfAbsent(&state.labels_by_name, alloc, name, label.id);
-            }
-        }
-    }
-
-    it = try rowsOrEmpty(db, .artwork);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const artwork = row.artwork;
-            state.next_artwork_id = @max(state.next_artwork_id, artwork.id +| 1);
-            if (try decodeOrSkip(artwork.path, alloc)) |path| {
-                try putStringIfAbsent(&state.artwork_by_path, alloc, path, artwork.id);
-            }
-        }
-    }
-
-    it = try rowsOrEmpty(db, .playlist_tree);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const node = row.playlist_tree_node;
-            state.next_playlist_node_id = @max(state.next_playlist_node_id, node.id +| 1);
-            try state.playlist_nodes.put(alloc, node.id, node.isFolder());
-        }
-    }
-
-    it = try rowsOrEmpty(db, .playlist_entries);
-    if (it) |*rows| {
-        while (try rows.next()) |row| {
-            const entry = row.playlist_entry;
-            const gop = try state.playlist_entry_counts.getOrPut(alloc, entry.playlist_id);
-            if (!gop.found_existing) gop.value_ptr.* = 0;
-            gop.value_ptr.* = @max(gop.value_ptr.*, entry.entry_index +| 1);
-        }
-    }
-
-    return state;
-}
-
 /// `putStringIfAbsent` for the leaf-tag map, which owns only the key's
 /// `label` slice.
 fn putTagKeyIfAbsent(
@@ -1143,6 +1018,226 @@ fn putTagKeyIfAbsent(
         gop.key_ptr.* = key;
         gop.value_ptr.* = value;
     }
+}
+
+/// Scans a plain database into a fresh `WriterState`: one pass per
+/// table, rebuilding the id counters (max id + 1) and the dedup maps the
+/// writer consults before inserting. First row wins on duplicate map
+/// keys, except `playlist_nodes`, where the last row wins (the oracle's
+/// `or_insert` vs `insert`). Rows are walked through the page chain, so
+/// deleted-row remnants in page heaps are invisible, exactly as to
+/// readers.
+/// Scans `tracks`: every id into `track_ids` (playlist-membership FK
+/// checks), every non-empty file path into `tracks_by_path`, and the
+/// id counter past the highest track id.
+fn scanTracks(
+    alloc: std.mem.Allocator,
+    db: *const pdb.Database,
+    state: *WriterState,
+) ScanError!void {
+    var it = try rowsOrEmpty(db, .tracks);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const track = row.track;
+            try state.track_ids.put(alloc, track.id, {});
+            state.next_track_id = @max(state.next_track_id, track.id +| 1);
+            if (try decodeOrSkip(track.offsets.inner.file_path, alloc)) |path| {
+                if (path.len > 0) {
+                    try putStringIfAbsent(&state.tracks_by_path, alloc, path, track.id);
+                } else {
+                    alloc.free(path);
+                }
+            }
+        }
+    }
+}
+
+/// Scans `artists`: names into `artists_by_name`, the id counter past
+/// the highest artist id.
+fn scanArtists(
+    alloc: std.mem.Allocator,
+    db: *const pdb.Database,
+    state: *WriterState,
+) ScanError!void {
+    var it = try rowsOrEmpty(db, .artists);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const artist = row.artist;
+            state.next_artist_id = @max(state.next_artist_id, artist.id +| 1);
+            if (try decodeOrSkip(artist.offsets.inner.name, alloc)) |name| {
+                try putStringIfAbsent(&state.artists_by_name, alloc, name, artist.id);
+            }
+        }
+    }
+}
+
+/// Scans `albums`: `(owning artist, name)` pairs into
+/// `albums_by_artist_and_name`, the id counter past the highest album
+/// id.
+fn scanAlbums(
+    alloc: std.mem.Allocator,
+    db: *const pdb.Database,
+    state: *WriterState,
+) ScanError!void {
+    var it = try rowsOrEmpty(db, .albums);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const album = row.album;
+            state.next_album_id = @max(state.next_album_id, album.id +| 1);
+            if (try decodeOrSkip(album.offsets.inner.name, alloc)) |name| {
+                try putAlbumIfAbsent(
+                    &state.albums_by_artist_and_name,
+                    alloc,
+                    .{ .artist_id = album.artist_id, .name = name },
+                    album.id,
+                );
+            }
+        }
+    }
+}
+
+/// Scans `genres`: names into `genres_by_name`, the id counter past the
+/// highest genre id.
+fn scanGenres(
+    alloc: std.mem.Allocator,
+    db: *const pdb.Database,
+    state: *WriterState,
+) ScanError!void {
+    var it = try rowsOrEmpty(db, .genres);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const genre = row.genre;
+            state.next_genre_id = @max(state.next_genre_id, genre.id +| 1);
+            if (try decodeOrSkip(genre.name, alloc)) |name| {
+                try putStringIfAbsent(&state.genres_by_name, alloc, name, genre.id);
+            }
+        }
+    }
+}
+
+/// Scans `keys`: names folded through `canonicalKeyName` into
+/// `keys_by_canonical`, so later lookups collide across spellings, and
+/// the id counter past the highest key id.
+fn scanKeys(
+    alloc: std.mem.Allocator,
+    db: *const pdb.Database,
+    state: *WriterState,
+) ScanError!void {
+    var it = try rowsOrEmpty(db, .keys);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const key = row.key;
+            state.next_key_id = @max(state.next_key_id, key.id +| 1);
+            if (try decodeOrSkip(key.name, alloc)) |name| {
+                const canonical = try canonicalKeyName(alloc, name);
+                alloc.free(name);
+                try putStringIfAbsent(&state.keys_by_canonical, alloc, canonical, key.id);
+            }
+        }
+    }
+}
+
+/// Scans `labels`: names into `labels_by_name`, the id counter past the
+/// highest label id.
+fn scanLabels(
+    alloc: std.mem.Allocator,
+    db: *const pdb.Database,
+    state: *WriterState,
+) ScanError!void {
+    var it = try rowsOrEmpty(db, .labels);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const label = row.label;
+            state.next_label_id = @max(state.next_label_id, label.id +| 1);
+            if (try decodeOrSkip(label.name, alloc)) |name| {
+                try putStringIfAbsent(&state.labels_by_name, alloc, name, label.id);
+            }
+        }
+    }
+}
+
+/// Scans `artwork`: paths into `artwork_by_path`, the id counter past
+/// the highest artwork id.
+fn scanArtwork(
+    alloc: std.mem.Allocator,
+    db: *const pdb.Database,
+    state: *WriterState,
+) ScanError!void {
+    var it = try rowsOrEmpty(db, .artwork);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const artwork = row.artwork;
+            state.next_artwork_id = @max(state.next_artwork_id, artwork.id +| 1);
+            if (try decodeOrSkip(artwork.path, alloc)) |path| {
+                try putStringIfAbsent(&state.artwork_by_path, alloc, path, artwork.id);
+            }
+        }
+    }
+}
+
+/// Scans `playlist_tree`: `id -> is_folder` into `playlist_nodes` —
+/// last row wins on a repeated id, the oracle's `insert` where the
+/// string maps' `or_insert` keeps the first — and the id counter past
+/// the highest node id.
+fn scanPlaylistTree(
+    alloc: std.mem.Allocator,
+    db: *const pdb.Database,
+    state: *WriterState,
+) ScanError!void {
+    var it = try rowsOrEmpty(db, .playlist_tree);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const node = row.playlist_tree_node;
+            state.next_playlist_node_id = @max(state.next_playlist_node_id, node.id +| 1);
+            try state.playlist_nodes.put(alloc, node.id, node.isFolder());
+        }
+    }
+}
+
+/// Scans `playlist_entries`: per-playlist `entry_index` high-water
+/// marks into `playlist_entry_counts` — `max(entry_index) + 1`, not the
+/// row count, so a reopened export with sparse indices doesn't collide.
+fn scanPlaylistEntries(
+    alloc: std.mem.Allocator,
+    db: *const pdb.Database,
+    state: *WriterState,
+) ScanError!void {
+    var it = try rowsOrEmpty(db, .playlist_entries);
+    if (it) |*rows| {
+        while (try rows.next()) |row| {
+            const entry = row.playlist_entry;
+            const gop = try state.playlist_entry_counts.getOrPut(alloc, entry.playlist_id);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* = @max(gop.value_ptr.*, entry.entry_index +| 1);
+        }
+    }
+}
+
+/// Scans a plain database into a fresh `WriterState`: one pass per
+/// table, rebuilding the id counters (max id + 1) and the dedup maps the
+/// writer consults before inserting. First row wins on duplicate map
+/// keys, except `playlist_nodes`, where the last row wins (the oracle's
+/// `or_insert` vs `insert`). Rows are walked through the page chain, so
+/// deleted-row remnants in page heaps are invisible, exactly as to
+/// readers.
+pub fn scanWriterState(
+    alloc: std.mem.Allocator,
+    db: *const pdb.Database,
+) ScanError!WriterState {
+    var state = WriterState{};
+    errdefer state.deinit(alloc);
+
+    try scanTracks(alloc, db, &state);
+    try scanArtists(alloc, db, &state);
+    try scanAlbums(alloc, db, &state);
+    try scanGenres(alloc, db, &state);
+    try scanKeys(alloc, db, &state);
+    try scanLabels(alloc, db, &state);
+    try scanArtwork(alloc, db, &state);
+    try scanPlaylistTree(alloc, db, &state);
+    try scanPlaylistEntries(alloc, db, &state);
+
+    return state;
 }
 
 /// Extends a `WriterState` with the tag state recovered from an ext
