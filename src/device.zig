@@ -1317,18 +1317,16 @@ pub const DeviceExport = struct {
         if (!state.track_ids.contains(track_id)) return error.UnknownForeignKey;
         if (!state.tag_categories.contains(category_id)) return error.UnknownForeignKey;
 
+        // Order-preserving dedup: `seen` answers membership, `kept`
+        // carries the surviving labels in first-seen order.
         var kept = std.ArrayList([]const u8).empty;
         defer kept.deinit(e.alloc);
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(e.alloc);
         for (labels) |label| {
             if (label.len == 0) continue;
-            var duplicate = false;
-            for (kept.items) |seen| {
-                if (std.mem.eql(u8, seen, label)) {
-                    duplicate = true;
-                    break;
-                }
-            }
-            if (!duplicate) try kept.append(e.alloc, label);
+            const gop = try seen.getOrPut(e.alloc, label);
+            if (!gop.found_existing) try kept.append(e.alloc, label);
         }
         if (kept.items.len == 0) return;
 
