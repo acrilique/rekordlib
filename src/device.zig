@@ -1495,15 +1495,11 @@ pub const DeviceExport = struct {
     ) (std.mem.Allocator.Error || std.Io.Dir.CreateDirPathError || AtomicWriteError)!void {
         // Each path is freed before the next is built, so a failure
         // between the creations leaks nothing.
-        const dir_fns = [_]*const fn (
-            Layout,
-            std.mem.Allocator,
-        ) std.mem.Allocator.Error![]u8{
+        inline for (.{
             Layout.rekordboxDir,
             Layout.usbanlzDir,
             Layout.contentsDir,
-        };
-        for (dir_fns) |dir_fn| {
+        }) |dir_fn| {
             const dir_path = try dir_fn(e.layout, e.alloc);
             defer e.alloc.free(dir_path);
             try dir.createDirPath(e.io, dir_path);
