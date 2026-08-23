@@ -654,7 +654,7 @@ pub const DeviceExport = struct {
             .pending_settings = pending,
             // Fresh counters and empty maps: the default color/column/menu
             // rows live in tables the writer doesn't track.
-            .writer_state = .{},
+            .writer_state = .{ .arena = std.heap.ArenaAllocator.init(alloc) },
             // Tags start empty — even over a root carrying a leftover
             // `exportExt.pdb`, which `save` then overwrites.
             .ext_pdb_state = .absent,
@@ -676,7 +676,7 @@ pub const DeviceExport = struct {
         if (e.pending_settings) |pending| {
             for (pending) |bytes| e.alloc.free(bytes);
         }
-        if (e.writer_state) |*state| state.deinit(e.alloc);
+        if (e.writer_state) |*state| state.deinit();
         for (e.pending_anlz.items) |*file| file.deinit(e.alloc);
         e.pending_anlz.deinit(e.alloc);
         if (e.dir) |dir| dir.close(e.io);
@@ -806,14 +806,16 @@ pub const DeviceExport = struct {
         row.remixer_id = remixer_id;
 
         // Reserve everything the bookkeeping needs so the steps after the
-        // insert cannot fail half-applied.
+        // insert cannot fail half-applied. Map keys and capacity come from
+        // the state's arena, so a key orphaned by a failure is reclaimed
+        // with the state instead of freed here.
         try e.pending_anlz.ensureUnusedCapacity(e.alloc, anlz_files.len);
-        try state.track_ids.ensureUnusedCapacity(e.alloc, 1);
+        const sa = state.arena.allocator();
+        try state.track_ids.ensureUnusedCapacity(sa, 1);
         var owned_path: ?[]u8 = null;
-        errdefer if (owned_path) |path| e.alloc.free(path);
         if (track.file_path.len > 0) {
-            owned_path = try e.alloc.dupe(u8, track.file_path);
-            try state.tracks_by_path.ensureUnusedCapacity(e.alloc, 1);
+            owned_path = try sa.dupe(u8, track.file_path);
+            try state.tracks_by_path.ensureUnusedCapacity(sa, 1);
         }
 
         const db = try e.openPdb();
@@ -1014,7 +1016,7 @@ pub const DeviceExport = struct {
         _ = try db.addRow(&row);
         state.next_artist_id += 1;
 
-        try putStringIfAbsent(&state.artists_by_name, e.alloc, try e.alloc.dupe(u8, name), id);
+        try putIfAbsent(&state.artists_by_name, state.arena.allocator(), try state.arena.allocator().dupe(u8, name), id);
         return id;
     }
 
@@ -1044,10 +1046,10 @@ pub const DeviceExport = struct {
         _ = try db.addRow(&row);
         state.next_album_id += 1;
 
-        try putAlbumIfAbsent(
+        try putIfAbsent(
             &state.albums_by_artist_and_name,
-            e.alloc,
-            .{ .artist_id = artist_id, .name = try e.alloc.dupe(u8, name) },
+            state.arena.allocator(),
+            AlbumKey{ .artist_id = artist_id, .name = try state.arena.allocator().dupe(u8, name) },
             id,
         );
         return id;
@@ -1069,7 +1071,7 @@ pub const DeviceExport = struct {
         _ = try db.addRow(&row);
         state.next_genre_id += 1;
 
-        try putStringIfAbsent(&state.genres_by_name, e.alloc, try e.alloc.dupe(u8, name), id);
+        try putIfAbsent(&state.genres_by_name, state.arena.allocator(), try state.arena.allocator().dupe(u8, name), id);
         return id;
     }
 
@@ -1079,8 +1081,8 @@ pub const DeviceExport = struct {
     fn getOrCreateKey(e: *DeviceExport, name: []const u8) AddTrackError!u32 {
         const state = try e.writerState();
         if (name.len == 0) return 0;
-        const canonical = try canonicalKeyName(e.alloc, name);
-        defer e.alloc.free(canonical);
+        const sa = state.arena.allocator();
+        const canonical = try canonicalKeyName(sa, name);
         if (state.keys_by_canonical.get(canonical)) |id| return id;
 
         const db = try e.openPdb();
@@ -1100,7 +1102,7 @@ pub const DeviceExport = struct {
         _ = try db.addRow(&row);
         state.next_key_id += 1;
 
-        try putStringIfAbsent(&state.keys_by_canonical, e.alloc, try e.alloc.dupe(u8, canonical), id);
+        try putIfAbsent(&state.keys_by_canonical, sa, canonical, id);
         return id;
     }
 
@@ -1120,7 +1122,7 @@ pub const DeviceExport = struct {
         _ = try db.addRow(&row);
         state.next_label_id += 1;
 
-        try putStringIfAbsent(&state.labels_by_name, e.alloc, try e.alloc.dupe(u8, name), id);
+        try putIfAbsent(&state.labels_by_name, state.arena.allocator(), try state.arena.allocator().dupe(u8, name), id);
         return id;
     }
 
@@ -1142,7 +1144,7 @@ pub const DeviceExport = struct {
         _ = try db.addRow(&row);
         state.next_artwork_id += 1;
 
-        try putStringIfAbsent(&state.artwork_by_path, e.alloc, try e.alloc.dupe(u8, path), id);
+        try putIfAbsent(&state.artwork_by_path, state.arena.allocator(), try state.arena.allocator().dupe(u8, path), id);
         return id;
     }
 
@@ -1198,7 +1200,7 @@ pub const DeviceExport = struct {
             .node_is_folder = if (is_folder) 1 else 0,
             .name = try pdb.DeviceSQLString.fromUtf8(a, name),
         };
-        try state.playlist_nodes.ensureUnusedCapacity(e.alloc, 1);
+        try state.playlist_nodes.ensureUnusedCapacity(state.arena.allocator(), 1);
         var row = pdb.Row{ .playlist_tree_node = boxed };
         _ = try db.addRow(&row);
 
@@ -1233,7 +1235,7 @@ pub const DeviceExport = struct {
             .track_id = track_id,
             .playlist_id = playlist_id,
         };
-        try state.playlist_entry_counts.ensureUnusedCapacity(e.alloc, 1);
+        try state.playlist_entry_counts.ensureUnusedCapacity(state.arena.allocator(), 1);
         var row = pdb.Row{ .playlist_entry = boxed };
         _ = try db.addRow(&row);
 
@@ -1260,7 +1262,7 @@ pub const DeviceExport = struct {
             .is_category = true,
             .row_index = row_index,
         }, name);
-        try state.tag_categories.ensureUnusedCapacity(e.alloc, 1);
+        try state.tag_categories.ensureUnusedCapacity(state.arena.allocator(), 1);
         var row = pdb.Row{ .tag = boxed };
         _ = try db.addRow(&row);
 
@@ -1349,13 +1351,13 @@ pub const DeviceExport = struct {
             .row_index = row_index,
         }, label);
 
-        // The map key outlives the call in the state; reserve both map
-        // updates before the insert so the bookkeeping after it cannot
+        // The map key outlives the call in the state's arena; reserve both
+        // map updates before the insert so the bookkeeping after it cannot
         // fail half-applied.
-        const owned_label = try e.alloc.dupe(u8, label);
-        errdefer e.alloc.free(owned_label);
-        try state.tags_by_key.ensureUnusedCapacity(e.alloc, 1);
-        try state.tag_leaf_counts.ensureUnusedCapacity(e.alloc, 1);
+        const sa = state.arena.allocator();
+        const owned_label = try sa.dupe(u8, label);
+        try state.tags_by_key.ensureUnusedCapacity(sa, 1);
+        try state.tag_leaf_counts.ensureUnusedCapacity(sa, 1);
         var row = pdb.Row{ .tag = boxed };
         _ = try db.addRow(&row);
 
@@ -1409,7 +1411,8 @@ pub const DeviceExport = struct {
         defer e.alloc.free(buf);
         var db = try pdb.Database.parse(e.alloc, buf, .ext);
         errdefer db.deinit();
-        try scanExtTags(e.alloc, &db, try e.writerState());
+        const state = try e.writerState();
+        try scanExtTags(state.arena.allocator(), &db, state);
         e.ext_pdb_state = .{ .loaded = db };
     }
 
@@ -1756,11 +1759,14 @@ pub const TagsByKey = std.HashMapUnmanaged(
 
 /// The writer's cached view of an export: one `next_*` id counter per
 /// table it appends to, plus the dedup maps that let later inserts reuse
-/// an existing row instead of duplicating it. Rebuilt from a plain
+/// an existing row instead of duplicating it. Everything the state
+/// allocates — map entries and string keys alike — comes from its arena
+/// and is reclaimed whole by `deinit`; a key that duplicates an existing
+/// one simply stays in the arena until then. Rebuilt from a plain
 /// database by `scanWriterState` and extended over an ext database's tag
-/// rows by `scanExtTags`; every string key is owned by the state and
-/// freed by `deinit`.
+/// rows by `scanExtTags`.
 pub const WriterState = struct {
+    arena: std.heap.ArenaAllocator,
     /// Next free id per table. Id 0 is the null foreign key, so the
     /// counters start at 1 and a scan leaves each one past the highest
     /// id that table carries.
@@ -1809,38 +1815,8 @@ pub const WriterState = struct {
     /// category).
     tag_leaf_counts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
 
-    pub fn deinit(state: *WriterState, alloc: std.mem.Allocator) void {
-        const string_maps = .{
-            &state.tracks_by_path,
-            &state.artists_by_name,
-            &state.genres_by_name,
-            &state.keys_by_canonical,
-            &state.labels_by_name,
-            &state.artwork_by_path,
-        };
-        inline for (string_maps) |map| {
-            var it = map.iterator();
-            while (it.next()) |entry| alloc.free(entry.key_ptr.*);
-            map.deinit(alloc);
-        }
-        {
-            var it = state.albums_by_artist_and_name.iterator();
-            while (it.next()) |entry| alloc.free(entry.key_ptr.name);
-            state.albums_by_artist_and_name.deinit(alloc);
-        }
-        {
-            var it = state.tags_by_key.iterator();
-            while (it.next()) |entry| alloc.free(entry.key_ptr.label);
-            state.tags_by_key.deinit(alloc);
-        }
-        const id_maps = .{
-            &state.track_ids,
-            &state.playlist_nodes,
-            &state.playlist_entry_counts,
-            &state.tag_categories,
-            &state.tag_leaf_counts,
-        };
-        inline for (id_maps) |map| map.deinit(alloc);
+    pub fn deinit(state: *WriterState) void {
+        state.arena.deinit();
     }
 };
 
@@ -1880,61 +1856,16 @@ fn decodeOrSkip(
 }
 
 /// Inserts `key -> value` unless `key` is already present — first row
-/// wins. The caller-owned `key` is freed when it duplicates an existing
-/// entry, and owned by the map afterwards.
-fn putStringIfAbsent(
-    map: *std.StringHashMapUnmanaged(u32),
-    alloc: std.mem.Allocator,
-    key: []u8,
+/// wins. The key must come from the state's arena; a duplicate's copy is
+/// simply left there, reclaimed with the state at `deinit`.
+fn putIfAbsent(
+    map: anytype,
+    a: std.mem.Allocator,
+    key: anytype,
     value: u32,
 ) std.mem.Allocator.Error!void {
-    const gop = map.getOrPut(alloc, key) catch |err| {
-        alloc.free(key);
-        return err;
-    };
-    if (gop.found_existing) {
-        alloc.free(key);
-    } else {
-        gop.key_ptr.* = key;
-        gop.value_ptr.* = value;
-    }
-}
-
-/// `putStringIfAbsent` for the album map, which owns only the key's
-/// `name` slice.
-fn putAlbumIfAbsent(
-    map: *AlbumsByArtistAndName,
-    alloc: std.mem.Allocator,
-    key: AlbumKey,
-    value: u32,
-) std.mem.Allocator.Error!void {
-    const gop = map.getOrPut(alloc, key) catch |err| {
-        alloc.free(key.name);
-        return err;
-    };
-    if (gop.found_existing) {
-        alloc.free(key.name);
-    } else {
-        gop.key_ptr.* = key;
-        gop.value_ptr.* = value;
-    }
-}
-
-/// `putStringIfAbsent` for the leaf-tag map, which owns only the key's
-/// `label` slice.
-fn putTagKeyIfAbsent(
-    map: *TagsByKey,
-    alloc: std.mem.Allocator,
-    key: TagKey,
-    value: u32,
-) std.mem.Allocator.Error!void {
-    const gop = map.getOrPut(alloc, key) catch |err| {
-        alloc.free(key.label);
-        return err;
-    };
-    if (gop.found_existing) {
-        alloc.free(key.label);
-    } else {
+    const gop = try map.getOrPut(a, key);
+    if (!gop.found_existing) {
         gop.key_ptr.* = key;
         gop.value_ptr.* = value;
     }
@@ -1994,11 +1925,8 @@ fn scanTracks(
             try state.track_ids.put(alloc, track.id, {});
             state.next_track_id = @max(state.next_track_id, track.id +| 1);
             if (try decodeOrSkip(track.offsets.inner.file_path, alloc)) |path| {
-                if (path.len > 0) {
-                    try putStringIfAbsent(&state.tracks_by_path, alloc, path, track.id);
-                } else {
-                    alloc.free(path);
-                }
+                if (path.len > 0)
+                    try putIfAbsent(&state.tracks_by_path, alloc, path, track.id);
             }
         }
     }
@@ -2017,7 +1945,7 @@ fn scanArtists(
             const artist = row.artist;
             state.next_artist_id = @max(state.next_artist_id, artist.id +| 1);
             if (try decodeOrSkip(artist.offsets.inner.name, alloc)) |name| {
-                try putStringIfAbsent(&state.artists_by_name, alloc, name, artist.id);
+                try putIfAbsent(&state.artists_by_name, alloc, name, artist.id);
             }
         }
     }
@@ -2037,10 +1965,10 @@ fn scanAlbums(
             const album = row.album;
             state.next_album_id = @max(state.next_album_id, album.id +| 1);
             if (try decodeOrSkip(album.offsets.inner.name, alloc)) |name| {
-                try putAlbumIfAbsent(
+                try putIfAbsent(
                     &state.albums_by_artist_and_name,
                     alloc,
-                    .{ .artist_id = album.artist_id, .name = name },
+                    AlbumKey{ .artist_id = album.artist_id, .name = name },
                     album.id,
                 );
             }
@@ -2061,7 +1989,7 @@ fn scanGenres(
             const genre = row.genre;
             state.next_genre_id = @max(state.next_genre_id, genre.id +| 1);
             if (try decodeOrSkip(genre.name, alloc)) |name| {
-                try putStringIfAbsent(&state.genres_by_name, alloc, name, genre.id);
+                try putIfAbsent(&state.genres_by_name, alloc, name, genre.id);
             }
         }
     }
@@ -2082,8 +2010,7 @@ fn scanKeys(
             state.next_key_id = @max(state.next_key_id, key.id +| 1);
             if (try decodeOrSkip(key.name, alloc)) |name| {
                 const canonical = try canonicalKeyName(alloc, name);
-                alloc.free(name);
-                try putStringIfAbsent(&state.keys_by_canonical, alloc, canonical, key.id);
+                try putIfAbsent(&state.keys_by_canonical, alloc, canonical, key.id);
             }
         }
     }
@@ -2102,7 +2029,7 @@ fn scanLabels(
             const label = row.label;
             state.next_label_id = @max(state.next_label_id, label.id +| 1);
             if (try decodeOrSkip(label.name, alloc)) |name| {
-                try putStringIfAbsent(&state.labels_by_name, alloc, name, label.id);
+                try putIfAbsent(&state.labels_by_name, alloc, name, label.id);
             }
         }
     }
@@ -2121,7 +2048,7 @@ fn scanArtwork(
             const artwork = row.artwork;
             state.next_artwork_id = @max(state.next_artwork_id, artwork.id +| 1);
             if (try decodeOrSkip(artwork.path, alloc)) |path| {
-                try putStringIfAbsent(&state.artwork_by_path, alloc, path, artwork.id);
+                try putIfAbsent(&state.artwork_by_path, alloc, path, artwork.id);
             }
         }
     }
@@ -2172,18 +2099,19 @@ pub fn scanWriterState(
     alloc: std.mem.Allocator,
     db: *const pdb.Database,
 ) ScanError!WriterState {
-    var state = WriterState{};
-    errdefer state.deinit(alloc);
+    var state = WriterState{ .arena = std.heap.ArenaAllocator.init(alloc) };
+    errdefer state.deinit();
 
-    try scanTracks(alloc, db, &state);
-    try scanArtists(alloc, db, &state);
-    try scanAlbums(alloc, db, &state);
-    try scanGenres(alloc, db, &state);
-    try scanKeys(alloc, db, &state);
-    try scanLabels(alloc, db, &state);
-    try scanArtwork(alloc, db, &state);
-    try scanPlaylistTree(alloc, db, &state);
-    try scanPlaylistEntries(alloc, db, &state);
+    const a = state.arena.allocator();
+    try scanTracks(a, db, &state);
+    try scanArtists(a, db, &state);
+    try scanAlbums(a, db, &state);
+    try scanGenres(a, db, &state);
+    try scanKeys(a, db, &state);
+    try scanLabels(a, db, &state);
+    try scanArtwork(a, db, &state);
+    try scanPlaylistTree(a, db, &state);
+    try scanPlaylistEntries(a, db, &state);
 
     return state;
 }
@@ -2218,10 +2146,10 @@ pub fn scanExtTags(
                 state.next_category_position = @max(state.next_category_position, tag.position +| 1);
             } else {
                 if (try decodeOrSkip(tag.offsets.inner.name, alloc)) |label| {
-                    try putTagKeyIfAbsent(
+                    try putIfAbsent(
                         &state.tags_by_key,
                         alloc,
-                        .{ .category_id = tag.parent_id, .label = label },
+                        TagKey{ .category_id = tag.parent_id, .label = label },
                         tag.id,
                     );
                 }

@@ -932,7 +932,7 @@ test "writer state scans num_rows at scale" {
     defer db.deinit();
 
     var state = try device.scanWriterState(alloc, &db);
-    defer state.deinit(alloc);
+    defer state.deinit();
 
     try testing.expectEqual(@as(usize, 3886), state.track_ids.count());
     try testing.expect(state.next_track_id > 3886);
@@ -980,9 +980,9 @@ test "ext tag scan recovers a built ext database" {
     var techno_dup = try testTagRow(a, 7, 2, 20, false, 3, "Techno");
     _ = try db.addRow(&techno_dup);
 
-    var state = device.WriterState{};
-    defer state.deinit(alloc);
-    try device.scanExtTags(alloc, &db, &state);
+    var state = device.WriterState{ .arena = std.heap.ArenaAllocator.init(alloc) };
+    defer state.deinit();
+    try device.scanExtTags(state.arena.allocator(), &db, &state);
 
     try testing.expectEqual(@as(u32, 21), state.next_tag_id);
     try testing.expectEqual(@as(u32, 4), state.next_tag_row_index);
@@ -1011,9 +1011,9 @@ test "ext tag scan recovers the with_anlz fixture" {
     var db = try pdb.Database.parse(alloc, input, .ext);
     defer db.deinit();
 
-    var state = device.WriterState{};
-    defer state.deinit(alloc);
-    try device.scanExtTags(alloc, &db, &state);
+    var state = device.WriterState{ .arena = std.heap.ArenaAllocator.init(alloc) };
+    defer state.deinit();
+    try device.scanExtTags(state.arena.allocator(), &db, &state);
 
     // Hand-checked against the fixture (2026-08-23): 4 categories —
     // Genre, Components, Situation, Untitled Column (ids 1-4, positions
