@@ -11,8 +11,7 @@
 //! * the crypto provider — implemented over `std.crypto` and registered
 //!   through SQLCipher's documented `SQLCIPHER_CRYPTO_CUSTOM` hook, so no
 //!   third-party crypto C is vendored;
-//! * a thin SQLite wrapper (the "A candidate" of the O1 spike) over the
-//!   symbol-renamed C API;
+//! * a thin SQLite wrapper over the symbol-renamed C API;
 //! * the read models (`Library`): every row of the 22 OneLibrary tables,
 //!   schema-pinned and arena-owned, with keyed access for the joins the
 //!   device reader needs.
@@ -26,34 +25,24 @@ const std = @import("std");
 const opts = @import("options");
 const c = @import("c");
 
-/// The build mode (`-Ddlp`), comptime-known; compare with `.off`/`.vendored`/
-/// `.system` literals.
 pub const mode = opts.dlp;
 
 fn dlpDisabled() noreturn {
     @compileError("rekordlib was built with -Ddlp=off; rebuild with -Ddlp=vendored (or =system) to use the OneLibrary store");
 }
 
-/// The symbols differ per mode: the vendored build renames every
-/// `sqlite3_*`/`sqlcipher_*` export to `rl_sqlite3_*` (decision 10) —
-/// including the `sqlite3_stmt` typedef — the system build binds the
-/// consumer's own unprefixed SQLCipher, and `off` translates the renamed
-/// header without compiling any C. One comptime prefix resolves every
-/// binding through both headers; the dead branch of the mode switch is
-/// not analyzed, so only the referenced set is emitted.
+/// off/vendored bind `rl_`-renamed symbols (typedefs included; `off`
+/// translates the renamed header without compiling any C); system binds
+/// the consumer's unprefixed SQLCipher.
 const prefix: []const u8 = switch (mode) {
     .system => "",
     .off, .vendored => "rl_",
 };
 
-/// Declaration lookup under the mode's prefix: `cfn("sqlite3_open_v2")`
-/// resolves `rl_sqlite3_open_v2` in off/vendored builds and
-/// `sqlite3_open_v2` in system builds.
 fn cfn(comptime name: []const u8) @TypeOf(@field(c, prefix ++ name)) {
     return @field(c, prefix ++ name);
 }
 
-/// The statement handle type, renamed in the vendored header.
 const cStmt = @field(c, prefix ++ "sqlite3_stmt");
 
 const api = switch (mode) {
@@ -121,12 +110,10 @@ pub const Provider = extern struct {
 };
 
 /// OS entropy source seed for salt/IV generation. SQLCipher passes the
-/// ctx it asks the provider to build (`ctx_init`) as the first argument
-/// to every callback, but gives `ctx_init` no input, so the wrapper parks
-/// its Io in this seed (`Db.open` does it); `providerCtxInit` copies the
-/// seed into each provider ctx, and callbacks then read their Io from
-/// there - an open db pins its own Io instead of racing on whatever
-/// `Db.open` ran last.
+/// provider ctx to every callback but gives `ctx_init` no input, so
+/// `Db.open` parks its Io here and `providerCtxInit` copies it into each
+/// provider ctx — an open db pins its own Io instead of racing on
+/// whatever `Db.open` ran last.
 var io_seed: ?std.Io = null;
 
 fn providerHmac(
@@ -198,11 +185,9 @@ fn providerKdf(
     };
 }
 
-/// AES-256-CBC over a whole number of 16-byte blocks (pages are).
-/// std.crypto ships no CBC mode (0.16's modes.zig carries only CTR), so
-/// the chain is implemented here. Public because it is the honest core -
-/// no C types, directly testable against published vectors - under the
-/// provider shell that owns the SQLCipher ABI.
+/// AES-256-CBC over a whole number of 16-byte blocks (pages are);
+/// std.crypto ships no CBC mode. Public and free of C types — directly
+/// testable against published vectors.
 pub fn cbc(comptime encrypt: bool, key: [32]u8, iv: [16]u8, dst: []u8, src: []const u8) void {
     std.debug.assert(dst.len >= src.len);
     const aes = if (encrypt)
@@ -226,8 +211,6 @@ pub fn cbc(comptime encrypt: bool, key: [32]u8, iv: [16]u8, dst: []u8, src: []co
     }
 }
 
-/// The cipher provider callback: a thin dishonest shell unwrapping the C
-/// arguments around `cbc`.
 fn providerCipher(
     ctx: ?*anyopaque,
     enc: c_int,
@@ -299,10 +282,10 @@ fn providerGetHmacSz(ctx: ?*anyopaque, algorithm: c_int) callconv(.c) c_int {
     };
 }
 
-/// Snapshots the seed Io into the provider ctx sqlcipher will hand back
-/// to every callback. No allocation happens before the first open parks
-/// an Io (sqlcipher's library init also comes through here): the ctx
-/// stays null then, and `providerRandom` refuses like it always did.
+/// Snapshots the seed Io into the provider ctx sqlcipher hands to every
+/// callback. Before the first open the seed is null (sqlcipher's library
+/// init also comes through here) and the ctx stays null; `providerRandom`
+/// refuses then.
 fn providerCtxInit(ctx: *?*anyopaque) callconv(.c) c_int {
     ctx.* = null;
     if (io_seed) |io| {
@@ -359,18 +342,17 @@ pub export fn rl_sqlcipher_zig_provider_setup(p: *Provider) c_int {
 }
 
 // ---------------------------------------------------------------------------
-// SQLite wrapper (O1 candidate A)
+// SQLite wrapper
 // ---------------------------------------------------------------------------
 
-/// rbox 0.1.5 `conn.rs` MAGIC with each byte decremented (plan Phase O).
+/// rbox 0.1.5 `conn.rs` MAGIC with each byte decremented.
 pub const passphrase = "r8gddnr4k847830ar6cqzbkk0el6qytmb3trbbx805jm74vez64i5o8fnrqryqls";
 
 pub const SqlError = error{ Sqlite, OutOfMemory };
 
 pub const StepResult = enum { row, done };
 
-/// One prepared statement over an open `Db`. Borrowed: finalizing returns
-/// it to the caller's discipline (the `deinit`-style call is `finalize`).
+/// One prepared statement over an open `Db`.
 pub const Stmt = struct {
     handle: *cStmt,
 
@@ -386,9 +368,6 @@ pub const Stmt = struct {
         _ = api.finalize(self.handle);
     }
 
-    /// Resets the statement and clears every binding: the rebind-everything
-    /// reuse discipline. (SQLite separates the two so callers can keep
-    /// bindings across a reset; nothing here needs that yet.)
     pub fn resetAndClear(self: Stmt) SqlError!void {
         if (api.reset(self.handle) != c.SQLITE_OK) return error.Sqlite;
         _ = api.clear_bindings(self.handle);
@@ -461,7 +440,7 @@ fn sqlite_transient() ?*const fn (?*anyopaque) callconv(.c) void {
     return @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
 }
 
-/// An open, keyed OneLibrary database. `open` reads (recovering WAL state),
+/// An open OneLibrary database. `open` reads (recovering WAL state),
 /// `openReadWriteCreate` also creates - both apply the DLP passphrase.
 pub const Db = struct {
     handle: *c.sqlite3,
@@ -553,13 +532,11 @@ pub fn sqliteVersion() [:0]const u8 {
 }
 
 // ---------------------------------------------------------------------------
-// OneLibrary read models (O2)
+// OneLibrary read models
 // ---------------------------------------------------------------------------
 
-/// Loading error of `Library.load`: the SQLite wrapper's errors plus the
-/// schema-shape validation (`SchemaMismatch`: a table's column count or
-/// column names differ from the pinned schema — the OneLibrary analog of
-/// the pdb `constant_fields` asserts).
+/// Loading error of `Library.load`: SQLite errors plus `SchemaMismatch`
+/// (a table's columns differ from the pinned schema).
 pub const LoadError = SqlError || error{SchemaMismatch};
 
 /// An `album` row. `isComplation` [sic] is Pioneer's typo, kept verbatim
@@ -597,14 +574,13 @@ pub const Color = struct {
 
 /// A `content` row: one track. The central table of the db — every other
 /// track-related table references it by `content_id`, and the pdb side
-/// joins by `path` (the two id spaces are independent). Facts pinned by
+/// joins by `path`. Facts pinned by
 /// the with_anlz fixture: `path` is device-root-absolute (`/Contents/...`),
 /// `analysisDataFilePath` is root-absolute to the track's ANLZ `.DAT`,
 /// `contentLink` = 788 224 = the pdb Track bitmask `0x000C0700`,
 /// `analysedBits` = 41 = the pdb Track `unknown5`, and the artist foreign
 /// keys are named `artist_id_<role>` (`djPlayCount` and
-/// `artist_id_originalArtist` are missing from the rbox 0.1.5 model — see
-/// the upstream-report checklist in PLAN.md).
+/// `artist_id_originalArtist` are missing from the rbox 0.1.5 model).
 pub const Content = struct {
     content_id: i64,
     title: ?[]const u8,
@@ -798,8 +774,8 @@ pub const PlaylistContent = struct {
 
 /// The `property` row — a singleton; real exports carry exactly one.
 /// `dbVersion` is a varchar holding `'10000'` (rbox models an INTEGER
-/// defaulting to 1000 — drift, see the checklist); `deviceName` is the
-/// empty string in exports; `myTagMasterDBID` derives from the master db
+/// defaulting to 1000); `deviceName` is the empty string in exports;
+/// `myTagMasterDBID` derives from the master db and writers may leave 0.
 /// and writers may leave 0.
 pub const Property = struct {
     deviceName: ?[]const u8,
@@ -811,8 +787,7 @@ pub const Property = struct {
 };
 
 /// A `recommendedLike` row: a liked-track relation between two contents.
-/// `createdDate` is an INTEGER here (rbox models TEXT — drift, see the
-/// checklist).
+/// `createdDate` is an INTEGER here (rbox models TEXT).
 pub const RecommendedLike = struct {
     content_id_1: ?i64,
     content_id_2: ?i64,
@@ -832,8 +807,6 @@ pub const Sort = struct {
 
 /// Every loaded table except `property` (a singleton loaded by hand):
 /// row type, SQL table name, and the `Library` field the rows land in.
-/// Field order is schema order — `loadTable` validates every column name
-/// against it.
 const row_tables = .{
     .{ .row = Album, .table = "album", .rows = "albums" },
     .{ .row = Artist, .table = "artist", .rows = "artists" },
@@ -859,8 +832,7 @@ const row_tables = .{
 };
 
 /// The keyed-access wiring for every table with a primary key: row type,
-/// `Library` rows field, map field, and the id column. SQLite enforces
-/// the PK constraint, so each id maps to exactly one row index.
+/// `Library` rows field, map field, and the id column.
 const id_tables = .{
     .{ .row = Album, .rows = "albums", .map = "album_by_id", .id = "album_id" },
     .{ .row = Artist, .rows = "artists", .map = "artist_by_id", .id = "artist_id" },
@@ -884,11 +856,11 @@ const id_tables = .{
 /// every table, strings and all. The models mirror the real schema
 /// exactly — column names verbatim (typos included), declaration order =
 /// schema order, and every non-primary-key column optional, because the
-/// real schema carries no NOT NULL anywhere (upstream-report checklist);
-/// the fixture writes NULL for unset foreign keys (`artist_id_remixer`)
-/// and empty strings elsewhere (`isrc`), and both survive verbatim.
+/// real schema carries no NOT NULL anywhere; the fixture writes NULL
+/// for unset foreign keys (`artist_id_remixer`) and empty strings
+/// elsewhere (`isrc`), and both survive verbatim.
 /// Integer columns are read through SQLite's numeric conversion; there
-/// are no enums — the O4 reader layer interprets raw values.
+/// are no enums — the reader layer interprets raw values.
 pub const Library = struct {
     /// Arena owning every row, string, and index parsed into this
     /// instance.
@@ -947,9 +919,7 @@ pub const Library = struct {
     hot_cue_bank_cues_by_list: std.AutoHashMapUnmanaged(i64, []u32) = .empty,
 
     /// Reads every table of an open db (keyed or plaintext — the models
-    /// do not differ). Each table's column layout is validated against
-    /// the pinned schema before any row is read; more than one
-    /// `property` row is a `SchemaMismatch`.
+    /// do not differ); more than one `property` row is a `SchemaMismatch`.
     pub fn load(alloc: std.mem.Allocator, db: Db) LoadError!Library {
         if (mode == .off) dlpDisabled();
         const arena = try alloc.create(std.heap.ArenaAllocator);
@@ -1017,9 +987,8 @@ pub const Library = struct {
         child.destroy(lib.arena);
     }
 
-    /// Model equality (decision 11's acceptance primitive): same rows,
-    /// field by field, in load order. Derived indexes are not compared —
-    /// they are functions of the rows.
+    /// Model equality: same rows, field by field, in load order. Derived
+    /// indexes are not compared — they are functions of the rows.
     pub fn eql(self: *const Library, other: *const Library) bool {
         inline for (row_tables) |t| {
             const mine = @field(self, t.rows);
@@ -1055,11 +1024,8 @@ fn loadTable(
         if (!std.mem.eql(u8, stmt.columnName(i), f.name)) return error.SchemaMismatch;
     }
 
-    // Exactly-sized: the arena cannot reclaim a grown buffer, so the row
-    // list is pre-sized from COUNT(*) rather than doubled through appends
-    // that would strand every previous buffer. If the db changed between
-    // the two queries, append still grows - correctness does not depend
-    // on the count.
+    // Pre-sized from COUNT(*) because the arena cannot reclaim a grown
+    // buffer; append still grows if the db changed between the queries.
     const count = try db.scalarInt("SELECT COUNT(*) FROM " ++ table ++ ";");
     var rows: std.ArrayListUnmanaged(T) = .empty;
     try rows.ensureTotalCapacity(a, @intCast(count));
@@ -1148,7 +1114,6 @@ fn indexById(
 /// Builds one junction grouping: key value → row indices, in row order;
 /// `order_field`, when given, re-orders each group by that column
 /// (`sequenceNo`) with NULLs last. Rows whose key is NULL are skipped.
-/// The four groupings mirror the schema's own four indexes.
 fn groupRows(
     a: std.mem.Allocator,
     rows: anytype,
