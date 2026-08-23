@@ -93,12 +93,10 @@ pub const Layout = struct {
     /// computed from `audio_path`; see `pathHash` for the format
     /// `audio_path` must have.
     pub fn anlzDir(l: Layout, alloc: std.mem.Allocator, audio_path: []const u8) PathError![]u8 {
-        var p_folder: [4]u8 = undefined;
-        var leaf_folder: [8]u8 = undefined;
-        const names = anlzFolderNames(try pathHash(audio_path), &p_folder, &leaf_folder);
+        const names = anlzFolderNames(try pathHash(audio_path));
         return std.fs.path.join(
             alloc,
-            &.{ l.root, "PIONEER", "USBANLZ", names.p_folder, names.leaf_folder },
+            &.{ l.root, "PIONEER", "USBANLZ", &names.p_folder, &names.leaf_folder },
         );
     }
 
@@ -190,18 +188,21 @@ pub fn pathHash(audio_path: []const u8) error{InvalidUtf8}!PathHash {
     return .{ .p_value = p_value, .hash = hash_result };
 }
 
-/// Formats a path hash's two folder names — `P{XXX}` and `{HHHHHHHH}`.
-/// The buffers exactly fit every value `pathHash` produces, so the prints
-/// cannot fail; the returned slices point into the buffers.
-fn anlzFolderNames(
-    h: PathHash,
-    p_folder: *[4]u8,
-    leaf_folder: *[8]u8,
-) struct { p_folder: []const u8, leaf_folder: []const u8 } {
-    return .{
-        .p_folder = std.fmt.bufPrint(p_folder, "P{X:0>3}", .{h.p_value}) catch unreachable,
-        .leaf_folder = std.fmt.bufPrint(leaf_folder, "{X:0>8}", .{h.hash}) catch unreachable,
-    };
+/// The two `USBANLZ` folder names a path hash maps to.
+const AnlzFolderNames = struct {
+    /// `P{XXX}` — three hexadecimal digits.
+    p_folder: [4]u8,
+    /// `{HHHHHHHH}` — eight hexadecimal digits.
+    leaf_folder: [8]u8,
+};
+
+/// Formats a path hash's two folder names. The arrays exactly fit every
+/// value `pathHash` produces, so the prints cannot fail.
+fn anlzFolderNames(h: PathHash) AnlzFolderNames {
+    var names: AnlzFolderNames = undefined;
+    _ = std.fmt.bufPrint(&names.p_folder, "P{X:0>3}", .{h.p_value}) catch unreachable;
+    _ = std.fmt.bufPrint(&names.leaf_folder, "{X:0>8}", .{h.hash}) catch unreachable;
+    return names;
 }
 
 /// Device-relative path stored in the pdb `analyze_path` column: the `.DAT`
@@ -209,13 +210,11 @@ fn anlzFolderNames(
 /// substitution on the same stem. Computed from `audio_path` via
 /// `pathHash`.
 pub fn anlzDevicePath(alloc: std.mem.Allocator, audio_path: []const u8) PathError![]u8 {
-    var p_folder: [4]u8 = undefined;
-    var leaf_folder: [8]u8 = undefined;
-    const names = anlzFolderNames(try pathHash(audio_path), &p_folder, &leaf_folder);
+    const names = anlzFolderNames(try pathHash(audio_path));
     return std.fmt.allocPrint(
         alloc,
         "/PIONEER/USBANLZ/{s}/{s}/ANLZ0000.DAT",
-        .{ names.p_folder, names.leaf_folder },
+        .{ &names.p_folder, &names.leaf_folder },
     );
 }
 
