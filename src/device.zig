@@ -132,9 +132,11 @@ pub const Layout = struct {
         audio_path: []const u8,
         filename: []const u8,
     ) PathError![]u8 {
-        const dir = try l.anlzDir(alloc, audio_path);
-        defer alloc.free(dir);
-        return std.fs.path.join(alloc, &.{ dir, filename });
+        const names = anlzFolderNames(try pathHash(audio_path));
+        return std.fs.path.join(
+            alloc,
+            &.{ l.root, "PIONEER", "USBANLZ", &names.p_folder, &names.leaf_folder, filename },
+        );
     }
 };
 
