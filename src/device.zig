@@ -493,15 +493,18 @@ pub const AddTrackError =
     pdb.DatabaseModifyError ||
     anlz.WriteError;
 
-/// Error of the playlist methods: building the writer state, loading or
-/// creating `exportExt.pdb`, encoding a name (too long, or invalid UTF-8
-/// where a format string requires it), a foreign key that names no
-/// existing row, or inserting the rows.
+/// Error of the playlist and tag methods: building the writer state,
+/// loading or creating `exportExt.pdb`, encoding a name or label (too
+/// long, or invalid UTF-8 where a format string requires it), a foreign
+/// key that names no existing row, or inserting the rows.
 pub const PlaylistError =
     WriterStateError ||
     OpenPdbError ||
     error{ UnknownForeignKey, TooLong, InvalidEncoding } ||
     pdb.DatabaseModifyError;
+
+/// The tag methods fail for the same reasons as the playlist ones.
+pub const TagError = PlaylistError;
 
 /// One serialized ANLZ file waiting for the next `save`: the host path it
 /// lands at, plus its image. `addTrack` serializes eagerly so the
@@ -540,6 +543,9 @@ pub const DeviceExport = struct {
     /// The writer's cached scan of the export — id counters and dedup
     /// maps — null until `writerState` builds it on first use.
     writer_state: ?WriterState = null,
+    /// The tag database (`exportExt.pdb`), touched only by the tag
+    /// methods and `save`.
+    ext_pdb_state: ExtPdbState = .unloaded,
     /// Serialized ANLZ images queued by `addTrack`, written by the next
     /// `save` — before `export.pdb`, so a crash leaves orphan analysis
     /// files players ignore, not rows naming missing ones.
@@ -549,6 +555,21 @@ pub const DeviceExport = struct {
         /// An export opened at `root`; the pdb parses on first touch.
         unloaded,
         /// In memory — parsed from disk or built by `create`.
+        loaded: pdb.Database,
+    };
+
+    /// Lifecycle of the tag database. A created export starts `absent`
+    /// (the oracle's `create` never reads a leftover `exportExt.pdb`
+    /// either — its first tag write starts fresh); an opened one starts
+    /// `unloaded` and examines the disk at the first tag call.
+    const ExtPdbState = union(enum) {
+        /// Not examined yet; the first tag call checks the disk.
+        unloaded,
+        /// No `exportExt.pdb` under the root; the first tag write builds
+        /// a fresh database in memory.
+        absent,
+        /// In memory — parsed from disk (prior tags preserved) or built
+        /// fresh.
         loaded: pdb.Database,
     };
 
@@ -612,6 +633,9 @@ pub const DeviceExport = struct {
             // Fresh counters and empty maps: the default color/column/menu
             // rows live in tables the writer doesn't track.
             .writer_state = .{},
+            // Tags start empty — even over a root carrying a leftover
+            // `exportExt.pdb`, which `save` then overwrites.
+            .ext_pdb_state = .absent,
         };
     }
 
@@ -622,6 +646,10 @@ pub const DeviceExport = struct {
         switch (e.pdb_state) {
             .loaded => |*db| db.deinit(),
             .unloaded => {},
+        }
+        switch (e.ext_pdb_state) {
+            .loaded => |*db| db.deinit(),
+            .unloaded, .absent => {},
         }
         if (e.pending_settings) |pending| {
             for (pending) |bytes| e.alloc.free(bytes);
@@ -1185,13 +1213,183 @@ pub const DeviceExport = struct {
         gop.value_ptr.* = entry_index + 1;
     }
 
+    /// Creates a top-level tag category (e.g. "My Tags") in the tag
+    /// database and returns its id. Leaf tags attach under a category
+    /// through `addTagsToTrack`. The tag database is the export's
+    /// `exportExt.pdb`, loaded lazily on first use — prior categories,
+    /// leaves, and junctions survive, and nothing lands on disk before
+    /// `save`.
+    pub fn createTagCategory(e: *DeviceExport, name: []const u8) TagError!u32 {
+        const state = try e.writerState();
+        const db = try e.extDb();
+        const id = state.next_tag_id;
+        const row_index = state.next_tag_row_index;
+        const a = db.arena.allocator();
+        const boxed = try buildTagRow(a, .{
+            .parent_id = 0,
+            .position = state.next_category_position,
+            .id = id,
+            .is_category = true,
+            .row_index = row_index,
+        }, name);
+        try state.tag_categories.ensureUnusedCapacity(e.alloc, 1);
+        var row = pdb.Row{ .tag = boxed };
+        _ = try db.addRow(&row);
+
+        state.next_tag_id = id + 1;
+        state.next_tag_row_index = row_index + 1;
+        state.next_category_position += 1;
+        state.tag_categories.putAssumeCapacity(id, {});
+        return id;
+    }
+
+    /// Associates `labels` with `track_id` under `category_id` in the tag
+    /// database. Empty labels are dropped and duplicates — within this
+    /// call or already existing under the category — collapse to one leaf
+    /// row, so each `(category, label)` pair produces at most one
+    /// junction row per track. `track_id` must name an existing track and
+    /// `category_id` a category this handle knows (one returned by
+    /// `createTagCategory`, or one recovered from the opened
+    /// `exportExt.pdb`), else `UnknownForeignKey`. A failure between leaf rows leaves the
+    /// earlier ones inserted — unreachable junctions are ignored by
+    /// players, not recovered automatically (the same residual risk as
+    /// `addTrack`'s dimension rows).
+    pub fn addTagsToTrack(
+        e: *DeviceExport,
+        track_id: u32,
+        category_id: u32,
+        labels: []const []const u8,
+    ) TagError!void {
+        const state = try e.writerState();
+        // The category check needs the tag state an opened export's
+        // `exportExt.pdb` carries, so the tag database loads (from disk
+        // only — not created) before either key is validated.
+        try e.ensureExtLoaded();
+        if (!state.track_ids.contains(track_id)) return error.UnknownForeignKey;
+        if (!state.tag_categories.contains(category_id)) return error.UnknownForeignKey;
+
+        var kept = std.ArrayList([]const u8).empty;
+        defer kept.deinit(e.alloc);
+        for (labels) |label| {
+            if (label.len == 0) continue;
+            var duplicate = false;
+            for (kept.items) |seen| {
+                if (std.mem.eql(u8, seen, label)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) try kept.append(e.alloc, label);
+        }
+        if (kept.items.len == 0) return;
+
+        for (kept.items) |label| {
+            const tag_id = try e.getOrCreateTag(category_id, label);
+            const db = try e.extDb();
+            const a = db.arena.allocator();
+            const boxed = try a.create(pdb.TrackTag);
+            boxed.* = .{ .track_id = track_id, .tag_id = tag_id };
+            var row = pdb.Row{ .track_tag = boxed };
+            _ = try db.addRow(&row);
+        }
+    }
+
+    /// Resolves `(category_id, label)` to a leaf tag, inserting one when
+    /// no scanned or previously created leaf matches. The id counter and
+    /// `index_shift` row counter bump only after the insert.
+    fn getOrCreateTag(
+        e: *DeviceExport,
+        category_id: u32,
+        label: []const u8,
+    ) TagError!u32 {
+        const state = try e.writerState();
+        if (state.tags_by_key.get(.{ .category_id = category_id, .label = label })) |id|
+            return id;
+
+        const db = try e.extDb();
+        const id = state.next_tag_id;
+        const row_index = state.next_tag_row_index;
+        const position = state.tag_leaf_counts.get(category_id) orelse 0;
+        const a = db.arena.allocator();
+        const boxed = try buildTagRow(a, .{
+            .parent_id = category_id,
+            .position = position,
+            .id = id,
+            .is_category = false,
+            .row_index = row_index,
+        }, label);
+
+        // The map key outlives the call in the state; reserve both map
+        // updates before the insert so the bookkeeping after it cannot
+        // fail half-applied.
+        const owned_label = try e.alloc.dupe(u8, label);
+        errdefer e.alloc.free(owned_label);
+        try state.tags_by_key.ensureUnusedCapacity(e.alloc, 1);
+        try state.tag_leaf_counts.ensureUnusedCapacity(e.alloc, 1);
+        var row = pdb.Row{ .tag = boxed };
+        _ = try db.addRow(&row);
+
+        state.next_tag_id = id + 1;
+        state.next_tag_row_index = row_index + 1;
+        state.tags_by_key.putAssumeCapacity(
+            .{ .category_id = category_id, .label = owned_label },
+            id,
+        );
+        const gop = state.tag_leaf_counts.getOrPutAssumeCapacity(category_id);
+        gop.value_ptr.* = position + 1;
+        return id;
+    }
+
+    /// The tag database, loading it first: parsed from disk when the root
+    /// carries an `exportExt.pdb` (prior tags preserved through the
+    /// `scanExtTags` recovery), else built fresh in memory. Only the
+    /// tag-writing methods call this, so an export whose tags were never
+    /// touched never gains an `exportExt.pdb` — `save` writes the
+    /// database only once it exists here.
+    fn extDb(e: *DeviceExport) TagError!*pdb.Database {
+        try e.ensureExtLoaded();
+        if (e.ext_pdb_state == .absent) {
+            e.ext_pdb_state = .{ .loaded = try pdb.Database.create(
+                e.alloc,
+                .ext,
+                &pdb.ext_table_page_types,
+            ) };
+        }
+        return &e.ext_pdb_state.loaded;
+    }
+
+    /// Examines `exportExt.pdb` once: present, it parses into the state
+    /// and its tag rows extend the writer state, so later tag calls
+    /// append instead of colliding; absent, the state is only marked so
+    /// the first tag write builds a fresh database in memory. A failure
+    /// leaves the state `unloaded` — a retry re-reads the file.
+    fn ensureExtLoaded(e: *DeviceExport) WriterStateError!void {
+        if (e.ext_pdb_state != .unloaded) return;
+
+        const path = try e.layout.exportExtPdb(e.alloc);
+        defer e.alloc.free(path);
+        const buf = e.dir.readFileAlloc(e.io, path, e.alloc, pdb_limit) catch |err| switch (err) {
+            error.FileNotFound => {
+                e.ext_pdb_state = .absent;
+                return;
+            },
+            else => return err,
+        };
+        defer e.alloc.free(buf);
+        var db = try pdb.Database.parse(e.alloc, buf, .ext);
+        errdefer db.deinit();
+        try scanExtTags(e.alloc, &db, try e.writerState());
+        e.ext_pdb_state = .{ .loaded = db };
+    }
+
     /// Writes the buffered export to disk — the handle's only
     /// disk-writing call. Everything that can fail on the in-memory
     /// model — parsing, track-row validation, serialization — happens
     /// before the first write, so a failed `save` leaves the disk
     /// untouched. Crash-safe write order: the default directory tree,
-    /// the four setting files, the queued ANLZ files, then `export.pdb`
-    /// — the index everything else is reached through — last, so a crash
+    /// the four setting files, the queued ANLZ files, `exportExt.pdb`
+    /// when the tag methods loaded or created one, then `export.pdb` —
+    /// the index everything else is reached through — last, so a crash
     /// leaves orphan files players ignore, not rows naming missing data.
     /// Every file lands through `writeFileAtomic`, so readers never
     /// see a torn one.
@@ -1200,9 +1398,20 @@ pub const DeviceExport = struct {
         try db.validateAllTrackRows();
         const image = try db.serialize(e.alloc);
         defer e.alloc.free(image);
+        var ext_image: ?[]u8 = null;
+        defer if (ext_image) |bytes| e.alloc.free(bytes);
+        if (e.ext_pdb_state == .loaded) {
+            ext_image = try e.ext_pdb_state.loaded.serialize(e.alloc);
+        }
 
         if (e.pending_settings) |pending| try e.writePendingSettings(pending);
         if (e.pending_anlz.items.len > 0) try e.writePendingAnlz();
+
+        if (ext_image) |bytes| {
+            const ext_path = try e.layout.exportExtPdb(e.alloc);
+            defer e.alloc.free(ext_path);
+            try e.writeFileAtomic(ext_path, bytes);
+        }
 
         const pdb_path = try e.layout.exportPdb(e.alloc);
         defer e.alloc.free(pdb_path);
@@ -1690,6 +1899,45 @@ fn putTagKeyIfAbsent(
         gop.key_ptr.* = key;
         gop.value_ptr.* = value;
     }
+}
+
+/// The writer-chosen fields of a Tag row; see `buildTagRow`.
+const TagRowInput = struct {
+    parent_id: u32,
+    position: u32,
+    id: u32,
+    is_category: bool,
+    row_index: u32,
+};
+
+/// Builds a category or leaf Tag row in `a`, the tag database's arena —
+/// nothing is inserted and no counter is consumed. Device-derived
+/// constants, confirmed against real Rekordbox exports (device-derived —
+/// copy exactly): `subtype` `0x0680`, `raw_is_category` `1 << 24` for a
+/// category and `0` for a leaf, `index_shift` `row_index * 0x20` (0x20
+/// per row, truncated to the field's u16 as the oracle's `as` cast
+/// does). Leaf ids are sequential here, not the large random 32-bit
+/// values Rekordbox writes — unknown whether players care; revisit if
+/// round-trip fidelity is needed (oracle note).
+fn buildTagRow(
+    a: std.mem.Allocator,
+    input: TagRowInput,
+    name: []const u8,
+) error{ TooLong, InvalidEncoding, OutOfMemory }!*pdb.TagOrCategory {
+    const boxed = try a.create(pdb.TagOrCategory);
+    boxed.* = .{
+        .subtype = 0x0680,
+        .index_shift = @truncate(input.row_index *% 0x20),
+        .parent_id = input.parent_id,
+        .position = input.position,
+        .id = input.id,
+        .raw_is_category = if (input.is_category) 1 << 24 else 0,
+        .offsets = .{ .inner = .{
+            .name = try pdb.DeviceSQLString.fromUtf8(a, name),
+            .unknown = pdb.DeviceSQLString.empty(),
+        } },
+    };
+    return boxed;
 }
 
 /// Scans `tracks`: every id into `track_ids` (playlist-membership FK

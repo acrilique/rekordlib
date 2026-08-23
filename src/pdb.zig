@@ -3008,6 +3008,14 @@ pub const standard_table_page_types = [20]PageType{
     @enumFromInt(18), .history,
 };
 
+/// The two-entry table order of a fresh `exportExt.pdb`, for
+/// `Database.create`: the ext meanings of the wire values that mean
+/// albums and labels in a plain database (see `ExtPageType`).
+pub const ext_table_page_types = [2]PageType{
+    @enumFromInt(@intFromEnum(ExtPageType.tag)),
+    @enumFromInt(@intFromEnum(ExtPageType.track_tag)),
+};
+
 /// The default color rows rekordbox inserts into a new export: an id, the
 /// color it names, and the color's display name.
 const default_colors = [_]struct { id: u8, color: util.ColorIndex, name: []const u8 }{

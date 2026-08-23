@@ -1540,3 +1540,326 @@ test "add track to playlist auto-indexes" {
     std.mem.sort(u32, &indices, {}, std.sort.asc(u32));
     try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, &indices);
 }
+
+/// Reads and parses the `exportExt.pdb` a save wrote under `tmp`.
+fn openSavedExtDb(
+    tmp: *testing.TmpDir,
+    io: std.Io,
+    alloc: std.mem.Allocator,
+) !pdb.Database {
+    const image = try tmp.dir.readFileAlloc(
+        io,
+        "PIONEER/rekordbox/exportExt.pdb",
+        alloc,
+        .limited(1 << 26),
+    );
+    defer alloc.free(image);
+    return pdb.Database.parse(alloc, image, .ext);
+}
+
+/// The Tag and TrackTag rows of a parsed ext database; the row pointers
+/// stay owned by the database's arena.
+const ExtRows = struct {
+    tags: std.ArrayList(*pdb.TagOrCategory),
+    track_tags: std.ArrayList(*pdb.TrackTag),
+
+    fn deinit(rows: *ExtRows, alloc: std.mem.Allocator) void {
+        rows.tags.deinit(alloc);
+        rows.track_tags.deinit(alloc);
+    }
+};
+
+fn collectExtRows(alloc: std.mem.Allocator, db: *const pdb.Database) !ExtRows {
+    var rows = ExtRows{ .tags = .empty, .track_tags = .empty };
+    errdefer rows.deinit(alloc);
+    var tags = try db.rows(@enumFromInt(@intFromEnum(pdb.ExtPageType.tag)));
+    while (try tags.next()) |row| switch (row.*) {
+        .tag => |tag| try rows.tags.append(alloc, tag),
+        else => {},
+    };
+    var track_tags = try db.rows(@enumFromInt(@intFromEnum(pdb.ExtPageType.track_tag)));
+    while (try track_tags.next()) |row| switch (row.*) {
+        .track_tag => |tt| try rows.track_tags.append(alloc, tt),
+        else => {},
+    };
+    return rows;
+}
+
+test "tags are not written when unused" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    _ = try ex.addTrack(.{
+        .title = "song",
+        .filename = "song.mp3",
+        .file_path = "/Contents/song.mp3",
+    });
+    try ex.save();
+
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(io, "PIONEER/rekordbox/exportExt.pdb", .{}),
+    );
+}
+
+test "add tags creates category leaves and junctions" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    const id1 = (try ex.addTrack(.{
+        .title = "a",
+        .filename = "a.mp3",
+        .file_path = "/Contents/a.mp3",
+    })).id;
+    const id2 = (try ex.addTrack(.{
+        .title = "b",
+        .filename = "b.mp3",
+        .file_path = "/Contents/b.mp3",
+    })).id;
+
+    const cat = try ex.createTagCategory("My Tags");
+    // The duplicate "Techno" within id1's call must collapse.
+    try ex.addTagsToTrack(id1, cat, &.{ "Techno", "Dub", "Techno" });
+    // The shared "Dub" must reuse one leaf row.
+    try ex.addTagsToTrack(id2, cat, &.{ "Dub", "House" });
+    try ex.save();
+
+    var ext = try openSavedExtDb(&tmp, io, alloc);
+    defer ext.deinit();
+    var rows = try collectExtRows(alloc, &ext);
+    defer rows.deinit(alloc);
+
+    var categories = std.ArrayList(*pdb.TagOrCategory).empty;
+    defer categories.deinit(alloc);
+    var leaves = std.ArrayList(*pdb.TagOrCategory).empty;
+    defer leaves.deinit(alloc);
+    for (rows.tags.items) |tag| {
+        if (tag.raw_is_category != 0) {
+            try categories.append(alloc, tag);
+        } else {
+            try leaves.append(alloc, tag);
+        }
+    }
+
+    // One category. The encodings here fold the oracle's focused
+    // `tag_row_encodings` self-check: categories are `0x01000000`, not 1,
+    // and `index_shift` is `row_index * 0x20` (0 for the first row, 0x60
+    // for the leaf at row 3).
+    try testing.expectEqual(@as(usize, 1), categories.items.len);
+    const category = categories.items[0];
+    try testing.expectEqual(@as(u32, 1 << 24), category.raw_is_category);
+    try testing.expectEqual(@as(u16, 0), category.index_shift);
+    try testing.expectEqual(cat, category.id);
+    try testing.expectEqual(@as(u32, 0), category.parent_id);
+    const cat_name = try category.offsets.inner.name.utf8(alloc);
+    defer alloc.free(cat_name);
+    try testing.expectEqualStrings("My Tags", cat_name);
+
+    try testing.expectEqual(@as(usize, 3), leaves.items.len);
+    for (leaves.items) |leaf| {
+        try testing.expectEqual(@as(u32, 0), leaf.raw_is_category);
+        try testing.expectEqual(cat, leaf.parent_id);
+    }
+    for ([_][]const u8{ "Techno", "Dub", "House" }) |want| {
+        var found = false;
+        for (leaves.items) |leaf| {
+            const name = try leaf.offsets.inner.name.utf8(alloc);
+            defer alloc.free(name);
+            if (std.mem.eql(u8, name, want)) found = true;
+        }
+        try testing.expect(found);
+    }
+    // The category is written first (row 0); the leaves follow, one 0x20
+    // step per row in write order.
+    std.mem.sort(*pdb.TagOrCategory, leaves.items, {}, struct {
+        fn byIndexShift(_: void, a: *pdb.TagOrCategory, b: *pdb.TagOrCategory) bool {
+            return a.index_shift < b.index_shift;
+        }
+    }.byIndexShift);
+    var shifts: [3]u16 = undefined;
+    for (leaves.items, 0..) |leaf, i| shifts[i] = leaf.index_shift;
+    try testing.expectEqualSlices(u16, &.{ 0x20, 0x40, 0x60 }, &shifts);
+
+    // id1: 2 tags, id2: 2 tags — four junctions, each with the constant.
+    try testing.expectEqual(@as(usize, 4), rows.track_tags.items.len);
+    for (rows.track_tags.items) |tt| try testing.expectEqual(@as(u32, 3), tt.unknown_const);
+}
+
+test "add tags rejects unknown track" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    const cat = try ex.createTagCategory("My Tags");
+    try testing.expectError(error.UnknownForeignKey, ex.addTagsToTrack(999, cat, &.{"x"}));
+}
+
+test "add tags rejects unknown category" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    const id = (try ex.addTrack(.{
+        .title = "a",
+        .filename = "a.mp3",
+        .file_path = "/Contents/a.mp3",
+    })).id;
+
+    try testing.expectError(error.UnknownForeignKey, ex.addTagsToTrack(id, 999, &.{"x"}));
+    // The track key is validated first (both keys bad reports the track
+    // one; our errors carry no kind, so this pins only that it errors).
+    try testing.expectError(error.UnknownForeignKey, ex.addTagsToTrack(888, 999, &.{"x"}));
+}
+
+test "add tags ignores empty labels" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    const id = (try ex.addTrack(.{
+        .title = "a",
+        .filename = "a.mp3",
+        .file_path = "/Contents/a.mp3",
+    })).id;
+
+    const cat = try ex.createTagCategory("My Tags");
+    try ex.addTagsToTrack(id, cat, &.{ "", "" });
+    try ex.save();
+
+    // The category write already created the tag database; the all-empty
+    // call added no leaf and no junction to it.
+    var ext = try openSavedExtDb(&tmp, io, alloc);
+    defer ext.deinit();
+    var rows = try collectExtRows(alloc, &ext);
+    defer rows.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), rows.tags.items.len);
+    try testing.expectEqual(@as(usize, 0), rows.track_tags.items.len);
+}
+
+test "open preserves existing tags" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    {
+        var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+        defer ex.deinit();
+        const id = (try ex.addTrack(.{
+            .title = "a",
+            .filename = "a.mp3",
+            .file_path = "/Contents/a.mp3",
+        })).id;
+        const cat = try ex.createTagCategory("My Tags");
+        try ex.addTagsToTrack(id, cat, &.{ "Techno", "Dub" });
+        try ex.save();
+    }
+
+    // Reopen and append a new leaf under the existing category (id 1,
+    // remembered from the first session — the foreign-key check passing
+    // at all is the assertion that the tag state was recovered) plus a
+    // brand-new category. The leaf call runs first, so the opened tag
+    // database must load before the category key is even checked.
+    var ex = device.DeviceExport.open(tmp_path, io, alloc);
+    defer ex.deinit();
+    const id = (try ex.addTrack(.{
+        .title = "a",
+        .filename = "a.mp3",
+        .file_path = "/Contents/a.mp3",
+    })).id;
+    try ex.addTagsToTrack(id, 1, &.{"House"});
+    const cat2 = try ex.createTagCategory("Mood");
+    try ex.addTagsToTrack(id, cat2, &.{"Dark"});
+    try ex.save();
+
+    var ext = try openSavedExtDb(&tmp, io, alloc);
+    defer ext.deinit();
+    var rows = try collectExtRows(alloc, &ext);
+    defer rows.deinit(alloc);
+
+    // Two categories, no duplicates.
+    var categories = std.ArrayList(*pdb.TagOrCategory).empty;
+    defer categories.deinit(alloc);
+    var leaves = std.ArrayList(*pdb.TagOrCategory).empty;
+    defer leaves.deinit(alloc);
+    for (rows.tags.items) |tag| {
+        if (tag.raw_is_category != 0) {
+            try categories.append(alloc, tag);
+        } else {
+            try leaves.append(alloc, tag);
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), categories.items.len);
+    for ([_][]const u8{ "My Tags", "Mood" }) |want| {
+        var found = false;
+        for (categories.items) |category| {
+            const name = try category.offsets.inner.name.utf8(alloc);
+            defer alloc.free(name);
+            if (std.mem.eql(u8, name, want)) found = true;
+        }
+        try testing.expect(found);
+    }
+
+    // The original leaves survive unduplicated; the new ones landed.
+    try testing.expectEqual(@as(usize, 4), leaves.items.len);
+    for ([_][]const u8{ "Techno", "Dub", "House", "Dark" }) |want| {
+        var count: usize = 0;
+        for (leaves.items) |leaf| {
+            const name = try leaf.offsets.inner.name.utf8(alloc);
+            defer alloc.free(name);
+            if (std.mem.eql(u8, name, want)) count += 1;
+        }
+        try testing.expectEqual(@as(usize, 1), count);
+    }
+
+    // 2 junctions from the first session + House + Dark.
+    try testing.expectEqual(@as(usize, 4), rows.track_tags.items.len);
+
+    // No two Tag rows share an id or an index_shift (a collision would
+    // mean a counter wasn't recovered).
+    var ids: [6]u32 = undefined;
+    var shifts: [6]u16 = undefined;
+    for (rows.tags.items, 0..) |tag, i| {
+        ids[i] = tag.id;
+        shifts[i] = tag.index_shift;
+    }
+    std.mem.sort(u32, &ids, {}, std.sort.asc(u32));
+    for (ids[1..], 0..) |value, i| try testing.expect(value != ids[i]);
+    std.mem.sort(u16, &shifts, {}, std.sort.asc(u16));
+    for (shifts[1..], 0..) |value, i| try testing.expect(value != shifts[i]);
+}
