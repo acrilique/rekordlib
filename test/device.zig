@@ -500,13 +500,13 @@ test "create saves an export shaped like the empty fixture" {
 
     // Same rows as the real export in every content and defaults table.
     // The one difference: rb writes a History row (the sync record) when
-    // it creates an export; the oracle's `create` — and ours — starts
+    // it creates an export; rekordcrate's `create` — and ours — starts
     // that table empty, so it is asserted as zero instead.
     const table_types = [_]pdb.PageType{
-        .tracks,   .genres,           .artists,  .albums,
-        .labels,   .keys,             .colors,   .playlist_tree,
-        .playlist_entries, .history_playlists, .history_entries,
-        .artwork,  .columns,          .menu,
+        .tracks,           .genres,            .artists,         .albums,
+        .labels,           .keys,              .colors,          .playlist_tree,
+        .playlist_entries, .history_playlists, .history_entries, .artwork,
+        .columns,          .menu,
     };
     inline for (table_types) |page_type| {
         try testing.expectEqual(
@@ -975,7 +975,7 @@ test "ext tag scan recovers a built ext database" {
     var dub = try testTagRow(a, 7, 1, 12, false, 2, "Dub");
     _ = try db.addRow(&dub);
     // A duplicate label under the same category: the scan keeps the
-    // first row's id (the oracle's `or_insert`).
+    // first row's id (rekordcrate's `or_insert`).
     var techno_dup = try testTagRow(a, 7, 2, 20, false, 3, "Techno");
     _ = try db.addRow(&techno_dup);
 

@@ -2608,9 +2608,9 @@ pub const Database = struct {
             return error.UnexpectedValue;
         const empty_candidate = table.empty_candidate;
 
-        // The chain tail must be a page that exists and parsed, like the
-        // oracle's eager load; an index-page tail (an empty created table)
-        // simply fails the insert below.
+        // The chain tail must be a page that exists and parsed, like
+        // rekordcrate's eager load; an index-page tail (an empty created
+        // table) simply fails the insert below.
         if (parsedPageAt(db.pages, old_last_page) == null)
             return error.UnexpectedValue;
 
@@ -2962,7 +2962,7 @@ pub fn validateTrackRowSize(
 /// Grows the row's `comment` with trailing spaces — semantically harmless
 /// free text — until `validateTrackRowSize` passes, the padding
 /// rekordcrate's high-level writer applies (only `comment` is re-encoded
-/// per pass, like the oracle). Strings are created with `alloc`, which
+/// per pass). Strings are created with `alloc`, which
 /// must be the allocator the row's strings use; each replaced comment is
 /// freed, so nothing leaks under a general allocator (an arena reclaims
 /// everything at once).

@@ -176,7 +176,7 @@ pub fn pathHash(audio_path: []const u8) error{InvalidUtf8}!PathHash {
         hash = temp *% 0x93B5 +% code_unit;
     }
 
-    const hash_result = hash % 0x30D43; // modulo 200 003 (prime)
+    const hash_result = hash % 0x30D43;
 
     var p_value: u16 = 0;
     p_value |= @intCast(hash_result & 1); // bit 0  -> bit 0
@@ -289,8 +289,7 @@ pub fn SettingPayload(comptime kind: SettingKind) type {
     };
 }
 
-/// The parsed payloads of the four `*SETTING.DAT` files. A file that
-/// is missing or invalid leaves its field null.
+/// The parsed payloads of the four `*SETTING.DAT` files.
 pub const Settings = struct {
     dev_setting: ?setting.DevSetting = null,
     djm_my_setting: ?setting.DJMMySetting = null,
@@ -304,7 +303,6 @@ const dat_limit = std.Io.Limit.limited(1 << 16);
 
 /// Error of `DeviceExport.loadSettings`: a setting file exists but could
 /// not be examined — unreadable, over the read cap, or memory ran out.
-/// A missing or invalid file is not an error; its field is simply null.
 pub const LoadSettingsError = std.Io.Dir.ReadFileAllocError;
 
 /// Reads and parses one `*SETTING.DAT` file. A missing file or one that
@@ -418,7 +416,7 @@ pub const DeviceExport = struct {
     /// 20-table layout (the `Unknown` slots must stay in place or CDJ
     /// players crash) with the default color, column, and menu rows, plus
     /// the four default setting files. Nothing touches the disk until
-    /// `save`, so a `deinit` without one leaves nothing behind.
+    /// `save`.
     pub fn create(
         root_path: []const u8,
         io: std.Io,
@@ -427,8 +425,7 @@ pub const DeviceExport = struct {
         const layout = Layout{ .root = root_path };
         const dir = std.Io.Dir.cwd();
 
-        // Exists-guard the oracle lacks: its `create_dir_all` silently
-        // orphans an existing export instead of refusing.
+        // Refuse to build over an existing export rather than orphan it.
         const pdb_path = try layout.exportPdb(alloc);
         defer alloc.free(pdb_path);
         if (dir.access(io, pdb_path, .{})) |_| {
@@ -459,9 +456,8 @@ pub const DeviceExport = struct {
             .dir = dir,
             .pdb_state = .{ .loaded = db },
             .pending_settings = pending,
-            // Fresh counters — id 0 is the null FK — and empty maps: the
-            // default color/column/menu rows live in tables the writer
-            // doesn't track.
+            // Fresh counters and empty maps: the default color/column/menu
+            // rows live in tables the writer doesn't track.
             .writer_state = .{},
         };
     }
@@ -484,11 +480,9 @@ pub const DeviceExport = struct {
         return e.layout.root;
     }
 
-    /// Loads the four `*SETTING.DAT` files in `dat_files` order. A file
-    /// that is missing or invalid leaves its field null — settings
-    /// loading is the tolerant side of the handle; pdb errors are fatal
-    /// — while errors that say the file could not be examined
-    /// (permissions, memory) propagate.
+    /// Loads the four `*SETTING.DAT` files in `dat_files` order. A
+    /// missing or invalid file leaves its field null; a file that
+    /// cannot be examined is an error.
     pub fn loadSettings(e: *const DeviceExport) LoadSettingsError!Settings {
         var settings = Settings{};
         inline for (dat_files) |dat| {
@@ -509,8 +503,7 @@ pub const DeviceExport = struct {
 
     /// The export's database, parsing it off disk on first call. Also the
     /// escape hatch for row surgery: edits made here bypass the writer's
-    /// id counters and dedup maps (which scan once, at the first
-    /// first-class mutating call) and reach the disk at the next `save`.
+    /// id counters and dedup maps and reach the disk at the next `save`.
     pub fn openPdb(e: *DeviceExport) OpenPdbError!*pdb.Database {
         switch (e.pdb_state) {
             .loaded => |*db| return db,
@@ -533,13 +526,11 @@ pub const DeviceExport = struct {
         return getPlaylistsDb(e.alloc, try e.openPdb());
     }
 
-    /// The writer's cached scan of the export: id counters and dedup
-    /// maps, rebuilt from the database on the first call (loading the
-    /// pdb first if needed). The mutating methods call this before they
-    /// touch the database, so read-only sessions never pay for it;
-    /// calling it directly only warms the cache early. Rows added
-    /// through the `openPdb` escape hatch after the state was built are
-    /// invisible to it.
+    /// The writer's cached scan of the export, built on first use
+    /// (loading the pdb first if needed). The mutating methods call
+    /// this before they touch the database, so read-only sessions
+    /// never pay for it. Rows added through the `openPdb` escape
+    /// hatch after the state was built are invisible to it.
     pub fn writerState(e: *DeviceExport) WriterStateError!*WriterState {
         if (e.writer_state == null) {
             const db = try e.openPdb();
@@ -553,14 +544,11 @@ pub const DeviceExport = struct {
     /// model — parsing, track-row validation, serialization — happens
     /// before the first write, so a failed `save` leaves the disk
     /// untouched. Crash-safe write order: the default directory tree
-    /// and the four setting files (a created export's first `save` only;
-    /// DATs are never rewritten later, and opened exports never write
-    /// them), then `export.pdb` — the index everything else is reached
-    /// through — last, so a crash leaves orphan files players ignore,
-    /// not rows naming missing data. Every file lands through a
-    /// same-directory temp file and an atomic rename: readers see the
-    /// old or the new file, never a torn one, and a second `save` is
-    /// byte-stable.
+    /// and the four setting files, then `export.pdb` — the index
+    /// everything else is reached through — last, so a crash leaves
+    /// orphan files players ignore, not rows naming missing data.
+    /// Every file lands through `writeFileAtomic`, so readers never
+    /// see a torn one.
     pub fn save(e: *DeviceExport) SaveError!void {
         const db = try e.openPdb();
         try db.validateAllTrackRows();
@@ -575,9 +563,8 @@ pub const DeviceExport = struct {
     }
 
     /// Writes the default directory tree and the four pending setting
-    /// images, the created export's first `save` only. A failed write
-    /// leaves every image owned by `pending_settings`, so `deinit`
-    /// reclaims them; they are freed only once all four have landed.
+    /// images, then releases them; a failure leaves them owned by
+    /// `pending_settings`, for `deinit` to reclaim.
     fn writePendingSettings(
         e: *DeviceExport,
         pending: [dat_files.len][]u8,
@@ -619,14 +606,12 @@ pub const DeviceExport = struct {
 
 /// A playlist (leaf of the playlist tree).
 pub const Playlist = struct {
-    /// ID of this node in the playlist tree.
     id: u32,
     name: []u8,
 };
 
 /// A playlist folder, grouping other nodes.
 pub const PlaylistFolder = struct {
-    /// ID of this node in the playlist tree.
     id: u32,
     name: []u8,
     /// Child nodes, in row order.
@@ -699,7 +684,7 @@ fn buildChildren(
 /// Builds the playlist tree from a database's playlist-tree rows: nodes
 /// parented to 0 form the top level, folders recurse into their children,
 /// and names are decoded to owned UTF-8. Nodes unreachable from the root
-/// (parented to a missing id) do not appear, as in rekordcrate; a folder id
+/// (parented to a missing id) do not appear; a folder id
 /// is expanded at most once, so parent-id cycles in corrupt data cannot
 /// recurse forever.
 ///
@@ -740,7 +725,7 @@ pub fn getPlaylistsDb(
     return roots;
 }
 
-// --- writer state (D5) ---------------------------------------------------------
+// --- writer state ---------------------------------------------------------------
 
 /// Folds a musical key name to a canonical form for deduplication
 /// (`C Major`/`Cmaj`/`C MAJOR`/`Cmajor` → `Cmaj`), so different spellings
@@ -749,12 +734,6 @@ pub fn getPlaylistsDb(
 /// String-equality only: enharmonic equivalents (`B♭m` ≠ `A#m`), Camelot,
 /// and Open Key notation are not resolved — different pitch spellings
 /// still create distinct rows.
-///
-/// The walk matches tokens on the original text with ASCII case folding;
-/// the oracle lowercases a copy first and indexes back into the original
-/// per character, which misaligns whenever lowercasing changes byte
-/// length (e.g. `İ`). Output is identical on every input where the
-/// oracle's indexing holds, and total here.
 pub fn canonicalKeyName(alloc: std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]u8 {
     const trimmed = std.mem.trim(u8, name, &std.ascii.whitespace);
     var out = std.ArrayList(u8).empty;
@@ -784,10 +763,7 @@ pub fn canonicalKeyName(alloc: std.mem.Allocator, name: []const u8) std.mem.Allo
         if (matched) continue;
 
         // Not a recognized token: copy one codepoint through, folding the
-        // unicode accidentals and dropping spaces on the way. The oracle
-        // folds both in a second pass; folding while copying is
-        // equivalent because tokens are pure ASCII and can never span a
-        // folded character.
+        // unicode accidentals and dropping spaces on the way.
         const cp_len = std.unicode.utf8ByteSequenceLength(trimmed[i]) catch 1;
         const end = @min(i + cp_len, trimmed.len);
         const codepoint = trimmed[i..end];
@@ -886,7 +862,7 @@ pub const WriterState = struct {
     next_label_id: u32 = 1,
     next_artwork_id: u32 = 1,
     next_playlist_node_id: u32 = 1,
-    /// Shared id space for tag categories and leaf tags (0 = null FK).
+    /// Shared id space for tag categories and leaf tags.
     next_tag_id: u32 = 1,
     /// Next `position` for a top-level category (0-based, as on real
     /// exports).
@@ -982,8 +958,7 @@ fn rowsOrEmpty(db: *const pdb.Database, page_type: pdb.PageType) ScanError!?pdb.
 }
 
 /// Decodes a row string, treating invalid encoding as null — the row
-/// still counts toward the id counters, only its map entry is skipped
-/// (the oracle's `if let Ok(..)`).
+/// still counts toward the id counters, only its map entry is skipped.
 fn decodeOrSkip(
     s: pdb.DeviceSQLString,
     alloc: std.mem.Allocator,
@@ -995,9 +970,8 @@ fn decodeOrSkip(
 }
 
 /// Inserts `key -> value` unless `key` is already present — first row
-/// wins, the oracle's `or_insert`. The caller-owned `key` is freed
-/// immediately when it duplicates an existing entry, and owned by the
-/// map afterwards.
+/// wins. The caller-owned `key` is freed when it duplicates an existing
+/// entry, and owned by the map afterwards.
 fn putStringIfAbsent(
     map: *std.StringHashMapUnmanaged(u32),
     alloc: std.mem.Allocator,
@@ -1056,13 +1030,6 @@ fn putTagKeyIfAbsent(
     }
 }
 
-/// Scans a plain database into a fresh `WriterState`: one pass per
-/// table, rebuilding the id counters (max id + 1) and the dedup maps the
-/// writer consults before inserting. First row wins on duplicate map
-/// keys, except `playlist_nodes`, where the last row wins (the oracle's
-/// `or_insert` vs `insert`). Rows are walked through the page chain, so
-/// deleted-row remnants in page heaps are invisible, exactly as to
-/// readers.
 /// Scans `tracks`: every id into `track_ids` (playlist-membership FK
 /// checks), every non-empty file path into `tracks_by_path`, and the
 /// id counter past the highest track id.
@@ -1211,10 +1178,8 @@ fn scanArtwork(
     }
 }
 
-/// Scans `playlist_tree`: `id -> is_folder` into `playlist_nodes` —
-/// last row wins on a repeated id, the oracle's `insert` where the
-/// string maps' `or_insert` keeps the first — and the id counter past
-/// the highest node id.
+/// Scans `playlist_tree`: `id -> is_folder` into `playlist_nodes` and
+/// the id counter past the highest node id.
 fn scanPlaylistTree(
     alloc: std.mem.Allocator,
     db: *const pdb.Database,
@@ -1231,8 +1196,7 @@ fn scanPlaylistTree(
 }
 
 /// Scans `playlist_entries`: per-playlist `entry_index` high-water
-/// marks into `playlist_entry_counts` — `max(entry_index) + 1`, not the
-/// row count, so a reopened export with sparse indices doesn't collide.
+/// marks into `playlist_entry_counts`.
 fn scanPlaylistEntries(
     alloc: std.mem.Allocator,
     db: *const pdb.Database,
@@ -1252,10 +1216,9 @@ fn scanPlaylistEntries(
 /// Scans a plain database into a fresh `WriterState`: one pass per
 /// table, rebuilding the id counters (max id + 1) and the dedup maps the
 /// writer consults before inserting. First row wins on duplicate map
-/// keys, except `playlist_nodes`, where the last row wins (the oracle's
-/// `or_insert` vs `insert`). Rows are walked through the page chain, so
-/// deleted-row remnants in page heaps are invisible, exactly as to
-/// readers.
+/// keys, except `playlist_nodes`, where the last row wins. Rows are
+/// walked through the page chain, so deleted-row remnants in page heaps
+/// are invisible, exactly as to readers.
 pub fn scanWriterState(
     alloc: std.mem.Allocator,
     db: *const pdb.Database,

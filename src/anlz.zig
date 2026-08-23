@@ -1366,7 +1366,7 @@ pub const PerformanceData = struct {
     sample_count: u64,
     /// Track tempo in BPM. When set, it is applied uniformly to every beat,
     /// even for a variable-tempo grid (a Rekordbox-era simplification kept
-    /// from the oracle); `null` derives the tempo per grid segment.
+    /// from rekordcrate); `null` derives the tempo per grid segment.
     bpm: ?f64 = null,
     /// Sparse beatgrid markers, in any order.
     beatgrid: []const BeatMarker = &.{},

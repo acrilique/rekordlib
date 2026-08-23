@@ -911,7 +911,7 @@ test "beatgrid negative index aligns bar" {
 }
 
 test "beatgrid tempo derives from the grid and saturates" {
-    // Ours (no oracle counterpart): with `bpm` null the tempo comes from
+    // Ours (no rekordcrate counterpart): with `bpm` null the tempo comes from
     // the grid segment, a set `bpm` overrides it uniformly, centi-BPM
     // saturates at the format ceiling, and unsorted markers are sorted by
     // sample offset before expansion.
@@ -1065,7 +1065,7 @@ test "built anlz input assembles consistently" {
 }
 
 test "built anlz input serializes and re-parses" {
-    // Ours (no oracle counterpart): a built AnlzInput, assembled into the
+    // Ours (no rekordcrate counterpart): a built AnlzInput, assembled into the
     // section sets the device writer will emit (.DAT/.EXT/.2EX, each led
     // by a PPTH path section), serializes, re-parses with equal data, and
     // roundtrips byte-identical — constructed output is valid ANLZ end to

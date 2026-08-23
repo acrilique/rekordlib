@@ -571,7 +571,7 @@ test "heapBytesRequired aligns calculated ucs2 items to 4 bytes" {
 
     // Calculated: 3 bytes of magic+offsets, "foo" at 3 (4 bytes), then
     // "é" aligned from 7 up to 8, adding its 6 bytes — the placement the
-    // oracle's calculated write produces.
+    // rekordcrate's calculated write produces.
     const calculated: pdb.OffsetArrayContainer(TestStringPair) = .{
         .offsets = .calculated,
         .inner = .{ .a = foo, .b = e_acute },
@@ -1383,7 +1383,7 @@ test "whole databases roundtrip byte-identical except zeroed dead space" {
 }
 
 /// Counts the valid rows of the table for `page_type` by walking its page
-/// chain from `first_page` to `last_page` the way the oracle's
+/// chain from `first_page` to `last_page` the way rekordcrate's
 /// `PageIterator` does, rejecting non-increasing links, pages outside the
 /// file, and pages that did not parse.
 fn countTableRows(db: *const pdb.Database, page_type: pdb.PageType) !usize {
@@ -1402,7 +1402,7 @@ test "num_rows database row counts per table" {
     defer db.deinit();
 
     // Ported from rekordcrate's `tests/test_pdb_num_rows.rs`, plus the
-    // menu rows the oracle test does not cover.
+    // menu rows the rekordcrate test does not cover.
     const expectations = .{
         .{ .page_type = pdb.PageType.tracks, .count = 3886 },
         .{ .page_type = pdb.PageType.genres, .count = 315 },
@@ -2093,7 +2093,7 @@ fn menuPageBytes(fill_gap: u8) [96]u8 {
 test "data page roundtrips with heap bytes in unused row group slots" {
     const alloc = testing.allocator;
     // The gap byte must be zero: heap bytes covered by neither a row nor
-    // a row group are zero on write, as in the oracle's fresh writes.
+    // a row group are zero on write, as in rekordcrate's fresh writes.
     const page = menuPageBytes(0);
 
     var c = bin.Cursor.initAlloc(alloc, &page);
