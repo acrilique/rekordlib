@@ -844,27 +844,29 @@ pub const DeviceExport = struct {
             .play_count = track.play_count,
             .rating = track.rating,
             .color = track.color,
-            .offsets = .{ .inner = .{
-                .isrc = try pdb.DeviceSQLString.fromUtf8(a, track.isrc),
-                .lyricist = try pdb.DeviceSQLString.fromUtf8(a, track.lyricist),
-                // Rekordbox writes "1" in both on fresh rows.
-                .unknown_string2 = try pdb.DeviceSQLString.fromUtf8(a, "1"),
-                .unknown_string3 = try pdb.DeviceSQLString.fromUtf8(a, "1"),
-                .message = try pdb.DeviceSQLString.fromUtf8(a, track.message),
-                .publish_track_information = try pdb.DeviceSQLString.fromUtf8(a, "ON"),
-                .autoload_hotcues = if (track.autoload_hotcues)
-                    try pdb.DeviceSQLString.fromUtf8(a, "ON")
-                else
-                    pdb.DeviceSQLString.empty(),
-                .date_added = try pdb.DeviceSQLString.fromUtf8(a, track.date_added),
-                .release_date = try pdb.DeviceSQLString.fromUtf8(a, track.release_date),
-                .mix_name = try pdb.DeviceSQLString.fromUtf8(a, track.mix_name),
-                .analyze_path = analyze_path,
-                .comment = try pdb.DeviceSQLString.fromUtf8(a, track.comment),
-                .title = try pdb.DeviceSQLString.fromUtf8(a, track.title),
-                .filename = try pdb.DeviceSQLString.fromUtf8(a, track.filename),
-                .file_path = try pdb.DeviceSQLString.fromUtf8(a, track.file_path),
-            } },
+            .offsets = .{
+                .inner = .{
+                    .isrc = try pdb.DeviceSQLString.fromUtf8(a, track.isrc),
+                    .lyricist = try pdb.DeviceSQLString.fromUtf8(a, track.lyricist),
+                    // Rekordbox writes "1" in both on fresh rows.
+                    .unknown_string2 = try pdb.DeviceSQLString.fromUtf8(a, "1"),
+                    .unknown_string3 = try pdb.DeviceSQLString.fromUtf8(a, "1"),
+                    .message = try pdb.DeviceSQLString.fromUtf8(a, track.message),
+                    .publish_track_information = try pdb.DeviceSQLString.fromUtf8(a, "ON"),
+                    .autoload_hotcues = if (track.autoload_hotcues)
+                        try pdb.DeviceSQLString.fromUtf8(a, "ON")
+                    else
+                        pdb.DeviceSQLString.empty(),
+                    .date_added = try pdb.DeviceSQLString.fromUtf8(a, track.date_added),
+                    .release_date = try pdb.DeviceSQLString.fromUtf8(a, track.release_date),
+                    .mix_name = try pdb.DeviceSQLString.fromUtf8(a, track.mix_name),
+                    .analyze_path = analyze_path,
+                    .comment = try pdb.DeviceSQLString.fromUtf8(a, track.comment),
+                    .title = try pdb.DeviceSQLString.fromUtf8(a, track.title),
+                    .filename = try pdb.DeviceSQLString.fromUtf8(a, track.filename),
+                    .file_path = try pdb.DeviceSQLString.fromUtf8(a, track.file_path),
+                },
+            },
         };
         try pdb.padTrackCommentToMinimum(boxed, a);
         return boxed;
