@@ -851,6 +851,28 @@ const row_tables = .{
     .{ .row = Sort, .table = "sort", .rows = "sorts" },
 };
 
+/// The keyed-access wiring for every table with a primary key: row type,
+/// `Library` rows field, map field, and the id column. SQLite enforces
+/// the PK constraint, so each id maps to exactly one row index.
+const id_tables = .{
+    .{ .row = Album, .rows = "albums", .map = "album_by_id", .id = "album_id" },
+    .{ .row = Artist, .rows = "artists", .map = "artist_by_id", .id = "artist_id" },
+    .{ .row = Category, .rows = "categories", .map = "category_by_id", .id = "category_id" },
+    .{ .row = Color, .rows = "colors", .map = "color_by_id", .id = "color_id" },
+    .{ .row = Content, .rows = "contents", .map = "content_by_id", .id = "content_id" },
+    .{ .row = Cue, .rows = "cues", .map = "cue_by_id", .id = "cue_id" },
+    .{ .row = Genre, .rows = "genres", .map = "genre_by_id", .id = "genre_id" },
+    .{ .row = History, .rows = "histories", .map = "history_by_id", .id = "history_id" },
+    .{ .row = HotCueBankList, .rows = "hot_cue_bank_lists", .map = "hot_cue_bank_list_by_id", .id = "hotCueBankList_id" },
+    .{ .row = Image, .rows = "images", .map = "image_by_id", .id = "image_id" },
+    .{ .row = Key, .rows = "keys", .map = "key_by_id", .id = "key_id" },
+    .{ .row = Label, .rows = "labels", .map = "label_by_id", .id = "label_id" },
+    .{ .row = MenuItem, .rows = "menu_items", .map = "menu_item_by_id", .id = "menuItem_id" },
+    .{ .row = MyTag, .rows = "my_tags", .map = "my_tag_by_id", .id = "myTag_id" },
+    .{ .row = Playlist, .rows = "playlists", .map = "playlist_by_id", .id = "playlist_id" },
+    .{ .row = Sort, .rows = "sorts", .map = "sort_by_id", .id = "sort_id" },
+};
+
 /// A whole `exportLibrary.db`, read into arena-owned models: every row of
 /// every table, strings and all. The models mirror the real schema
 /// exactly — column names verbatim (typos included), declaration order =
@@ -888,6 +910,35 @@ pub const Library = struct {
     /// The singleton `property` row, or null when the table is empty.
     property: ?Property = null,
 
+    /// Keyed access built by `load`: one id → row-index map per
+    /// primary-key table (`byId`), the pdb-side join by `content.path`
+    /// (`contentByPath`), and the junction groupings mirroring the
+    /// schema's own four indexes — the only indexes real files carry.
+    album_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    artist_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    category_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    color_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    content_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    cue_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    genre_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    history_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    hot_cue_bank_list_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    image_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    key_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    label_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    menu_item_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    my_tag_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    playlist_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    sort_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    /// First row wins on duplicate paths — the schema enforces no
+    /// uniqueness there. Rows with a NULL path are skipped (unkeyable,
+    /// like NULL foreign keys).
+    content_by_path: std.StringHashMapUnmanaged(u32) = .empty,
+    playlist_contents_by_playlist: std.AutoHashMapUnmanaged(i64, []u32) = .empty,
+    my_tag_contents_by_my_tag: std.AutoHashMapUnmanaged(i64, []u32) = .empty,
+    my_tag_contents_by_content: std.AutoHashMapUnmanaged(i64, []u32) = .empty,
+    hot_cue_bank_cues_by_list: std.AutoHashMapUnmanaged(i64, []u32) = .empty,
+
     /// Reads every table of an open db (keyed or plaintext — the models
     /// do not differ). Each table's column layout is validated against
     /// the pinned schema before any row is read; more than one
@@ -909,7 +960,47 @@ pub const Library = struct {
         if (props.len > 1) return error.SchemaMismatch;
         lib.property = if (props.len == 1) props[0] else null;
 
+        inline for (id_tables) |t|
+            @field(lib, t.map) = try indexById(a, @field(lib, t.rows), t.id);
+
+        try lib.content_by_path.ensureTotalCapacity(a, @intCast(lib.contents.len));
+        for (lib.contents, 0..) |*row, i| {
+            const path = row.path orelse continue;
+            const gop = lib.content_by_path.getOrPutAssumeCapacity(path);
+            if (!gop.found_existing) gop.value_ptr.* = @intCast(i);
+        }
+
+        lib.playlist_contents_by_playlist =
+            try groupRows(a, lib.playlist_contents, "playlist_id", "sequenceNo");
+        lib.my_tag_contents_by_my_tag =
+            try groupRows(a, lib.my_tag_contents, "myTag_id", null);
+        lib.my_tag_contents_by_content =
+            try groupRows(a, lib.my_tag_contents, "content_id", null);
+        lib.hot_cue_bank_cues_by_list =
+            try groupRows(a, lib.hot_cue_bank_cues, "hotCueBankList_id", "sequenceNo");
+
         return lib;
+    }
+
+    /// Row lookup for any primary-key table — `lib.byId(dlp.Artist, 3)`.
+    /// Ids absent from the table, including the 0 = "no foreign key"
+    /// convention, return null.
+    pub fn byId(self: *const Library, comptime T: type, id: i64) ?*const T {
+        inline for (id_tables) |t| {
+            if (T == t.row) {
+                const idx = @field(self, t.map).get(id) orelse return null;
+                return &@field(self, t.rows)[idx];
+            }
+        }
+        @compileError("Library has no by-id map for " ++ @typeName(T));
+    }
+
+    /// The join to the pdb side: `content.path` values are
+    /// device-root-absolute (`/Contents/...`), the value shape of the pdb
+    /// Track `file_path` — the two id spaces are otherwise independent.
+    pub fn contentByPath(self: *const Library, path: []const u8) ?*const Content {
+        const idx = self.content_by_path.get(path) orelse return null;
+        return &self.contents[idx];
     }
 
     /// Frees the instance and every value parsed into it.
@@ -998,4 +1089,64 @@ fn cellEql(comptime F: type, a: F, b: F) bool {
             (a != null and b != null and std.mem.eql(u8, a.?, b.?));
     }
     @compileError("unsupported OneLibrary column type: " ++ @typeName(F));
+}
+
+/// Builds one id → row-index map (see `id_tables`); SQLite's PK
+/// constraint guarantees unique keys.
+fn indexById(
+    a: std.mem.Allocator,
+    rows: anytype,
+    comptime id_field: []const u8,
+) LoadError!std.AutoHashMapUnmanaged(i64, u32) {
+    var map: std.AutoHashMapUnmanaged(i64, u32) = .empty;
+    try map.ensureTotalCapacity(a, @intCast(rows.len));
+    for (rows, 0..) |row, i| map.putAssumeCapacity(@field(row, id_field), @intCast(i));
+    return map;
+}
+
+/// Builds one junction grouping: key value → row indices, in row order;
+/// `order_field`, when given, re-orders each group by that column
+/// (`sequenceNo`) with NULLs last. Rows whose key is NULL are skipped.
+/// The four groupings mirror the schema's own four indexes.
+fn groupRows(
+    a: std.mem.Allocator,
+    rows: anytype,
+    comptime key_field: []const u8,
+    comptime order_field: ?[]const u8,
+) LoadError!std.AutoHashMapUnmanaged(i64, []u32) {
+    var lists: std.AutoHashMapUnmanaged(i64, std.ArrayListUnmanaged(u32)) = .empty;
+    for (rows, 0..) |row, i| {
+        const key = @field(row, key_field) orelse continue;
+        const gop = try lists.getOrPut(a, key);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(a, @intCast(i));
+    }
+    var grouped: std.AutoHashMapUnmanaged(i64, []u32) = .empty;
+    try grouped.ensureTotalCapacity(a, lists.count());
+    var it = lists.iterator();
+    while (it.next()) |entry| {
+        var list = entry.value_ptr.*;
+        if (order_field) |field| orderIndices(rows, field, list.items);
+        grouped.putAssumeCapacity(entry.key_ptr.*, try list.toOwnedSlice(a));
+    }
+    return grouped;
+}
+
+fn orderIndices(rows: anytype, comptime field: []const u8, indices: []u32) void {
+    const Order = SeqOrder(@TypeOf(rows), field);
+    std.sort.pdq(u32, indices, Order{ .rows = rows }, Order.lessThan);
+}
+
+/// Sort context ordering row indices by one nullable-i64 column, NULLs
+/// last, ties by row order.
+fn SeqOrder(comptime Rows: type, comptime field: []const u8) type {
+    return struct {
+        rows: Rows,
+
+        fn lessThan(self: @This(), a: u32, b: u32) bool {
+            const sa = @field(self.rows[a], field) orelse std.math.maxInt(i64);
+            const sb = @field(self.rows[b], field) orelse std.math.maxInt(i64);
+            return if (sa == sb) a < b else sa < sb;
+        }
+    };
 }

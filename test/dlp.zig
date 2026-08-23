@@ -267,3 +267,91 @@ test "O2 load: plaintext and encrypted paths yield identical models" {
 
     try testing.expect(plain_lib.eql(&enc_lib));
 }
+
+test "O2 keyed: by-id maps and the path join" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openPlaintextFixtureDb(io, &tmp, alloc);
+    defer db.close();
+    var lib = try dlp.Library.load(alloc, db);
+    defer lib.deinit();
+
+    // the pdb-side join
+    const bako = lib.contentByPath(
+        "/Contents/Reboot/www.electronicfresh.com/01. Reboot - Bako (Original Mix).mp3",
+    ).?;
+    try testing.expectEqual(@as(i64, 2), bako.content_id);
+    try testing.expect(lib.contentByPath("/Contents/nope") == null);
+
+    try testing.expectEqualStrings("Reboot", lib.byId(dlp.Artist, 1).?.name.?);
+    try testing.expectEqualStrings("Tech House", lib.byId(dlp.Genre, 2).?.name.?);
+    try testing.expectEqualStrings("Cecille", lib.byId(dlp.Label, 1).?.name.?);
+    try testing.expectEqualStrings("Genre", lib.byId(dlp.MyTag, 1).?.name.?);
+    try testing.expectEqualStrings(
+        "/PIONEER/Artwork/00001/b2.jpg",
+        lib.byId(dlp.Image, 2).?.path.?,
+    );
+    try testing.expectEqual(@as(i64, 12900), lib.byId(dlp.Content, 2).?.bpmx100.?);
+    // empty tables and the 0 = "no foreign key" convention
+    try testing.expect(lib.byId(dlp.Key, 1) == null);
+    try testing.expect(lib.byId(dlp.Content, 0) == null);
+}
+
+test "O2 keyed: junction groupings order, skip, and first-win" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openPlaintextFixtureDb(io, &tmp, alloc);
+    defer db.close();
+
+    // fixture order: sequenceNo 1, 2 -> contents 1, 2
+    {
+        var lib = try dlp.Library.load(alloc, db);
+        defer lib.deinit();
+        const entries = lib.playlist_contents_by_playlist.get(1).?;
+        try testing.expectEqual(@as(usize, 2), entries.len);
+        try testing.expectEqual(@as(i64, 1), lib.playlist_contents[entries[0]].content_id.?);
+        try testing.expectEqual(@as(i64, 2), lib.playlist_contents[entries[1]].content_id.?);
+        try testing.expect(lib.playlist_contents_by_playlist.get(2) == null);
+        try testing.expectEqual(@as(u32, 0), lib.my_tag_contents_by_my_tag.count());
+        try testing.expect(lib.hot_cue_bank_cues_by_list.count() == 0);
+        try testing.expectEqual(@as(u32, 2), lib.content_by_path.count());
+    }
+
+    // shuffle the storage order: groups must order by sequenceNo (NULLs
+    // last), NULL keys drop out, and duplicate paths first-win
+    try db.exec(
+        \\INSERT INTO playlist_content (playlist_id, content_id, sequenceNo)
+        \\VALUES (1, 2, 0), (1, 1, NULL), (NULL, 1, 5);
+        \\INSERT INTO content (content_id, path)
+        \\VALUES (99, '/Contents/Reboot/www.electronicfresh.com/01. Reboot - Bako (Original Mix).mp3');
+        \\
+    );
+    var lib = try dlp.Library.load(alloc, db);
+    defer lib.deinit();
+    try testing.expectEqual(@as(usize, 5), lib.playlist_contents.len);
+    const entries = lib.playlist_contents_by_playlist.get(1).?;
+    try testing.expectEqual(@as(usize, 4), entries.len); // the NULL playlist_id row drops
+    const got = [_]i64{
+        lib.playlist_contents[entries[0]].content_id.?,
+        lib.playlist_contents[entries[1]].content_id.?,
+        lib.playlist_contents[entries[2]].content_id.?,
+        lib.playlist_contents[entries[3]].content_id.?,
+    };
+    // sequenceNo 0, 1, 2, then the NULL sequenceNo last
+    try testing.expectEqualSlices(i64, &[_]i64{ 2, 1, 2, 1 }, &got);
+    try testing.expectEqual(@as(u32, 2), lib.content_by_path.count()); // duplicate path skipped
+    try testing.expectEqual(
+        @as(i64, 2),
+        lib.contentByPath(
+            "/Contents/Reboot/www.electronicfresh.com/01. Reboot - Bako (Original Mix).mp3",
+        ).?.content_id,
+    );
+}
