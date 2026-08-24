@@ -1482,14 +1482,14 @@ pub const Writer = struct {
 
         // rbox's migration seeds dbVersion 1000 as an INTEGER; real
         // exports carry the varchar '10000'.
-        var property = try db.prepare(
-            "INSERT INTO property (deviceName, dbVersion, numberOfContents, createdDate, backGroundColorType, myTagMasterDBID) " ++
-                "VALUES ('', '10000', 0, ?1, 0, ?2);",
-        );
-        defer property.finalize();
-        try property.bindText(1, options.created_date);
-        try property.bindInt(2, options.my_tag_master_dbid);
-        if ((try property.step()) != .done) return error.Sqlite;
+        try insertRow(db, "property", Property{
+            .deviceName = "",
+            .dbVersion = "10000",
+            .numberOfContents = 0,
+            .createdDate = options.created_date,
+            .backGroundColorType = 0,
+            .myTagMasterDBID = options.my_tag_master_dbid,
+        });
         try tx.commit();
 
         return .{ .db = db };
