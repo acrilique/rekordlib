@@ -473,32 +473,29 @@ fn sqlite_transient() ?*const fn (?*anyopaque) callconv(.c) void {
 pub const Db = struct {
     handle: *c.sqlite3,
 
-    const SQLITE_OPEN_READWRITE: c_int = 0x00000002;
-    const SQLITE_OPEN_CREATE: c_int = 0x00000004;
-
     pub const OpenError = SqlError;
 
     /// `io` seeds the crypto provider's entropy source (salt/IV generation
     /// on write); read-only sessions never draw from it.
     pub fn open(io: std.Io, path: [:0]const u8) OpenError!Db {
-        return openFlags(io, path, SQLITE_OPEN_READWRITE, true);
+        return openFlags(io, path, c.SQLITE_OPEN_READWRITE, true);
     }
 
     pub fn openReadWriteCreate(io: std.Io, path: [:0]const u8) OpenError!Db {
-        return openFlags(io, path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, true);
+        return openFlags(io, path, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE, true);
     }
 
     /// Opens a db without applying the DLP passphrase: plaintext fixtures
     /// (`testdata/dlp/`) and consumer-written plain SQLite files. SQLCipher
     /// reads an unkeyed plaintext file exactly like stock SQLite.
     pub fn openPlaintext(io: std.Io, path: [:0]const u8) OpenError!Db {
-        return openFlags(io, path, SQLITE_OPEN_READWRITE, false);
+        return openFlags(io, path, c.SQLITE_OPEN_READWRITE, false);
     }
 
     /// Creates or opens a plaintext db without applying the DLP
     /// passphrase (`Writer.create` with `plaintext` writes such files).
     pub fn openPlaintextReadWriteCreate(io: std.Io, path: [:0]const u8) OpenError!Db {
-        return openFlags(io, path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, false);
+        return openFlags(io, path, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE, false);
     }
 
     fn openFlags(io: std.Io, path: [:0]const u8, flags: c_int, keyed: bool) OpenError!Db {
