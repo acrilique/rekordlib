@@ -360,6 +360,13 @@ pub export fn rl_sqlcipher_zig_provider_setup(p: *Provider) c_int {
 /// rbox 0.1.5 `conn.rs` MAGIC with each byte decremented.
 pub const passphrase = "r8gddnr4k847830ar6cqzbkk0el6qytmb3trbbx805jm74vez64i5o8fnrqryqls";
 
+comptime {
+    // The passphrase is inlined into the key pragma's SQL string; a
+    // single quote would break out of the literal.
+    if (std.mem.indexOfScalar(u8, passphrase, '\'') != null)
+        @compileError("dlp.passphrase must not contain a single quote");
+}
+
 pub const SqlError = error{ Sqlite, OutOfMemory };
 
 pub const StepResult = enum { row, done };
