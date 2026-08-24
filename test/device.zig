@@ -690,6 +690,107 @@ test "addTrack mirrors a content row and its dimensions" {
     try testing.expectEqualStrings("Amin", lib.keys[0].name.?);
 }
 
+test "addTrack authors OL-only columns and mints a lyricist artist" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    _ = try ex.addTrack(.{
+        .title = "Cirrus",
+        .artist = "Ninja",
+        .lyricist = "Kuro",
+        .date_added = "2026-01-02",
+        .date_created = "2025-12-31",
+        .subtitle = "Original Mix",
+        .title_for_search = "cirrus",
+        .kuvo_delivery_on = false,
+        .kuvo_delivery_comment = "hold",
+        .cue_update_count = 1,
+        .analysis_data_update_count = 2,
+        .information_update_count = 3,
+        .file_path = "/Contents/Ninja/01. Cirrus.mp3",
+        .filename = "01. Cirrus.mp3",
+    });
+    // The dedup path ignores OL extras: the same file_path returns the
+    // existing track (append-only, no update), so none of this lands.
+    const dup = try ex.addTrack(.{
+        .title = "Cirrus",
+        .file_path = "/Contents/Ninja/01. Cirrus.mp3",
+        .subtitle = "ignored",
+    });
+    try testing.expect(!dup.is_new);
+    try ex.save();
+
+    const db_path = try tmpOlDbPath(&tmp, alloc);
+    defer alloc.free(db_path);
+    var db = try dlp.Db.open(io, db_path);
+    defer db.close();
+    var lib = try dlp.Library.load(alloc, db);
+    defer lib.deinit();
+
+    try testing.expectEqual(@as(usize, 1), lib.contents.len);
+    const content = lib.contents[0];
+    try testing.expectEqualStrings("Original Mix", content.subtitle.?);
+    try testing.expectEqualStrings("cirrus", content.titleForSearch.?);
+    try testing.expectEqual(@as(i64, 0), content.isKuvoDeliverStatusOn.?);
+    try testing.expectEqualStrings("hold", content.kuvoDeliveryComment.?);
+    try testing.expectEqualStrings("2025-12-31", content.dateCreated.?);
+    try testing.expectEqualStrings("2026-01-02", content.dateAdded.?);
+    try testing.expectEqual(@as(i64, 1), content.cueUpdateCount.?);
+    try testing.expectEqual(@as(i64, 2), content.analysisDataUpdateCount.?);
+    try testing.expectEqual(@as(i64, 3), content.informationUpdateCount.?);
+
+    // Two artist rows: the bridged performer and the minted lyricist —
+    // the only mirrored row without a pdb id, so its id starts above
+    // every possible bridged u32.
+    try testing.expectEqual(@as(usize, 2), lib.artists.len);
+    try testing.expectEqualStrings("Ninja", lib.artists[0].name.?);
+    try testing.expectEqual(@as(i64, 1), lib.artists[0].artist_id);
+    const lyricist = lib.byId(dlp.Artist, content.artist_id_lyricist.?).?;
+    try testing.expectEqualStrings("Kuro", lyricist.name.?);
+    try testing.expect(lyricist.artist_id >= 0x1_0000_0000);
+}
+
+test "a lyricist sharing the track artist resolves, never mints" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    _ = try ex.addTrack(.{
+        .title = "Kite",
+        .artist = "Yuki",
+        .lyricist = "Yuki",
+        .file_path = "/Contents/Yuki/01. Kite.flac",
+        .filename = "01. Kite.flac",
+    });
+    try ex.save();
+
+    const db_path = try tmpOlDbPath(&tmp, alloc);
+    defer alloc.free(db_path);
+    var db = try dlp.Db.open(io, db_path);
+    defer db.close();
+    var lib = try dlp.Library.load(alloc, db);
+    defer lib.deinit();
+
+    try testing.expectEqual(@as(usize, 1), lib.artists.len);
+    const content = lib.contents[0];
+    try testing.expectEqual(content.artist_id_artist, content.artist_id_lyricist);
+}
+
 test "a failed OL batch rolls back whole and stays pending" {
     if (dlp.mode != .vendored) return;
     const alloc = testing.allocator;
