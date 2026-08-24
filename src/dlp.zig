@@ -1113,11 +1113,8 @@ fn decodeRow(comptime T: type, a: std.mem.Allocator, stmt: Stmt) LoadError!T {
         switch (f.type) {
             i64 => @field(row, f.name) = stmt.readInt(i),
             ?i64 => @field(row, f.name) = if (stmt.isNull(i)) null else stmt.readInt(i),
-            []const u8, ?[]const u8 => {
-                texts[i] = if (f.type == ?[]const u8 and stmt.isNull(i))
-                    null
-                else
-                    stmt.readText(i);
+            ?[]const u8 => {
+                texts[i] = if (stmt.isNull(i)) null else stmt.readText(i);
                 if (texts[i]) |t| len += t.len;
             },
             else => @compileError("unsupported OneLibrary column type: " ++ @typeName(f.type)),
@@ -1127,12 +1124,12 @@ fn decodeRow(comptime T: type, a: std.mem.Allocator, stmt: Stmt) LoadError!T {
     var off: usize = 0;
     inline for (fields, 0..) |f, i| {
         switch (f.type) {
-            []const u8, ?[]const u8 => {
+            ?[]const u8 => {
                 if (texts[i]) |t| {
                     @memcpy(buf[off..][0..t.len], t);
                     @field(row, f.name) = buf[off..][0..t.len];
                     off += t.len;
-                } else if (f.type == ?[]const u8) {
+                } else {
                     @field(row, f.name) = null;
                 }
             },
@@ -1153,7 +1150,6 @@ fn rowEql(comptime T: type, a: *const T, b: *const T) bool {
 fn cellEql(comptime F: type, a: F, b: F) bool {
     return switch (F) {
         i64, ?i64 => a == b,
-        []const u8 => std.mem.eql(u8, a, b),
         ?[]const u8 => if (a) |x|
             (b != null and std.mem.eql(u8, x, b.?))
         else
@@ -1761,7 +1757,6 @@ fn bindCell(stmt: Stmt, i: usize, cell: anytype) SqlError!void {
     return switch (@TypeOf(cell)) {
         i64 => stmt.bindInt(i, cell),
         ?i64 => if (cell) |v| stmt.bindInt(i, v) else stmt.bindNull(i),
-        []const u8 => stmt.bindTextStatic(i, cell),
         ?[]const u8 => if (cell) |v| stmt.bindTextStatic(i, v) else stmt.bindNull(i),
         else => @compileError("unsupported OneLibrary column type: " ++ @typeName(@TypeOf(cell))),
     };
