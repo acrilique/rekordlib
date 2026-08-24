@@ -446,6 +446,15 @@ pub const Stmt = struct {
         if (rc != c.SQLITE_OK) return error.Sqlite;
     }
 
+    /// `text` is read by SQLite when the statement is next stepped, not
+    /// copied (SQLITE_STATIC), and must stay valid until then. The
+    /// row-binding paths use it: caller rows outlive their step, so the
+    /// copy `bindText` pays is pure overhead there.
+    fn bindTextStatic(self: Stmt, i: usize, text: []const u8) SqlError!void {
+        const rc = api.bind_text(self.handle, @intCast(i), text.ptr, @intCast(text.len), null);
+        if (rc != c.SQLITE_OK) return error.Sqlite;
+    }
+
     /// `blob` is copied by SQLite before the call returns (SQLITE_TRANSIENT).
     pub fn bindBlob(self: Stmt, i: usize, blob: []const u8) SqlError!void {
         const rc = api.bind_blob(self.handle, @intCast(i), blob.ptr, @intCast(blob.len), sqlite_transient());
@@ -1401,8 +1410,9 @@ pub const CreateOptions = struct {
 /// A OneLibrary db opened for writing: `create` builds a fresh export's
 /// db (schema, seeded defaults, the property singleton), `open` attaches
 /// to an existing one, and both write through prepared SQL over the O2
-/// row models — inserts bind NULL for null fields and copy text before
-/// returning, so borrowed input is fine. First-class mutation is
+/// row models — inserts bind NULL for null fields and step before
+/// returning (SQLite reads text at the step, no copy), so borrowed
+/// input is fine. First-class mutation is
 /// append-only, mirroring the device writer's stance; there is no update.
 /// The schema carries no foreign keys, so no method validates ids — tree
 /// and junction semantics belong to the caller (the O4 device writer).
@@ -1638,7 +1648,7 @@ fn pkOf(comptime T: type) []const u8 {
 /// One INSERT, built and bound from the row's comptime layout — the
 /// write-side mirror of `decodeRow`: null fields bind NULL (one of the
 /// fixture's unset conventions), empty strings bind as themselves (the
-/// other), and SQLite copies text before the call returns.
+/// other), and SQLite reads the text at the step without copying it.
 fn insertRow(db: Db, comptime table: []const u8, row: anytype) SqlError!void {
     var stmt = try db.prepare(comptime insertSql(table, @TypeOf(row)));
     defer stmt.finalize();
@@ -1738,8 +1748,8 @@ fn bindCell(stmt: Stmt, i: usize, cell: anytype) SqlError!void {
     return switch (@TypeOf(cell)) {
         i64 => stmt.bindInt(i, cell),
         ?i64 => if (cell) |v| stmt.bindInt(i, v) else stmt.bindNull(i),
-        []const u8 => stmt.bindText(i, cell),
-        ?[]const u8 => if (cell) |v| stmt.bindText(i, v) else stmt.bindNull(i),
+        []const u8 => stmt.bindTextStatic(i, cell),
+        ?[]const u8 => if (cell) |v| stmt.bindTextStatic(i, v) else stmt.bindNull(i),
         else => @compileError("unsupported OneLibrary column type: " ++ @typeName(@TypeOf(cell))),
     };
 }
