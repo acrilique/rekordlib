@@ -472,12 +472,10 @@ pub const Db = struct {
     /// `io` seeds the crypto provider's entropy source (salt/IV generation
     /// on write); read-only sessions never draw from it.
     pub fn open(io: std.Io, path: [:0]const u8) OpenError!Db {
-        if (mode == .off) dlpDisabled();
         return openFlags(io, path, SQLITE_OPEN_READWRITE, true);
     }
 
     pub fn openReadWriteCreate(io: std.Io, path: [:0]const u8) OpenError!Db {
-        if (mode == .off) dlpDisabled();
         return openFlags(io, path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, true);
     }
 
@@ -485,14 +483,12 @@ pub const Db = struct {
     /// (`testdata/dlp/`) and consumer-written plain SQLite files. SQLCipher
     /// reads an unkeyed plaintext file exactly like stock SQLite.
     pub fn openPlaintext(io: std.Io, path: [:0]const u8) OpenError!Db {
-        if (mode == .off) dlpDisabled();
         return openFlags(io, path, SQLITE_OPEN_READWRITE, false);
     }
 
     /// Creates or opens a plaintext db without applying the DLP
     /// passphrase (`Writer.create` with `plaintext` writes such files).
     pub fn openPlaintextReadWriteCreate(io: std.Io, path: [:0]const u8) OpenError!Db {
-        if (mode == .off) dlpDisabled();
         return openFlags(io, path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, false);
     }
 
