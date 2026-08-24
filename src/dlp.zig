@@ -1609,9 +1609,10 @@ pub const Writer = struct {
     /// writer's playlist-pair drain. Each insert sees the ones before it,
     /// so the dense 1-based `sequenceNo`s are exactly
     /// `addContentToPlaylist`'s, continuing past rows already on disk.
-    /// `pairs` is a slice, array, or tuple of structs carrying
-    /// `playlist_id` and `content_id` fields; any failure rolls the whole
-    /// batch back.
+    /// `pairs` is a slice or array of structs carrying `playlist_id` and
+    /// `content_id` fields (unlike `insertAll`, a plain `for` iterates
+    /// `pairs`, so a tuple literal is not an accepted shape); any failure
+    /// rolls the whole batch back.
     pub fn addAllToPlaylist(self: Writer, pairs: anytype) SqlError!void {
         if (pairs.len == 0) return;
         var tx = try Tx.begin(self.db);
