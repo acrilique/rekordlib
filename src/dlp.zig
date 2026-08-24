@@ -1394,30 +1394,31 @@ pub const CreateOptions = struct {
 pub const Writer = struct {
     db: Db,
 
-    /// Error of `create`: `LibraryAlreadyExists` is the exists-guard
-    /// refusing to build over an existing file; the rest is the guard's
-    /// directory access and the SQLite calls.
+    /// Error of `create`: `LibraryAlreadyExists` is the exclusive claim
+    /// refusing to build over an existing file; the rest is the claim's
+    /// file creation and the SQLite calls.
     pub const CreateError = SqlError ||
-        std.Io.Dir.OpenError ||
-        std.Io.Dir.AccessError ||
+        std.Io.File.OpenError ||
         error{LibraryAlreadyExists};
 
     /// Creates a fresh OneLibrary db at `path`: the real schema (see
     /// `schema_sql`), the four seeded tables' default rows, and the
     /// property singleton with `dbVersion` `'10000'`, all in one
     /// transaction — a failed create leaves no file behind, not a
-    /// half-built db the exists-guard below would then refuse to
-    /// overwrite. The db is keyed with the DLP passphrase unless
-    /// `plaintext` is set, and starts in WAL journal mode like rb's
-    /// exports.
+    /// half-built db the claim below would then refuse to overwrite.
+    /// The target is claimed with an exclusive create (O_EXCL), so a
+    /// concurrent creator loses cleanly and the failure cleanup can only
+    /// ever delete a file this call created. The db is keyed with the
+    /// DLP passphrase unless `plaintext` is set, and starts in WAL
+    /// journal mode like rb's exports.
     pub fn create(io: std.Io, path: [:0]const u8, options: CreateOptions) CreateError!Writer {
-        // Refuse to build over an existing db rather than corrupt it.
-        const dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
-        defer dir.close(io);
-        if (dir.access(io, path, .{})) |_| {
-            return error.LibraryAlreadyExists;
+        const cwd = std.Io.Dir.cwd();
+        // Claim the target exclusively: no window between an access
+        // check and the create in which another writer could appear.
+        if (cwd.createFile(io, path, .{ .exclusive = true })) |claim| {
+            claim.close(io);
         } else |err| switch (err) {
-            error.FileNotFound => {},
+            error.PathAlreadyExists => return error.LibraryAlreadyExists,
             else => return err,
         }
 
@@ -1427,7 +1428,7 @@ pub const Writer = struct {
             try Db.openReadWriteCreate(io, path);
         errdefer {
             db.close();
-            std.Io.Dir.cwd().deleteFile(io, path) catch {};
+            cwd.deleteFile(io, path) catch {};
         }
 
         // journal_mode cannot change inside a transaction; everything
