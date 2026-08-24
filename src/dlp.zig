@@ -188,11 +188,17 @@ fn providerKdf(
     };
 }
 
+/// Error of `cbc`: the destination must be at least as long as the
+/// source, and the source a whole number of 16-byte blocks — checked in
+/// every build mode, not only where debug asserts run.
+pub const CbcError = error{ BufferTooSmall, NotBlockAligned };
+
 /// AES-256-CBC over a whole number of 16-byte blocks (pages are);
 /// std.crypto ships no CBC mode. Public and free of C types — directly
 /// testable against published vectors.
-pub fn cbc(comptime encrypt: bool, key: [32]u8, iv: [16]u8, dst: []u8, src: []const u8) void {
-    std.debug.assert(dst.len >= src.len);
+pub fn cbc(comptime encrypt: bool, key: [32]u8, iv: [16]u8, dst: []u8, src: []const u8) CbcError!void {
+    if (dst.len < src.len) return error.BufferTooSmall;
+    if (src.len % 16 != 0) return error.NotBlockAligned;
     const aes = if (encrypt)
         std.crypto.core.aes.Aes256.initEnc(key)
     else
@@ -230,9 +236,9 @@ fn providerCipher(
     if (in_sz < 0 or @rem(in_sz, 16) != 0) return c.SQLITE_ERROR;
     const n: usize = @intCast(in_sz);
     if (enc == SQLCIPHER_ENCRYPT)
-        cbc(true, key.?[0..32].*, iv.?[0..16].*, out.?[0..n], in.?[0..n])
+        cbc(true, key.?[0..32].*, iv.?[0..16].*, out.?[0..n], in.?[0..n]) catch return c.SQLITE_ERROR
     else
-        cbc(false, key.?[0..32].*, iv.?[0..16].*, out.?[0..n], in.?[0..n]);
+        cbc(false, key.?[0..32].*, iv.?[0..16].*, out.?[0..n], in.?[0..n]) catch return c.SQLITE_ERROR;
     return c.SQLITE_OK;
 }
 

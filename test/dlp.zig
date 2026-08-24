@@ -144,10 +144,14 @@ test "cbc matches NIST SP 800-38A F.2.5 (AES-256-CBC)" {
     );
 
     var buf: [64]u8 = undefined;
-    dlp.cbc(true, key, iv, &buf, &pt);
+    try dlp.cbc(true, key, iv, &buf, &pt);
     try testing.expectEqualSlices(u8, &ct, buf[0..pt.len]);
-    dlp.cbc(false, key, iv, &buf, &ct);
+    try dlp.cbc(false, key, iv, &buf, &ct);
     try testing.expectEqualSlices(u8, &pt, buf[0..ct.len]);
+
+    // the preconditions are real errors, not debug asserts
+    try testing.expectError(error.BufferTooSmall, dlp.cbc(true, key, iv, buf[0..8], &pt));
+    try testing.expectError(error.NotBlockAligned, dlp.cbc(true, key, iv, &buf, pt[0..20]));
 }
 
 fn hex(comptime s: []const u8) [s.len / 2]u8 {
