@@ -885,19 +885,35 @@ const tables = [_]Table{
     .{ .row = Sort, .table = "sort", .rows = "sorts", .map = "sort_by_id", .id = "sort_id" },
 };
 
-/// The primary-key subset of `tables` (`map` set): what `load` indexes
-/// and `byId` serves.
-const id_tables = blk: {
-    var selected: [tables.len]Table = undefined;
+/// The element type `filterTables` returns for `pred`.
+fn FilteredTables(comptime pred: fn (Table) bool) type {
     var n: usize = 0;
     for (tables) |t| {
-        if (t.map != null) {
+        if (pred(t)) n += 1;
+    }
+    return [n]Table;
+}
+
+/// `tables` filtered by `pred` — the comptime subset views below.
+fn filterTables(comptime pred: fn (Table) bool) FilteredTables(pred) {
+    var selected: FilteredTables(pred) = undefined;
+    var n: usize = 0;
+    for (tables) |t| {
+        if (pred(t)) {
             selected[n] = t;
             n += 1;
         }
     }
-    break :blk selected[0..n].*;
-};
+    return selected;
+}
+
+/// The primary-key subset of `tables` (`map` set): what `load` indexes
+/// and `byId` serves.
+const id_tables = filterTables(struct {
+    fn keyed(t: Table) bool {
+        return t.map != null;
+    }
+}.keyed);
 
 /// A whole `exportLibrary.db`, read into arena-owned models: every row of
 /// every table, strings and all. The models mirror the real schema
@@ -1385,17 +1401,11 @@ const Tx = struct {
 /// playlists, my-tags). Cue, history, and hot-cue-bank authoring is
 /// absent on purpose — fresh exports carry no rows there and rbox
 /// offers no inserts for them either.
-const write_tables = blk: {
-    var selected: [tables.len]Table = undefined;
-    var n: usize = 0;
-    for (tables) |t| {
-        if (t.writable) {
-            selected[n] = t;
-            n += 1;
-        }
+const write_tables = filterTables(struct {
+    fn isWritable(t: Table) bool {
+        return t.writable;
     }
-    break :blk selected[0..n].*;
-};
+}.isWritable);
 
 /// Options of `Writer.create`.
 pub const CreateOptions = struct {
