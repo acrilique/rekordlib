@@ -116,8 +116,11 @@ pub const Provider = extern struct {
 /// provider ctx to every callback but gives `ctx_init` no input, so
 /// `Db.open` parks its Io here and `providerCtxInit` copies it into each
 /// provider ctx — an open db pins its own Io instead of racing on
-/// whatever `Db.open` ran last.
+/// whatever `Db.open` ran last. The seed itself is module-global, so
+/// `open_gate` serializes the open-to-key stretch that reads it: a
+/// concurrent open cannot swap another db's entropy source in.
 var io_seed: ?std.Io = null;
+var open_gate: std.Io.Mutex = .init;
 
 fn providerHmac(
     ctx: ?*anyopaque,
@@ -488,6 +491,11 @@ pub const Db = struct {
 
     fn openFlags(io: std.Io, path: [:0]const u8, flags: c_int, keyed: bool) OpenError!Db {
         if (mode == .off) dlpDisabled();
+        // Hold the gate until the key pragma has copied the seed into
+        // this db's provider ctx (plaintext opens need no seed, but the
+        // library init inside the first open_v2 reads it too).
+        open_gate.lockUncancelable(io);
+        defer open_gate.unlock(io);
         io_seed = io;
         var handle: ?*c.sqlite3 = null;
         const rc = api.open_v2(path.ptr, &handle, flags, null);
