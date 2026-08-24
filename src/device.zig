@@ -421,6 +421,17 @@ pub const OpenOlLibraryError =
     dlp.LoadError ||
     error{ CwdUnavailable, OutOfMemory };
 
+/// Error of the OL mirroring helpers: pinning the working directory,
+/// examining or loading the existing `exportLibrary.db` (a drifted schema
+/// is `SchemaMismatch`), building its path or a device ANLZ path, or
+/// allocating.
+pub const OlMirrorError =
+    std.Io.Dir.OpenError ||
+    std.Io.Dir.AccessError ||
+    dlp.LoadError ||
+    std.mem.Allocator.Error ||
+    error{ CwdUnavailable, InvalidUtf8 };
+
 /// `bitmask` value on fresh Rekordbox Track rows (`0x000c0700`); the
 /// OneLibrary db mirrors it as `contentLink`. Copy exactly.
 const track_bitmask: u32 = 788_224;
@@ -433,9 +444,10 @@ const track_unknown5: u16 = 41;
 /// no foreign-key ids. Input to `DeviceExport.addTrack`, which resolves
 /// artists/albums/genres/keys/labels/artwork into deduplicated rows and
 /// handles format quirks (the 221-byte minimum row size, centi-BPM
-/// tempo). Every slice is borrowed for the call only. Experts needing
-/// fields not exposed here should build a `pdb.Track` row directly
-/// through `openPdb`.
+/// tempo); when the export carries a OneLibrary db, the same facts
+/// mirror into it. Every slice is borrowed for the call only. Experts
+/// needing fields not exposed here should build a `pdb.Track` row
+/// directly through `openPdb`.
 pub const TrackInput = struct {
     /// Track title.
     title: []const u8 = "",
@@ -535,13 +547,15 @@ pub const AddTrackOutcome = struct {
 
 /// Error of `DeviceExport.addTrack`: building the writer state, encoding
 /// the track's strings (too long, or invalid UTF-8 where a format string
-/// requires it), deriving its ANLZ paths, or inserting the rows.
+/// requires it), deriving its ANLZ paths, inserting the rows, or building
+/// the OneLibrary mirror's view of the export.
 pub const AddTrackError =
     WriterStateError ||
     PathError ||
     error{ TooLong, InvalidEncoding } ||
     pdb.DatabaseModifyError ||
-    anlz.WriteError;
+    anlz.WriteError ||
+    OlMirrorError;
 
 /// Error of the playlist and tag methods: building the writer state,
 /// loading or creating `exportExt.pdb`, encoding a name or label (too
@@ -912,6 +926,183 @@ pub const DeviceExport = struct {
         );
     }
 
+    /// The OneLibrary store, building it on first use: an export that
+    /// carries an `exportLibrary.db` gets a store holding its rows' dedup
+    /// state (the db is loaded and closed again — pending rows are the
+    /// only mutations until `save`); an export without one never gains
+    /// one, so mirroring is a no-op there. Null in the absent case.
+    fn olStore(e: *DeviceExport) OlMirrorError!?*OlStore {
+        switch (e.ol_state) {
+            .store => |*store| return store,
+            .absent => return null,
+            .unloaded => {
+                const dir = try e.dirHandle();
+                const rel = try e.layout.exportLibraryDb(e.alloc);
+                defer e.alloc.free(rel);
+                if (dir.access(e.io, rel, .{})) |_| {} else |err| switch (err) {
+                    error.FileNotFound => {
+                        e.ol_state = .absent;
+                        return null;
+                    },
+                    else => return err,
+                }
+
+                const path = try e.olDbPath();
+                defer e.alloc.free(path);
+                var db = try dlp.Db.open(e.io, path);
+                errdefer db.close();
+                var lib = try dlp.Library.load(e.alloc, db);
+                defer lib.deinit();
+                db.close();
+
+                var store = OlStore{ .arena = std.heap.ArenaAllocator.init(e.alloc) };
+                errdefer store.deinit();
+                try scanOlStore(&lib, &store);
+                e.ol_state = .{ .store = store };
+                return &e.ol_state.store;
+            },
+        }
+    }
+
+    /// Builds the OL store before a mutating method touches the pdb, so
+    /// an unopenable or schema-drifted `exportLibrary.db` fails the call
+    /// with the export untouched. A no-op in `-Ddlp=off` builds and on
+    /// exports that carry no db.
+    fn primeOlStore(e: *DeviceExport) OlMirrorError!void {
+        if (dlp.mode == .off) return;
+        _ = try e.olStore();
+    }
+
+    /// Mirrors a just-inserted track into the OL store: one `content` row
+    /// plus whatever dimension rows its foreign keys need, resolved
+    /// against the store's dedup state. Field conventions copy the
+    /// fixture: unset artist roles bind NULL while the dimension foreign
+    /// keys (`artist_id_lyricist`, `album_id`, `genre_id`, `label_id`,
+    /// `key_id`, `color_id`) bind 0, `titleForSearch` is NULL but
+    /// `subtitle`/`isrc`/`kuvoDeliveryComment` are empty text,
+    /// `analysedBits`/`contentLink` carry the pdb row's constants, and no
+    /// master-db ids are written (writers may leave them out). A failure
+    /// after some rows appended leaves those pending — the same residual
+    /// risk as `addTrack`'s pdb dimension rows.
+    fn mirrorAddedTrack(
+        e: *DeviceExport,
+        track: TrackInput,
+        row: *const pdb.Track,
+    ) OlMirrorError!void {
+        if (dlp.mode == .off) return;
+        const store = (try e.olStore()) orelse return;
+        const a = store.arena.allocator();
+
+        const artist_id = try olNamedRow(
+            store,
+            &store.artists_by_name,
+            &store.artists,
+            olArtistRow,
+            row.artist_id,
+            track.artist,
+        );
+        const remixer_id = try olNamedRow(
+            store,
+            &store.artists_by_name,
+            &store.artists,
+            olArtistRow,
+            row.remixer_id,
+            track.remixer,
+        );
+        const orig_artist_id = try olNamedRow(
+            store,
+            &store.artists_by_name,
+            &store.artists,
+            olArtistRow,
+            row.orig_artist_id,
+            track.orig_artist,
+        );
+        const composer_id = try olNamedRow(
+            store,
+            &store.artists_by_name,
+            &store.artists,
+            olArtistRow,
+            row.composer_id,
+            track.composer,
+        );
+        const genre_id = try olNamedRow(
+            store,
+            &store.genres_by_name,
+            &store.genres,
+            olGenreRow,
+            row.genre_id,
+            track.genre,
+        );
+        const label_id = try olNamedRow(
+            store,
+            &store.labels_by_name,
+            &store.labels,
+            olLabelRow,
+            row.label_id,
+            track.label,
+        );
+        const key_id = try olKeyId(store, track.key, row.key_id);
+        const album_id = try olAlbumId(store, track.album, row.album_id, artist_id);
+        const image_id = try olImageId(store, row.artwork_id);
+
+        const analysis_path: ?[]const u8 = if (track.analysis != null)
+            try anlzDevicePath(a, track.file_path)
+        else
+            null;
+
+        try store.contents.append(a, .{
+            .content_id = row.id,
+            .title = try a.dupe(u8, track.title),
+            .titleForSearch = null,
+            .subtitle = "",
+            .bpmx100 = row.tempo,
+            .length = row.duration,
+            .trackNo = row.track_number,
+            .discNo = row.disc_number,
+            .artist_id_artist = artist_id,
+            .artist_id_remixer = remixer_id,
+            .artist_id_originalArtist = orig_artist_id,
+            .artist_id_composer = composer_id,
+            // The pdb carries no lyricist foreign key — the name lives in
+            // its string table, and the OL column stays 0 as in the
+            // fixture.
+            .artist_id_lyricist = 0,
+            .album_id = album_id orelse 0,
+            .genre_id = genre_id orelse 0,
+            .label_id = label_id orelse 0,
+            .key_id = key_id orelse 0,
+            .color_id = @intFromEnum(row.color),
+            .image_id = image_id,
+            .djComment = try a.dupe(u8, track.comment),
+            .rating = row.rating,
+            .releaseYear = row.year,
+            .releaseDate = try a.dupe(u8, track.release_date),
+            .dateCreated = try a.dupe(u8, track.date_added),
+            .dateAdded = try a.dupe(u8, track.date_added),
+            .path = try a.dupe(u8, track.file_path),
+            .fileName = try a.dupe(u8, track.filename),
+            .fileSize = row.file_size,
+            .fileType = @intFromEnum(row.file_type),
+            .bitrate = row.bitrate,
+            .bitDepth = row.sample_depth,
+            .samplingRate = row.sample_rate,
+            .isrc = try a.dupe(u8, track.isrc),
+            .djPlayCount = row.play_count,
+            .isHotCueAutoLoadOn = if (track.autoload_hotcues) 1 else 0,
+            .isKuvoDeliverStatusOn = 1,
+            .kuvoDeliveryComment = "",
+            .masterDbId = null,
+            .masterContentId = null,
+            .analysisDataFilePath = analysis_path,
+            .analysedBits = track_unknown5,
+            .contentLink = track_bitmask,
+            .hasModified = 0,
+            .cueUpdateCount = null,
+            .analysisDataUpdateCount = null,
+            .informationUpdateCount = null,
+        });
+    }
+
     /// The writer's cached scan of the export, built on first use
     /// (loading the pdb first if needed). The mutating methods call
     /// this before they touch the database, so read-only sessions
@@ -927,7 +1118,11 @@ pub const DeviceExport = struct {
 
     /// Adds a track to the export. Resolves — creating where needed —
     /// the Artist, Album, Genre, Key, Label, and Artwork rows, then
-    /// inserts a Track row pointing at them by id.
+    /// inserts a Track row pointing at them by id. When the export
+    /// carries a OneLibrary db (`create`d exports, newer opened ones),
+    /// the same facts mirror into it: one content row per track, its
+    /// dimension rows deduped through the OL side's own view, its ids
+    /// bridged from the pdb side.
     ///
     /// Idempotent on a non-empty `file_path`: if a track with that path
     /// was already added (this session, or read back by the writer-state
@@ -935,18 +1130,22 @@ pub const DeviceExport = struct {
     /// is inserted; `AddTrackOutcome.is_new` tells the cases apart.
     ///
     /// Everything that can fail on the caller's data — string encoding,
-    /// ANLZ serialization — happens before any id is taken or row
-    /// inserted, so a bad string leaves the export untouched. A failure
-    /// between the dimension-row inserts and the Track row (allocation
-    /// failure, or a database counters inconsistency) can still leave
-    /// orphaned dimension rows — unreachable from any track, ignored by
-    /// players, not recovered automatically.
+    /// ANLZ serialization, the OL store's view of the export — happens
+    /// before any id is taken or row inserted, so a bad string leaves the
+    /// export untouched. A failure between the dimension-row inserts and
+    /// the Track row (allocation failure, or a database counters
+    /// inconsistency) can still leave orphaned dimension rows —
+    /// unreachable from any track, ignored by players, not recovered
+    /// automatically — and a failure in the OL mirroring after the Track
+    /// insert leaves the pdb side complete with the OL side partially
+    /// pending (same risk class; the next `save` lands what pends).
     pub fn addTrack(e: *DeviceExport, track: TrackInput) AddTrackError!AddTrackOutcome {
         const state = try e.writerState();
         if (track.file_path.len > 0) {
             if (state.tracks_by_path.get(track.file_path)) |id|
                 return .{ .id = id, .is_new = false };
         }
+        try e.primeOlStore();
         const track_id = state.next_track_id;
 
         // The caller's data fails here or never: nothing below this point
@@ -1003,6 +1202,8 @@ pub const DeviceExport = struct {
         if (owned_path) |path| state.tracks_by_path.putAssumeCapacity(path, track_id);
         for (anlz_files) |slot| if (slot) |file|
             e.pending_anlz.appendAssumeCapacity(file);
+
+        try e.mirrorAddedTrack(track, row);
 
         return .{ .id = track_id, .is_new = true };
     }
@@ -1922,6 +2123,19 @@ const OlStore = struct {
     my_tags: std.ArrayListUnmanaged(dlp.MyTag) = .empty,
     my_tag_pairs: std.ArrayListUnmanaged(OlTagPair) = .empty,
 
+    /// Dedup state over the existing db (filled by `scanOlStore`) and the
+    /// pending rows; values are OL ids. Name lookups make a reopened db
+    /// resolve to its own ids — in lockstep dbs those are exactly the
+    /// bridged pdb ids.
+    artists_by_name: std.StringHashMapUnmanaged(i64) = .empty,
+    albums_by_artist_and_name: OlAlbumsByArtistAndName = .empty,
+    genres_by_name: std.StringHashMapUnmanaged(i64) = .empty,
+    labels_by_name: std.StringHashMapUnmanaged(i64) = .empty,
+    /// Key names indexed under their canonical form, like the pdb side.
+    keys_by_canonical: std.StringHashMapUnmanaged(i64) = .empty,
+    /// Bridged artwork ids whose `image` row exists or pends.
+    image_ids: std.AutoHashMapUnmanaged(i64, void) = .empty,
+
     fn hasPending(store: *const OlStore) bool {
         return store.artists.items.len > 0 or
             store.albums.items.len > 0 or
@@ -2009,6 +2223,164 @@ pub const OlAlbumsByArtistAndName = std.HashMapUnmanaged(
     OlAlbumKeyContext,
     std.hash_map.default_max_load_percentage,
 );
+
+/// Extends a store's dedup state with an existing db's rows, so mirrored
+/// inserts reuse the db's own ids where they collide by name (a db
+/// written in lockstep resolves to the bridged pdb id) and never
+/// duplicate a row the db already carries. A NULL album artist keys as 0,
+/// the pdb-side null convention.
+fn scanOlStore(lib: *const dlp.Library, store: *OlStore) std.mem.Allocator.Error!void {
+    const a = store.arena.allocator();
+    for (lib.artists) |row| {
+        if (row.name) |name|
+            try putIfAbsent(&store.artists_by_name, a, try a.dupe(u8, name), row.artist_id);
+    }
+    for (lib.albums) |row| {
+        if (row.name) |name| try putIfAbsent(
+            &store.albums_by_artist_and_name,
+            a,
+            OlAlbumKey{ .artist_id = row.artist_id orelse 0, .name = try a.dupe(u8, name) },
+            row.album_id,
+        );
+    }
+    for (lib.genres) |row| {
+        if (row.name) |name|
+            try putIfAbsent(&store.genres_by_name, a, try a.dupe(u8, name), row.genre_id);
+    }
+    for (lib.labels) |row| {
+        if (row.name) |name|
+            try putIfAbsent(&store.labels_by_name, a, try a.dupe(u8, name), row.label_id);
+    }
+    for (lib.keys) |row| {
+        if (row.name) |name| try putIfAbsent(
+            &store.keys_by_canonical,
+            a,
+            try canonicalKeyName(a, name),
+            row.key_id,
+        );
+    }
+    for (lib.images) |row| try store.image_ids.put(a, row.image_id, {});
+}
+
+/// One mirrored `artist` row; see `olNamedRow`.
+fn olArtistRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!dlp.Artist {
+    _ = a;
+    return .{ .artist_id = id, .name = name, .nameForSearch = null };
+}
+
+/// One mirrored `genre` row; see `olNamedRow`.
+fn olGenreRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!dlp.Genre {
+    _ = a;
+    return .{ .genre_id = id, .name = name };
+}
+
+/// One mirrored `label` row; see `olNamedRow`.
+fn olLabelRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!dlp.Label {
+    _ = a;
+    return .{ .label_id = id, .name = name };
+}
+
+/// Resolves `name` through `map` to a mirrored row: an existing entry
+/// (the db's own id) is returned as-is; a miss appends a pending row
+/// built by `build_row` under the bridged `pdb_id` — the fixture shows
+/// rb keeps the pdb and OL id spaces aligned (artist 1 ↔ artist 1), so a
+/// lockstep db never sees a collision. The map key is duped and its
+/// capacity reserved before the append, so the bookkeeping after it
+/// cannot fail half-applied (the `getOrCreateStringRow` discipline).
+/// Empty names resolve to null: no row, no foreign key.
+fn olNamedRow(
+    store: *OlStore,
+    map: *std.StringHashMapUnmanaged(i64),
+    list: anytype,
+    comptime build_row: anytype,
+    pdb_id: i64,
+    name: []const u8,
+) std.mem.Allocator.Error!?i64 {
+    if (name.len == 0) return null;
+    if (map.get(name)) |id| return id;
+
+    const a = store.arena.allocator();
+    const owned = try a.dupe(u8, name);
+    try map.ensureUnusedCapacity(a, 1);
+    try list.append(a, try build_row(a, owned, pdb_id));
+    map.putAssumeCapacity(owned, pdb_id);
+    return pdb_id;
+}
+
+/// Resolves `name` — folded through `canonicalKeyName` — to a mirrored
+/// `key` row; the stored spelling is the canonical one, exactly like the
+/// pdb Key row this mirrors.
+fn olKeyId(
+    store: *OlStore,
+    name: []const u8,
+    pdb_id: i64,
+) std.mem.Allocator.Error!?i64 {
+    if (name.len == 0) return null;
+    const a = store.arena.allocator();
+    const canonical = try canonicalKeyName(a, name);
+    if (store.keys_by_canonical.get(canonical)) |id| return id;
+
+    // A name that folds to nothing (whitespace only) keeps the original.
+    const owned = if (canonical.len == 0) try a.dupe(u8, name) else canonical;
+    try store.keys_by_canonical.ensureUnusedCapacity(a, 1);
+    try store.keys.append(a, .{ .key_id = pdb_id, .name = owned });
+    store.keys_by_canonical.putAssumeCapacity(canonical, pdb_id);
+    return pdb_id;
+}
+
+/// Resolves `(owning artist, name)` to a mirrored `album` row. The pdb
+/// side keys albums per-artist; the OL side keys per-OL-artist, which for
+/// lockstep dbs is the same thing. A null artist (the pdb null fk 0)
+/// mirrors as the fixture does: `artist_id` NULL.
+fn olAlbumId(
+    store: *OlStore,
+    name: []const u8,
+    pdb_id: i64,
+    ol_artist_id: ?i64,
+) std.mem.Allocator.Error!?i64 {
+    if (name.len == 0) return null;
+    if (store.albums_by_artist_and_name.get(.{
+        .artist_id = ol_artist_id orelse 0,
+        .name = name,
+    })) |id| return id;
+
+    const a = store.arena.allocator();
+    const owned = try a.dupe(u8, name);
+    try store.albums_by_artist_and_name.ensureUnusedCapacity(a, 1);
+    try store.albums.append(a, .{
+        .album_id = pdb_id,
+        .name = owned,
+        .artist_id = ol_artist_id,
+        .image_id = null,
+        .isComplation = 0,
+        .nameForSearch = null,
+    });
+    store.albums_by_artist_and_name.putAssumeCapacity(.{
+        .artist_id = ol_artist_id orelse 0,
+        .name = owned,
+    }, pdb_id);
+    return pdb_id;
+}
+
+/// Resolves an artwork row to its mirrored `image` row: the bridge is the
+/// artwork id itself, and the stored path is the OneLibrary `b{id}.jpg`
+/// variant derived from it — not the caller's `a*` path, which the spec
+/// (`artworkSpec`) tells the caller to place alongside. No artwork (id
+/// 0) mirrors nothing.
+fn olImageId(store: *OlStore, pdb_artwork_id: u32) std.mem.Allocator.Error!?i64 {
+    if (pdb_artwork_id == 0) return null;
+    const id: i64 = pdb_artwork_id;
+    if (store.image_ids.contains(id)) return id;
+
+    const a = store.arena.allocator();
+    try store.image_ids.ensureUnusedCapacity(a, 1);
+    try store.images.append(a, .{
+        .image_id = id,
+        .path = try olArtworkPath(a, pdb_artwork_id),
+    });
+    store.image_ids.putAssumeCapacity(id, {});
+    return id;
+}
 
 // --- writer state ---------------------------------------------------------------
 
@@ -2235,7 +2607,7 @@ fn putIfAbsent(
     map: anytype,
     a: std.mem.Allocator,
     key: anytype,
-    value: u32,
+    value: anytype,
 ) std.mem.Allocator.Error!void {
     const gop = try map.getOrPut(a, key);
     if (!gop.found_existing) {

@@ -550,6 +550,228 @@ test "off builds write no exportLibrary.db" {
     );
 }
 
+test "addTrack mirrors a content row and its dimensions" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    const first = try ex.addTrack(.{
+        .title = "Bako",
+        .artist = "Reboot",
+        .album = " www.electronicfresh.com",
+        .genre = "Tech House",
+        .key = "Am",
+        .label = "Cecille",
+        .comment = "nice one",
+        .release_date = "2022-03-04",
+        .date_added = "2026-08-24",
+        .file_path = "/Contents/Reboot/01. Bako.mp3",
+        .filename = "01. Bako.mp3",
+        .artwork_device_path = "/PIONEER/Artwork/00001/a1.jpg",
+        .tempo = 129.0,
+        .bitrate = 320,
+        .sample_rate = 44_100,
+        .sample_depth = 16,
+        .duration_secs = 398,
+        .file_size = 16_009_841,
+        .track_number = 1,
+        .year = 2022,
+        .rating = 4,
+        .play_count = 2,
+        .color = .aqua,
+        .file_type = .mp3,
+        .autoload_hotcues = true,
+    });
+    // A second track sharing the artist, genre, label, key, and artwork:
+    // the mirrored dimensions dedup, exactly like the pdb side.
+    _ = try ex.addTrack(.{
+        .title = "Assign",
+        .artist = "Reboot",
+        .genre = "Tech House",
+        .key = "A Minor",
+        .label = "Cecille",
+        .remixer = "Reboot",
+        .file_path = "/Contents/Reboot/02. Assign.mp3",
+        .filename = "02. Assign.mp3",
+        .artwork_device_path = "/PIONEER/Artwork/00001/a1.jpg",
+    });
+    try ex.save();
+
+    const db_path = try tmpOlDbPath(&tmp, alloc);
+    defer alloc.free(db_path);
+    var db = try dlp.Db.open(io, db_path);
+    defer db.close();
+    var lib = try dlp.Library.load(alloc, db);
+    defer lib.deinit();
+
+    try testing.expectEqual(@as(usize, 2), lib.contents.len);
+    try testing.expectEqual(@as(i64, 2), lib.property.?.numberOfContents.?);
+
+    // The content row: bridged id, mirrored facts, the fixture's NULL
+    // versus empty-string conventions, and the cross-format constants.
+    const content = lib.byId(dlp.Content, first.id).?;
+    try testing.expectEqualStrings("Bako", content.title.?);
+    try testing.expectEqual(@as(i64, 12_900), content.bpmx100.?);
+    try testing.expectEqual(@as(i64, 398), content.length.?);
+    try testing.expectEqual(@as(i64, 1), content.trackNo.?);
+    try testing.expectEqual(@as(i64, 1), content.artist_id_artist.?);
+    try testing.expectEqual(@as(i64, 1), content.album_id.?);
+    try testing.expectEqual(@as(i64, 1), content.genre_id.?);
+    try testing.expectEqual(@as(i64, 1), content.label_id.?);
+    try testing.expectEqual(@as(i64, 1), content.key_id.?);
+    try testing.expectEqual(@as(i64, 6), content.color_id.?);
+    try testing.expectEqual(@as(i64, 1), content.image_id.?);
+    try testing.expectEqualStrings("nice one", content.djComment.?);
+    try testing.expectEqual(@as(i64, 4), content.rating.?);
+    try testing.expectEqual(@as(i64, 2022), content.releaseYear.?);
+    try testing.expectEqualStrings("2022-03-04", content.releaseDate.?);
+    try testing.expectEqualStrings("2026-08-24", content.dateCreated.?);
+    try testing.expectEqualStrings("2026-08-24", content.dateAdded.?);
+    try testing.expectEqualStrings("/Contents/Reboot/01. Bako.mp3", content.path.?);
+    try testing.expectEqual(@as(i64, 320), content.bitrate.?);
+    try testing.expectEqual(@as(i64, 16), content.bitDepth.?);
+    try testing.expectEqual(@as(i64, 44_100), content.samplingRate.?);
+    try testing.expectEqual(@as(i64, 1), content.fileType.?);
+    try testing.expectEqual(@as(i64, 41), content.analysedBits.?);
+    try testing.expectEqual(@as(i64, 788_224), content.contentLink.?);
+    try testing.expectEqual(@as(i64, 1), content.isHotCueAutoLoadOn.?);
+    try testing.expect(content.titleForSearch == null);
+    try testing.expect(content.subtitle != null and content.subtitle.?.len == 0);
+    try testing.expect(content.isrc != null and content.isrc.?.len == 0);
+    try testing.expect(content.artist_id_remixer == null);
+    try testing.expect(content.masterDbId == null);
+    try testing.expect(content.analysisDataFilePath == null);
+    try testing.expect(content.cueUpdateCount == null);
+
+    // The second track: dimensions reused (both point at id 1), the
+    // remixer resolved as its own artist role, and no new rows.
+    const second = lib.contentByPath("/Contents/Reboot/02. Assign.mp3").?;
+    try testing.expectEqual(@as(i64, 1), second.artist_id_artist.?);
+    try testing.expectEqual(@as(i64, 1), second.artist_id_remixer.?);
+    try testing.expectEqual(@as(i64, 1), second.genre_id.?);
+    try testing.expectEqual(@as(i64, 1), second.label_id.?);
+    try testing.expectEqual(@as(i64, 1), second.key_id.?);
+    try testing.expectEqual(@as(i64, 0), second.album_id.?);
+    try testing.expectEqual(@as(i64, 0), second.color_id.?);
+
+    try testing.expectEqual(@as(usize, 1), lib.artists.len);
+    try testing.expectEqual(@as(usize, 1), lib.genres.len);
+    try testing.expectEqual(@as(usize, 1), lib.labels.len);
+    try testing.expectEqual(@as(usize, 1), lib.keys.len);
+    try testing.expectEqual(@as(usize, 1), lib.albums.len);
+    try testing.expectEqual(@as(usize, 1), lib.images.len);
+    try testing.expectEqualStrings("/PIONEER/Artwork/00001/b1.jpg", lib.images[0].path.?);
+    // "Am" and "A Minor" folded to one canonical key row.
+    try testing.expectEqualStrings("Amin", lib.keys[0].name.?);
+}
+
+test "addTrack mirrors the analysis path when analysis pends" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var beats = [1]anlz.Beat{.{ .beat_number = 1, .tempo = 12_800, .time = 0 }};
+    const input = anlz.AnlzInput{ .beats = &beats };
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    _ = try ex.addTrack(.{
+        .title = "analyzed",
+        .file_path = "/Contents/analyzed.mp3",
+        .analysis = &input,
+    });
+    try ex.save();
+
+    const db_path = try tmpOlDbPath(&tmp, alloc);
+    defer alloc.free(db_path);
+    var db = try dlp.Db.open(io, db_path);
+    defer db.close();
+    var lib = try dlp.Library.load(alloc, db);
+    defer lib.deinit();
+
+    const content = lib.contents[0];
+    const want = try device.anlzDevicePath(alloc, "/Contents/analyzed.mp3");
+    defer alloc.free(want);
+    try testing.expectEqualStrings(want, content.analysisDataFilePath.?);
+}
+
+test "mirroring dedups against an existing OL db" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+    try copyFixturePdb(&tmp, io, alloc, "with_anlz");
+    try copyFixtureOlDb(&tmp, io, alloc);
+
+    var ex = device.DeviceExport.open(tmp_path, io, alloc);
+    defer ex.deinit();
+    // The fixture's own artist and genre, a new path: the mirror must
+    // reuse the db's rows (artist 1 "Reboot", genre 2 "Tech House")
+    // instead of inserting bridged duplicates.
+    const outcome = try ex.addTrack(.{
+        .title = "new song",
+        .artist = "Reboot",
+        .genre = "Tech House",
+        .file_path = "/Contents/Reboot/03. new song.mp3",
+        .filename = "03. new song.mp3",
+    });
+    try testing.expect(outcome.is_new);
+    try testing.expectEqual(@as(u32, 3), outcome.id);
+    try ex.save();
+
+    const db_path = try tmpOlDbPath(&tmp, alloc);
+    defer alloc.free(db_path);
+    var db = try dlp.Db.open(io, db_path);
+    defer db.close();
+    var lib = try dlp.Library.load(alloc, db);
+    defer lib.deinit();
+
+    try testing.expectEqual(@as(usize, 3), lib.contents.len);
+    try testing.expectEqual(@as(i64, 3), lib.property.?.numberOfContents.?);
+    try testing.expectEqual(@as(usize, 1), lib.artists.len);
+    try testing.expectEqual(@as(usize, 2), lib.genres.len);
+    const content = lib.contentByPath("/Contents/Reboot/03. new song.mp3").?;
+    try testing.expectEqual(@as(i64, 3), content.content_id);
+    try testing.expectEqual(@as(i64, 1), content.artist_id_artist.?);
+    try testing.expectEqual(@as(i64, 2), content.genre_id.?);
+
+    // Across the save/reopen boundary the pdb-side path dedup still
+    // gates the mirror: re-adding inserts nothing anywhere.
+    var reopened = device.DeviceExport.open(tmp_path, io, alloc);
+    defer reopened.deinit();
+    const again = try reopened.addTrack(.{
+        .title = "new song",
+        .artist = "Reboot",
+        .genre = "Tech House",
+        .file_path = "/Contents/Reboot/03. new song.mp3",
+        .filename = "03. new song.mp3",
+    });
+    try testing.expect(!again.is_new);
+    try reopened.save();
+
+    var db2 = try dlp.Db.open(io, db_path);
+    defer db2.close();
+    var lib2 = try dlp.Library.load(alloc, db2);
+    defer lib2.deinit();
+    try testing.expectEqual(@as(usize, 3), lib2.contents.len);
+}
+
 test "playlist tree nests folders in row order" {
     const alloc = testing.allocator;
 
