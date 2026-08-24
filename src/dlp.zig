@@ -1582,16 +1582,18 @@ pub const Writer = struct {
         return self.db.scalarInt("SELECT numberOfContents FROM property LIMIT 1;");
     }
 
+    /// The append both playlist APIs share: the dense 1-based
+    /// `sequenceNo` is derived from the table at insert time, so the
+    /// single and bulk paths can never number apart.
+    const playlist_append_sql = "INSERT INTO playlist_content (playlist_id, content_id, sequenceNo) VALUES (?1, ?2, " ++
+        "(SELECT COALESCE(MAX(sequenceNo), 0) + 1 FROM playlist_content WHERE playlist_id = ?1))";
+
     /// Appends a track to a playlist, assigning the next dense 1-based
     /// `sequenceNo` under that playlist (real exports number entries from
     /// 1) and returning it. One atomic INSERT; the keys are not validated
     /// (no FK in the schema — the caller owns tree semantics).
     pub fn addContentToPlaylist(self: Writer, playlist_id: i64, content_id: i64) SqlError!i64 {
-        var stmt = try self.db.prepare(
-            "INSERT INTO playlist_content (playlist_id, content_id, sequenceNo) VALUES (?1, ?2, " ++
-                "(SELECT COALESCE(MAX(sequenceNo), 0) + 1 FROM playlist_content WHERE playlist_id = ?1)) " ++
-                "RETURNING sequenceNo;",
-        );
+        var stmt = try self.db.prepare(playlist_append_sql ++ " RETURNING sequenceNo;");
         defer stmt.finalize();
         try stmt.bindInt(1, playlist_id);
         try stmt.bindInt(2, content_id);
@@ -1614,10 +1616,7 @@ pub const Writer = struct {
         if (pairs.len == 0) return;
         var tx = try Tx.begin(self.db);
         errdefer tx.deinit();
-        var stmt = try self.db.prepare(
-            "INSERT INTO playlist_content (playlist_id, content_id, sequenceNo) VALUES (?1, ?2, " ++
-                "(SELECT COALESCE(MAX(sequenceNo), 0) + 1 FROM playlist_content WHERE playlist_id = ?1));",
-        );
+        var stmt = try self.db.prepare(playlist_append_sql ++ ";");
         defer stmt.finalize();
         for (pairs) |pair| {
             try stmt.bindInt(1, pair.playlist_id);
