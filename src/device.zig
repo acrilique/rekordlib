@@ -533,6 +533,37 @@ pub const TrackInput = struct {
     /// library does not do beat detection; see `anlz.buildAnlzInput` for
     /// assembling one from performance data.
     analysis: ?*const anlz.AnlzInput = null,
+
+    // OneLibrary-only data: columns that exist in `exportLibrary.db`
+    // and never reach the pdb. Ignored when the export carries no OL db
+    // (an opened pdb-only export never gains one), in `-Ddlp=off`
+    // builds, and on the dedup path — `addTrack` returning an existing
+    // track never updates it (append-only). Every default equals the
+    // fixture's convention, so a track authored without them writes the
+    // same OL row as before these fields existed.
+
+    /// Track subtitle (OL `subtitle`), empty per the fixture. Not the
+    /// pdb `mix_name` string — the correspondence is plausible but no
+    /// fixture pins it, so they stay separate fields.
+    subtitle: []const u8 = "",
+    /// Search-optimized title (OL `titleForSearch`); null writes NULL
+    /// (the fixture's convention), an empty slice writes `''`.
+    title_for_search: ?[]const u8 = null,
+    /// KUVO delivery flag (OL `isKuvoDeliverStatusOn`); on, as the
+    /// fixture carries it.
+    kuvo_delivery_on: bool = true,
+    /// KUVO delivery comment (OL `kuvoDeliveryComment`), empty per the
+    /// fixture.
+    kuvo_delivery_comment: []const u8 = "",
+    /// OL `dateCreated`; null mirrors `date_added` (the fixture writes
+    /// the two equal), a value makes them diverge.
+    date_created: ?[]const u8 = null,
+    /// OL `cueUpdateCount`; null writes NULL (fresh-export shape).
+    cue_update_count: ?i64 = null,
+    /// OL `analysisDataUpdateCount`; null writes NULL.
+    analysis_data_update_count: ?i64 = null,
+    /// OL `informationUpdateCount`; null writes NULL.
+    information_update_count: ?i64 = null,
 };
 
 /// The outcome of `DeviceExport.addTrack`: a freshly inserted track, or
@@ -978,15 +1009,18 @@ pub const DeviceExport = struct {
 
     /// Mirrors a just-inserted track into the OL store: one `content` row
     /// plus whatever dimension rows its foreign keys need, resolved
-    /// against the store's dedup state. Field conventions copy the
-    /// fixture: unset artist roles bind NULL while the dimension foreign
-    /// keys (`artist_id_lyricist`, `album_id`, `genre_id`, `label_id`,
-    /// `key_id`, `color_id`) bind 0, `titleForSearch` is NULL but
-    /// `subtitle`/`isrc`/`kuvoDeliveryComment` are empty text,
-    /// `analysedBits`/`contentLink` carry the pdb row's constants, and no
-    /// master-db ids are written (writers may leave them out). A failure
-    /// after some rows appended leaves those pending — the same residual
-    /// risk as `addTrack`'s pdb dimension rows.
+    /// against the store's dedup state. The OL-only columns come from
+    /// the `TrackInput` fields of the same names; their defaults keep
+    /// the fixture's conventions — unset artist roles bind NULL while
+    /// the dimension foreign keys (`artist_id_lyricist`, `album_id`,
+    /// `genre_id`, `label_id`, `key_id`, `color_id`) bind 0,
+    /// `titleForSearch` is NULL but `subtitle`/`isrc`/
+    /// `kuvoDeliveryComment` are empty text, `dateCreated` mirrors
+    /// `date_added`, `analysedBits`/`contentLink` carry the pdb row's
+    /// constants, and no master-db ids are written (writers may leave
+    /// them out). A failure after some rows appended leaves those
+    /// pending — the same residual risk as `addTrack`'s pdb dimension
+    /// rows.
     fn mirrorAddedTrack(
         e: *DeviceExport,
         track: TrackInput,
@@ -1055,8 +1089,8 @@ pub const DeviceExport = struct {
         try store.contents.append(a, .{
             .content_id = row.id,
             .title = try a.dupe(u8, track.title),
-            .titleForSearch = null,
-            .subtitle = "",
+            .titleForSearch = if (track.title_for_search) |s| try a.dupe(u8, s) else null,
+            .subtitle = try a.dupe(u8, track.subtitle),
             .bpmx100 = row.tempo,
             .length = row.duration,
             .trackNo = row.track_number,
@@ -1079,7 +1113,7 @@ pub const DeviceExport = struct {
             .rating = row.rating,
             .releaseYear = row.year,
             .releaseDate = try a.dupe(u8, track.release_date),
-            .dateCreated = try a.dupe(u8, track.date_added),
+            .dateCreated = try a.dupe(u8, track.date_created orelse track.date_added),
             .dateAdded = try a.dupe(u8, track.date_added),
             .path = try a.dupe(u8, track.file_path),
             .fileName = try a.dupe(u8, track.filename),
@@ -1091,17 +1125,17 @@ pub const DeviceExport = struct {
             .isrc = try a.dupe(u8, track.isrc),
             .djPlayCount = row.play_count,
             .isHotCueAutoLoadOn = if (track.autoload_hotcues) 1 else 0,
-            .isKuvoDeliverStatusOn = 1,
-            .kuvoDeliveryComment = "",
+            .isKuvoDeliverStatusOn = if (track.kuvo_delivery_on) 1 else 0,
+            .kuvoDeliveryComment = try a.dupe(u8, track.kuvo_delivery_comment),
             .masterDbId = null,
             .masterContentId = null,
             .analysisDataFilePath = analysis_path,
             .analysedBits = track_unknown5,
             .contentLink = track_bitmask,
             .hasModified = 0,
-            .cueUpdateCount = null,
-            .analysisDataUpdateCount = null,
-            .informationUpdateCount = null,
+            .cueUpdateCount = track.cue_update_count,
+            .analysisDataUpdateCount = track.analysis_data_update_count,
+            .informationUpdateCount = track.information_update_count,
         });
     }
 
