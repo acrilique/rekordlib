@@ -1156,20 +1156,32 @@ fn groupRows(
     comptime key_field: []const u8,
     comptime order_field: ?[]const u8,
 ) LoadError!std.AutoHashMapUnmanaged(i64, []u32) {
-    var lists: std.AutoHashMapUnmanaged(i64, std.ArrayListUnmanaged(u32)) = .empty;
-    for (rows, 0..) |row, i| {
+    var counts: std.AutoHashMapUnmanaged(i64, u32) = .empty;
+    for (rows) |row| {
         const key = @field(row, key_field) orelse continue;
-        const gop = try lists.getOrPut(a, key);
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        try gop.value_ptr.append(a, @intCast(i));
+        const gop = try counts.getOrPut(a, key);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
     }
     var grouped: std.AutoHashMapUnmanaged(i64, []u32) = .empty;
-    try grouped.ensureTotalCapacity(a, lists.count());
-    var it = lists.iterator();
+    try grouped.ensureTotalCapacity(a, counts.count());
+    var it = counts.iterator();
     while (it.next()) |entry| {
-        var list = entry.value_ptr.*;
-        if (order_field) |field| orderIndices(rows, field, list.items);
-        grouped.putAssumeCapacity(entry.key_ptr.*, try list.toOwnedSlice(a));
+        // one exact allocation per key: a grown-and-copied list would
+        // strand both its buffers in the arena
+        const indices = try a.alloc(u32, entry.value_ptr.*);
+        entry.value_ptr.* = 0; // the count becomes the write cursor
+        grouped.putAssumeCapacity(entry.key_ptr.*, indices);
+    }
+    for (rows, 0..) |row, i| {
+        const key = @field(row, key_field) orelse continue;
+        const cursor = counts.getPtr(key).?;
+        grouped.getPtr(key).?.*[cursor.*] = @intCast(i);
+        cursor.* += 1;
+    }
+    if (order_field) |field| {
+        var groups = grouped.valueIterator();
+        while (groups.next()) |indices| orderIndices(rows, field, indices.*);
     }
     return grouped;
 }
