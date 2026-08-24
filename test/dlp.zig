@@ -673,6 +673,45 @@ test "O3 mutate: playlist append is dense and 1-based" {
     try testing.expectEqual(@as(i64, 2), lib.playlist_contents[entries[1]].sequenceNo.?);
 }
 
+test "O3 mutate: insertAll batches rows atomically through one statement" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    defer alloc.free(db_path);
+    var w = try dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    defer w.db.close();
+
+    try w.insertAll(&.{
+        dlp.Artist{ .artist_id = 1, .name = "A" },
+        dlp.Artist{ .artist_id = 2, .name = "B" },
+        dlp.Artist{ .artist_id = 3, .name = "C" },
+    });
+    // a Content batch maintains numberOfContents once, like insertContent
+    try w.insertAll(&.{
+        dlp.Content{ .content_id = 1, .path = "/Contents/a.mp3" },
+        dlp.Content{ .content_id = 2, .path = "/Contents/b.mp3" },
+    });
+    try testing.expectEqual(@as(i64, 2), try w.numberOfContents());
+    try testing.expectEqual(@as(i64, 4), try w.nextId(dlp.Artist));
+
+    var lib = try dlp.Library.load(alloc, w.db);
+    defer lib.deinit();
+    try testing.expectEqual(@as(usize, 3), lib.artists.len);
+    try testing.expectEqualStrings("B", lib.byId(dlp.Artist, 2).?.name.?);
+
+    // a duplicate key rolls the whole batch back
+    try testing.expectError(error.Sqlite, w.insertAll(&.{
+        dlp.Artist{ .artist_id = 4, .name = "D" },
+        dlp.Artist{ .artist_id = 4, .name = "D again" },
+    }));
+    try testing.expectEqual(@as(i64, 3), w.db.scalarInt("SELECT COUNT(*) FROM artist;"));
+    try testing.expectEqual(@as(i64, 4), try w.nextId(dlp.Artist));
+}
+
 test "O3 create: keyed db is encrypted and reopens through the provider" {
     if (dlp.mode != .vendored) return;
     const alloc = testing.allocator;

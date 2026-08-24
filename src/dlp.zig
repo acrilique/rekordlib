@@ -1384,9 +1384,12 @@ pub const Writer = struct {
 
     /// Creates a fresh OneLibrary db at `path`: the real schema (see
     /// `schema_sql`), the four seeded tables' default rows, and the
-    /// property singleton with `dbVersion` `'10000'`. The db is keyed
-    /// with the DLP passphrase unless `plaintext` is set, and starts in
-    /// WAL journal mode like rb's exports.
+    /// property singleton with `dbVersion` `'10000'`, all in one
+    /// transaction — a failed create leaves no file behind, not a
+    /// half-built db the exists-guard below would then refuse to
+    /// overwrite. The db is keyed with the DLP passphrase unless
+    /// `plaintext` is set, and starts in WAL journal mode like rb's
+    /// exports.
     pub fn create(io: std.Io, path: [:0]const u8, options: CreateOptions) CreateError!Writer {
         // Refuse to build over an existing db rather than corrupt it.
         const dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
@@ -1402,14 +1405,21 @@ pub const Writer = struct {
             try Db.openPlaintextReadWriteCreate(io, path)
         else
             try Db.openReadWriteCreate(io, path);
-        errdefer db.close();
+        errdefer {
+            db.close();
+            std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        }
 
+        // journal_mode cannot change inside a transaction; everything
+        // else lands or leaves as one unit.
         try db.exec("PRAGMA journal_mode = WAL;");
+        var tx = try Tx.begin(db);
+        errdefer tx.deinit();
         try db.exec(schema_sql);
-        for (default_colors) |row| try insertRow(db, "color", row);
-        for (default_menu_items) |row| try insertRow(db, "menuItem", row);
-        for (default_categories) |row| try insertRow(db, "category", row);
-        for (default_sorts) |row| try insertRow(db, "sort", row);
+        try insertRows(db, "color", &default_colors);
+        try insertRows(db, "menuItem", &default_menu_items);
+        try insertRows(db, "category", &default_categories);
+        try insertRows(db, "sort", &default_sorts);
 
         // rbox's migration seeds dbVersion 1000 as an INTEGER; real
         // exports carry the varchar '10000'.
@@ -1421,6 +1431,7 @@ pub const Writer = struct {
         try property.bindText(1, options.created_date);
         try property.bindInt(2, options.my_tag_master_dbid);
         if ((try property.step()) != .done) return error.Sqlite;
+        try tx.commit();
 
         return .{ .db = db };
     }
@@ -1454,6 +1465,24 @@ pub const Writer = struct {
         if (T == Content)
             @compileError("insertContent maintains property.numberOfContents; use it for content rows");
         return insertRow(self.db, comptime tableOf(T), row);
+    }
+
+    /// Inserts many rows of one `write_tables` family atomically, through
+    /// a single prepared statement stepped per row instead of a
+    /// prepare/finalize pair per row — the bulk path for mirroring a
+    /// library-sized batch. `rows` is any slice, array, or tuple of
+    /// like-typed rows (`&batch`, `&.{ row, row }`). A `Content` batch
+    /// maintains `property.numberOfContents` once, like `insertContent`;
+    /// ids are the caller's to mint, and any failure — a duplicate key
+    /// included — rolls the whole batch back.
+    pub fn insertAll(self: Writer, rows: anytype) SqlError!void {
+        if (rows.len == 0) return;
+        const T = rowOf(@TypeOf(rows));
+        var tx = try Tx.begin(self.db);
+        errdefer tx.deinit();
+        try insertRows(self.db, comptime tableOf(T), rows);
+        if (T == Content) try maintainNumberOfContents(tx.db);
+        try tx.commit();
     }
 
     /// Inserts one `content` row and keeps `property.numberOfContents`
@@ -1548,11 +1577,78 @@ fn pkOf(comptime T: type) []const u8 {
 /// fixture's unset conventions), empty strings bind as themselves (the
 /// other), and SQLite copies text before the call returns.
 fn insertRow(db: Db, comptime table: []const u8, row: anytype) SqlError!void {
-    const T = @TypeOf(row);
-    const sql = comptime insertSql(table, T);
-    var stmt = try db.prepare(sql);
+    var stmt = try db.prepare(comptime insertSql(table, @TypeOf(row)));
     defer stmt.finalize();
-    inline for (@typeInfo(T).@"struct".fields, 1..) |f, i|
+    try bindAndStep(stmt, row);
+}
+
+/// Many INSERTs of one table through one prepared statement — the path
+/// behind `Writer.insertAll` and `Writer.create`'s seeding: prepare once,
+/// then bind, step, and `resetAndClear` per row instead of paying a
+/// prepare/finalize pair per row.
+fn insertRows(db: Db, comptime table: []const u8, rows: anytype) SqlError!void {
+    const T = rowOf(@TypeOf(rows));
+    var stmt = try db.prepare(comptime insertSql(table, T));
+    defer stmt.finalize();
+    if (comptime tupleArg(@TypeOf(rows))) {
+        // an anonymous batch literal coerces to the array it denotes,
+        // so one plain loop covers every accepted shape
+        const arr: [rows.len]T = if (@typeInfo(@TypeOf(rows)) == .pointer) rows.* else rows;
+        for (arr) |row| try stepRow(stmt, row);
+    } else {
+        for (rows) |row| try stepRow(stmt, row);
+    }
+}
+
+/// Binds one row's fields (primary key included), steps the INSERT, and
+/// readies the statement for the next row of a batch.
+fn stepRow(stmt: Stmt, row: anytype) SqlError!void {
+    try bindAndStep(stmt, row);
+    try stmt.resetAndClear();
+}
+
+/// The row type of an `insertAll`/`insertRows` batch argument: a slice,
+/// an array or tuple, or a pointer to either — the shapes a caller
+/// spells naturally (`&batch`, `&.{ row, row }`). `std.meta.Elem` alone
+/// rejects tuple pointers, the type of an anonymous literal argument.
+fn rowOf(comptime rows: type) type {
+    switch (@typeInfo(rows)) {
+        .pointer => |p| switch (p.size) {
+            .slice => return p.child,
+            .one => switch (@typeInfo(p.child)) {
+                .@"array" => |a| return a.child,
+                .@"struct" => |s| return tupleRow(s, rows),
+                else => {},
+            },
+            else => {},
+        },
+        .@"array" => |a| return a.child,
+        .@"struct" => |s| return tupleRow(s, rows),
+        else => {},
+    }
+    @compileError("expected a slice, array, or tuple of rows, found " ++ @typeName(rows));
+}
+
+/// The row type of a (non-empty) tuple argument.
+fn tupleRow(comptime s: std.builtin.Type.Struct, comptime rows: type) type {
+    if (!s.is_tuple or s.fields.len == 0)
+        @compileError("expected a slice, array, or tuple of rows, found " ++ @typeName(rows));
+    return s.fields[0].type;
+}
+
+/// True for a tuple argument or a pointer to one.
+fn tupleArg(comptime rows: type) bool {
+    return switch (@typeInfo(rows)) {
+        .@"struct" => |s| s.is_tuple,
+        .pointer => |p| p.size == .one and
+            @typeInfo(p.child) == .@"struct" and @typeInfo(p.child).@"struct".is_tuple,
+        else => false,
+    };
+}
+
+/// Binds one row's fields (primary key included) and steps the INSERT.
+fn bindAndStep(stmt: Stmt, row: anytype) SqlError!void {
+    inline for (@typeInfo(@TypeOf(row)).@"struct".fields, 1..) |f, i|
         try bindCell(stmt, i, @field(row, f.name));
     if ((try stmt.step()) != .done) return error.Sqlite;
 }
