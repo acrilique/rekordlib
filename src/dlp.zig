@@ -1060,11 +1060,11 @@ fn loadTable(
         if (!std.mem.eql(u8, stmt.columnName(i), f.name)) return error.SchemaMismatch;
     }
 
-    // Pre-sized from COUNT(*) because the arena cannot reclaim a grown
-    // buffer; append still grows if the db changed between the queries.
-    const count = try db.scalarInt("SELECT COUNT(*) FROM " ++ table ++ ";");
+    // Grown by doubling: a COUNT(*) pre-pass would read and decrypt
+    // every page of the table twice under SQLCipher, while the growth
+    // buffers the arena strands along the way cost at most ~2x
+    // transient memory.
     var rows: std.ArrayListUnmanaged(T) = .empty;
-    try rows.ensureTotalCapacity(a, @intCast(count));
     while ((try stmt.step()) == .row) try rows.append(a, try decodeRow(T, a, stmt));
     out_rows.* = rows.items;
 }
