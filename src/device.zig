@@ -473,7 +473,9 @@ pub const TrackInput = struct {
     comment: []const u8 = "",
     /// ISRC, in rekordbox's mangled format.
     isrc: []const u8 = "",
-    /// Lyricist name.
+    /// Lyricist name. The pdb side keeps it as a plain string (no
+    /// foreign key); the OL side resolves it to a real artist row under
+    /// a minted id (see `olLyricistId`).
     lyricist: []const u8 = "",
     /// Remix/mix name.
     mix_name: []const u8 = "",
@@ -1012,8 +1014,9 @@ pub const DeviceExport = struct {
     /// against the store's dedup state. The OL-only columns come from
     /// the `TrackInput` fields of the same names; their defaults keep
     /// the fixture's conventions — unset artist roles bind NULL while
-    /// the dimension foreign keys (`artist_id_lyricist`, `album_id`,
-    /// `genre_id`, `label_id`, `key_id`, `color_id`) bind 0,
+    /// the dimension foreign keys (`album_id`, `genre_id`, `label_id`,
+    /// `key_id`, `color_id`) bind 0, `artist_id_lyricist` binds 0 with
+    /// no lyricist and a minted artist id with one,
     /// `titleForSearch` is NULL but `subtitle`/`isrc`/
     /// `kuvoDeliveryComment` are empty text, `dateCreated` mirrors
     /// `date_added`, `analysedBits`/`contentLink` carry the pdb row's
@@ -1061,6 +1064,9 @@ pub const DeviceExport = struct {
             row.composer_id,
             track.composer,
         );
+        // No pdb id to bridge — the pdb keeps the lyricist as a plain
+        // string — so a new name gets a minted id.
+        const lyricist_id = try olLyricistId(store, track.lyricist);
         const genre_id = try olNamedRow(
             store,
             &store.genres_by_name,
@@ -1099,10 +1105,7 @@ pub const DeviceExport = struct {
             .artist_id_remixer = remixer_id,
             .artist_id_originalArtist = orig_artist_id,
             .artist_id_composer = composer_id,
-            // The pdb carries no lyricist foreign key — the name lives in
-            // its string table, and the OL column stays 0 as in the
-            // fixture.
-            .artist_id_lyricist = 0,
+            .artist_id_lyricist = lyricist_id orelse 0,
             .album_id = album_id orelse 0,
             .genre_id = genre_id orelse 0,
             .label_id = label_id orelse 0,
@@ -2215,6 +2218,12 @@ const OlStore = struct {
     /// Bridged ext tag ids whose `myTag` row exists or pends.
     my_tag_ids: std.AutoHashMapUnmanaged(i64, void) = .empty,
 
+    /// Next id for a minted artist row — the lyricist resolution, the
+    /// one mirrored row with no pdb id to bridge. Seeded at
+    /// `first_minted_artist_id` and raised past every artist id an
+    /// existing db carries.
+    next_minted_artist_id: i64 = first_minted_artist_id,
+
     fn hasPending(store: *const OlStore) bool {
         return store.artists.items.len > 0 or
             store.albums.items.len > 0 or
@@ -2293,6 +2302,8 @@ fn scanOlStore(lib: *const dlp.Library, store: *OlStore) std.mem.Allocator.Error
     for (lib.artists) |row| {
         if (row.name) |name|
             try putIfAbsent(&store.artists_by_name, a, try a.dupe(u8, name), row.artist_id);
+        store.next_minted_artist_id =
+            @max(store.next_minted_artist_id, row.artist_id + 1);
     }
     for (lib.albums) |row| {
         if (row.name) |name| try putIfAbsent(
@@ -2371,6 +2382,37 @@ fn olNamedRow(
     try list.append(a, try build_row(a, owned, pdb_id));
     map.putAssumeCapacity(owned, pdb_id);
     return pdb_id;
+}
+
+/// Minted artist ids start above every possible bridged id: pdb ids are
+/// u32 and the bridge copies them verbatim, so ids from 2^32 upward can
+/// never collide with a bridged row — a lockstep db stays collision-free
+/// by construction. Unpinnable by the fixture (it carries no lyricist
+/// artist rows); recorded in `docs/DIVERGENCES.md`.
+const first_minted_artist_id: i64 = 0x1_0000_0000;
+
+/// Resolves the lyricist name to a mirrored artist row. Unlike the
+/// other artist roles there is no pdb id to bridge — the pdb keeps the
+/// lyricist as a plain string — so a new name is minted an id from
+/// `first_minted_artist_id` upward; an existing name (bridged or
+/// previously minted) resolves to its own id, exactly like the other
+/// roles. The `olNamedRow` bookkeeping discipline applies: the map key
+/// is duped and capacity reserved before the append.
+fn olLyricistId(
+    store: *OlStore,
+    name: []const u8,
+) std.mem.Allocator.Error!?i64 {
+    if (name.len == 0) return null;
+    if (store.artists_by_name.get(name)) |id| return id;
+
+    const a = store.arena.allocator();
+    const owned = try a.dupe(u8, name);
+    try store.artists_by_name.ensureUnusedCapacity(a, 1);
+    const id = store.next_minted_artist_id;
+    try store.artists.append(a, .{ .artist_id = id, .name = owned, .nameForSearch = null });
+    store.artists_by_name.putAssumeCapacity(owned, id);
+    store.next_minted_artist_id = id + 1;
+    return id;
 }
 
 /// Resolves `name` — folded through `canonicalKeyName` — to a mirrored
