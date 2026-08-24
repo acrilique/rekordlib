@@ -560,12 +560,14 @@ pub const AddTrackError =
 /// Error of the playlist and tag methods: building the writer state,
 /// loading or creating `exportExt.pdb`, encoding a name or label (too
 /// long, or invalid UTF-8 where a format string requires it), a foreign
-/// key that names no existing row, or inserting the rows.
+/// key that names no existing row, inserting the rows, or building the
+/// OneLibrary mirror's view of the export.
 pub const PlaylistError =
     WriterStateError ||
     OpenPdbError ||
     error{ UnknownForeignKey, TooLong, InvalidEncoding } ||
-    pdb.DatabaseModifyError;
+    pdb.DatabaseModifyError ||
+    OlMirrorError;
 
 /// The tag methods fail for the same reasons as the playlist ones.
 pub const TagError = PlaylistError;
@@ -930,8 +932,10 @@ pub const DeviceExport = struct {
     /// carries an `exportLibrary.db` gets a store holding its rows' dedup
     /// state (the db is loaded and closed again — pending rows are the
     /// only mutations until `save`); an export without one never gains
-    /// one, so mirroring is a no-op there. Null in the absent case.
+    /// one, so mirroring is a no-op there. Null in the absent case — and
+    /// always, in `-Ddlp=off` builds, where mirroring is compiled out.
     fn olStore(e: *DeviceExport) OlMirrorError!?*OlStore {
+        if (dlp.mode == .off) return null;
         switch (e.ol_state) {
             .store => |*store| return store,
             .absent => return null,
@@ -966,10 +970,9 @@ pub const DeviceExport = struct {
 
     /// Builds the OL store before a mutating method touches the pdb, so
     /// an unopenable or schema-drifted `exportLibrary.db` fails the call
-    /// with the export untouched. A no-op in `-Ddlp=off` builds and on
-    /// exports that carry no db.
+    /// with the export untouched. A no-op on exports that carry no db
+    /// (and in `-Ddlp=off` builds).
     fn primeOlStore(e: *DeviceExport) OlMirrorError!void {
-        if (dlp.mode == .off) return;
         _ = try e.olStore();
     }
 
@@ -989,7 +992,6 @@ pub const DeviceExport = struct {
         track: TrackInput,
         row: *const pdb.Track,
     ) OlMirrorError!void {
-        if (dlp.mode == .off) return;
         const store = (try e.olStore()) orelse return;
         const a = store.arena.allocator();
 
@@ -1541,7 +1543,8 @@ pub const DeviceExport = struct {
     /// playlists — and returns its id. `parent_id` is 0 (the tree root)
     /// or the id of an existing folder (one this method or a scanned
     /// export created); anything else, including a playlist's id, is
-    /// `UnknownForeignKey`.
+    /// `UnknownForeignKey`. When the export carries a OneLibrary db the
+    /// node mirrors into it (`attribute` 1).
     pub fn createPlaylistFolder(
         e: *DeviceExport,
         name: []const u8,
@@ -1552,7 +1555,8 @@ pub const DeviceExport = struct {
 
     /// Creates a playlist — a leaf node holding tracks through
     /// `addTrackToPlaylist` — under `parent_id` (same rule as
-    /// `createPlaylistFolder`) and returns its id.
+    /// `createPlaylistFolder`) and returns its id. When the export
+    /// carries a OneLibrary db the node mirrors into it (`attribute` 0).
     pub fn createPlaylist(
         e: *DeviceExport,
         name: []const u8,
@@ -1572,6 +1576,7 @@ pub const DeviceExport = struct {
         is_folder: bool,
     ) PlaylistError!u32 {
         const state = try e.writerState();
+        try e.primeOlStore();
         // The root (id 0) is always a valid parent; any other id must
         // name an existing folder — a playlist cannot hold children.
         if (parent_id != 0) {
@@ -1595,6 +1600,9 @@ pub const DeviceExport = struct {
 
         state.next_playlist_node_id = id + 1;
         state.playlist_nodes.putAssumeCapacity(id, is_folder);
+
+        if (try e.olStore()) |store|
+            try mirrorPlaylistRow(store, name, parent_id, id, is_folder);
         return id;
     }
 
@@ -1602,13 +1610,17 @@ pub const DeviceExport = struct {
     /// assigned automatically, dense from 0 and continuing across save
     /// and reopen. `playlist_id` must name an existing *playlist* (a
     /// folder id is rejected — tracks go into playlists only) and
-    /// `track_id` an existing track, else `UnknownForeignKey`.
+    /// `track_id` an existing track, else `UnknownForeignKey`. When the
+    /// export carries a OneLibrary db the membership mirrors into it —
+    /// with the OL side's own dense 1-based `sequenceNo`, continuing
+    /// past the rows already there.
     pub fn addTrackToPlaylist(
         e: *DeviceExport,
         playlist_id: u32,
         track_id: u32,
     ) PlaylistError!void {
         const state = try e.writerState();
+        try e.primeOlStore();
         const node_is_folder = state.playlist_nodes.get(playlist_id) orelse
             return error.UnknownForeignKey;
         if (node_is_folder) return error.UnknownForeignKey;
@@ -1630,21 +1642,32 @@ pub const DeviceExport = struct {
 
         const gop = state.playlist_entry_counts.getOrPutAssumeCapacity(playlist_id);
         gop.value_ptr.* = entry_index + 1;
+
+        if (try e.olStore()) |store| {
+            try store.playlist_pairs.append(store.arena.allocator(), .{
+                .playlist_id = playlist_id,
+                .content_id = track_id,
+            });
+        }
     }
 
     /// Creates a top-level tag category (e.g. "My Tags") in the tag
     /// database and returns its id. Leaf tags attach under a category
     /// through `addTagsToTrack`. The tag database (`exportExt.pdb`) loads
-    /// lazily on first use; nothing lands on disk before `save`.
+    /// lazily on first use; nothing lands on disk before `save`. When
+    /// the export carries a OneLibrary db the category mirrors into its
+    /// `myTag` tree under the same id.
     pub fn createTagCategory(e: *DeviceExport, name: []const u8) TagError!u32 {
         const state = try e.writerState();
+        try e.primeOlStore();
         const db = try e.extDb();
         const id = state.next_tag_id;
         const row_index = state.next_tag_row_index;
+        const position = state.next_category_position;
         const a = db.arena.allocator();
         const boxed = try buildTagRow(a, .{
             .parent_id = 0,
-            .position = state.next_category_position,
+            .position = position,
             .id = id,
             .is_category = true,
             .row_index = row_index,
@@ -1657,6 +1680,9 @@ pub const DeviceExport = struct {
         state.next_tag_row_index = row_index + 1;
         state.next_category_position += 1;
         state.tag_categories.putAssumeCapacity(id, {});
+
+        if (try e.olStore()) |store|
+            try mirrorMyTagRow(store, name, id, position, true, 0);
         return id;
     }
 
@@ -1672,7 +1698,10 @@ pub const DeviceExport = struct {
     /// opened `exportExt.pdb`), else `UnknownForeignKey`. A failure
     /// between leaf rows leaves the earlier ones inserted — unreachable
     /// junctions are ignored by players, not recovered automatically
-    /// (the same residual risk as `addTrack`'s dimension rows).
+    /// (the same residual risk as `addTrack`'s dimension rows). When the
+    /// export carries a OneLibrary db, new leaf tags mirror into its
+    /// `myTag` tree under their ext ids and every junction lands as a
+    /// `myTag_content` row.
     pub fn addTagsToTrack(
         e: *DeviceExport,
         track_id: u32,
@@ -1680,6 +1709,7 @@ pub const DeviceExport = struct {
         labels: []const []const u8,
     ) TagError!void {
         const state = try e.writerState();
+        try e.primeOlStore();
         // The category check needs the tag state an opened export's
         // `exportExt.pdb` carries, so the tag database loads (from disk
         // only — not created) before either key is validated.
@@ -1702,12 +1732,19 @@ pub const DeviceExport = struct {
 
         const ext_db = try e.extDb();
         for (kept.items) |label| {
-            const tag_id = try getOrCreateTag(state, ext_db, category_id, label);
+            const tag_id = try e.getOrCreateTag(state, ext_db, category_id, label);
             const a = ext_db.arena.allocator();
             const boxed = try a.create(pdb.TrackTag);
             boxed.* = .{ .track_id = track_id, .tag_id = tag_id };
             var row = pdb.Row{ .track_tag = boxed };
             _ = try ext_db.addRow(&row);
+
+            if (try e.olStore()) |store| {
+                try store.my_tag_pairs.append(store.arena.allocator(), .{
+                    .my_tag_id = tag_id,
+                    .content_id = track_id,
+                });
+            }
         }
     }
 
@@ -1715,6 +1752,7 @@ pub const DeviceExport = struct {
     /// no scanned or previously created leaf matches. The id counter and
     /// `index_shift` row counter bump only after the insert.
     fn getOrCreateTag(
+        e: *DeviceExport,
         state: *WriterState,
         db: *pdb.Database,
         category_id: u32,
@@ -1753,6 +1791,9 @@ pub const DeviceExport = struct {
         );
         const gop = state.tag_leaf_counts.getOrPutAssumeCapacity(category_id);
         gop.value_ptr.* = position + 1;
+
+        if (try e.olStore()) |store|
+            try mirrorMyTagRow(store, label, id, position, false, category_id);
         return id;
     }
 
@@ -2135,6 +2176,14 @@ const OlStore = struct {
     keys_by_canonical: std.StringHashMapUnmanaged(i64) = .empty,
     /// Bridged artwork ids whose `image` row exists or pends.
     image_ids: std.AutoHashMapUnmanaged(i64, void) = .empty,
+    /// Bridged pdb node ids whose `playlist` row exists or pends.
+    playlist_ids: std.AutoHashMapUnmanaged(i64, void) = .empty,
+    /// Parent id → next per-child `sequenceNo` (dense from 0, max + 1
+    /// over existing rows) — the sibling ordinal, like the ext tag
+    /// positions.
+    playlist_child_counts: std.AutoHashMapUnmanaged(i64, i64) = .empty,
+    /// Bridged ext tag ids whose `myTag` row exists or pends.
+    my_tag_ids: std.AutoHashMapUnmanaged(i64, void) = .empty,
 
     fn hasPending(store: *const OlStore) bool {
         return store.artists.items.len > 0 or
@@ -2260,6 +2309,13 @@ fn scanOlStore(lib: *const dlp.Library, store: *OlStore) std.mem.Allocator.Error
         );
     }
     for (lib.images) |row| try store.image_ids.put(a, row.image_id, {});
+    for (lib.playlists) |row| {
+        try store.playlist_ids.put(a, row.playlist_id, {});
+        const gop = try store.playlist_child_counts.getOrPut(a, row.playlist_id_parent orelse 0);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* = @max(gop.value_ptr.*, (row.sequenceNo orelse -1) + 1);
+    }
+    for (lib.my_tags) |row| try store.my_tag_ids.put(a, row.myTag_id, {});
 }
 
 /// One mirrored `artist` row; see `olNamedRow`.
@@ -2380,6 +2436,66 @@ fn olImageId(store: *OlStore, pdb_artwork_id: u32) std.mem.Allocator.Error!?i64 
     });
     store.image_ids.putAssumeCapacity(id, {});
     return id;
+}
+
+/// Mirrors a playlist-tree node: the OL `playlist` row carries the pdb
+/// node's bridged id, `attribute` 1 for a folder and 0 for a playlist
+/// (the myTag column convention; the fixture's single leaf carries 0),
+/// the parent bridged, and a per-parent dense `sequenceNo` from 0 — the
+/// same ordinal shape the myTag columns number by. A bridged id the db
+/// already carries is left alone (a diverged db keeps its own row).
+fn mirrorPlaylistRow(
+    store: *OlStore,
+    name: []const u8,
+    parent_id: u32,
+    id: u32,
+    is_folder: bool,
+) std.mem.Allocator.Error!void {
+    if (store.playlist_ids.contains(id)) return;
+
+    const a = store.arena.allocator();
+    const sequence_no = store.playlist_child_counts.get(parent_id) orelse 0;
+    try store.playlist_ids.ensureUnusedCapacity(a, 1);
+    try store.playlist_child_counts.ensureUnusedCapacity(a, 1);
+    try store.playlists.append(a, .{
+        .playlist_id = id,
+        .sequenceNo = sequence_no,
+        .name = try a.dupe(u8, name),
+        .image_id = null,
+        .attribute = if (is_folder) 1 else 0,
+        .playlist_id_parent = parent_id,
+    });
+    store.playlist_ids.putAssumeCapacity(id, {});
+    const gop = store.playlist_child_counts.getOrPutAssumeCapacity(parent_id);
+    gop.value_ptr.* = sequence_no + 1;
+}
+
+/// Mirrors a my-tag row: the ext tag id bridges — the fixture's ext Tag
+/// ids and OL myTag ids are equal (Genre 1-4, Acid House 4275955888 on
+/// both sides) — `attribute` 1 for a category and 0 for a leaf mirrors
+/// `raw_is_category`, the parent bridges, and `sequenceNo` reuses the
+/// ext row's position (dense from 0 within the parent, as the fixture's
+/// columns number 0..3 and their leaves 0..n).
+fn mirrorMyTagRow(
+    store: *OlStore,
+    name: []const u8,
+    id: u32,
+    sequence_no: u32,
+    is_category: bool,
+    parent_id: u32,
+) std.mem.Allocator.Error!void {
+    if (store.my_tag_ids.contains(id)) return;
+
+    const a = store.arena.allocator();
+    try store.my_tag_ids.ensureUnusedCapacity(a, 1);
+    try store.my_tags.append(a, .{
+        .myTag_id = id,
+        .sequenceNo = sequence_no,
+        .name = try a.dupe(u8, name),
+        .attribute = if (is_category) 1 else 0,
+        .myTag_id_parent = parent_id,
+    });
+    store.my_tag_ids.putAssumeCapacity(id, {});
 }
 
 // --- writer state ---------------------------------------------------------------

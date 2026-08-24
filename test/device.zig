@@ -437,22 +437,40 @@ test "OL reader hook is null without an exportLibrary.db" {
 
 // --- OneLibrary writer mirror (O4) ---------------------------------------------
 
+/// Copies one file of a fixture export into the same place under a
+/// temp-dir export root.
+fn copyFixtureFile(
+    tmp: *testing.TmpDir,
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    fixture: []const u8,
+    sub_path: []const u8,
+) !void {
+    const src = try std.fmt.allocPrint(
+        alloc,
+        "complete_export/{s}/{s}",
+        .{ fixture, sub_path },
+    );
+    defer alloc.free(src);
+    const image = try testutil.readFixture(alloc, src, .limited(1 << 22));
+    defer alloc.free(image);
+    try tmp.dir.createDirPath(io, std.fs.path.dirname(sub_path) orelse ".");
+    try tmp.dir.writeFile(io, .{ .sub_path = sub_path, .data = image });
+}
+
 /// Copies a fixture's `exportLibrary.db` into a temp-dir export root.
 fn copyFixtureOlDb(
     tmp: *testing.TmpDir,
     io: std.Io,
     alloc: std.mem.Allocator,
 ) !void {
-    const image = try testutil.readFixture(
+    try copyFixtureFile(
+        tmp,
+        io,
         alloc,
-        "complete_export/with_anlz/PIONEER/rekordbox/exportLibrary.db",
-        .limited(1 << 20),
+        "with_anlz",
+        "PIONEER/rekordbox/exportLibrary.db",
     );
-    defer alloc.free(image);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "PIONEER/rekordbox/exportLibrary.db",
-        .data = image,
-    });
 }
 
 /// The absolute, NUL-terminated path of the temp dir's OL db.
@@ -2354,4 +2372,180 @@ test "a relative root stays pinned to the working directory of first use" {
             tmp.dir.access(io, "b/root/PIONEER/rekordbox/exportLibrary.db", .{}),
         );
     }
+}
+
+test "playlist operations mirror into the OL db" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    const folder = try ex.createPlaylistFolder("Folder", 0);
+    const inside = try ex.createPlaylist("Inside", folder);
+    const outside = try ex.createPlaylist("Outside", 0);
+    const t1 = (try ex.addTrack(.{
+        .title = "one",
+        .file_path = "/Contents/one.mp3",
+    })).id;
+    const t2 = (try ex.addTrack(.{
+        .title = "two",
+        .file_path = "/Contents/two.mp3",
+    })).id;
+    try ex.addTrackToPlaylist(inside, t1);
+    try ex.addTrackToPlaylist(inside, t2);
+    try ex.save();
+
+    const db_path = try tmpOlDbPath(&tmp, alloc);
+    defer alloc.free(db_path);
+    var db = try dlp.Db.open(io, db_path);
+    defer db.close();
+    var lib = try dlp.Library.load(alloc, db);
+    defer lib.deinit();
+
+    // Three nodes, ids bridged from the pdb side, folder marked
+    // attribute 1, per-parent dense sequenceNo from 0.
+    try testing.expectEqual(@as(usize, 3), lib.playlists.len);
+    const ol_folder = lib.byId(dlp.Playlist, folder).?;
+    try testing.expectEqualStrings("Folder", ol_folder.name.?);
+    try testing.expectEqual(@as(i64, 1), ol_folder.attribute.?);
+    try testing.expectEqual(@as(i64, 0), ol_folder.playlist_id_parent.?);
+    try testing.expectEqual(@as(i64, 0), ol_folder.sequenceNo.?);
+    const ol_inside = lib.byId(dlp.Playlist, inside).?;
+    try testing.expectEqual(@as(i64, 0), ol_inside.attribute.?);
+    try testing.expectEqual(folder, ol_inside.playlist_id_parent.?);
+    try testing.expectEqual(@as(i64, 0), ol_inside.sequenceNo.?);
+    const ol_outside = lib.byId(dlp.Playlist, outside).?;
+    try testing.expectEqual(@as(i64, 0), ol_outside.playlist_id_parent.?);
+    try testing.expectEqual(@as(i64, 1), ol_outside.sequenceNo.?);
+
+    // Memberships: the OL side's own dense 1-based sequenceNo, content
+    // ids bridged.
+    try testing.expectEqual(@as(usize, 2), lib.playlist_contents.len);
+    const entries = lib.playlist_contents_by_playlist.get(inside).?;
+    try testing.expectEqual(@as(i64, t1), lib.playlist_contents[entries[0]].content_id.?);
+    try testing.expectEqual(@as(i64, 1), lib.playlist_contents[entries[0]].sequenceNo.?);
+    try testing.expectEqual(@as(i64, t2), lib.playlist_contents[entries[1]].content_id.?);
+    try testing.expectEqual(@as(i64, 2), lib.playlist_contents[entries[1]].sequenceNo.?);
+}
+
+test "tag operations mirror into the OL db" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    const track = (try ex.addTrack(.{
+        .title = "a",
+        .file_path = "/Contents/a.mp3",
+    })).id;
+    const cat = try ex.createTagCategory("My Tags");
+    try ex.addTagsToTrack(track, cat, &.{ "Techno", "Dub" });
+    // The second call dedups Techno and adds one leaf.
+    try ex.addTagsToTrack(track, cat, &.{ "Techno", "House" });
+    try ex.save();
+
+    const db_path = try tmpOlDbPath(&tmp, alloc);
+    defer alloc.free(db_path);
+    var db = try dlp.Db.open(io, db_path);
+    defer db.close();
+    var lib = try dlp.Library.load(alloc, db);
+    defer lib.deinit();
+
+    // Four myTag rows whose ids are exactly the ext tag ids (the id
+    // bridge), the category attribute 1 with leaves 0 under it, and
+    // sequenceNo reusing the ext positions.
+    try testing.expectEqual(@as(usize, 4), lib.my_tags.len);
+    const ol_cat = lib.byId(dlp.MyTag, cat).?;
+    try testing.expectEqualStrings("My Tags", ol_cat.name.?);
+    try testing.expectEqual(@as(i64, 1), ol_cat.attribute.?);
+    try testing.expectEqual(@as(i64, 0), ol_cat.myTag_id_parent.?);
+    try testing.expectEqual(@as(i64, 0), ol_cat.sequenceNo.?);
+
+    var ext = try openSavedExtDb(&tmp, io, alloc);
+    defer ext.deinit();
+    var ext_rows = try collectExtRows(alloc, &ext);
+    defer ext_rows.deinit(alloc);
+    try testing.expectEqual(lib.my_tags.len, ext_rows.tags.items.len);
+    for (ext_rows.tags.items) |tag| {
+        const mirrored = lib.byId(dlp.MyTag, tag.id) orelse {
+            std.debug.print("ext tag {d} has no mirrored myTag row\n", .{tag.id});
+            return error.TestUnexpectedResult;
+        };
+        try testing.expectEqual(@as(i64, tag.position), mirrored.sequenceNo.?);
+        try testing.expectEqual(
+            @as(i64, if (tag.raw_is_category != 0) 1 else 0),
+            mirrored.attribute.?,
+        );
+        try testing.expectEqual(@as(i64, tag.parent_id), mirrored.myTag_id_parent.?);
+    }
+
+    // Junctions are not deduplicated across calls: the second call's
+    // "Techno" stacks a second junction for the same leaf — 4 total.
+    try testing.expectEqual(@as(usize, 4), lib.my_tag_contents.len);
+    for (lib.my_tag_contents) |junction| {
+        try testing.expectEqual(@as(i64, track), junction.content_id.?);
+        try testing.expect(lib.byId(dlp.MyTag, junction.myTag_id.?) != null);
+    }
+}
+
+test "playlist and tag mirroring continues an existing OL db" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+    try copyFixtureFile(&tmp, io, alloc, "with_anlz", "PIONEER/rekordbox/export.pdb");
+    try copyFixtureFile(&tmp, io, alloc, "with_anlz", "PIONEER/rekordbox/exportExt.pdb");
+    try copyFixtureOlDb(&tmp, io, alloc);
+
+    var ex = device.DeviceExport.open(tmp_path, io, alloc);
+    defer ex.deinit();
+    const track = (try ex.addTrack(.{
+        .title = "new song",
+        .artist = "Reboot",
+        .file_path = "/Contents/Reboot/03. new song.mp3",
+        .filename = "03. new song.mp3",
+    })).id;
+    try testing.expectEqual(@as(u32, 3), track);
+    // The fixture's playlist 1 ("aaaaa") gains the track; its OL
+    // sequenceNo continues past the existing 1 and 2.
+    try ex.addTrackToPlaylist(1, track);
+    // "Techno" already exists under category 1 both sides: the junction
+    // mirrors, no myTag row is added.
+    try ex.addTagsToTrack(track, 1, &.{"Techno"});
+    try ex.save();
+
+    const db_path = try tmpOlDbPath(&tmp, alloc);
+    defer alloc.free(db_path);
+    var db = try dlp.Db.open(io, db_path);
+    defer db.close();
+    var lib = try dlp.Library.load(alloc, db);
+    defer lib.deinit();
+
+    // The existing label resolves on both sides: 28 myTag rows stay 28.
+    try testing.expectEqual(@as(usize, 28), lib.my_tags.len);
+    const entries = lib.playlist_contents_by_playlist.get(1).?;
+    try testing.expectEqual(@as(usize, 3), entries.len);
+    try testing.expectEqual(@as(i64, 3), lib.playlist_contents[entries[2]].content_id.?);
+    try testing.expectEqual(@as(i64, 3), lib.playlist_contents[entries[2]].sequenceNo.?);
+
+    try testing.expectEqual(@as(usize, 1), lib.my_tag_contents.len);
+    const junction = lib.my_tag_contents[0];
+    try testing.expectEqual(@as(i64, 3), junction.content_id.?);
+    try testing.expectEqual(@as(i64, 3139558292), junction.myTag_id.?);
 }
