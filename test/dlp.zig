@@ -712,6 +712,49 @@ test "O3 mutate: insertAll batches rows atomically through one statement" {
     try testing.expectEqual(@as(i64, 4), try w.nextId(dlp.Artist));
 }
 
+test "O3 mutate: addAllToPlaylist batches dense appends through one statement" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    defer alloc.free(db_path);
+    var w = try dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    defer w.db.close();
+
+    try w.insertAll(&.{
+        dlp.Content{ .content_id = 1, .path = "/Contents/a.mp3" },
+        dlp.Content{ .content_id = 2, .path = "/Contents/b.mp3" },
+        dlp.Content{ .content_id = 3, .path = "/Contents/c.mp3" },
+    });
+    try w.insertAll(&.{
+        dlp.Playlist{ .playlist_id = 1, .sequenceNo = 0, .name = "pl", .attribute = 0, .playlist_id_parent = 0 },
+        dlp.Playlist{ .playlist_id = 2, .sequenceNo = 1, .name = "other", .attribute = 0, .playlist_id_parent = 0 },
+    });
+
+    // The batch continues past a row already on disk, then stays dense
+    // per playlist — the ordinals addContentToPlaylist would assign.
+    _ = try w.addContentToPlaylist(1, 1);
+    const Pair = struct { playlist_id: i64, content_id: i64 };
+    try w.addAllToPlaylist(&[_]Pair{
+        .{ .playlist_id = 1, .content_id = 2 },
+        .{ .playlist_id = 1, .content_id = 3 },
+        .{ .playlist_id = 2, .content_id = 1 },
+    });
+
+    var lib = try dlp.Library.load(alloc, w.db);
+    defer lib.deinit();
+    try testing.expectEqual(@as(usize, 4), lib.playlist_contents.len);
+    const pl1 = lib.playlist_contents_by_playlist.get(1).?;
+    try testing.expectEqual(@as(i64, 1), lib.playlist_contents[pl1[0]].sequenceNo.?);
+    try testing.expectEqual(@as(i64, 2), lib.playlist_contents[pl1[1]].sequenceNo.?);
+    try testing.expectEqual(@as(i64, 3), lib.playlist_contents[pl1[2]].sequenceNo.?);
+    const pl2 = lib.playlist_contents_by_playlist.get(2).?;
+    try testing.expectEqual(@as(i64, 1), lib.playlist_contents[pl2[0]].sequenceNo.?);
+}
+
 test "O3 create: keyed db is encrypted and reopens through the provider" {
     if (dlp.mode != .vendored) return;
     const alloc = testing.allocator;

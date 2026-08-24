@@ -1739,12 +1739,11 @@ pub const DeviceExport = struct {
             var row = pdb.Row{ .track_tag = boxed };
             _ = try ext_db.addRow(&row);
 
-            if (try e.olStore()) |store| {
+            if (try e.olStore()) |store|
                 try store.my_tag_pairs.append(store.arena.allocator(), .{
-                    .my_tag_id = tag_id,
+                    .myTag_id = tag_id,
                     .content_id = track_id,
                 });
-            }
         }
     }
 
@@ -1922,17 +1921,17 @@ pub const DeviceExport = struct {
 
         // Dimensions before content and junctions — no FK makes it
         // necessary, but the insert order stays deterministic.
-        try olDrain(w, &store.artists, olInsertRow);
-        try olDrain(w, &store.albums, olInsertRow);
-        try olDrain(w, &store.genres, olInsertRow);
-        try olDrain(w, &store.labels, olInsertRow);
-        try olDrain(w, &store.keys, olInsertRow);
-        try olDrain(w, &store.images, olInsertRow);
-        try olDrain(w, &store.playlists, olInsertRow);
-        try olDrain(w, &store.contents, olInsertContent);
-        try olDrain(w, &store.playlist_pairs, olInsertPlaylistPair);
-        try olDrain(w, &store.my_tags, olInsertRow);
-        try olDrain(w, &store.my_tag_pairs, olInsertTagPair);
+        try olDrain(w, &store.artists);
+        try olDrain(w, &store.albums);
+        try olDrain(w, &store.genres);
+        try olDrain(w, &store.labels);
+        try olDrain(w, &store.keys);
+        try olDrain(w, &store.images);
+        try olDrain(w, &store.playlists);
+        try olDrain(w, &store.contents);
+        try olDrainPlaylistPairs(w, &store.playlist_pairs);
+        try olDrain(w, &store.my_tags);
+        try olDrain(w, &store.my_tag_pairs);
 
         try w.close();
         store.fresh = false;
@@ -2122,17 +2121,12 @@ pub fn getPlaylistsDb(
 
 // --- OneLibrary mirror (O4) -----------------------------------------------------
 
-/// A playlist membership waiting for `save`; the db assigns its
-/// `sequenceNo` at insert time (dense, 1-based, continuing past rows
-/// already on disk).
+/// A playlist membership waiting for `save`, inserted through
+/// `Writer.addAllToPlaylist` — the pair carries no `sequenceNo` because
+/// the Writer derives it at insert time (dense, 1-based, continuing past
+/// rows already on disk).
 const OlPlaylistPair = struct {
     playlist_id: i64,
-    content_id: i64,
-};
-
-/// A track-to-tag junction waiting for `save`.
-const OlTagPair = struct {
-    my_tag_id: i64,
     content_id: i64,
 };
 
@@ -2162,7 +2156,9 @@ const OlStore = struct {
     playlists: std.ArrayListUnmanaged(dlp.Playlist) = .empty,
     playlist_pairs: std.ArrayListUnmanaged(OlPlaylistPair) = .empty,
     my_tags: std.ArrayListUnmanaged(dlp.MyTag) = .empty,
-    my_tag_pairs: std.ArrayListUnmanaged(OlTagPair) = .empty,
+    /// Pending `myTag_content` rows — the row type itself, since the
+    /// junction carries nothing the insert derives.
+    my_tag_pairs: std.ArrayListUnmanaged(dlp.MyTagContent) = .empty,
 
     /// Dedup state over the existing db (filled by `scanOlStore`) and the
     /// pending rows; values are OL ids. Name lookups make a reopened db
@@ -2204,45 +2200,25 @@ const OlStore = struct {
     }
 };
 
-/// One row's insert into the materializing db: plain `Writer.insert` for
-/// everything; content and playlist pairs have their own wrappers below.
-fn olInsertRow(w: dlp.Writer, row: anytype) dlp.SqlError!void {
-    try w.insert(row);
+/// Drains `list` through one `Writer.insertAll` batch — one prepared
+/// statement and one commit for the whole table instead of a
+/// prepare/finalize/commit triple per row — clearing it only after the
+/// batch commits. A failure rolls the whole batch back and leaves every
+/// row pending for the next `save`, so a retry never duplicates a landed
+/// one (nothing landed): the pending lists keep naming exactly the rows
+/// the db lacks, all-or-nothing per table rather than per row.
+fn olDrain(w: dlp.Writer, list: anytype) dlp.SqlError!void {
+    try w.insertAll(list.items);
+    list.clearRetainingCapacity();
 }
 
-/// A `content` row through `insertContent`, keeping
-/// `property.numberOfContents` in step.
-fn olInsertContent(w: dlp.Writer, row: dlp.Content) dlp.SqlError!void {
-    try w.insertContent(row);
-}
-
-/// A playlist pair through `addContentToPlaylist`, which assigns the
-/// dense 1-based `sequenceNo`.
-fn olInsertPlaylistPair(w: dlp.Writer, pair: OlPlaylistPair) dlp.SqlError!void {
-    _ = try w.addContentToPlaylist(pair.playlist_id, pair.content_id);
-}
-
-/// A tag junction, materialized as its `myTag_content` row.
-fn olInsertTagPair(w: dlp.Writer, pair: OlTagPair) dlp.SqlError!void {
-    try w.insert(dlp.MyTagContent{
-        .myTag_id = pair.my_tag_id,
-        .content_id = pair.content_id,
-    });
-}
-
-/// Drains `list` through `insert_row`, dropping each row from the list
-/// only after its insert commits — a failure mid-drain leaves exactly the
-/// unwritten rows pending for the next `save`, and a retry never
-/// duplicates a landed one.
-fn olDrain(
-    w: dlp.Writer,
-    list: anytype,
-    comptime insert_row: anytype,
-) dlp.SqlError!void {
-    while (list.items.len > 0) {
-        try insert_row(w, list.items[0]);
-        _ = list.orderedRemove(0);
-    }
+/// Drains `list` through one `Writer.addAllToPlaylist` batch: the dense
+/// 1-based `sequenceNo`s are derived inside the transaction, continuing
+/// past rows already on disk. The same clear-only-after-commit contract
+/// as `olDrain`.
+fn olDrainPlaylistPairs(w: dlp.Writer, list: anytype) dlp.SqlError!void {
+    try w.addAllToPlaylist(list.items);
+    list.clearRetainingCapacity();
 }
 
 /// The dedup key of a mirrored album, like `AlbumKey` but over the OL id

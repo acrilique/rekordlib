@@ -1495,7 +1495,7 @@ pub const Writer = struct {
     /// equal to the table count — both atomically, so a failure leaves
     /// the count consistent. Dimension and junction rows are separate
     /// `insert` calls (their orphaning risk is documented on the device
-    /// writer's `addTrack`, which drives this).
+    /// writer's `addTrack`; the batch path is `insertAll`).
     pub fn insertContent(self: Writer, row: Content) SqlError!void {
         var tx = try Tx.begin(self.db);
         errdefer tx.deinit();
@@ -1550,6 +1550,33 @@ pub const Writer = struct {
         const sequence_no = stmt.readInt(0);
         if ((try stmt.step()) != .done) return error.Sqlite;
         return sequence_no;
+    }
+
+    /// Appends many tracks to playlists atomically, through a single
+    /// prepared statement stepped per pair instead of a
+    /// prepare/finalize pair per row — the bulk path behind the device
+    /// writer's playlist-pair drain. Each insert sees the ones before it,
+    /// so the dense 1-based `sequenceNo`s are exactly
+    /// `addContentToPlaylist`'s, continuing past rows already on disk.
+    /// `pairs` is a slice, array, or tuple of structs carrying
+    /// `playlist_id` and `content_id` fields; any failure rolls the whole
+    /// batch back.
+    pub fn addAllToPlaylist(self: Writer, pairs: anytype) SqlError!void {
+        if (pairs.len == 0) return;
+        var tx = try Tx.begin(self.db);
+        errdefer tx.deinit();
+        var stmt = try self.db.prepare(
+            "INSERT INTO playlist_content (playlist_id, content_id, sequenceNo) VALUES (?1, ?2, " ++
+                "(SELECT COALESCE(MAX(sequenceNo), 0) + 1 FROM playlist_content WHERE playlist_id = ?1));",
+        );
+        defer stmt.finalize();
+        for (pairs) |pair| {
+            try stmt.bindInt(1, pair.playlist_id);
+            try stmt.bindInt(2, pair.content_id);
+            if ((try stmt.step()) != .done) return error.Sqlite;
+            try stmt.resetAndClear();
+        }
+        try tx.commit();
     }
 };
 

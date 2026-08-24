@@ -690,6 +690,118 @@ test "addTrack mirrors a content row and its dimensions" {
     try testing.expectEqualStrings("Amin", lib.keys[0].name.?);
 }
 
+test "a failed OL batch rolls back whole and stays pending" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    _ = try ex.addTrack(.{ .title = "a", .artist = "Ar", .file_path = "/Contents/a.mp3" });
+    try ex.save();
+
+    // Break the lockstep id bridge by hand: an artist row under the id
+    // the next mirror will bridge (1 "Ar", then 2, 3...), named NULL so
+    // no dedup key collides with it either.
+    const db_path = try tmpOlDbPath(&tmp, alloc);
+    defer alloc.free(db_path);
+    {
+        var w = try dlp.Writer.open(io, db_path);
+        try w.insert(dlp.Artist{ .artist_id = 3 });
+        try w.close();
+    }
+
+    _ = try ex.addTrack(.{ .title = "b", .artist = "Br", .file_path = "/Contents/b.mp3" });
+    _ = try ex.addTrack(.{ .title = "c", .artist = "Cr", .file_path = "/Contents/c.mp3" });
+
+    // The artists batch dies on the poisoned id and rolls back whole —
+    // "Br", the row before the poison, stays out of the db too (the
+    // table keeps just "Ar" and the poison itself) — and the pending
+    // rows survive the failure, failing a retry the same way without
+    // ever duplicating a landed row.
+    try testing.expectError(error.Sqlite, ex.save());
+    {
+        var db = try dlp.Db.open(io, db_path);
+        defer db.close();
+        var lib = try dlp.Library.load(alloc, db);
+        defer lib.deinit();
+        try testing.expectEqual(@as(usize, 2), lib.artists.len);
+        try testing.expectEqual(@as(usize, 1), lib.contents.len);
+        try testing.expect(lib.byId(dlp.Artist, 2) == null);
+    }
+    try testing.expectError(error.Sqlite, ex.save());
+    var db = try dlp.Db.open(io, db_path);
+    defer db.close();
+    var lib = try dlp.Library.load(alloc, db);
+    defer lib.deinit();
+    try testing.expectEqual(@as(usize, 2), lib.artists.len);
+    try testing.expectEqual(@as(usize, 1), lib.contents.len);
+    try testing.expect(lib.byId(dlp.Artist, 2) == null);
+}
+
+test "a save blocked at the first OL batch recovers whole on retry" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    const first = try ex.addTrack(.{
+        .title = "first",
+        .artist = "Ar",
+        .file_path = "/Contents/first.mp3",
+    });
+    const pl = try ex.createPlaylist("pl", 0);
+    try ex.addTrackToPlaylist(pl, first.id);
+    const cat = try ex.createTagCategory("Cats");
+    try ex.addTagsToTrack(first.id, cat, &.{"fav"});
+    try ex.save();
+
+    const second = try ex.addTrack(.{
+        .title = "second",
+        .artist = "Br",
+        .file_path = "/Contents/second.mp3",
+    });
+    try ex.addTrackToPlaylist(pl, second.id);
+    try ex.addTagsToTrack(second.id, cat, &.{"go"});
+
+    // A second connection holding the write lock fails the first drain's
+    // BEGIN IMMEDIATE — nothing lands.
+    const db_path = try tmpOlDbPath(&tmp, alloc);
+    defer alloc.free(db_path);
+    var blocker = try dlp.Db.open(io, db_path);
+    try blocker.exec("BEGIN IMMEDIATE;");
+    try testing.expectError(error.Sqlite, ex.save());
+    try blocker.exec("ROLLBACK;");
+    blocker.close();
+
+    // The still-pending rows land whole on the retry, exactly once, with
+    // the playlist ordinals continuing past the rows already on disk.
+    try ex.save();
+    var db = try dlp.Db.open(io, db_path);
+    defer db.close();
+    var lib = try dlp.Library.load(alloc, db);
+    defer lib.deinit();
+    try testing.expectEqual(@as(usize, 2), lib.artists.len);
+    try testing.expectEqual(@as(usize, 2), lib.contents.len);
+    try testing.expectEqual(@as(i64, 2), lib.property.?.numberOfContents.?);
+    try testing.expectEqual(@as(usize, 2), lib.playlist_contents.len);
+    const entries = lib.playlist_contents_by_playlist.get(pl).?;
+    try testing.expectEqual(@as(i64, 1), lib.playlist_contents[entries[0]].sequenceNo.?);
+    try testing.expectEqual(@as(i64, 2), lib.playlist_contents[entries[1]].sequenceNo.?);
+    try testing.expectEqual(@as(usize, 2), lib.my_tag_contents.len);
+}
+
 test "addTrack mirrors the analysis path when analysis pends" {
     if (dlp.mode != .vendored) return;
     const alloc = testing.allocator;
