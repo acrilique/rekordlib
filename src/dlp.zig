@@ -815,51 +815,59 @@ pub const Sort = struct {
     isSelectedAsSubColumn: ?i64 = null,
 };
 
-/// Every loaded table except `property` (a singleton loaded by hand):
-/// row type, SQL table name, and the `Library` field the rows land in.
-const row_tables = .{
-    .{ .row = Album, .table = "album", .rows = "albums" },
-    .{ .row = Artist, .table = "artist", .rows = "artists" },
-    .{ .row = Category, .table = "category", .rows = "categories" },
-    .{ .row = Color, .table = "color", .rows = "colors" },
-    .{ .row = Content, .table = "content", .rows = "contents" },
-    .{ .row = Cue, .table = "cue", .rows = "cues" },
-    .{ .row = Genre, .table = "genre", .rows = "genres" },
-    .{ .row = History, .table = "history", .rows = "histories" },
-    .{ .row = HistoryContent, .table = "history_content", .rows = "history_contents" },
-    .{ .row = HotCueBankList, .table = "hotCueBankList", .rows = "hot_cue_bank_lists" },
-    .{ .row = HotCueBankListCue, .table = "hotCueBankList_cue", .rows = "hot_cue_bank_cues" },
-    .{ .row = Image, .table = "image", .rows = "images" },
-    .{ .row = Key, .table = "key", .rows = "keys" },
-    .{ .row = Label, .table = "label", .rows = "labels" },
-    .{ .row = MenuItem, .table = "menuItem", .rows = "menu_items" },
-    .{ .row = MyTag, .table = "myTag", .rows = "my_tags" },
-    .{ .row = MyTagContent, .table = "myTag_content", .rows = "my_tag_contents" },
-    .{ .row = Playlist, .table = "playlist", .rows = "playlists" },
-    .{ .row = PlaylistContent, .table = "playlist_content", .rows = "playlist_contents" },
-    .{ .row = RecommendedLike, .table = "recommendedLike", .rows = "recommended_likes" },
-    .{ .row = Sort, .table = "sort", .rows = "sorts" },
+/// One table's wiring into the rest of the module: the row type, the
+/// SQL table name, and the `Library` field its rows load into — plus,
+/// where present, the keyed-access map (`map` and `id` are set exactly
+/// for the primary-key tables `load` indexes) and the `writable` mark
+/// of the families `Writer.insert` accepts.
+const Table = struct {
+    row: type,
+    table: []const u8,
+    rows: []const u8,
+    map: ?[]const u8 = null,
+    id: ?[]const u8 = null,
+    writable: bool = false,
 };
 
-/// The keyed-access wiring for every table with a primary key: row type,
-/// `Library` rows field, map field, and the id column.
-const id_tables = .{
-    .{ .row = Album, .rows = "albums", .map = "album_by_id", .id = "album_id" },
-    .{ .row = Artist, .rows = "artists", .map = "artist_by_id", .id = "artist_id" },
-    .{ .row = Category, .rows = "categories", .map = "category_by_id", .id = "category_id" },
-    .{ .row = Color, .rows = "colors", .map = "color_by_id", .id = "color_id" },
-    .{ .row = Content, .rows = "contents", .map = "content_by_id", .id = "content_id" },
-    .{ .row = Cue, .rows = "cues", .map = "cue_by_id", .id = "cue_id" },
-    .{ .row = Genre, .rows = "genres", .map = "genre_by_id", .id = "genre_id" },
-    .{ .row = History, .rows = "histories", .map = "history_by_id", .id = "history_id" },
-    .{ .row = HotCueBankList, .rows = "hot_cue_bank_lists", .map = "hot_cue_bank_list_by_id", .id = "hotCueBankList_id" },
-    .{ .row = Image, .rows = "images", .map = "image_by_id", .id = "image_id" },
-    .{ .row = Key, .rows = "keys", .map = "key_by_id", .id = "key_id" },
-    .{ .row = Label, .rows = "labels", .map = "label_by_id", .id = "label_id" },
-    .{ .row = MenuItem, .rows = "menu_items", .map = "menu_item_by_id", .id = "menuItem_id" },
-    .{ .row = MyTag, .rows = "my_tags", .map = "my_tag_by_id", .id = "myTag_id" },
-    .{ .row = Playlist, .rows = "playlists", .map = "playlist_by_id", .id = "playlist_id" },
-    .{ .row = Sort, .rows = "sorts", .map = "sort_by_id", .id = "sort_id" },
+/// Every table except `property` (a singleton loaded by hand), in
+/// schema order — the single registry the load, keyed-access, and write
+/// paths all derive from.
+const tables = [_]Table{
+    .{ .row = Album, .table = "album", .rows = "albums", .map = "album_by_id", .id = "album_id", .writable = true },
+    .{ .row = Artist, .table = "artist", .rows = "artists", .map = "artist_by_id", .id = "artist_id", .writable = true },
+    .{ .row = Category, .table = "category", .rows = "categories", .map = "category_by_id", .id = "category_id" },
+    .{ .row = Color, .table = "color", .rows = "colors", .map = "color_by_id", .id = "color_id" },
+    .{ .row = Content, .table = "content", .rows = "contents", .map = "content_by_id", .id = "content_id", .writable = true },
+    .{ .row = Cue, .table = "cue", .rows = "cues", .map = "cue_by_id", .id = "cue_id" },
+    .{ .row = Genre, .table = "genre", .rows = "genres", .map = "genre_by_id", .id = "genre_id", .writable = true },
+    .{ .row = History, .table = "history", .rows = "histories", .map = "history_by_id", .id = "history_id" },
+    .{ .row = HistoryContent, .table = "history_content", .rows = "history_contents" },
+    .{ .row = HotCueBankList, .table = "hotCueBankList", .rows = "hot_cue_bank_lists", .map = "hot_cue_bank_list_by_id", .id = "hotCueBankList_id" },
+    .{ .row = HotCueBankListCue, .table = "hotCueBankList_cue", .rows = "hot_cue_bank_cues" },
+    .{ .row = Image, .table = "image", .rows = "images", .map = "image_by_id", .id = "image_id", .writable = true },
+    .{ .row = Key, .table = "key", .rows = "keys", .map = "key_by_id", .id = "key_id", .writable = true },
+    .{ .row = Label, .table = "label", .rows = "labels", .map = "label_by_id", .id = "label_id", .writable = true },
+    .{ .row = MenuItem, .table = "menuItem", .rows = "menu_items", .map = "menu_item_by_id", .id = "menuItem_id" },
+    .{ .row = MyTag, .table = "myTag", .rows = "my_tags", .map = "my_tag_by_id", .id = "myTag_id", .writable = true },
+    .{ .row = MyTagContent, .table = "myTag_content", .rows = "my_tag_contents", .writable = true },
+    .{ .row = Playlist, .table = "playlist", .rows = "playlists", .map = "playlist_by_id", .id = "playlist_id", .writable = true },
+    .{ .row = PlaylistContent, .table = "playlist_content", .rows = "playlist_contents", .writable = true },
+    .{ .row = RecommendedLike, .table = "recommendedLike", .rows = "recommended_likes" },
+    .{ .row = Sort, .table = "sort", .rows = "sorts", .map = "sort_by_id", .id = "sort_id" },
+};
+
+/// The primary-key subset of `tables` (`map` set): what `load` indexes
+/// and `byId` serves.
+const id_tables = blk: {
+    var selected: [tables.len]Table = undefined;
+    var n: usize = 0;
+    for (tables) |t| {
+        if (t.map != null) {
+            selected[n] = t;
+            n += 1;
+        }
+    }
+    break :blk selected[0..n].*;
 };
 
 /// A whole `exportLibrary.db`, read into arena-owned models: every row of
@@ -940,7 +948,7 @@ pub const Library = struct {
         const a = arena.allocator();
 
         var lib = Library{ .arena = arena };
-        inline for (row_tables) |t|
+        inline for (tables) |t|
             try loadTable(t.row, t.table, a, db, &@field(lib, t.rows));
 
         var props: []const Property = &.{};
@@ -949,7 +957,7 @@ pub const Library = struct {
         lib.property = if (props.len == 1) props[0] else null;
 
         inline for (id_tables) |t|
-            @field(lib, t.map) = try indexById(a, @field(lib, t.rows), t.id);
+            @field(lib, t.map.?) = try indexById(a, @field(lib, t.rows), t.id.?);
 
         try lib.content_by_path.ensureTotalCapacity(a, @intCast(lib.contents.len));
         for (lib.contents, 0..) |*row, i| {
@@ -976,7 +984,7 @@ pub const Library = struct {
     pub fn byId(self: *const Library, comptime T: type, id: i64) ?*const T {
         inline for (id_tables) |t| {
             if (T == t.row) {
-                const idx = @field(self, t.map).get(id) orelse return null;
+                const idx = @field(self, t.map.?).get(id) orelse return null;
                 return &@field(self, t.rows)[idx];
             }
         }
@@ -1001,7 +1009,7 @@ pub const Library = struct {
     /// Model equality: same rows, field by field, in load order. Derived
     /// indexes are not compared — they are functions of the rows.
     pub fn eql(self: *const Library, other: *const Library) bool {
-        inline for (row_tables) |t| {
+        inline for (tables) |t| {
             const mine = @field(self, t.rows);
             const theirs = @field(other, t.rows);
             if (mine.len != theirs.len) return false;
@@ -1331,23 +1339,21 @@ const Tx = struct {
     }
 };
 
-/// The row types `Writer.insert` accepts, with their SQL table names: the
-/// entity families a device writer mirrors (dimensions, content through
-/// `insertContent`, playlists, my-tags). Cue, history, and hot-cue-bank
-/// authoring is absent on purpose — fresh exports carry no rows there and
-/// rbox offers no inserts for them either.
-const write_tables = .{
-    .{ .row = Album, .table = "album" },
-    .{ .row = Artist, .table = "artist" },
-    .{ .row = Content, .table = "content" },
-    .{ .row = Genre, .table = "genre" },
-    .{ .row = Image, .table = "image" },
-    .{ .row = Key, .table = "key" },
-    .{ .row = Label, .table = "label" },
-    .{ .row = MyTag, .table = "myTag" },
-    .{ .row = MyTagContent, .table = "myTag_content" },
-    .{ .row = Playlist, .table = "playlist" },
-    .{ .row = PlaylistContent, .table = "playlist_content" },
+/// The `writable` subset of `tables`: the entity families a device
+/// writer mirrors (dimensions, content through `insertContent`,
+/// playlists, my-tags). Cue, history, and hot-cue-bank authoring is
+/// absent on purpose — fresh exports carry no rows there and rbox
+/// offers no inserts for them either.
+const write_tables = blk: {
+    var selected: [tables.len]Table = undefined;
+    var n: usize = 0;
+    for (tables) |t| {
+        if (t.writable) {
+            selected[n] = t;
+            n += 1;
+        }
+    }
+    break :blk selected[0..n].*;
 };
 
 /// Options of `Writer.create`.
