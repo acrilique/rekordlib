@@ -104,6 +104,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "anlz", .module = anlz },
             .{ .name = "pdb", .module = pdb },
             .{ .name = "setting", .module = setting },
+            .{ .name = "dlp", .module = dlp },
         },
     });
 

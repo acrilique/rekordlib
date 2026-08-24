@@ -5,6 +5,7 @@
 const std = @import("std");
 const anlz = @import("anlz");
 const device = @import("device");
+const dlp = @import("dlp");
 const pdb = @import("pdb");
 const setting = @import("setting");
 const testutil = @import("util.zig");
@@ -280,6 +281,7 @@ test "reader loads all four settings of every fixture" {
         const path = try std.fmt.allocPrint(alloc, "testdata/complete_export/{s}", .{fixture.name});
         defer alloc.free(path);
         var ex = device.DeviceExport.open(path, io, alloc);
+        defer ex.deinit();
         const settings = try ex.loadSettings();
         try testing.expect(settings.dev_setting != null);
         try testing.expect(settings.djm_my_setting != null);
@@ -309,6 +311,7 @@ test "settings loading tolerates missing and invalid files" {
     try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER/DJMMYSETTING.DAT", .data = "garbage" });
 
     var ex = device.DeviceExport.open(tmp_path, io, alloc);
+    defer ex.deinit();
     const settings = try ex.loadSettings();
     try testing.expect(settings.my_setting != null);
     try testing.expect(settings.djm_my_setting == null);
@@ -317,6 +320,7 @@ test "settings loading tolerates missing and invalid files" {
 
     // A root without any export content at all stays quiet and empty.
     var empty_ex = device.DeviceExport.open(".zig-cache/definitely-not-here", io, alloc);
+    defer empty_ex.deinit();
     const empty_settings = try empty_ex.loadSettings();
     try testing.expect(empty_settings.dev_setting == null);
     try testing.expect(empty_settings.djm_my_setting == null);
@@ -342,6 +346,7 @@ test "loadSettings propagates a file that is not absence-shaped" {
     try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER/DEVSETTING.DAT", .data = big });
 
     var ex = device.DeviceExport.open(tmp_path, io, alloc);
+    defer ex.deinit();
     try testing.expectError(error.StreamTooLong, ex.loadSettings());
 }
 
@@ -389,6 +394,45 @@ test "playlist trees match the fixtures" {
             .folder => try testing.expect(false),
         };
     }
+}
+
+// --- OneLibrary reader hook (O4) ----------------------------------------------
+
+test "OL reader hook loads with_anlz and joins tracks by path" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var ex = device.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
+    defer ex.deinit();
+
+    const lib = (try ex.openOlLibrary()).?;
+    // The join: each pdb track's file_path names its OL content row,
+    // carrying the fields the pdb lacks.
+    const bako = lib.contentByPath(
+        "/Contents/Reboot/www.electronicfresh.com/01. Reboot - Bako (Original Mix).mp3",
+    ).?;
+    try testing.expectEqual(@as(i64, 2), bako.content_id);
+    try testing.expectEqualStrings("Bako (Original Mix)", bako.title.?);
+    try testing.expectEqual(@as(i64, 16), bako.bitDepth.?);
+    try testing.expectEqual(@as(i64, 44100), bako.samplingRate.?);
+    try testing.expectEqual(@as(i64, 0), bako.djPlayCount.?);
+    try testing.expect(lib.hot_cue_bank_lists.len == 0);
+
+    // Cached: the second call returns the same models without re-reading.
+    try testing.expectEqual(lib, (try ex.openOlLibrary()).?);
+}
+
+test "OL reader hook is null without an exportLibrary.db" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var ex = device.DeviceExport.open("testdata/complete_export/demo_tracks", io, alloc);
+    defer ex.deinit();
+    try testing.expect((try ex.openOlLibrary()) == null);
+    // The absent verdict is cached too.
+    try testing.expect((try ex.openOlLibrary()) == null);
 }
 
 test "playlist tree nests folders in row order" {

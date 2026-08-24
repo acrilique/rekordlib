@@ -14,6 +14,7 @@
 const std = @import("std");
 const bin = @import("bin");
 const anlz = @import("anlz");
+const dlp = @import("dlp");
 const pdb = @import("pdb");
 const setting = @import("setting");
 const util = @import("util");
@@ -406,6 +407,16 @@ pub const SaveError =
 /// `export.pdb`, or scanning it.
 pub const WriterStateError = OpenPdbError || ScanError;
 
+/// Error of `DeviceExport.openOlLibrary`: pinning the working directory,
+/// examining or opening `exportLibrary.db`, loading its models (a drifted
+/// schema is `SchemaMismatch`), or building its path (the process cwd was
+/// unreadable when the handle pinned it).
+pub const OpenOlLibraryError =
+    std.Io.Dir.OpenError ||
+    std.Io.Dir.AccessError ||
+    dlp.LoadError ||
+    error{ CwdUnavailable, OutOfMemory };
+
 /// `bitmask` value on fresh Rekordbox Track rows (`0x000c0700`); the
 /// OneLibrary db mirrors it as `contentLink`. Copy exactly.
 const track_bitmask: u32 = 788_224;
@@ -554,13 +565,26 @@ const PendingAnlz = struct {
     }
 };
 
+/// Reads the process working directory through libc. Only called in
+/// `-Ddlp` builds (which link libc) to snapshot the cwd a SQLite path can
+/// be made absolute against; a cwd longer than the path buffer, or one
+/// that cannot be read at all, reports `OutOfMemory` — callers treat that
+/// as "no snapshot" and fail later at path-build time.
+fn captureCwd(alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const p = std.c.getcwd(&buf, buf.len) orelse return error.OutOfMemory;
+    return alloc.dupe(u8, std.mem.sliceTo(@as([*:0]u8, @ptrCast(p)), 0));
+}
+
 /// A handle to a Rekordbox device export on disk: the setting files and
 /// the pdb database, located through `Layout`. `open` points the handle
 /// at an existing export (reading; the `openPdb` escape hatch edits),
 /// `create` builds a fresh one in memory. `save` is the only call that
 /// writes; `deinit` discards whatever was never saved. Files the export
 /// carries but the handle does not model are ignored by design:
-/// `djprofile.nxs` (undocumented) and `exportLibrary.db`.
+/// `djprofile.nxs` (undocumented). The OneLibrary db
+/// (`exportLibrary.db`, newer exports) is read through `openOlLibrary`
+/// and mirrored by the writer side of the handle.
 pub const DeviceExport = struct {
     layout: Layout,
     io: std.Io,
@@ -571,6 +595,11 @@ pub const DeviceExport = struct {
     /// relative root between calls. Null until then: `open` is infallible
     /// and opening the handle can fail. Closed by `deinit`.
     dir: ?std.Io.Dir,
+    /// The process cwd at the moment `dir` was pinned — the absolute
+    /// prefix SQLite paths are built on (they resolve against the process
+    /// cwd, not the pinned handle). Null in `-Ddlp=off` builds (nothing
+    /// needs it), until the pin, or when the cwd was unreadable.
+    dir_path: ?[]u8 = null,
     /// The export's pdb, loaded on the first pdb-touching call — `open`
     /// stays cheap for settings-only sessions.
     pdb_state: PdbState = .unloaded,
@@ -587,12 +616,26 @@ pub const DeviceExport = struct {
     /// `save` — before `export.pdb`, so a crash leaves orphan analysis
     /// files players ignore, not rows naming missing ones.
     pending_anlz: std.ArrayList(PendingAnlz) = .empty,
+    /// The OneLibrary db read side (`openOlLibrary`), independent of the
+    /// writer side.
+    ol_library: OlLibraryState = .unloaded,
 
     const PdbState = union(enum) {
         /// An export opened at `root`; the pdb parses on first touch.
         unloaded,
         /// In memory — parsed from disk or built by `create`.
         loaded: pdb.Database,
+    };
+
+    /// Lifecycle of the `exportLibrary.db` models, loaded on first
+    /// `openOlLibrary` call and cached for the handle's life.
+    const OlLibraryState = union(enum) {
+        /// Not examined yet; the first call checks the disk.
+        unloaded,
+        /// No `exportLibrary.db` under the root (older exports).
+        absent,
+        /// Loaded and cached; owned by the handle.
+        loaded: dlp.Library,
     };
 
     /// Lifecycle of the tag database. A created export starts `absent`
@@ -625,9 +668,18 @@ pub const DeviceExport = struct {
     /// The pinned working directory, opening it on first use. `Dir.cwd()`
     /// is only an `AT_FDCWD` sentinel — every call resolves against the
     /// process cwd as it is *then* — so a real handle is opened once and
-    /// reused.
-    fn dirHandle(e: *DeviceExport) std.Io.Dir.OpenError!std.Io.Dir {
-        if (e.dir == null) e.dir = try std.Io.Dir.cwd().openDir(e.io, ".", .{});
+    /// reused. `-Ddlp` builds also snapshot the cwd string: SQLite, which
+    /// the OneLibrary store goes through, resolves paths against the
+    /// process cwd rather than a directory handle.
+    fn dirHandle(e: *DeviceExport) (std.Io.Dir.OpenError || std.mem.Allocator.Error)!std.Io.Dir {
+        if (e.dir == null) {
+            e.dir = try std.Io.Dir.cwd().openDir(e.io, ".", .{});
+            if (dlp.mode != .off) {
+                // A cwd that cannot be read leaves `dir_path` null; the
+                // OneLibrary paths then fail with `CwdUnavailable`.
+                e.dir_path = captureCwd(e.alloc) catch null;
+            }
+        }
         return e.dir.?;
     }
 
@@ -645,6 +697,11 @@ pub const DeviceExport = struct {
         // Pin the working directory now: create is the export's first I/O.
         const dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
         errdefer dir.close(io);
+        const dir_path: ?[]u8 = if (dlp.mode != .off)
+            captureCwd(alloc) catch null
+        else
+            null;
+        errdefer if (dir_path) |p| alloc.free(p);
 
         // Refuse to build over an existing export rather than orphan it.
         const pdb_path = try layout.exportPdb(alloc);
@@ -675,6 +732,7 @@ pub const DeviceExport = struct {
             .io = io,
             .alloc = alloc,
             .dir = dir,
+            .dir_path = dir_path,
             .pdb_state = .{ .loaded = db },
             .pending_settings = pending,
             // Fresh counters and empty maps: the default color/column/menu
@@ -697,12 +755,17 @@ pub const DeviceExport = struct {
             .loaded => |*db| db.deinit(),
             .unloaded, .absent => {},
         }
+        switch (e.ol_library) {
+            .loaded => |*lib| lib.deinit(),
+            .unloaded, .absent => {},
+        }
         if (e.pending_settings) |pending| {
             for (pending) |bytes| e.alloc.free(bytes);
         }
         if (e.writer_state) |*state| state.deinit();
         for (e.pending_anlz.items) |*file| file.deinit(e.alloc);
         e.pending_anlz.deinit(e.alloc);
+        if (e.dir_path) |path| e.alloc.free(path);
         if (e.dir) |dir| dir.close(e.io);
     }
 
@@ -756,6 +819,66 @@ pub const DeviceExport = struct {
         e: *DeviceExport,
     ) (OpenPdbError || PlaylistTreeError)!std.ArrayList(PlaylistNode) {
         return getPlaylistsDb(e.alloc, try e.openPdb());
+    }
+
+    /// The export's OneLibrary db (`exportLibrary.db`, carried by newer
+    /// exports), loaded on first call and cached until `deinit`; null when
+    /// the export carries none. The join to the pdb side is by path:
+    /// `content.path` values are the device-root-absolute file paths the
+    /// pdb Track rows store, so `lib.contentByPath(file_path)` hands back
+    /// the OL view of a track — including the fields the pdb lacks
+    /// (remixer/composer/lyricist/original-artist ids, subtitle, bit
+    /// depth, sampling rate, djPlayCount). Only compiled with
+    /// `-Ddlp=vendored` (or `=system`).
+    pub fn openOlLibrary(e: *DeviceExport) OpenOlLibraryError!?*const dlp.Library {
+        if (dlp.mode == .off)
+            @compileError("rekordlib was built with -Ddlp=off; rebuild with -Ddlp=vendored (or =system) to read the OneLibrary store");
+        switch (e.ol_library) {
+            .loaded => |*lib| return lib,
+            .absent => return null,
+            .unloaded => {
+                const dir = try e.dirHandle();
+                const rel = try e.layout.exportLibraryDb(e.alloc);
+                defer e.alloc.free(rel);
+                if (dir.access(e.io, rel, .{})) |_| {} else |err| switch (err) {
+                    error.FileNotFound => {
+                        e.ol_library = .absent;
+                        return null;
+                    },
+                    else => return err,
+                }
+
+                const path = try e.olDbPath();
+                defer e.alloc.free(path);
+                var db = try dlp.Db.open(e.io, path);
+                errdefer db.close();
+                e.ol_library = .{ .loaded = try dlp.Library.load(e.alloc, db) };
+                db.close();
+                return &e.ol_library.loaded;
+            },
+        }
+    }
+
+    /// The absolute, NUL-terminated path of `exportLibrary.db`. SQLite
+    /// resolves file names against the process cwd, not the pinned
+    /// directory handle, so the cwd snapshot taken at pin time prefixes a
+    /// relative root; the caller owns the result.
+    fn olDbPath(e: *DeviceExport) error{ CwdUnavailable, OutOfMemory }![:0]u8 {
+        const prefix = e.dir_path orelse return error.CwdUnavailable;
+        if (std.fs.path.isAbsolute(e.layout.root)) {
+            return std.fmt.allocPrintSentinel(
+                e.alloc,
+                "{s}/PIONEER/rekordbox/exportLibrary.db",
+                .{e.layout.root},
+                0,
+            );
+        }
+        return std.fmt.allocPrintSentinel(
+            e.alloc,
+            "{s}/{s}/PIONEER/rekordbox/exportLibrary.db",
+            .{ prefix, e.layout.root },
+            0,
+        );
     }
 
     /// The writer's cached scan of the export, built on first use
