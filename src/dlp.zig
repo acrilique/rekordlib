@@ -90,6 +90,12 @@ const SQLCIPHER_HMAC_SHA1: c_int = 0;
 const SQLCIPHER_HMAC_SHA256: c_int = 1;
 const SQLCIPHER_HMAC_SHA512: c_int = 2;
 
+/// The kdf callback's algorithm ids, named as in the amalgamation's own
+/// `SQLCIPHER_PBKDF2_HMAC_*` defines.
+const SQLCIPHER_PBKDF2_HMAC_SHA1: c_int = 0;
+const SQLCIPHER_PBKDF2_HMAC_SHA256: c_int = 1;
+const SQLCIPHER_PBKDF2_HMAC_SHA512: c_int = 2;
+
 /// Mirrors `struct sqlcipher_provider` from sqlcipher.h.
 pub const Provider = extern struct {
     init: ?*const fn () callconv(.c) c_int = null,
@@ -184,9 +190,9 @@ fn providerKdf(
     const rounds: u32 = @intCast(workfactor);
     return switch (algorithm) {
         // v4 default: key = PBKDF2-HMAC-SHA512(passphrase, salt, 256000)
-        2 => kdfPbkdf2(std.crypto.hash.sha2.Sha512, p, s, rounds, k),
-        1 => kdfPbkdf2(std.crypto.hash.sha2.Sha256, p, s, rounds, k),
-        0 => kdfPbkdf2(std.crypto.hash.Sha1, p, s, rounds, k),
+        SQLCIPHER_PBKDF2_HMAC_SHA512 => kdfPbkdf2(std.crypto.hash.sha2.Sha512, p, s, rounds, k),
+        SQLCIPHER_PBKDF2_HMAC_SHA256 => kdfPbkdf2(std.crypto.hash.sha2.Sha256, p, s, rounds, k),
+        SQLCIPHER_PBKDF2_HMAC_SHA1 => kdfPbkdf2(std.crypto.hash.Sha1, p, s, rounds, k),
         else => c.SQLITE_ERROR,
     };
 }
