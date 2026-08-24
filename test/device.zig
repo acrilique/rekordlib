@@ -435,6 +435,121 @@ test "OL reader hook is null without an exportLibrary.db" {
     try testing.expect((try ex.openOlLibrary()) == null);
 }
 
+// --- OneLibrary writer mirror (O4) ---------------------------------------------
+
+/// Copies a fixture's `exportLibrary.db` into a temp-dir export root.
+fn copyFixtureOlDb(
+    tmp: *testing.TmpDir,
+    io: std.Io,
+    alloc: std.mem.Allocator,
+) !void {
+    const image = try testutil.readFixture(
+        alloc,
+        "complete_export/with_anlz/PIONEER/rekordbox/exportLibrary.db",
+        .limited(1 << 20),
+    );
+    defer alloc.free(image);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "PIONEER/rekordbox/exportLibrary.db",
+        .data = image,
+    });
+}
+
+/// The absolute, NUL-terminated path of the temp dir's OL db.
+fn tmpOlDbPath(tmp: *testing.TmpDir, alloc: std.mem.Allocator) ![:0]u8 {
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+    return std.fmt.allocPrintSentinel(
+        alloc,
+        "{s}/PIONEER/rekordbox/exportLibrary.db",
+        .{tmp_path},
+        0,
+    );
+}
+
+test "create saves an OL db with defaults and zero contents" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    try ex.save();
+
+    // The db is keyed (salt, not the SQLite magic) and leaves no sidecars.
+    const raw = try tmp.dir.readFileAlloc(
+        io,
+        "PIONEER/rekordbox/exportLibrary.db",
+        alloc,
+        .limited(1 << 20),
+    );
+    defer alloc.free(raw);
+    try testing.expect(!std.mem.eql(u8, raw[0..16], "SQLite format 3\x00"));
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "PIONEER/rekordbox/exportLibrary.db-wal", .{}));
+
+    const db_path = try tmpOlDbPath(&tmp, alloc);
+    defer alloc.free(db_path);
+    var db = try dlp.Db.open(io, db_path);
+    defer db.close();
+    var lib = try dlp.Library.load(alloc, db);
+    defer lib.deinit();
+
+    // The same seeded shape as a fresh rb export, and nothing else.
+    try testing.expectEqual(@as(usize, 8), lib.colors.len);
+    try testing.expectEqual(@as(usize, 27), lib.menu_items.len);
+    try testing.expectEqual(@as(usize, 22), lib.categories.len);
+    try testing.expectEqual(@as(usize, 17), lib.sorts.len);
+    try testing.expectEqual(@as(usize, 0), lib.contents.len);
+    try testing.expectEqual(@as(usize, 0), lib.artists.len);
+    try testing.expectEqual(@as(usize, 0), lib.my_tags.len);
+    try testing.expectEqualStrings("10000", lib.property.?.dbVersion.?);
+    try testing.expectEqual(@as(i64, 0), lib.property.?.numberOfContents.?);
+    // The library reads no clock and create takes no date.
+    try testing.expectEqualStrings("", lib.property.?.createdDate.?);
+
+    var check = try db.prepare("PRAGMA integrity_check;");
+    defer check.finalize();
+    try testing.expectEqual(.row, try check.step());
+    try testing.expectEqualStrings("ok", check.readText(0));
+
+    // A second save with nothing pending does not rewrite the db.
+    try ex.save();
+    const again = try tmp.dir.readFileAlloc(
+        io,
+        "PIONEER/rekordbox/exportLibrary.db",
+        alloc,
+        .limited(1 << 20),
+    );
+    defer alloc.free(again);
+    try testing.expectEqualSlices(u8, raw, again);
+}
+
+test "off builds write no exportLibrary.db" {
+    if (dlp.mode != .off) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    _ = try ex.addTrack(.{ .title = "song", .file_path = "/Contents/song.mp3" });
+    try ex.save();
+
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(io, "PIONEER/rekordbox/exportLibrary.db", .{}),
+    );
+}
+
 test "playlist tree nests folders in row order" {
     const alloc = testing.allocator;
 
@@ -2007,4 +2122,14 @@ test "a relative root stays pinned to the working directory of first use" {
         error.FileNotFound,
         tmp.dir.access(io, "b/root/PIONEER/rekordbox/export.pdb", .{}),
     );
+
+    // SQLite resolves paths against the process cwd (now b), not the
+    // pinned directory — the OL db must still land under a.
+    if (dlp.mode != .off) {
+        try tmp.dir.access(io, "a/root/PIONEER/rekordbox/exportLibrary.db", .{});
+        try testing.expectError(
+            error.FileNotFound,
+            tmp.dir.access(io, "b/root/PIONEER/rekordbox/exportLibrary.db", .{}),
+        );
+    }
 }

@@ -401,7 +401,11 @@ pub const SaveError =
     pdb.DatabaseEncodeError ||
     pdb.ValidateAllTrackRowsError ||
     std.Io.Dir.CreateDirPathError ||
-    AtomicWriteError;
+    AtomicWriteError ||
+    std.Io.Dir.DeleteFileError ||
+    dlp.Writer.CreateError ||
+    dlp.SqlError ||
+    error{CwdUnavailable};
 
 /// Error of `DeviceExport.writerState`: reading or parsing
 /// `export.pdb`, or scanning it.
@@ -619,6 +623,9 @@ pub const DeviceExport = struct {
     /// The OneLibrary db read side (`openOlLibrary`), independent of the
     /// writer side.
     ol_library: OlLibraryState = .unloaded,
+    /// The OneLibrary db write side: rows mirrored by the mutating
+    /// methods, buffered until `save` materializes them.
+    ol_state: OlState = .unloaded,
 
     const PdbState = union(enum) {
         /// An export opened at `root`; the pdb parses on first touch.
@@ -636,6 +643,20 @@ pub const DeviceExport = struct {
         absent,
         /// Loaded and cached; owned by the handle.
         loaded: dlp.Library,
+    };
+
+    /// Lifecycle of the OneLibrary write side. Mirroring is a no-op in
+    /// the `absent` state: an opened export without an
+    /// `exportLibrary.db` never gains one — only `create` builds a fresh
+    /// db.
+    const OlState = union(enum) {
+        /// Not examined yet; the first mirrored mutation checks the disk.
+        unloaded,
+        /// No `exportLibrary.db` under the root; nothing mirrors.
+        absent,
+        /// The store: pending rows plus (once mirroring lands) the dedup
+        /// state over the existing db and the pending rows.
+        store: OlStore,
     };
 
     /// Lifecycle of the tag database. A created export starts `absent`
@@ -741,6 +762,12 @@ pub const DeviceExport = struct {
             // Absent, not unloaded: create never reads a leftover
             // `exportExt.pdb`.
             .ext_pdb_state = .absent,
+            // The OneLibrary db is part of a created export's shape; it
+            // exists only in memory until the first `save` builds it.
+            .ol_state = .{ .store = .{
+                .arena = std.heap.ArenaAllocator.init(alloc),
+                .fresh = true,
+            } },
         };
     }
 
@@ -757,6 +784,10 @@ pub const DeviceExport = struct {
         }
         switch (e.ol_library) {
             .loaded => |*lib| lib.deinit(),
+            .unloaded, .absent => {},
+        }
+        switch (e.ol_state) {
+            .store => |*store| store.deinit(),
             .unloaded, .absent => {},
         }
         if (e.pending_settings) |pending| {
@@ -1573,11 +1604,12 @@ pub const DeviceExport = struct {
     /// before the first write, so a failed `save` leaves the disk
     /// untouched. Crash-safe write order: the default directory tree,
     /// the four setting files, the queued ANLZ files, `exportExt.pdb`
-    /// when the tag methods loaded or created one, then `export.pdb` —
-    /// the index everything else is reached through — last, so a crash
-    /// leaves orphan files players ignore, not rows naming missing data.
-    /// Every file lands through `writeFileAtomic`, so readers never
-    /// see a torn one.
+    /// when the tag methods loaded or created one, `exportLibrary.db`
+    /// when the OneLibrary side was created or carries pending rows,
+    /// then `export.pdb` — the index everything else is reached
+    /// through — last, so a crash leaves orphan files players ignore,
+    /// not rows naming missing data. Every file lands through
+    /// `writeFileAtomic`, so readers never see a torn one.
     pub fn save(e: *DeviceExport) SaveError!void {
         const db = try e.openPdb();
         try db.validateAllTrackRows();
@@ -1599,9 +1631,69 @@ pub const DeviceExport = struct {
             try e.writeFileAtomic(dir, ext_path, bytes);
         }
 
+        try e.writeOl();
+
         const pdb_path = try e.layout.exportPdb(e.alloc);
         defer e.alloc.free(pdb_path);
         try e.writeFileAtomic(dir, pdb_path, image);
+    }
+
+    /// Lands the OneLibrary side on disk — between `exportExt.pdb` and
+    /// `export.pdb`, per the crash-safe order (a crash leaves the index
+    /// naming the previous consistent state; an OL db ahead of it is
+    /// ignored like an export without one). A created export builds a
+    /// fresh keyed db on its first `save` even with nothing pending —
+    /// newer exports carry one — overwriting a leftover file; the
+    /// property's `createdDate` lands empty (the library reads no clock
+    /// and `create` takes no date). Later saves touch the file only when
+    /// rows are pending. `close` checkpoints, so the landed file is
+    /// complete with no `-wal`/`-shm` sidecars, exactly rb's shape.
+    /// Skipped entirely in `-Ddlp=off` builds.
+    fn writeOl(e: *DeviceExport) SaveError!void {
+        if (dlp.mode == .off) return;
+        const store = switch (e.ol_state) {
+            .store => |*store| store,
+            // Nothing mirrored — no db, or an untouched one: never write.
+            .unloaded, .absent => return,
+        };
+        if (!store.fresh and !store.hasPending()) return;
+
+        const rel = try e.layout.exportLibraryDb(e.alloc);
+        defer e.alloc.free(rel);
+        const path = try e.olDbPath();
+        defer e.alloc.free(path);
+
+        var w: dlp.Writer = undefined;
+        if (store.fresh) {
+            // A created export starts from an empty db even over a
+            // leftover file — the same overwrite stance as the ext pdb.
+            const dir = try e.dirHandle();
+            dir.deleteFile(e.io, rel) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            w = try dlp.Writer.create(e.io, path, .{ .created_date = "" });
+        } else {
+            w = try dlp.Writer.open(e.io, path);
+        }
+        errdefer w.db.close();
+
+        // Dimensions before content and junctions — no FK makes it
+        // necessary, but the insert order stays deterministic.
+        try olDrain(w, &store.artists, olInsertRow);
+        try olDrain(w, &store.albums, olInsertRow);
+        try olDrain(w, &store.genres, olInsertRow);
+        try olDrain(w, &store.labels, olInsertRow);
+        try olDrain(w, &store.keys, olInsertRow);
+        try olDrain(w, &store.images, olInsertRow);
+        try olDrain(w, &store.playlists, olInsertRow);
+        try olDrain(w, &store.contents, olInsertContent);
+        try olDrain(w, &store.playlist_pairs, olInsertPlaylistPair);
+        try olDrain(w, &store.my_tags, olInsertRow);
+        try olDrain(w, &store.my_tag_pairs, olInsertTagPair);
+
+        try w.close();
+        store.fresh = false;
     }
 
     /// Writes every queued ANLZ file — creating its `USBANLZ` folder —
@@ -1785,6 +1877,138 @@ pub fn getPlaylistsDb(
     try buildChildren(alloc, &groups, &visited, 0, &roots);
     return roots;
 }
+
+// --- OneLibrary mirror (O4) -----------------------------------------------------
+
+/// A playlist membership waiting for `save`; the db assigns its
+/// `sequenceNo` at insert time (dense, 1-based, continuing past rows
+/// already on disk).
+const OlPlaylistPair = struct {
+    playlist_id: i64,
+    content_id: i64,
+};
+
+/// A track-to-tag junction waiting for `save`.
+const OlTagPair = struct {
+    my_tag_id: i64,
+    content_id: i64,
+};
+
+/// The writer's OneLibrary side: rows mirrored from the mutating methods,
+/// buffered in memory until `save` materializes them — nothing
+/// SQLite-shaped happens before `save`, so a discarded handle leaves no
+/// `exportLibrary.db` behind. Every value the store allocates comes from
+/// its arena and is reclaimed whole by `deinit`.
+const OlStore = struct {
+    arena: std.heap.ArenaAllocator,
+    /// True until this handle's first `save` lands the db: a created
+    /// export builds a fresh `exportLibrary.db` on its first save even
+    /// with nothing pending (newer exports carry one), overwriting a
+    /// leftover file — the same stance as the ext pdb. An opened export
+    /// never sets this: it only ever appends, and only when the export
+    /// already carries the db.
+    fresh: bool = false,
+
+    /// Rows pending their first insert, in mirroring order.
+    artists: std.ArrayListUnmanaged(dlp.Artist) = .empty,
+    albums: std.ArrayListUnmanaged(dlp.Album) = .empty,
+    genres: std.ArrayListUnmanaged(dlp.Genre) = .empty,
+    labels: std.ArrayListUnmanaged(dlp.Label) = .empty,
+    keys: std.ArrayListUnmanaged(dlp.Key) = .empty,
+    images: std.ArrayListUnmanaged(dlp.Image) = .empty,
+    contents: std.ArrayListUnmanaged(dlp.Content) = .empty,
+    playlists: std.ArrayListUnmanaged(dlp.Playlist) = .empty,
+    playlist_pairs: std.ArrayListUnmanaged(OlPlaylistPair) = .empty,
+    my_tags: std.ArrayListUnmanaged(dlp.MyTag) = .empty,
+    my_tag_pairs: std.ArrayListUnmanaged(OlTagPair) = .empty,
+
+    fn hasPending(store: *const OlStore) bool {
+        return store.artists.items.len > 0 or
+            store.albums.items.len > 0 or
+            store.genres.items.len > 0 or
+            store.labels.items.len > 0 or
+            store.keys.items.len > 0 or
+            store.images.items.len > 0 or
+            store.contents.items.len > 0 or
+            store.playlists.items.len > 0 or
+            store.playlist_pairs.items.len > 0 or
+            store.my_tags.items.len > 0 or
+            store.my_tag_pairs.items.len > 0;
+    }
+
+    fn deinit(store: *OlStore) void {
+        store.arena.deinit();
+    }
+};
+
+/// One row's insert into the materializing db: plain `Writer.insert` for
+/// everything; content and playlist pairs have their own wrappers below.
+fn olInsertRow(w: dlp.Writer, row: anytype) dlp.SqlError!void {
+    try w.insert(row);
+}
+
+/// A `content` row through `insertContent`, keeping
+/// `property.numberOfContents` in step.
+fn olInsertContent(w: dlp.Writer, row: dlp.Content) dlp.SqlError!void {
+    try w.insertContent(row);
+}
+
+/// A playlist pair through `addContentToPlaylist`, which assigns the
+/// dense 1-based `sequenceNo`.
+fn olInsertPlaylistPair(w: dlp.Writer, pair: OlPlaylistPair) dlp.SqlError!void {
+    _ = try w.addContentToPlaylist(pair.playlist_id, pair.content_id);
+}
+
+/// A tag junction, materialized as its `myTag_content` row.
+fn olInsertTagPair(w: dlp.Writer, pair: OlTagPair) dlp.SqlError!void {
+    try w.insert(dlp.MyTagContent{
+        .myTag_id = pair.my_tag_id,
+        .content_id = pair.content_id,
+    });
+}
+
+/// Drains `list` through `insert_row`, dropping each row from the list
+/// only after its insert commits — a failure mid-drain leaves exactly the
+/// unwritten rows pending for the next `save`, and a retry never
+/// duplicates a landed one.
+fn olDrain(
+    w: dlp.Writer,
+    list: anytype,
+    comptime insert_row: anytype,
+) dlp.SqlError!void {
+    while (list.items.len > 0) {
+        try insert_row(w, list.items[0]);
+        _ = list.orderedRemove(0);
+    }
+}
+
+/// The dedup key of a mirrored album, like `AlbumKey` but over the OL id
+/// space.
+pub const OlAlbumKey = struct {
+    artist_id: i64,
+    name: []const u8,
+};
+
+const OlAlbumKeyContext = struct {
+    pub fn hash(_: OlAlbumKeyContext, key: OlAlbumKey) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&key.artist_id));
+        h.update(key.name);
+        return h.final();
+    }
+
+    pub fn eql(_: OlAlbumKeyContext, a: OlAlbumKey, b: OlAlbumKey) bool {
+        return a.artist_id == b.artist_id and std.mem.eql(u8, a.name, b.name);
+    }
+};
+
+/// Mirrored albums keyed by `(owning OL artist, name)`.
+pub const OlAlbumsByArtistAndName = std.HashMapUnmanaged(
+    OlAlbumKey,
+    i64,
+    OlAlbumKeyContext,
+    std.hash_map.default_max_load_percentage,
+);
 
 // --- writer state ---------------------------------------------------------------
 
