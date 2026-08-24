@@ -197,9 +197,6 @@ fn providerKdf(
     };
 }
 
-/// Error of `cbc`: the destination must be at least as long as the
-/// source, and the source a whole number of 16-byte blocks — checked in
-/// every build mode, not only where debug asserts run.
 pub const CbcError = error{ BufferTooSmall, NotBlockAligned };
 
 /// AES-256-CBC over a whole number of 16-byte blocks (pages are);
@@ -612,10 +609,9 @@ pub const Color = struct {
 };
 
 /// A `content` row: one track. The central table of the db — every other
-/// track-related table references it by `content_id`, and the pdb side
-/// joins by `path`. Facts pinned by
-/// the with_anlz fixture: `path` is device-root-absolute (`/Contents/...`),
-/// `analysisDataFilePath` is root-absolute to the track's ANLZ `.DAT`,
+/// track-related table references it by `content_id`. Facts pinned by
+/// the with_anlz fixture: `analysisDataFilePath` is root-absolute to the
+/// track's ANLZ `.DAT`,
 /// `contentLink` = 788 224 = the pdb Track bitmask `0x000C0700`,
 /// `analysedBits` = 41 = the pdb Track `unknown5`, and the artist foreign
 /// keys are named `artist_id_<role>` (`djPlayCount` and
@@ -803,8 +799,7 @@ pub const Playlist = struct {
     playlist_id_parent: ?i64 = null,
 };
 
-/// A `playlist_content` row: playlist membership; `sequenceNo` is dense
-/// and 1-based in the fixture.
+/// A `playlist_content` row: playlist membership.
 pub const PlaylistContent = struct {
     playlist_id: ?i64 = null,
     content_id: ?i64 = null,
@@ -813,9 +808,7 @@ pub const PlaylistContent = struct {
 
 /// The `property` row — a singleton; real exports carry exactly one.
 /// `dbVersion` is a varchar holding `'10000'` (rbox models an INTEGER
-/// defaulting to 1000); `deviceName` is the empty string in exports;
-/// `myTagMasterDBID` derives from the master db and writers may leave 0.
-/// and writers may leave 0.
+/// defaulting to 1000); `deviceName` is the empty string in exports.
 pub const Property = struct {
     deviceName: ?[]const u8 = null,
     dbVersion: ?[]const u8 = null,
@@ -885,7 +878,6 @@ const tables = [_]Table{
     .{ .row = Sort, .table = "sort", .rows = "sorts", .map = "sort_by_id", .id = "sort_id" },
 };
 
-/// The element type `filterTables` returns for `pred`.
 fn FilteredTables(comptime pred: fn (Table) bool) type {
     var n: usize = 0;
     for (tables) |t| {
@@ -894,7 +886,6 @@ fn FilteredTables(comptime pred: fn (Table) bool) type {
     return [n]Table;
 }
 
-/// `tables` filtered by `pred` — the comptime subset views below.
 fn filterTables(comptime pred: fn (Table) bool) FilteredTables(pred) {
     var selected: FilteredTables(pred) = undefined;
     var n: usize = 0;
@@ -907,8 +898,7 @@ fn filterTables(comptime pred: fn (Table) bool) FilteredTables(pred) {
     return selected;
 }
 
-/// The primary-key subset of `tables` (`map` set): what `load` indexes
-/// and `byId` serves.
+/// What `load` indexes and `byId` serves.
 const id_tables = filterTables(struct {
     fn keyed(t: Table) bool {
         return t.map != null;
@@ -921,13 +911,10 @@ const id_tables = filterTables(struct {
 /// schema order, and every non-primary-key column optional, because the
 /// real schema carries no NOT NULL anywhere; the fixture writes NULL
 /// for unset foreign keys (`artist_id_remixer`) and empty strings
-/// elsewhere (`isrc`), and both survive verbatim. Optional fields default
-/// to null, so `Writer` input literals only name what they set.
-/// Integer columns are read through SQLite's numeric conversion; there
-/// are no enums — the reader layer interprets raw values.
+/// elsewhere (`isrc`), and both survive verbatim. Integer columns are
+/// read through SQLite's numeric conversion; there are no enums — the
+/// reader layer interprets raw values.
 pub const Library = struct {
-    /// Arena owning every row, string, and index parsed into this
-    /// instance.
     arena: *std.heap.ArenaAllocator,
     albums: []const Album = &.{},
     artists: []const Artist = &.{},
@@ -1102,8 +1089,7 @@ fn loadTable(
 /// the statement (valid until the next step) and then copied into one
 /// arena allocation holding all of the row's strings contiguously. The
 /// per-row pool replaces one allocation per text cell. Nullable columns
-/// read NULL as null (non-null text is copied even when empty — the
-/// fixture's `isrc` is `''`, not NULL).
+/// read NULL as null.
 fn decodeRow(comptime T: type, a: std.mem.Allocator, stmt: Stmt) LoadError!T {
     const fields = @typeInfo(T).@"struct".fields;
     var row: T = undefined;
@@ -1283,9 +1269,7 @@ const default_colors = [_]Color{
     .{ .color_id = 8, .name = "Purple" },
 };
 
-/// The 27 browse-column headers a fresh export carries, named with the
-/// same `\u{fffa}`/`\u{fffb}` interlinear-annotation wrapping as pdb Menu
-/// rows.
+/// The 27 browse-column headers a fresh export carries.
 const default_menu_items = [_]MenuItem{
     .{ .menuItem_id = 1, .kind = 128, .name = "\u{fffa}GENRE\u{fffb}" },
     .{ .menuItem_id = 2, .kind = 129, .name = "\u{fffa}ARTIST\u{fffb}" },
@@ -1344,8 +1328,8 @@ const default_categories = [_]Category{
     .{ .category_id = 27, .menuItem_id = 22, .sequenceNo = 10, .isVisible = 1 },
 };
 
-/// The track-list column layout over `menuItem` a fresh export carries
-/// (`sort_id` is 0-based; ids 14 and 24/25 are absent in real files too).
+/// The track-list column layout over `menuItem` a fresh export carries;
+/// ids 14 and 24/25 are absent in real files too.
 const default_sorts = [_]Sort{
     .{ .sort_id = 0, .menuItem_id = 25, .sequenceNo = 1, .isVisible = 1, .isSelectedAsSubColumn = 0 },
     .{ .sort_id = 1, .menuItem_id = 26, .sequenceNo = 2, .isVisible = 1, .isSelectedAsSubColumn = 0 },
@@ -1383,9 +1367,8 @@ const Tx = struct {
         tx.spent = true;
     }
 
-    /// Rolls the transaction back unless it was committed; a rollback
-    /// failure is swallowed — there is nothing left to do but leave the
-    /// connection to `close`.
+    /// A rollback failure is swallowed — there is nothing left to do
+    /// but leave the connection to `close`.
     fn deinit(tx: *Tx) void {
         if (!tx.spent) tx.db.exec("ROLLBACK;") catch {};
         tx.spent = true;
@@ -1419,32 +1402,25 @@ pub const CreateOptions = struct {
 /// A OneLibrary db opened for writing: `create` builds a fresh export's
 /// db (schema, seeded defaults, the property singleton), `open` attaches
 /// to an existing one, and both write through prepared SQL over the O2
-/// row models — inserts bind NULL for null fields and step before
-/// returning (SQLite reads text at the step, no copy), so borrowed
-/// input is fine. First-class mutation is
+/// row models — borrowed input is fine. First-class mutation is
 /// append-only, mirroring the device writer's stance; there is no update.
 /// The schema carries no foreign keys, so no method validates ids — tree
 /// and junction semantics belong to the caller (the O4 device writer).
 pub const Writer = struct {
     db: Db,
 
-    /// Error of `create`: `LibraryAlreadyExists` is the exclusive claim
-    /// refusing to build over an existing file; the rest is the claim's
-    /// file creation and the SQLite calls.
+    /// Error of `create`: `LibraryAlreadyExists` — the exclusive claim
+    /// refusing to build over an existing file.
     pub const CreateError = SqlError ||
         std.Io.File.OpenError ||
         error{LibraryAlreadyExists};
 
     /// Creates a fresh OneLibrary db at `path`: the real schema (see
     /// `schema_sql`), the four seeded tables' default rows, and the
-    /// property singleton with `dbVersion` `'10000'`, all in one
-    /// transaction — a failed create leaves no file behind, not a
-    /// half-built db the claim below would then refuse to overwrite.
-    /// The target is claimed with an exclusive create (O_EXCL), so a
-    /// concurrent creator loses cleanly and the failure cleanup can only
-    /// ever delete a file this call created. The db is keyed with the
-    /// DLP passphrase unless `plaintext` is set, and starts in WAL
-    /// journal mode like rb's exports.
+    /// property singleton, all in one transaction — a failed create
+    /// leaves no file behind. The db is keyed with the DLP passphrase
+    /// unless `plaintext` is set, and starts in WAL journal mode like
+    /// rb's exports.
     pub fn create(io: std.Io, path: [:0]const u8, options: CreateOptions) CreateError!Writer {
         const cwd = std.Io.Dir.cwd();
         // Claim the target exclusively: no window between an access
@@ -1476,8 +1452,6 @@ pub const Writer = struct {
         try insertRows(db, "category", &default_categories);
         try insertRows(db, "sort", &default_sorts);
 
-        // rbox's migration seeds dbVersion 1000 as an INTEGER; real
-        // exports carry the varchar '10000'.
         try insertRow(db, "property", Property{
             .deviceName = "",
             .dbVersion = "10000",
@@ -1522,14 +1496,13 @@ pub const Writer = struct {
         return insertRow(self.db, comptime tableOf(T), row);
     }
 
-    /// Inserts many rows of one `write_tables` family atomically, through
-    /// a single prepared statement stepped per row instead of a
-    /// prepare/finalize pair per row — the bulk path for mirroring a
-    /// library-sized batch. `rows` is any slice, array, or tuple of
-    /// like-typed rows (`&batch`, `&.{ row, row }`). A `Content` batch
-    /// maintains `property.numberOfContents` once, like `insertContent`;
-    /// ids are the caller's to mint, and any failure — a duplicate key
-    /// included — rolls the whole batch back.
+    /// Inserts many rows of one `write_tables` family atomically — the
+    /// bulk path for mirroring a library-sized batch. `rows` is any
+    /// slice, array, or tuple of like-typed rows (`&batch`,
+    /// `&.{ row, row }`). A `Content` batch maintains
+    /// `property.numberOfContents` once, like `insertContent`; ids are
+    /// the caller's to mint, and any failure — a duplicate key included —
+    /// rolls the whole batch back.
     pub fn insertAll(self: Writer, rows: anytype) SqlError!void {
         if (rows.len == 0) return;
         const T = rowOf(@TypeOf(rows));
@@ -1542,9 +1515,7 @@ pub const Writer = struct {
 
     /// Inserts one `content` row and keeps `property.numberOfContents`
     /// equal to the table count — both atomically, so a failure leaves
-    /// the count consistent. Dimension and junction rows are separate
-    /// `insert` calls (their orphaning risk is documented on the device
-    /// writer's `addTrack`; the batch path is `insertAll`).
+    /// the count consistent.
     pub fn insertContent(self: Writer, row: Content) SqlError!void {
         var tx = try Tx.begin(self.db);
         errdefer tx.deinit();
@@ -1582,16 +1553,13 @@ pub const Writer = struct {
         return self.db.scalarInt("SELECT numberOfContents FROM property LIMIT 1;");
     }
 
-    /// The append both playlist APIs share: the dense 1-based
-    /// `sequenceNo` is derived from the table at insert time, so the
-    /// single and bulk paths can never number apart.
+    /// The append both playlist APIs share.
     const playlist_append_sql = "INSERT INTO playlist_content (playlist_id, content_id, sequenceNo) VALUES (?1, ?2, " ++
         "(SELECT COALESCE(MAX(sequenceNo), 0) + 1 FROM playlist_content WHERE playlist_id = ?1))";
 
     /// Appends a track to a playlist, assigning the next dense 1-based
     /// `sequenceNo` under that playlist (real exports number entries from
-    /// 1) and returning it. One atomic INSERT; the keys are not validated
-    /// (no FK in the schema — the caller owns tree semantics).
+    /// 1) and returning it. One atomic INSERT.
     pub fn addContentToPlaylist(self: Writer, playlist_id: i64, content_id: i64) SqlError!i64 {
         var stmt = try self.db.prepare(playlist_append_sql ++ " RETURNING sequenceNo;");
         defer stmt.finalize();
@@ -1603,16 +1571,11 @@ pub const Writer = struct {
         return sequence_no;
     }
 
-    /// Appends many tracks to playlists atomically, through a single
-    /// prepared statement stepped per pair instead of a
-    /// prepare/finalize pair per row — the bulk path behind the device
-    /// writer's playlist-pair drain. Each insert sees the ones before it,
-    /// so the dense 1-based `sequenceNo`s are exactly
-    /// `addContentToPlaylist`'s, continuing past rows already on disk.
-    /// `pairs` is a slice or array of structs carrying `playlist_id` and
-    /// `content_id` fields (unlike `insertAll`, a plain `for` iterates
-    /// `pairs`, so a tuple literal is not an accepted shape); any failure
-    /// rolls the whole batch back.
+    /// Appends many tracks to playlists atomically. `pairs` is a slice
+    /// or array of structs carrying `playlist_id` and `content_id`
+    /// fields (unlike `insertAll`, a plain `for` iterates `pairs`, so a
+    /// tuple literal is not an accepted shape); any failure rolls the
+    /// whole batch back.
     pub fn addAllToPlaylist(self: Writer, pairs: anytype) SqlError!void {
         if (pairs.len == 0) return;
         var tx = try Tx.begin(self.db);
@@ -1629,9 +1592,8 @@ pub const Writer = struct {
     }
 };
 
-/// Count-derived `numberOfContents` maintenance (inside the caller's
-/// transaction): always equal to `SELECT COUNT(*) FROM content`, never a
-/// value a caller could pass stale.
+/// Count-derived `numberOfContents` maintenance, inside the caller's
+/// transaction.
 fn maintainNumberOfContents(db: Db) SqlError!void {
     try db.exec("UPDATE property SET numberOfContents = (SELECT COUNT(*) FROM content);");
 }
@@ -1655,9 +1617,9 @@ fn pkOf(comptime T: type) []const u8 {
 }
 
 /// One INSERT, built and bound from the row's comptime layout — the
-/// write-side mirror of `decodeRow`: null fields bind NULL (one of the
-/// fixture's unset conventions), empty strings bind as themselves (the
-/// other), and SQLite reads the text at the step without copying it.
+/// write-side mirror of `decodeRow`: null fields bind NULL, empty
+/// strings bind as themselves, and SQLite reads the text at the step
+/// without copying it.
 fn insertRow(db: Db, comptime table: []const u8, row: anytype) SqlError!void {
     var stmt = try db.prepare(comptime insertSql(table, @TypeOf(row)));
     defer stmt.finalize();
@@ -1682,8 +1644,6 @@ fn insertRows(db: Db, comptime table: []const u8, rows: anytype) SqlError!void {
     }
 }
 
-/// Binds one row's fields (primary key included), steps the INSERT, and
-/// readies the statement for the next row of a batch.
 fn stepRow(stmt: Stmt, row: anytype) SqlError!void {
     try bindAndStep(stmt, row);
     try stmt.resetAndClear();
@@ -1698,13 +1658,13 @@ fn rowOf(comptime rows: type) type {
         .pointer => |p| switch (p.size) {
             .slice => return p.child,
             .one => switch (@typeInfo(p.child)) {
-                .@"array" => |a| return a.child,
+                .array => |a| return a.child,
                 .@"struct" => |s| return tupleRow(s, rows),
                 else => {},
             },
             else => {},
         },
-        .@"array" => |a| return a.child,
+        .array => |a| return a.child,
         .@"struct" => |s| return tupleRow(s, rows),
         else => {},
     }
@@ -1728,7 +1688,6 @@ fn tupleArg(comptime rows: type) bool {
     };
 }
 
-/// Binds one row's fields (primary key included) and steps the INSERT.
 fn bindAndStep(stmt: Stmt, row: anytype) SqlError!void {
     inline for (@typeInfo(@TypeOf(row)).@"struct".fields, 1..) |f, i|
         try bindCell(stmt, i, @field(row, f.name));
