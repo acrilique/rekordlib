@@ -192,6 +192,63 @@ test "artwork spec pins shard folders, file names, and resolutions" {
     try testing.expectEqual(@as(u16, 240), spec.medium_resolution.height);
 }
 
+test "artwork spec carries the OneLibrary b-variant" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Rekordbox writes both the a* and b* sets; the with_anlz export
+    // carries all four files for artwork ids 1 and 2 under shard 00001.
+    var spec = try device.artworkSpec(alloc, 1);
+    defer spec.deinit(alloc);
+    try testing.expectEqualStrings("/PIONEER/Artwork/00001/b1.jpg", spec.ol_thumbnail_path);
+    try testing.expectEqualStrings("/PIONEER/Artwork/00001/b1_m.jpg", spec.ol_medium_path);
+
+    const files = [_][]const u8{
+        spec.thumbnail_path,
+        spec.medium_path,
+        spec.ol_thumbnail_path,
+        spec.ol_medium_path,
+    };
+    for (files) |file| {
+        const host = try std.fmt.allocPrint(
+            alloc,
+            "testdata/complete_export/with_anlz{s}",
+            .{file},
+        );
+        defer alloc.free(host);
+        _ = try std.Io.Dir.cwd().statFile(io, host, .{});
+    }
+
+    var spec2 = try device.artworkSpec(alloc, 20);
+    defer spec2.deinit(alloc);
+    try testing.expectEqualStrings("/PIONEER/Artwork/00002/b20.jpg", spec2.ol_thumbnail_path);
+    try testing.expectEqualStrings("/PIONEER/Artwork/00002/b20_m.jpg", spec2.ol_medium_path);
+}
+
+test "layout derives the exportLibrary.db path" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    const layout = device.Layout{ .root = "testdata/complete_export/with_anlz" };
+    const path = try layout.exportLibraryDb(alloc);
+    defer alloc.free(path);
+    try testing.expectEqualStrings(
+        "testdata/complete_export/with_anlz/PIONEER/rekordbox/exportLibrary.db",
+        path,
+    );
+    // Newer exports carry the OneLibrary db; the two older fixtures don't.
+    _ = try std.Io.Dir.cwd().statFile(io, path, .{});
+    for ([_][]const u8{ "empty", "demo_tracks" }) |name| {
+        const other = try std.fmt.allocPrint(
+            alloc,
+            "testdata/complete_export/{s}/PIONEER/rekordbox/exportLibrary.db",
+            .{name},
+        );
+        defer alloc.free(other);
+        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, other, .{}));
+    }
+}
+
 // --- device reader (D2) -------------------------------------------------------
 
 /// Fixture roots under `testdata`, with hand-checked track counts (the

@@ -74,6 +74,11 @@ pub const Layout = struct {
         return std.fs.path.join(alloc, &.{ l.root, "PIONEER", "rekordbox", "exportExt.pdb" });
     }
 
+    /// Path to `exportLibrary.db`, the OneLibrary store of newer exports.
+    pub fn exportLibraryDb(l: Layout, alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+        return std.fs.path.join(alloc, &.{ l.root, "PIONEER", "rekordbox", "exportLibrary.db" });
+    }
+
     /// Directory holding per-track analysis files.
     pub fn usbanlzDir(l: Layout, alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         return std.fs.path.join(alloc, &.{ l.root, "PIONEER", "USBANLZ" });
@@ -236,14 +241,23 @@ pub const Resolution = struct {
 };
 
 /// What a caller must create on the device for an artwork row with `id`:
-/// two JPEG files under the `PIONEER/Artwork` shard folder. The caller
-/// writes the files and stores `thumbnail_path` in the pdb Artwork row.
+/// JPEG files under the `PIONEER/Artwork` shard folder — the `a*` set the
+/// pdb names and the `b*` set the OneLibrary db names. Rekordbox writes
+/// both sets (same shard rule, `b` where the pdb set says `a`); the caller
+/// writes the files, stores `thumbnail_path` in the pdb Artwork row, and
+/// the OneLibrary mirror stores `ol_thumbnail_path`.
 pub const ArtworkSpec = struct {
     /// Device-root-absolute path of the 80x80 thumbnail `a{id}.jpg` — the
     /// path stored in the pdb Artwork row.
     thumbnail_path: []u8,
     /// Device-root-absolute path of the 240x240 image `a{id}_m.jpg`.
     medium_path: []u8,
+    /// Device-root-absolute path of the 80x80 OneLibrary variant
+    /// `b{id}.jpg` — the path stored in the OneLibrary `image` row.
+    ol_thumbnail_path: []u8,
+    /// Device-root-absolute path of the 240x240 OneLibrary variant
+    /// `b{id}_m.jpg`.
+    ol_medium_path: []u8,
     codec: ArtworkCodec,
     thumbnail_resolution: Resolution,
     medium_resolution: Resolution,
@@ -251,31 +265,48 @@ pub const ArtworkSpec = struct {
     pub fn deinit(spec: *ArtworkSpec, alloc: std.mem.Allocator) void {
         alloc.free(spec.thumbnail_path);
         alloc.free(spec.medium_path);
+        alloc.free(spec.ol_thumbnail_path);
+        alloc.free(spec.ol_medium_path);
     }
 };
 
 /// Builds the `ArtworkSpec` for artwork row `id`.
 pub fn artworkSpec(alloc: std.mem.Allocator, id: u32) std.mem.Allocator.Error!ArtworkSpec {
-    const folder = try artworkFolder(alloc, id);
-    defer alloc.free(folder);
-    const thumbnail_path = try std.fmt.allocPrint(
-        alloc,
-        "/PIONEER/Artwork/{s}/a{d}.jpg",
-        .{ folder, id },
-    );
+    const thumbnail_path = try artworkFilePath(alloc, id, 'a', "");
     errdefer alloc.free(thumbnail_path);
-    const medium_path = try std.fmt.allocPrint(
-        alloc,
-        "/PIONEER/Artwork/{s}/a{d}_m.jpg",
-        .{ folder, id },
-    );
+    const medium_path = try artworkFilePath(alloc, id, 'a', "_m");
+    errdefer alloc.free(medium_path);
+    const ol_thumbnail_path = try artworkFilePath(alloc, id, 'b', "");
+    errdefer alloc.free(ol_thumbnail_path);
+    const ol_medium_path = try artworkFilePath(alloc, id, 'b', "_m");
     return .{
         .thumbnail_path = thumbnail_path,
         .medium_path = medium_path,
+        .ol_thumbnail_path = ol_thumbnail_path,
+        .ol_medium_path = ol_medium_path,
         .codec = .jpeg,
         .thumbnail_resolution = .{ .width = 80, .height = 80 },
         .medium_resolution = .{ .width = 240, .height = 240 },
     };
+}
+
+/// Device-root-absolute path of one artwork file: variant `a` (pdb) or `b`
+/// (OneLibrary) of `id`, with `_m` naming the 240x240 medium resolution.
+fn artworkFilePath(
+    alloc: std.mem.Allocator,
+    id: u32,
+    variant: u8,
+    suffix: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    const folder = try artworkFolder(alloc, id);
+    defer alloc.free(folder);
+    return std.fmt.allocPrint(alloc, "/PIONEER/Artwork/{s}/{c}{d}{s}.jpg", .{ folder, variant, id, suffix });
+}
+
+/// Device-root-absolute path of the OneLibrary 80x80 variant `b{id}.jpg`
+/// the `image` mirror row stores.
+fn olArtworkPath(alloc: std.mem.Allocator, id: u32) std.mem.Allocator.Error![]u8 {
+    return artworkFilePath(alloc, id, 'b', "");
 }
 
 /// Five-digit shard folder name for artwork `id`: `id/20 + 1`, zero-padded.
