@@ -1520,7 +1520,9 @@ fn barPosition(global_beat: i64) u16 {
 /// time-signature changes. `bpm` seeds the `tempo` field (see
 /// `PerformanceData.bpm`); `sample_count` clips the tail — no beats are
 /// emitted past the track end or before its start. Markers sharing a
-/// sample offset are skipped.
+/// sample offset are skipped. The final marker only ends the last
+/// segment: the tempo beyond it is unknown, so no beat is emitted at or
+/// past it — a grid's last beat is the one before the final marker.
 pub fn expandBeatgrid(
     alloc: std.mem.Allocator,
     markers: []const BeatMarker,
