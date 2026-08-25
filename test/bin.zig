@@ -234,6 +234,29 @@ test "bin.takeStruct/bin.putStruct walk u24-backed packed structs" {
     try testing.expectEqual(@as(u11, 22), s.high);
 }
 
+test "serializedLen counts bare u24 fields at their bit size" {
+    const Sample = struct {
+        narrow: u24 = 0,
+        tag: enum(u24) { a = 1, _ } = .a,
+        wide: u16 = 0,
+    };
+
+    // The walkers read `intBytes` (bit size / 8), not the padded `@sizeOf`
+    // — 3 bytes per u24, not 4.
+    try testing.expectEqual(@as(usize, 8), bin.serializedLen(Sample));
+    var e = bin.Emitter.init(testing.allocator);
+    defer e.deinit();
+    try bin.putStruct(&e, Sample{ .narrow = 0xABCDEF, .tag = @enumFromInt(2), .wide = 0x0102 }, .big);
+    try testing.expectEqualSlices(u8, &.{ 0xAB, 0xCD, 0xEF, 0x00, 0x00, 0x02, 0x01, 0x02 }, e.written());
+
+    var c = bin.Cursor.init(e.written());
+    const s = try bin.takeStruct(&c, Sample, .big);
+    try testing.expect(c.atEnd());
+    try testing.expectEqual(@as(u24, 0xABCDEF), s.narrow);
+    try testing.expectEqual(@as(u24, 2), @intFromEnum(s.tag));
+    try testing.expectEqual(@as(u16, 0x0102), s.wide);
+}
+
 test "bin.takeStruct/bin.putStruct delegate to custom codecs" {
     const Sample = struct {
         tag: u8 = 0,

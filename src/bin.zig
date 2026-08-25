@@ -178,7 +178,7 @@ fn isPackedStruct(comptime T: type) bool {
 /// Serialized byte count of an integer, its bit size in whole bytes — for
 /// non-power-of-two ints like `u24` this is smaller than the ABI
 /// `@sizeOf`, which includes padding.
-fn intBytes(comptime T: type) usize {
+pub fn intBytes(comptime T: type) usize {
     return @divExact(@bitSizeOf(T), 8);
 }
 
@@ -312,9 +312,9 @@ pub fn serializedLen(comptime T: type) usize {
             if (hasCodec(field.type))
                 @compileError("serializedLen: codec fields have a data-dependent length, `" ++ @typeName(T) ++ "." ++ field.name ++ "`");
             switch (@typeInfo(field.type)) {
-                .int => len += @sizeOf(field.type),
-                .float => len += @sizeOf(field.type),
-                .@"enum" => |en| len += @sizeOf(en.tag_type),
+                .int => len += intBytes(field.type),
+                .float => len += intBytes(field.type),
+                .@"enum" => |en| len += intBytes(en.tag_type),
                 .array => |a| {
                     if (a.child != u8) @compileError("serializedLen: array fields must be `[N]u8`, `" ++ @typeName(field.type) ++ "` is not");
                     len += a.len;

@@ -1015,8 +1015,8 @@ fn fixedLen(comptime T: type) usize {
         var len: usize = 0;
         for (std.meta.fields(T)) |field| {
             switch (rowFieldKind(field.type)) {
-                .int => len += @sizeOf(field.type),
-                .@"enum" => len += @sizeOf(@typeInfo(field.type).@"enum".tag_type),
+                .int => len += bin.intBytes(field.type),
+                .@"enum" => len += bin.intBytes(@typeInfo(field.type).@"enum".tag_type),
                 .string, .offset_container => {},
             }
         }
