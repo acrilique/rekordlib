@@ -1,7 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 
-const dlp = @import("dlp");
+const dlp = @import("rekordlib").dlp;
 const testutil = @import("util.zig");
 
 test {

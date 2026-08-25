@@ -20,7 +20,7 @@
 //! - <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/exports.html#devicesql-strings>
 
 const std = @import("std");
-const bin = @import("bin");
+const bin = @import("bin.zig");
 const util = @import("util");
 
 /// Decoding error; `InvalidFormat` means the bytes do not follow the

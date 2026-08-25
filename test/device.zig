@@ -3,11 +3,11 @@
 // obtain one at https://mozilla.org/MPL/2.0/.
 
 const std = @import("std");
-const anlz = @import("anlz");
-const device = @import("device");
-const dlp = @import("dlp");
-const pdb = @import("pdb");
-const setting = @import("setting");
+const anlz = @import("rekordlib").anlz;
+const device = @import("rekordlib").device;
+const dlp = @import("rekordlib").dlp;
+const pdb = @import("rekordlib").pdb;
+const setting = @import("rekordlib").setting;
 const testutil = @import("util.zig");
 
 const testing = std.testing;

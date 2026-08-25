@@ -1,6 +1,6 @@
 const std = @import("std");
-const setting = @import("setting");
-const bin = @import("bin");
+const setting = @import("rekordlib").setting;
+const bin = @import("rekordlib").bin;
 const testutil = @import("util.zig");
 
 const testing = std.testing;

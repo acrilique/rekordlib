@@ -55,79 +55,23 @@ pub fn build(b: *std.Build) void {
         },
     }
 
-    const bin = b.addModule("bin", .{
-        .root_source_file = b.path("src/bin.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const setting = b.addModule("setting", .{
-        .root_source_file = b.path("src/setting.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "bin", .module = bin },
-        },
-    });
-
-    const xor = b.addModule("xor", .{
-        .root_source_file = b.path("src/xor.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const anlz = b.addModule("anlz", .{
-        .root_source_file = b.path("src/anlz.zig"),
+    // The library is one module: the format modules reach each other by
+    // relative import (see `src/root.zig`). Only dlp, which needs the
+    // translated C API and the build options, and util, which dlp shares,
+    // are separate modules.
+    const rekordlib = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "bin", .module = bin },
-            .{ .name = "util", .module = util },
-            .{ .name = "xor", .module = xor },
-        },
-    });
-
-    const pdb = b.addModule("pdb", .{
-        .root_source_file = b.path("src/pdb.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "bin", .module = bin },
-            .{ .name = "util", .module = util },
-        },
-    });
-
-    const device = b.addModule("device", .{
-        .root_source_file = b.path("src/device.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "bin", .module = bin },
-            .{ .name = "util", .module = util },
-            .{ .name = "anlz", .module = anlz },
-            .{ .name = "pdb", .module = pdb },
-            .{ .name = "setting", .module = setting },
             .{ .name = "dlp", .module = dlp },
+            .{ .name = "util", .module = util },
         },
     });
 
     const lib = b.addLibrary(.{
         .name = "rekordlib",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "bin", .module = bin },
-                .{ .name = "setting", .module = setting },
-                .{ .name = "xor", .module = xor },
-                .{ .name = "anlz", .module = anlz },
-                .{ .name = "pdb", .module = pdb },
-                .{ .name = "device", .module = device },
-                .{ .name = "util", .module = util },
-                .{ .name = "dlp", .module = dlp },
-            },
-        }),
+        .root_module = rekordlib,
     });
 
     b.installArtifact(lib);
@@ -145,13 +89,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "bin", .module = bin },
-            .{ .name = "util", .module = util },
-            .{ .name = "anlz", .module = anlz },
-            .{ .name = "pdb", .module = pdb },
-            .{ .name = "setting", .module = setting },
-            .{ .name = "device", .module = device },
-            .{ .name = "dlp", .module = dlp },
+            .{ .name = "rekordlib", .module = rekordlib },
         },
     });
 
@@ -195,7 +133,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "pdb", .module = pdb },
+            .{ .name = "rekordlib", .module = rekordlib },
         },
     });
 

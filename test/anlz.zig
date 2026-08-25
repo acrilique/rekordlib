@@ -1,7 +1,7 @@
 const std = @import("std");
-const anlz = @import("anlz");
-const bin = @import("bin");
-const util = @import("util");
+const anlz = @import("rekordlib").anlz;
+const bin = @import("rekordlib").bin;
+const util = @import("rekordlib").util;
 const testutil = @import("util.zig");
 
 const testing = std.testing;

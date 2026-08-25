@@ -21,7 +21,7 @@
 //! most noise-resistant figure.
 
 const std = @import("std");
-const pdb = @import("pdb");
+const pdb = @import("rekordlib").pdb;
 
 const default_fixture = "testdata/pdb/num_rows/export.pdb";
 

@@ -12,11 +12,11 @@
 //! `src/device/reader.rs`/`writer.rs`.
 
 const std = @import("std");
-const bin = @import("bin");
-const anlz = @import("anlz");
+const bin = @import("bin.zig");
+const anlz = @import("anlz.zig");
 const dlp = @import("dlp");
-const pdb = @import("pdb");
-const setting = @import("setting");
+const pdb = @import("pdb.zig");
+const setting = @import("setting.zig");
 const util = @import("util");
 
 /// Error of the layout functions that hash or format an audio path.
@@ -2121,7 +2121,7 @@ fn buildChildren(
 /// The caller owns the returned list; free it by deinitializing every
 /// element and then the list itself:
 ///
-///     const device = @import("device");
+///     const device = @import("rekordlib").device;
 ///     var playlists = try device.getPlaylistsDb(alloc, &db);
 ///     defer {
 ///         for (playlists.items) |*node| node.deinit(alloc);

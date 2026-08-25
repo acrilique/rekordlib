@@ -9,7 +9,7 @@
 //! Ported from rekordcrate's `src/setting.rs`
 
 const std = @import("std");
-const bin = @import("bin");
+const bin = @import("bin.zig");
 
 /// Size of the three NUL-padded string fields at the start of the file.
 const string_field_len = 32;

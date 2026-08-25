@@ -20,9 +20,9 @@
 //! - <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/anlz.html>
 
 const std = @import("std");
-const bin = @import("bin");
+const bin = @import("bin.zig");
 const util = @import("util");
-const xor = @import("xor");
+const xor = @import("xor.zig");
 
 pub const ParseError = error{ UnexpectedEof, OutOfMemory, InvalidFormat, UnexpectedValue };
 

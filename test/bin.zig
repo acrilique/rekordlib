@@ -1,5 +1,5 @@
 const std = @import("std");
-const bin = @import("bin");
+const bin = @import("rekordlib").bin;
 
 const testing = std.testing;
 
