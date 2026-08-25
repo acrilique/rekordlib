@@ -380,6 +380,38 @@ test "writing more cues than the u16 len_cues field holds fails" {
     try testing.expectError(error.Overflow, anlz.serializeFile(alloc, &test_file_header_data, &sections));
 }
 
+test "cue list counts that cannot fit the section fail before allocating" {
+    const alloc = testing.allocator;
+
+    // A hot list's memory_count is the sentinel whatever the count, so a
+    // patched len_cues reaches the fits-in-section check. The field sits
+    // at file offset 12 (`PMAI`) + 16 (header_data) + 12 (section header)
+    // + 6 (list_type, unknown).
+    var cues = [_]anlz.Cue{.{}};
+    const sections = [_]anlz.Content{
+        .{ .cue_list = .{ .list_type = .hot_cues, .memory_count = 0xFFFF_FFFF, .cues = &cues } },
+    };
+    const out = try anlz.serializeFile(alloc, &test_file_header_data, &sections);
+    defer alloc.free(out);
+    const bad = try alloc.dupe(u8, out);
+    defer alloc.free(bad);
+    std.mem.writeInt(u16, bad[46..48], 0xFFFF, .big);
+    try testing.expectError(error.UnexpectedEof, anlz.Anlz.parse(alloc, bad));
+
+    // Same for an extended list, whose len_cues sits at +4 (list_type):
+    // the minimum entry size alone already exceeds the section.
+    var extended = [_]anlz.ExtendedCue{.{}};
+    const ext_sections = [_]anlz.Content{
+        .{ .extended_cue_list = .{ .cues = &extended } },
+    };
+    const ext_out = try anlz.serializeFile(alloc, &test_file_header_data, &ext_sections);
+    defer alloc.free(ext_out);
+    const ext_bad = try alloc.dupe(u8, ext_out);
+    defer alloc.free(ext_bad);
+    std.mem.writeInt(u16, ext_bad[44..46], 0xFFFF, .big);
+    try testing.expectError(error.UnexpectedEof, anlz.Anlz.parse(alloc, ext_bad));
+}
+
 test "cue list memory_count is derived and validated" {
     const alloc = testing.allocator;
     var cues = [_]anlz.Cue{.{ .time = 1000 }};

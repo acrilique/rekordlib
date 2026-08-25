@@ -280,6 +280,10 @@ pub const CueList = struct {
         const len_cues = try c.takeInt(u16, .big);
         const memory_count = try c.takeInt(u32, .big);
         if (memory_count != derivedMemoryCount(list_type, len_cues)) return error.UnexpectedValue;
+        // Each entry occupies exactly `Cue.wire_len` bytes; a count whose
+        // entries cannot fit the section is rejected before anything is
+        // allocated (the `takeStructSlice` discipline).
+        if (@as(u64, len_cues) * Cue.wire_len > c.remaining()) return error.UnexpectedEof;
         const cues = try alloc.alloc(Cue, len_cues);
         var entry_header_size: ?u32 = null;
         for (cues) |*cue| cue.* = try Cue.parse(c, &entry_header_size);
@@ -561,6 +565,10 @@ pub const ExtendedCueList = struct {
         const len_cues = try c.takeInt(u16, .big);
         const unknown = try c.takeInt(u16, .big);
         try bin.validateConstantFields(ExtendedCueList, .{ .list_type = list_type, .unknown = unknown });
+        // Entries are at least `fixed_wire_len` bytes each, their comment
+        // payload and trailing bytes add more; a count whose entries cannot
+        // fit the section is rejected before anything is allocated.
+        if (@as(u64, len_cues) * ExtendedCue.fixed_wire_len > c.remaining()) return error.UnexpectedEof;
         const cues = try alloc.alloc(ExtendedCue, len_cues);
         for (cues) |*cue| cue.* = try ExtendedCue.parse(c, alloc);
         return .{ .list_type = list_type, .unknown = unknown, .cues = cues };
