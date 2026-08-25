@@ -21,7 +21,7 @@
 
 const std = @import("std");
 const bin = @import("bin.zig");
-const util = @import("util");
+const util = @import("util.zig");
 
 /// Decoding error; `InvalidFormat` means the bytes do not follow the
 /// DeviceSQL string format.

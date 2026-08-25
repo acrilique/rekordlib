@@ -10,14 +10,6 @@ pub fn build(b: *std.Build) void {
     const dlp_options = b.addOptions();
     dlp_options.addOption(DlpMode, "dlp", dlp_mode);
 
-    // util stays a separate module so dlp (which cannot reach the library's
-    // files by relative import) shares the wire tables.
-    const util = b.addModule("util", .{
-        .root_source_file = b.path("src/util.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     // The vendored build renames every sqlite3_/sqlcipher_ export to rl_*;
     // the system build binds the consumer's own unprefixed SQLCipher.
     const dlp_c_header = switch (dlp_mode) {
@@ -30,44 +22,32 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const dlp = b.addModule("dlp", .{
-        .root_source_file = b.path("src/dlp.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "c", .module = dlp_translate.createModule() },
-            .{ .name = "options", .module = dlp_options.createModule() },
-            .{ .name = "util", .module = util },
-        },
-    });
-    switch (dlp_mode) {
-        .off => {},
-        .vendored => {
-            dlp.addCSourceFile(.{
-                .file = b.path("vendor/sqlcipher/rl_sqlcipher.c"),
-                .flags = &sqlcipher_flags,
-            });
-            dlp.link_libc = true;
-        },
-        .system => {
-            dlp.link_libc = true;
-            dlp.linkSystemLibrary("sqlcipher", .{});
-        },
-    }
-
-    // The library is one module: the format modules reach each other by
-    // relative import (see `src/root.zig`). Only dlp, which needs the
-    // translated C API and the build options, and util, which dlp shares,
-    // are separate modules.
+    // The library is one module: every file reaches the others by relative
+    // import (see `src/root.zig`); only the translated C API and the build
+    // options enter as module imports.
     const rekordlib = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "dlp", .module = dlp },
-            .{ .name = "util", .module = util },
+            .{ .name = "c", .module = dlp_translate.createModule() },
+            .{ .name = "options", .module = dlp_options.createModule() },
         },
     });
+    switch (dlp_mode) {
+        .off => {},
+        .vendored => {
+            rekordlib.addCSourceFile(.{
+                .file = b.path("vendor/sqlcipher/rl_sqlcipher.c"),
+                .flags = &sqlcipher_flags,
+            });
+            rekordlib.link_libc = true;
+        },
+        .system => {
+            rekordlib.link_libc = true;
+            rekordlib.linkSystemLibrary("sqlcipher", .{});
+        },
+    }
 
     const lib = b.addLibrary(.{
         .name = "rekordlib",

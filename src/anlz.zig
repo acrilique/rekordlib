@@ -21,7 +21,7 @@
 
 const std = @import("std");
 const bin = @import("bin.zig");
-const util = @import("util");
+const util = @import("util.zig");
 const xor = @import("xor.zig");
 
 pub const ParseError = error{ UnexpectedEof, OutOfMemory, InvalidFormat, UnexpectedValue };

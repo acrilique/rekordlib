@@ -14,10 +14,10 @@
 const std = @import("std");
 const bin = @import("bin.zig");
 const anlz = @import("anlz.zig");
-const dlp = @import("dlp");
+const dlp = @import("dlp.zig");
 const pdb = @import("pdb.zig");
 const setting = @import("setting.zig");
-const util = @import("util");
+const util = @import("util.zig");
 
 /// Error of the layout functions that hash or format an audio path.
 pub const PathError = error{ OutOfMemory, InvalidUtf8 };

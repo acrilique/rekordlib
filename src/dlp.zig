@@ -25,7 +25,7 @@
 //! with zig cc; `system` binds the consumer's own unprefixed SQLCipher.
 
 const std = @import("std");
-const util = @import("util");
+const util = @import("util.zig");
 const opts = @import("options");
 const c = @import("c");
 
