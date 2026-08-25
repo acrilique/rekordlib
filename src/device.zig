@@ -2903,22 +2903,37 @@ fn visitTrack(ctx: anytype, row: *const pdb.Row) ScanError!void {
     }
 }
 
-/// Scans `artists`: names into `artists_by_name`, the id counter past
-/// the highest artist id.
-fn scanArtists(
+/// Scans a table whose rows are deduplicated by one string field (artists,
+/// genres, labels, artwork): the id counter past the highest row id, and
+/// every row's id into `map` under its decoded key — an invalid encoding
+/// skips the map entry but still advances the counter. `tag` selects the
+/// `Row` variant; `field_path` names the `DeviceSQLString` within the row
+/// payload, through nested structs (`.{"name"}`,
+/// `.{ "offsets", "inner", "name" }`).
+fn scanStringKeyed(
     alloc: std.mem.Allocator,
     db: *const pdb.Database,
-    state: *WriterState,
+    page_type: pdb.PageType,
+    comptime tag: []const u8,
+    comptime field_path: []const []const u8,
+    map: *std.StringHashMapUnmanaged(u32),
+    counter: *u32,
 ) ScanError!void {
-    try forEachRow(db, .artists, .{ .alloc = alloc, .state = state }, visitArtist);
+    var it = (try rowsOrEmpty(db, page_type)) orelse return;
+    while (try it.next()) |row| {
+        const payload = @field(row.*, tag);
+        counter.* = @max(counter.*, payload.id +| 1);
+        if (try decodeOrSkip(stringField(payload, field_path), alloc)) |key| {
+            try putIfAbsent(map, alloc, key, payload.id);
+        }
+    }
 }
 
-fn visitArtist(ctx: anytype, row: *const pdb.Row) ScanError!void {
-    const artist = row.artist;
-    ctx.state.next_artist_id = @max(ctx.state.next_artist_id, artist.id +| 1);
-    if (try decodeOrSkip(artist.offsets.inner.name, ctx.alloc)) |name| {
-        try putIfAbsent(&ctx.state.artists_by_name, ctx.alloc, name, artist.id);
-    }
+/// The `DeviceSQLString` at `field_path` within `row`, through nested
+/// structs (see `scanStringKeyed`).
+fn stringField(value: anytype, comptime field_path: []const []const u8) pdb.DeviceSQLString {
+    if (field_path.len == 1) return @field(value, field_path[0]);
+    return stringField(@field(value, field_path[0]), field_path[1..]);
 }
 
 /// Scans `albums`: `(owning artist, name)` pairs into
@@ -2945,24 +2960,6 @@ fn visitAlbum(ctx: anytype, row: *const pdb.Row) ScanError!void {
     }
 }
 
-/// Scans `genres`: names into `genres_by_name`, the id counter past the
-/// highest genre id.
-fn scanGenres(
-    alloc: std.mem.Allocator,
-    db: *const pdb.Database,
-    state: *WriterState,
-) ScanError!void {
-    try forEachRow(db, .genres, .{ .alloc = alloc, .state = state }, visitGenre);
-}
-
-fn visitGenre(ctx: anytype, row: *const pdb.Row) ScanError!void {
-    const genre = row.genre;
-    ctx.state.next_genre_id = @max(ctx.state.next_genre_id, genre.id +| 1);
-    if (try decodeOrSkip(genre.name, ctx.alloc)) |name| {
-        try putIfAbsent(&ctx.state.genres_by_name, ctx.alloc, name, genre.id);
-    }
-}
-
 /// Scans `keys`: names folded through `canonicalKeyName` into
 /// `keys_by_canonical`, so later lookups collide across spellings, and
 /// the id counter past the highest key id.
@@ -2980,42 +2977,6 @@ fn visitKey(ctx: anytype, row: *const pdb.Row) ScanError!void {
     if (try decodeOrSkip(key.name, ctx.alloc)) |name| {
         const canonical = try canonicalKeyName(ctx.alloc, name);
         try putIfAbsent(&ctx.state.keys_by_canonical, ctx.alloc, canonical, key.id);
-    }
-}
-
-/// Scans `labels`: names into `labels_by_name`, the id counter past the
-/// highest label id.
-fn scanLabels(
-    alloc: std.mem.Allocator,
-    db: *const pdb.Database,
-    state: *WriterState,
-) ScanError!void {
-    try forEachRow(db, .labels, .{ .alloc = alloc, .state = state }, visitLabel);
-}
-
-fn visitLabel(ctx: anytype, row: *const pdb.Row) ScanError!void {
-    const label = row.label;
-    ctx.state.next_label_id = @max(ctx.state.next_label_id, label.id +| 1);
-    if (try decodeOrSkip(label.name, ctx.alloc)) |name| {
-        try putIfAbsent(&ctx.state.labels_by_name, ctx.alloc, name, label.id);
-    }
-}
-
-/// Scans `artwork`: paths into `artwork_by_path`, the id counter past
-/// the highest artwork id.
-fn scanArtwork(
-    alloc: std.mem.Allocator,
-    db: *const pdb.Database,
-    state: *WriterState,
-) ScanError!void {
-    try forEachRow(db, .artwork, .{ .alloc = alloc, .state = state }, visitArtwork);
-}
-
-fn visitArtwork(ctx: anytype, row: *const pdb.Row) ScanError!void {
-    const artwork = row.artwork;
-    ctx.state.next_artwork_id = @max(ctx.state.next_artwork_id, artwork.id +| 1);
-    if (try decodeOrSkip(artwork.path, ctx.alloc)) |path| {
-        try putIfAbsent(&ctx.state.artwork_by_path, ctx.alloc, path, artwork.id);
     }
 }
 
@@ -3067,12 +3028,12 @@ pub fn scanWriterState(
 
     const a = state.arena.allocator();
     try scanTracks(a, db, &state);
-    try scanArtists(a, db, &state);
+    try scanStringKeyed(a, db, .artists, "artist", &.{ "offsets", "inner", "name" }, &state.artists_by_name, &state.next_artist_id);
     try scanAlbums(a, db, &state);
-    try scanGenres(a, db, &state);
+    try scanStringKeyed(a, db, .genres, "genre", &.{"name"}, &state.genres_by_name, &state.next_genre_id);
     try scanKeys(a, db, &state);
-    try scanLabels(a, db, &state);
-    try scanArtwork(a, db, &state);
+    try scanStringKeyed(a, db, .labels, "label", &.{"name"}, &state.labels_by_name, &state.next_label_id);
+    try scanStringKeyed(a, db, .artwork, "artwork", &.{"path"}, &state.artwork_by_path, &state.next_artwork_id);
     try scanPlaylistTree(a, db, &state);
     try scanPlaylistEntries(a, db, &state);
 
