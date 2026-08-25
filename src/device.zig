@@ -449,22 +449,17 @@ const track_unknown5: u16 = 41;
 /// needing fields not exposed here should build a `pdb.Track` row
 /// directly through `openPdb`.
 pub const TrackInput = struct {
-    /// Track title.
     title: []const u8 = "",
     /// Performing artist name.
     artist: []const u8 = "",
-    /// Album name.
     album: []const u8 = "",
-    /// Genre name.
     genre: []const u8 = "",
     /// Musical key name (e.g. "Cmaj", "D♭min"); folded to a canonical
     /// form for dedup.
     key: []const u8 = "",
     /// Record label name.
     label: []const u8 = "",
-    /// Composer name.
     composer: []const u8 = "",
-    /// Remixer name.
     remixer: []const u8 = "",
     /// Original performer, distinct from `artist` (covers/reworks).
     orig_artist: []const u8 = "",
@@ -477,7 +472,6 @@ pub const TrackInput = struct {
     /// foreign key); the OL side resolves it to a real artist row under
     /// a minted id (see `olLyricistId`).
     lyricist: []const u8 = "",
-    /// Remix/mix name.
     mix_name: []const u8 = "",
     /// Free text; Rekordbox writes strict `YYYY-MM-DD` or empty, this
     /// field passes through verbatim so callers can probe hardware
@@ -512,18 +506,13 @@ pub const TrackInput = struct {
     file_size: u32 = 0,
     /// Track number within the album.
     track_number: u32 = 0,
-    /// Disc number.
     disc_number: u16 = 0,
-    /// Release year.
     year: u16 = 0,
-    /// Number of times the track was played.
     play_count: u16 = 0,
     /// Star rating, 0-5; stored raw — the pdb byte, not the XML's
     /// `0/51/102/153/204/255` scale.
     rating: u8 = 0,
-    /// Color label.
     color: util.ColorIndex = .none,
-    /// Audio file format.
     file_type: pdb.FileType = .unknown,
     /// Whether stored hotcues auto-load on a CDJ; maps to the pdb string
     /// `"ON"` / empty.

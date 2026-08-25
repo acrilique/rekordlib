@@ -1126,7 +1126,6 @@ pub fn rowDeinit(comptime T: type, row: *T, alloc: std.mem.Allocator) void {
 }
 
 pub const Genre = struct {
-    /// ID of this row.
     id: u32 = 0,
     /// Name of the genre.
     name: DeviceSQLString = DeviceSQLString.empty(),
@@ -1135,7 +1134,6 @@ pub const Genre = struct {
 };
 
 pub const Label = struct {
-    /// ID of this row.
     id: u32 = 0,
     /// Name of the record label.
     name: DeviceSQLString = DeviceSQLString.empty(),
@@ -1144,7 +1142,6 @@ pub const Label = struct {
 };
 
 pub const Key = struct {
-    /// ID of this row.
     id: u32 = 0,
     /// Apparently a second copy of the row ID.
     id2: u32 = 0,
@@ -1155,13 +1152,10 @@ pub const Key = struct {
 };
 
 pub const Color = struct {
-    /// Unknown field.
     unknown1: u32 = 0,
-    /// Unknown field.
     unknown2: u8 = 0,
     /// Numeric color ID.
     color: util.ColorIndex = .none,
-    /// Unknown field.
     unknown3: u16 = 0,
     /// User-defined name of the color.
     name: DeviceSQLString = DeviceSQLString.empty(),
@@ -1170,7 +1164,6 @@ pub const Color = struct {
 };
 
 pub const Artwork = struct {
-    /// ID of this row.
     id: u32 = 0,
     /// Path to the album art file.
     path: DeviceSQLString = DeviceSQLString.empty(),
@@ -1179,7 +1172,6 @@ pub const Artwork = struct {
 };
 
 pub const HistoryPlaylist = struct {
-    /// ID of this row.
     id: u32 = 0,
     /// Name of the playlist.
     name: DeviceSQLString = DeviceSQLString.empty(),
@@ -1298,7 +1290,6 @@ pub const Artist = struct {
     /// Unknown field, called `index_shift` by flesniak; appears to always
     /// be `0x20 * row index`.
     index_shift: u16 = 0,
-    /// ID of this row.
     id: u32 = 0,
     /// The offsets and the name at the end of the row.
     offsets: OffsetArrayContainer(TrailingName) = .{},
@@ -1313,13 +1304,10 @@ pub const Album = struct {
     subtype: u16 = 0x0080,
     /// Unknown field; appears to always be `0x20 * row index`.
     index_shift: u16 = 0,
-    /// Unknown field.
     unknown2: u32 = 0,
     /// ID of the artist row associated with this row.
     artist_id: u32 = 0,
-    /// ID of this row.
     id: u32 = 0,
-    /// Unknown field.
     unknown3: u32 = 0,
     /// The offsets and the name at the end of the row.
     offsets: OffsetArrayContainer(TrailingName) = .{},
@@ -1333,11 +1321,9 @@ pub const PlaylistTreeNode = struct {
     /// ID of the parent row (which must be a folder); nodes parented to
     /// `PlaylistTreeNodeId.root` (0) sit at the top level.
     parent_id: u32 = 0,
-    /// Unknown field.
     unknown: u32 = 0,
     /// Sort order indicator.
     sort_order: u32 = 0,
-    /// ID of this row.
     id: u32 = 0,
     /// Non-zero when the node is a folder, zero when it is a leaf
     /// playlist (rekordcrate's doc comment inverts the meaning; its

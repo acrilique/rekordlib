@@ -164,9 +164,8 @@ pub const DevSetting = struct {
     /// Version string found in `DEVSETTING.DAT` files written by Rekordbox.
     pub const default_version = "6.6.1";
 
-    /// Unknown fields that must hold their default value in all known files;
-    /// other values are rejected on parse. Unknown fields not listed here are
-    /// kept verbatim.
+    /// Fields that must hold their default value in all known files;
+    /// other values are rejected on parse (see `bin.validateConstantFields`).
     pub const constant_fields = .{ .unknown1, .unknown2, .unknown3 };
 };
 
@@ -239,9 +238,8 @@ pub const MySetting = struct {
     /// Version string found in `MYSETTING.DAT` files written by Rekordbox 6.6.1.
     pub const default_version = "0.001";
 
-    /// Unknown fields that must hold their default value in all known files;
-    /// other values are rejected on parse. Unknown fields not listed here are
-    /// kept verbatim.
+    /// Fields that must hold their default value in all known files;
+    /// other values are rejected on parse (see `bin.validateConstantFields`).
     pub const constant_fields = .{ .unknown4, .unknown5, .unknown6 };
 };
 
@@ -278,9 +276,8 @@ pub const MySetting2 = struct {
     /// Version string found in `MYSETTING2.DAT` files written by Rekordbox 6.6.1.
     pub const default_version = "0.001";
 
-    /// Unknown fields that must hold their default value in all known files;
-    /// other values are rejected on parse. Unknown fields not listed here are
-    /// kept verbatim.
+    /// Fields that must hold their default value in all known files;
+    /// other values are rejected on parse (see `bin.validateConstantFields`).
     pub const constant_fields = .{ .unknown1, .unknown3 };
 };
 

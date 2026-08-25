@@ -129,10 +129,7 @@ pub const BeatGrid = struct {
     /// slice on write.
     beats: []Beat = &.{},
 
-    /// Kind of the section this content serializes as.
     const kind: Kind = .beat_grid;
-    /// Fixed size of the section header: the 12-byte prefix plus the
-    /// preamble fields.
     const header_size: u32 = 24;
 
     fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!BeatGrid {
@@ -145,7 +142,6 @@ pub const BeatGrid = struct {
         return .{ .unknown1 = unknown1, .unknown2 = unknown2, .beats = beats };
     }
 
-    /// Bytes of section content beyond the fixed header.
     fn contentLen(bg: *const BeatGrid) usize {
         return bin.serializedLen(Beat) * bg.beats.len;
     }
@@ -207,13 +203,9 @@ pub const Cue = struct {
     /// Time in milliseconds at which the loop jumps back to `time` (at
     /// normal playback speed).
     loop_time: u32 = 0xFFFF_FFFF,
-    /// Unknown field.
     unknown4: u32 = 0,
-    /// Unknown field.
     unknown5: u32 = 0,
-    /// Unknown field.
     unknown6: u32 = 0,
-    /// Unknown field.
     unknown7: u32 = 0,
 
     /// Length of a serialized entry, its nested header included.
@@ -267,10 +259,7 @@ pub const CueList = struct {
     /// byte-identical.
     entry_header_size: u32 = 16,
 
-    /// Kind of the section this content serializes as.
     const kind: Kind = .cue_list;
-    /// Fixed size of the section header: the 12-byte prefix plus the
-    /// preamble fields.
     const header_size: u32 = 24;
 
     fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!CueList {
@@ -296,7 +285,6 @@ pub const CueList = struct {
         };
     }
 
-    /// Bytes of section content beyond the fixed header.
     fn contentLen(cl: *const CueList) usize {
         return Cue.wire_len * cl.cues.len;
     }
@@ -407,9 +395,7 @@ pub const ExtendedCue = struct {
     color: util.ColorIndex = .none,
     /// Unknown field, `1` in all known files (stored verbatim).
     unknown3: u8 = 1,
-    /// Unknown field.
     unknown4: u16 = 0,
-    /// Unknown field.
     unknown5: u32 = 0,
     /// Loop size numerator (if this is a quantized loop).
     loop_numerator: u16 = 0,
@@ -490,15 +476,11 @@ pub const ExtendedCue = struct {
     /// of a player that has loaded the cue. `(0, 0, 0)` if no color is
     /// associated with this hot cue.
     hot_cue_color_rgb: [3]u8 = .{ 0, 0, 0 },
-    /// Unknown field.
     unknown6: u32 = 0,
     /// Unknown field, `0x00C17000` in all known files (stored verbatim).
     unknown7: u32 = 0x00C1_7000,
-    /// Unknown field.
     unknown8: u32 = 0,
-    /// Unknown field.
     unknown9: u32 = 0,
-    /// Unknown field.
     unknown10: u32 = 0,
     /// Trailing unknown bytes after `unknown10` to the end of the entry:
     /// `total_size - 68 - comment byte_len` bytes.
@@ -548,15 +530,11 @@ pub const ExtendedCueList = struct {
     /// on write.
     cues: []ExtendedCue = &.{},
 
-    /// Kind of the section this content serializes as.
     const kind: Kind = .extended_cue_list;
-    /// Fixed size of the section header: the 12-byte prefix plus the
-    /// preamble fields.
     const header_size: u32 = 20;
 
-    /// Unknown fields that must hold their default value in all known files;
-    /// other values are rejected on parse (rekordcrate asserts `unknown` is
-    /// zero on read).
+    /// Fields that must hold their default value in all known files;
+    /// other values are rejected on parse (see `bin.validateConstantFields`).
     pub const constant_fields = .{.unknown};
 
     fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!ExtendedCueList {
@@ -574,7 +552,6 @@ pub const ExtendedCueList = struct {
         return .{ .list_type = list_type, .unknown = unknown, .cues = cues };
     }
 
-    /// Bytes of section content beyond the fixed header.
     fn contentLen(cl: *const ExtendedCueList) usize {
         var len: usize = 0;
         for (cl.cues) |*cue| len += cue.wireLen();
@@ -595,10 +572,7 @@ pub const Path = struct {
     /// must equal the section's `content_size`.
     path: LenPrefixedWideString = .{},
 
-    /// Kind of the section this content serializes as.
     const kind: Kind = .path;
-    /// Fixed size of the section header: the 12-byte prefix plus the
-    /// preamble fields.
     const header_size: u32 = 16;
 
     fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!Path {
@@ -609,7 +583,6 @@ pub const Path = struct {
         return p;
     }
 
-    /// Bytes of section content beyond the fixed header.
     fn contentLen(p: *const Path) usize {
         return p.path.byte_len();
     }
@@ -621,15 +594,11 @@ pub const Path = struct {
 
 /// Seek information for variable bitrate files.
 pub const Vbr = struct {
-    /// Unknown field.
     unknown1: u32 = 0,
     /// Unknown data blob, the raw section content.
     data: []const u8 = &.{},
 
-    /// Kind of the section this content serializes as.
     const kind: Kind = .vbr;
-    /// Fixed size of the section header: the 12-byte prefix plus the
-    /// preamble fields.
     const header_size: u32 = 16;
 
     fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!Vbr {
@@ -639,7 +608,6 @@ pub const Vbr = struct {
         return .{ .unknown1 = unknown1, .data = data };
     }
 
-    /// Bytes of section content beyond the fixed header.
     fn contentLen(v: *const Vbr) usize {
         return v.data.len;
     }
@@ -670,7 +638,6 @@ pub const WaveformPreviewColumn = packed struct(u8) {
 pub const TinyWaveformPreviewColumn = packed struct(u8) {
     /// Height of the column in pixels.
     height: u4 = 0,
-    /// Unknown field.
     unused: u4 = 0,
 };
 
@@ -694,7 +661,6 @@ pub const WaveformColorPreviewColumn = struct {
 /// the fields big-endian, starting with `red` in the three most significant
 /// bits (see `WaveformPreviewColumn` for the field order).
 pub const WaveformColorDetailColumn = packed struct(u16) {
-    /// Unknown field.
     unknown: u2 = 0,
     /// Height of the column.
     height: u5 = 0,
@@ -751,10 +717,7 @@ fn WaveformSection(comptime spec: WaveformSpec) type {
     return struct {
         const Self = @This();
 
-        /// Kind of the section this content serializes as.
         const kind: Kind = spec.kind;
-        /// Fixed size of the section header: the 12-byte prefix plus the
-        /// preamble fields.
         const header_size: u32 = 12 + 4 + (if (spec.entry_bytes != null) 4 else 0) + (if (spec.unknown != null) 4 else 0);
 
         /// Unknown preamble field, stored verbatim (see the section alias
@@ -784,7 +747,6 @@ fn WaveformSection(comptime spec: WaveformSpec) type {
             };
         }
 
-        /// Bytes of section content beyond the fixed header.
         fn contentLen(w: *const Self) usize {
             return bin.serializedLen(Column) * w.data.len;
         }
@@ -912,19 +874,16 @@ pub const Phrase = struct {
     beat: u16 = 0,
     /// Kind of phrase that Rekordbox has identified (?).
     kind: u16 = 0,
-    /// Unknown field.
     unknown1: u8 = 0,
     /// Flag byte used for numbered variations (in case of the `high` mood).
     ///
     /// See <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/anlz.html#high-phrase-variants>
     k1: u8 = 0,
-    /// Unknown field.
     unknown2: u8 = 0,
     /// Flag byte used for numbered variations (in case of the `high` mood).
     ///
     /// See <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/anlz.html#high-phrase-variants>
     k2: u8 = 0,
-    /// Unknown field.
     unknown3: u8 = 0,
     /// Flag that determines if only `beat2` is used (0), or if `beat2`,
     /// `beat3` and `beat4` are used (1).
@@ -935,13 +894,11 @@ pub const Phrase = struct {
     beat3: u16 = 0,
     /// Beat number.
     beat4: u16 = 0,
-    /// Unknown field.
     unknown4: u8 = 0,
     /// Flag byte used for numbered variations (in case of the `high` mood).
     ///
     /// See <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/anlz.html#high-phrase-variants>
     k3: u8 = 0,
-    /// Unknown field.
     unknown5: u8 = 0,
     /// Indicates if there are fill (non-phrase) beats at the end of the
     /// phrase.
@@ -955,17 +912,13 @@ pub const Phrase = struct {
 pub const SongStructureData = struct {
     /// Overall type of phrase structure.
     mood: Mood = .high,
-    /// Unknown field.
     unknown1: u32 = 0,
-    /// Unknown field.
     unknown2: u16 = 0,
     /// Number of the beat at which the last recognized phrase ends.
     end_beat: u16 = 0,
-    /// Unknown field.
     unknown3: u16 = 0,
     /// Stylistic bank assigned in Lighting Mode.
     bank: Bank = .default,
-    /// Unknown field.
     unknown4: u8 = 0,
     /// Phrase entries. The `len_entries` count is recomputed from this
     /// slice on write (and feeds the XOR key).
@@ -1025,10 +978,7 @@ pub const SongStructure = struct {
     /// Song structure data.
     data: SongStructureData = .{},
 
-    /// Kind of the section this content serializes as.
     const kind: Kind = .song_structure;
-    /// Fixed size of the section header: the 12-byte prefix plus the
-    /// preamble fields.
     const header_size: u32 = 32;
 
     fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!SongStructure {
@@ -1048,7 +998,6 @@ pub const SongStructure = struct {
         return .{ .is_encrypted = is_encrypted, .data = data };
     }
 
-    /// Bytes of section content beyond the fixed header.
     fn contentLen(ss: *const SongStructure) usize {
         return bin.serializedLen(Phrase) * ss.data.phrases.len;
     }
