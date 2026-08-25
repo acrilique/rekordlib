@@ -25,6 +25,7 @@
 //! with zig cc; `system` binds the consumer's own unprefixed SQLCipher.
 
 const std = @import("std");
+const util = @import("util");
 const opts = @import("options");
 const c = @import("c");
 
@@ -1257,47 +1258,23 @@ const schema_sql =
 ;
 
 /// The eight fixed track colors a fresh export carries (rbox's migration
-/// inserts the same rows).
-const default_colors = [_]Color{
-    .{ .color_id = 1, .name = "Pink" },
-    .{ .color_id = 2, .name = "Red" },
-    .{ .color_id = 3, .name = "Orange" },
-    .{ .color_id = 4, .name = "Yellow" },
-    .{ .color_id = 5, .name = "Green" },
-    .{ .color_id = 6, .name = "Aqua" },
-    .{ .color_id = 7, .name = "Blue" },
-    .{ .color_id = 8, .name = "Purple" },
+/// inserts the same rows): `util.color_specs` projected onto `Color` rows.
+const default_colors = proj: {
+    var rows: [util.color_specs.len]Color = undefined;
+    for (util.color_specs, 0..) |spec, i| rows[i] = .{ .color_id = spec.id, .name = spec.name };
+    break :proj rows;
 };
 
-/// The 27 browse-column headers a fresh export carries.
-const default_menu_items = [_]MenuItem{
-    .{ .menuItem_id = 1, .kind = 128, .name = "\u{fffa}GENRE\u{fffb}" },
-    .{ .menuItem_id = 2, .kind = 129, .name = "\u{fffa}ARTIST\u{fffb}" },
-    .{ .menuItem_id = 3, .kind = 130, .name = "\u{fffa}ALBUM\u{fffb}" },
-    .{ .menuItem_id = 4, .kind = 131, .name = "\u{fffa}TRACK\u{fffb}" },
-    .{ .menuItem_id = 5, .kind = 133, .name = "\u{fffa}BPM\u{fffb}" },
-    .{ .menuItem_id = 6, .kind = 134, .name = "\u{fffa}RATING\u{fffb}" },
-    .{ .menuItem_id = 7, .kind = 135, .name = "\u{fffa}YEAR\u{fffb}" },
-    .{ .menuItem_id = 8, .kind = 136, .name = "\u{fffa}REMIXER\u{fffb}" },
-    .{ .menuItem_id = 9, .kind = 137, .name = "\u{fffa}LABEL\u{fffb}" },
-    .{ .menuItem_id = 10, .kind = 138, .name = "\u{fffa}ORIGINAL ARTIST\u{fffb}" },
-    .{ .menuItem_id = 11, .kind = 139, .name = "\u{fffa}KEY\u{fffb}" },
-    .{ .menuItem_id = 12, .kind = 141, .name = "\u{fffa}CUE\u{fffb}" },
-    .{ .menuItem_id = 13, .kind = 142, .name = "\u{fffa}COLOR\u{fffb}" },
-    .{ .menuItem_id = 14, .kind = 146, .name = "\u{fffa}TIME\u{fffb}" },
-    .{ .menuItem_id = 15, .kind = 147, .name = "\u{fffa}BITRATE\u{fffb}" },
-    .{ .menuItem_id = 16, .kind = 148, .name = "\u{fffa}FILE NAME\u{fffb}" },
-    .{ .menuItem_id = 17, .kind = 132, .name = "\u{fffa}PLAYLIST\u{fffb}" },
-    .{ .menuItem_id = 18, .kind = 152, .name = "\u{fffa}HOT CUE BANK\u{fffb}" },
-    .{ .menuItem_id = 19, .kind = 149, .name = "\u{fffa}HISTORY\u{fffb}" },
-    .{ .menuItem_id = 20, .kind = 145, .name = "\u{fffa}SEARCH\u{fffb}" },
-    .{ .menuItem_id = 21, .kind = 150, .name = "\u{fffa}COMMENTS\u{fffb}" },
-    .{ .menuItem_id = 22, .kind = 140, .name = "\u{fffa}DATE ADDED\u{fffb}" },
-    .{ .menuItem_id = 23, .kind = 151, .name = "\u{fffa}DJ PLAY COUNT\u{fffb}" },
-    .{ .menuItem_id = 24, .kind = 144, .name = "\u{fffa}FOLDER\u{fffb}" },
-    .{ .menuItem_id = 25, .kind = 161, .name = "\u{fffa}DEFAULT\u{fffb}" },
-    .{ .menuItem_id = 26, .kind = 162, .name = "\u{fffa}ALPHABET\u{fffb}" },
-    .{ .menuItem_id = 27, .kind = 170, .name = "\u{fffa}MATCHING\u{fffb}" },
+/// The 27 browse-column headers a fresh export carries:
+/// `util.column_specs` projected onto `MenuItem` rows.
+const default_menu_items = proj: {
+    var rows: [util.column_specs.len]MenuItem = undefined;
+    for (util.column_specs, 0..) |spec, i| rows[i] = .{
+        .menuItem_id = spec.id,
+        .kind = spec.kind,
+        .name = spec.name,
+    };
+    break :proj rows;
 };
 
 /// The browse-category layout over `menuItem` a fresh export carries.

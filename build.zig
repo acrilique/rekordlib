@@ -10,6 +10,14 @@ pub fn build(b: *std.Build) void {
     const dlp_options = b.addOptions();
     dlp_options.addOption(DlpMode, "dlp", dlp_mode);
 
+    // util stays a separate module so dlp (which cannot reach the library's
+    // files by relative import) shares the wire tables.
+    const util = b.addModule("util", .{
+        .root_source_file = b.path("src/util.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // The vendored build renames every sqlite3_/sqlcipher_ export to rl_*;
     // the system build binds the consumer's own unprefixed SQLCipher.
     const dlp_c_header = switch (dlp_mode) {
@@ -29,6 +37,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "c", .module = dlp_translate.createModule() },
             .{ .name = "options", .module = dlp_options.createModule() },
+            .{ .name = "util", .module = util },
         },
     });
     switch (dlp_mode) {
@@ -48,12 +57,6 @@ pub fn build(b: *std.Build) void {
 
     const bin = b.addModule("bin", .{
         .root_source_file = b.path("src/bin.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const util = b.addModule("util", .{
-        .root_source_file = b.path("src/util.zig"),
         .target = target,
         .optimize = optimize,
     });

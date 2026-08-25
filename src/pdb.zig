@@ -3016,51 +3016,6 @@ pub const ext_table_page_types = [2]PageType{
     @enumFromInt(@intFromEnum(ExtPageType.track_tag)),
 };
 
-/// The default color rows rekordbox inserts into a new export: an id, the
-/// color it names, and the color's display name.
-const default_colors = [_]struct { id: u8, color: util.ColorIndex, name: []const u8 }{
-    .{ .id = 1, .color = .pink, .name = "Pink" },
-    .{ .id = 2, .color = .red, .name = "Red" },
-    .{ .id = 3, .color = .orange, .name = "Orange" },
-    .{ .id = 4, .color = .yellow, .name = "Yellow" },
-    .{ .id = 5, .color = .green, .name = "Green" },
-    .{ .id = 6, .color = .aqua, .name = "Aqua" },
-    .{ .id = 7, .color = .blue, .name = "Blue" },
-    .{ .id = 8, .color = .purple, .name = "Purple" },
-};
-
-/// The default metadata-category rows rekordbox inserts into a new
-/// export: an id, an unknown constant, and the annotation-wrapped name.
-const default_columns = [_]struct { id: u16, unknown0: u16, name: []const u8 }{
-    .{ .id = 1, .unknown0 = 128, .name = "\u{FFFA}GENRE\u{FFFB}" },
-    .{ .id = 2, .unknown0 = 129, .name = "\u{FFFA}ARTIST\u{FFFB}" },
-    .{ .id = 3, .unknown0 = 130, .name = "\u{FFFA}ALBUM\u{FFFB}" },
-    .{ .id = 4, .unknown0 = 131, .name = "\u{FFFA}TRACK\u{FFFB}" },
-    .{ .id = 5, .unknown0 = 133, .name = "\u{FFFA}BPM\u{FFFB}" },
-    .{ .id = 6, .unknown0 = 134, .name = "\u{FFFA}RATING\u{FFFB}" },
-    .{ .id = 7, .unknown0 = 135, .name = "\u{FFFA}YEAR\u{FFFB}" },
-    .{ .id = 8, .unknown0 = 136, .name = "\u{FFFA}REMIXER\u{FFFB}" },
-    .{ .id = 9, .unknown0 = 137, .name = "\u{FFFA}LABEL\u{FFFB}" },
-    .{ .id = 10, .unknown0 = 138, .name = "\u{FFFA}ORIGINAL ARTIST\u{FFFB}" },
-    .{ .id = 11, .unknown0 = 139, .name = "\u{FFFA}KEY\u{FFFB}" },
-    .{ .id = 12, .unknown0 = 141, .name = "\u{FFFA}CUE\u{FFFB}" },
-    .{ .id = 13, .unknown0 = 142, .name = "\u{FFFA}COLOR\u{FFFB}" },
-    .{ .id = 14, .unknown0 = 146, .name = "\u{FFFA}TIME\u{FFFB}" },
-    .{ .id = 15, .unknown0 = 147, .name = "\u{FFFA}BITRATE\u{FFFB}" },
-    .{ .id = 16, .unknown0 = 148, .name = "\u{FFFA}FILE NAME\u{FFFB}" },
-    .{ .id = 17, .unknown0 = 132, .name = "\u{FFFA}PLAYLIST\u{FFFB}" },
-    .{ .id = 18, .unknown0 = 152, .name = "\u{FFFA}HOT CUE BANK\u{FFFB}" },
-    .{ .id = 19, .unknown0 = 149, .name = "\u{FFFA}HISTORY\u{FFFB}" },
-    .{ .id = 20, .unknown0 = 145, .name = "\u{FFFA}SEARCH\u{FFFB}" },
-    .{ .id = 21, .unknown0 = 150, .name = "\u{FFFA}COMMENTS\u{FFFB}" },
-    .{ .id = 22, .unknown0 = 140, .name = "\u{FFFA}DATE ADDED\u{FFFB}" },
-    .{ .id = 23, .unknown0 = 151, .name = "\u{FFFA}DJ PLAY COUNT\u{FFFB}" },
-    .{ .id = 24, .unknown0 = 144, .name = "\u{FFFA}FOLDER\u{FFFB}" },
-    .{ .id = 25, .unknown0 = 161, .name = "\u{FFFA}DEFAULT\u{FFFB}" },
-    .{ .id = 26, .unknown0 = 162, .name = "\u{FFFA}ALPHABET\u{FFFB}" },
-    .{ .id = 27, .unknown0 = 170, .name = "\u{FFFA}MATCHING\u{FFFB}" },
-};
-
 /// The default menu rows rekordbox inserts into a new export, in row
 /// order.
 const default_menus = [_]struct {
@@ -3124,9 +3079,11 @@ fn addDefaultRow(db: *Database, payload: anytype) DatabaseModifyError!void {
     _ = try db.addRow(&row);
 }
 
+/// Inserts the default color rows (`util.color_specs`) rekordbox writes
+/// into a new export.
 pub fn insertDefaultColors(db: *Database) DatabaseModifyError!void {
     const a = db.arena.allocator();
-    for (default_colors) |entry| {
+    for (util.color_specs) |entry| {
         try addDefaultRow(db, Color{
             .unknown2 = entry.id,
             .color = entry.color,
@@ -3135,12 +3092,14 @@ pub fn insertDefaultColors(db: *Database) DatabaseModifyError!void {
     }
 }
 
+/// Inserts the default metadata-category rows (`util.column_specs`)
+/// rekordbox writes into a new export.
 pub fn insertDefaultColumns(db: *Database) DatabaseModifyError!void {
     const a = db.arena.allocator();
-    for (default_columns) |entry| {
+    for (util.column_specs) |entry| {
         try addDefaultRow(db, ColumnEntry{
             .id = entry.id,
-            .unknown0 = entry.unknown0,
+            .unknown0 = entry.kind,
             .column_name = try defaultString(a, entry.name),
         });
     }
