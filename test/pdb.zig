@@ -940,6 +940,32 @@ test "index page content pads to capacity with empty entries and zeros" {
     try testing.expect(c.atEnd());
 }
 
+test "index page content pads to the full page off the entry grid" {
+    const alloc = testing.allocator;
+    const content = pdb.IndexPageContent{ .header = .{ .page_index = 1, .next_page = 2 } };
+
+    var e = bin.Emitter.init(alloc);
+    defer e.deinit();
+    // Unreachable from a parsed database — Header.decode refuses the
+    // geometry — but a hand-built one must still encode a whole page:
+    // the entry capacity truncates to 1004 and the remainder pads.
+    try content.encode(&e, 4097);
+    try testing.expectEqual(@as(usize, 4097 - 0x20), e.written().len);
+}
+
+test "database parse rejects a page size off the index entry grid" {
+    const alloc = testing.allocator;
+    // Everything about page 0 is valid except the geometry: index pages
+    // quantize their entries at 4-byte strides, so a file with this page
+    // size could be parsed but never saved whole — it must fail at the
+    // trust boundary instead of saving back silently emptied.
+    var buf = [_]u8{0} ** 4097;
+    std.mem.writeInt(u32, buf[4..8], 4097, .little);
+    std.mem.writeInt(u32, buf[16..20], 5, .little);
+    std.mem.writeInt(u32, buf[20..24], 1, .little);
+    try testing.expectError(error.UnexpectedValue, pdb.Database.parse(alloc, &buf, .plain));
+}
+
 test "index page content rejects malformed input" {
     const alloc = testing.allocator;
 

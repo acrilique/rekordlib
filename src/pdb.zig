@@ -862,8 +862,8 @@ pub const IndexPageContent = struct {
     }
 
     /// Writes the header with its verbatim `num_entries`, the entries,
-    /// `totalEntries(page_size) - entries.len` empty entries, and the
-    /// trailing zeros.
+    /// `totalEntries(page_size) - entries.len` empty entries, and zero
+    /// padding to the end of the page.
     pub fn encode(self: *const IndexPageContent, e: *bin.Emitter, page_size: usize) IndexPageEncodeError!void {
         if (self.entries.len > std.math.maxInt(u16) or
             self.entries.len < self.header.num_entries) return error.UnexpectedValue;
@@ -873,7 +873,18 @@ pub const IndexPageContent = struct {
         try bin.putStruct(e, self.header, .little);
         for (self.entries) |entry| try bin.putStruct(e, entry, .little);
         for (self.entries.len..capacity) |_| try bin.putStruct(e, IndexEntry.empty, .little);
-        try e.pad(index_page_zero_tail);
+        // Pad to the full page, not just the fixed zero tail:
+        // `totalEntries` rounds the entry capacity down to whole entries,
+        // so a page size off the entry grid would otherwise encode short
+        // and shift every later page boundary. Aligned geometries pad
+        // exactly the tail, so their output is unchanged. The page header
+        // precedes this content, so the whole page's bytes are accounted.
+        const written = bin.serializedLen(PageHeader) +
+            bin.serializedLen(IndexPageHeader) +
+            capacity * bin.serializedLen(IndexEntry);
+        if (written > page_size or page_size - written < index_page_zero_tail)
+            return error.UnexpectedValue;
+        try e.pad(page_size - written);
     }
 
     pub fn deinit(content: *IndexPageContent, alloc: std.mem.Allocator) void {
@@ -2041,11 +2052,18 @@ pub const Header = struct {
     pub const constant_fields = .{ .magic, .gap };
 
     /// Reads the fixed fields (validating the magics and that the tables
-    /// fit within page 0), then the `num_tables` table entries. The
-    /// returned `tables` slice is allocated with `alloc`.
+    /// fit within page 0), then the `num_tables` table entries. A page
+    /// size off the index-entry grid is refused: index pages quantize
+    /// their entries at 4-byte strides, so such a geometry truncates the
+    /// entry capacity and can never encode back to the full page — a file
+    /// declaring it could be parsed but not saved without shifting every
+    /// later page boundary. The returned `tables` slice is allocated
+    /// with `alloc`.
     pub fn decode(c: *bin.Cursor, alloc: std.mem.Allocator) HeaderDecodeError!Header {
         var header = try bin.takeStruct(c, Header, .little);
         try bin.validateConstantFields(Header, header);
+        if (header.page_size % bin.serializedLen(IndexEntry) != 0)
+            return error.UnexpectedValue;
         if (headerFixedAndTablesLen(header.num_tables) > header.page_size)
             return error.UnexpectedValue;
         header.tables = try bin.takeStructSlice(
