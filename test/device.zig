@@ -1494,14 +1494,14 @@ test "writer state scans each fixture" {
         defer ex.deinit();
         const ws = try ex.writerState();
 
-        try testing.expectEqual(want.next_track_id, ws.next_track_id);
-        try testing.expectEqual(want.next_artist_id, ws.next_artist_id);
-        try testing.expectEqual(want.next_album_id, ws.next_album_id);
-        try testing.expectEqual(want.next_genre_id, ws.next_genre_id);
-        try testing.expectEqual(want.next_key_id, ws.next_key_id);
-        try testing.expectEqual(want.next_label_id, ws.next_label_id);
-        try testing.expectEqual(want.next_artwork_id, ws.next_artwork_id);
-        try testing.expectEqual(want.next_playlist_node_id, ws.next_playlist_node_id);
+        try testing.expectEqual(want.next_track_id, ws.next_track_id.next);
+        try testing.expectEqual(want.next_artist_id, ws.next_artist_id.next);
+        try testing.expectEqual(want.next_album_id, ws.next_album_id.next);
+        try testing.expectEqual(want.next_genre_id, ws.next_genre_id.next);
+        try testing.expectEqual(want.next_key_id, ws.next_key_id.next);
+        try testing.expectEqual(want.next_label_id, ws.next_label_id.next);
+        try testing.expectEqual(want.next_artwork_id, ws.next_artwork_id.next);
+        try testing.expectEqual(want.next_playlist_node_id, ws.next_playlist_node_id.next);
 
         try testing.expectEqual(want.track_ids, ws.track_ids.count());
         try testing.expectEqual(want.tracks_by_path.len, ws.tracks_by_path.count());
@@ -1544,7 +1544,7 @@ test "writer state pins with_anlz relationships" {
     // One top-level leaf playlist holding entries up to index 2
     // (max entry_index + 1 = 3, not the row count).
     try testing.expectEqual(false, ws.playlist_nodes.get(1).?);
-    try testing.expectEqual(@as(u32, 3), ws.playlist_entry_counts.get(1).?);
+    try testing.expectEqual(@as(u32, 3), ws.playlist_entry_counts.get(1).?.next);
 }
 
 test "writer state ignores dead-row remnants" {
@@ -1584,11 +1584,11 @@ test "writer state is lazy, cached, and pre-built by create" {
     const fresh = try created.writerState();
     // Fresh counters — id 0 is the null FK — and empty maps; the default
     // color/column/menu rows live in tables the writer doesn't track.
-    try testing.expectEqual(@as(u32, 1), fresh.next_track_id);
-    try testing.expectEqual(@as(u32, 1), fresh.next_artist_id);
-    try testing.expectEqual(@as(u32, 1), fresh.next_tag_id);
-    try testing.expectEqual(@as(u32, 0), fresh.next_category_position);
-    try testing.expectEqual(@as(u32, 0), fresh.next_tag_row_index);
+    try testing.expectEqual(@as(u32, 1), fresh.next_track_id.next);
+    try testing.expectEqual(@as(u32, 1), fresh.next_artist_id.next);
+    try testing.expectEqual(@as(u32, 1), fresh.next_tag_id.next);
+    try testing.expectEqual(@as(u32, 0), fresh.next_category_position.next);
+    try testing.expectEqual(@as(u32, 0), fresh.next_tag_row_index.next);
     try testing.expectEqual(@as(usize, 0), fresh.track_ids.count());
     try testing.expectEqual(@as(usize, 0), fresh.tracks_by_path.count());
 }
@@ -1604,7 +1604,71 @@ test "writer state scans num_rows at scale" {
     defer state.deinit();
 
     try testing.expectEqual(@as(usize, 3886), state.track_ids.count());
-    try testing.expect(state.next_track_id > 3886);
+    try testing.expect(state.next_track_id.next > 3886);
+}
+
+test "IdMint rejects an exhausted id space" {
+    var m = device.IdMint(u32){ .next = 5 };
+    try testing.expectEqual(@as(u32, 5), try m.mint());
+    try testing.expectEqual(@as(u32, 6), try m.mint());
+
+    // The boundary id is never minted...
+    m = .{ .next = std.math.maxInt(u32) };
+    try testing.expectError(error.IdSpaceExhausted, m.mint());
+    // ...nor accepted from an untrusted database.
+    try testing.expectError(error.IdSpaceExhausted, m.raisePast(std.math.maxInt(u32)));
+    // One below it leaves the space exhausted without overflowing.
+    m = .{ .next = 0 };
+    try m.raisePast(std.math.maxInt(u32) - 1);
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), m.next);
+    try testing.expectError(error.IdSpaceExhausted, m.mint());
+}
+
+test "writer state scan rejects a max track id" {
+    const alloc = testing.allocator;
+    var db = try pdb.Database.create(alloc, .plain, &pdb.standard_table_page_types);
+    defer db.deinit();
+    try pdb.insertDefaultColors(&db);
+    try pdb.insertDefaultColumns(&db);
+    try pdb.insertDefaultMenus(&db);
+    const a = db.arena.allocator();
+    const track = try a.create(pdb.Track);
+    track.* = .{
+        .id = std.math.maxInt(u32),
+        .offsets = .{ .inner = .{
+            .file_path = try pdb.DeviceSQLString.fromUtf8(a, "/x.mp3"),
+        } },
+    };
+    try pdb.padTrackCommentToMinimum(track, a);
+    var row = pdb.Row{ .track = track };
+    _ = try db.addRow(&row);
+
+    // Saturation would leave the counter at maxInt and collide every
+    // later mint with the hostile row (or panic on the bump).
+    try testing.expectError(
+        error.IdSpaceExhausted,
+        device.scanWriterState(alloc, &db),
+    );
+}
+
+test "writer state scan rejects a max playlist entry index" {
+    const alloc = testing.allocator;
+    var db = try pdb.Database.create(alloc, .plain, &pdb.standard_table_page_types);
+    defer db.deinit();
+    const a = db.arena.allocator();
+    const entry = try a.create(pdb.PlaylistEntry);
+    entry.* = .{
+        .entry_index = std.math.maxInt(u32),
+        .track_id = 1,
+        .playlist_id = 1,
+    };
+    var row = pdb.Row{ .playlist_entry = entry };
+    _ = try db.addRow(&row);
+
+    try testing.expectError(
+        error.IdSpaceExhausted,
+        device.scanWriterState(alloc, &db),
+    );
 }
 
 /// Builds a boxed TagOrCategory row on `a`, for the ext-scan tests.
@@ -1653,10 +1717,10 @@ test "ext tag scan recovers a built ext database" {
     defer state.deinit();
     try device.scanExtTags(state.arena.allocator(), &db, &state);
 
-    try testing.expectEqual(@as(u32, 21), state.next_tag_id);
-    try testing.expectEqual(@as(u32, 4), state.next_tag_row_index);
+    try testing.expectEqual(@as(u32, 21), state.next_tag_id.next);
+    try testing.expectEqual(@as(u32, 4), state.next_tag_row_index.next);
     try testing.expect(state.tag_categories.contains(7));
-    try testing.expectEqual(@as(u32, 1), state.next_category_position);
+    try testing.expectEqual(@as(u32, 1), state.next_category_position.next);
     try testing.expectEqual(@as(u32, 2), state.tags_by_key.count());
     try testing.expectEqual(@as(u32, 9), state.tags_by_key.get(.{
         .category_id = 7,
@@ -1666,7 +1730,26 @@ test "ext tag scan recovers a built ext database" {
         .category_id = 7,
         .label = "Dub",
     }).?);
-    try testing.expectEqual(@as(u32, 3), state.tag_leaf_counts.get(7).?);
+    try testing.expectEqual(@as(u32, 3), state.tag_leaf_counts.get(7).?.next);
+}
+
+test "ext tag scan rejects a max tag id" {
+    const alloc = testing.allocator;
+    var db = try pdb.Database.create(alloc, .ext, &[_]pdb.PageType{
+        @enumFromInt(@intFromEnum(pdb.ExtPageType.tag)),
+        @enumFromInt(@intFromEnum(pdb.ExtPageType.track_tag)),
+    });
+    defer db.deinit();
+    const a = db.arena.allocator();
+    var hostile = try testTagRow(a, 0, 0, std.math.maxInt(u32), true, 0, "X");
+    _ = try db.addRow(&hostile);
+
+    var state = device.WriterState{ .arena = std.heap.ArenaAllocator.init(alloc) };
+    defer state.deinit();
+    try testing.expectError(
+        error.IdSpaceExhausted,
+        device.scanExtTags(state.arena.allocator(), &db, &state),
+    );
 }
 
 test "ext tag scan recovers the with_anlz fixture" {
@@ -1689,9 +1772,9 @@ test "ext tag scan recovers the with_anlz fixture" {
     // 0-3) — holding 7/8/8/1 leaves; 28 Tag rows stepping index_shift by
     // 0x20; leaf ids are random-looking u32s (the max is Acid House's
     // 4275955888), mirroring the OL db's 28 myTag rows.
-    try testing.expectEqual(@as(u32, 4275955889), state.next_tag_id);
-    try testing.expectEqual(@as(u32, 28), state.next_tag_row_index);
-    try testing.expectEqual(@as(u32, 4), state.next_category_position);
+    try testing.expectEqual(@as(u32, 4275955889), state.next_tag_id.next);
+    try testing.expectEqual(@as(u32, 28), state.next_tag_row_index.next);
+    try testing.expectEqual(@as(u32, 4), state.next_category_position.next);
     try testing.expectEqual(@as(usize, 4), state.tag_categories.count());
     for ([_]u32{ 1, 2, 3, 4 }) |id| try testing.expect(state.tag_categories.contains(id));
     try testing.expectEqual(@as(u32, 4275955888), state.tags_by_key.get(.{
@@ -1707,10 +1790,10 @@ test "ext tag scan recovers the with_anlz fixture" {
         .label = "My Comment",
     }).?);
     try testing.expectEqual(@as(usize, 24), state.tags_by_key.count());
-    try testing.expectEqual(@as(u32, 7), state.tag_leaf_counts.get(1).?);
-    try testing.expectEqual(@as(u32, 8), state.tag_leaf_counts.get(2).?);
-    try testing.expectEqual(@as(u32, 8), state.tag_leaf_counts.get(3).?);
-    try testing.expectEqual(@as(u32, 1), state.tag_leaf_counts.get(4).?);
+    try testing.expectEqual(@as(u32, 7), state.tag_leaf_counts.get(1).?.next);
+    try testing.expectEqual(@as(u32, 8), state.tag_leaf_counts.get(2).?.next);
+    try testing.expectEqual(@as(u32, 8), state.tag_leaf_counts.get(3).?.next);
+    try testing.expectEqual(@as(u32, 1), state.tag_leaf_counts.get(4).?.next);
 }
 
 // --- writer: add_track (D6) ----------------------------------------------------
@@ -1839,7 +1922,7 @@ test "a string that fails to encode leaves the export untouched" {
     );
     try testing.expectEqual(@as(usize, 0), try countTableRows(try ex.openPdb(), .tracks));
     try testing.expectEqual(@as(usize, 0), try countTableRows(try ex.openPdb(), .artists));
-    try testing.expectEqual(@as(u32, 1), (try ex.writerState()).next_track_id);
+    try testing.expectEqual(@as(u32, 1), (try ex.writerState()).next_track_id.next);
 
     // The export still accepts the next, valid track — with id 1.
     const outcome = try ex.addTrack(.{ .title = "ok", .file_path = "/Contents/ok.mp3" });

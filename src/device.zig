@@ -430,14 +430,14 @@ pub const OpenOlLibraryError =
 
 /// Error of the OL mirroring helpers: pinning the working directory,
 /// examining or loading the existing `exportLibrary.db` (a drifted schema
-/// is `SchemaMismatch`), building its path or a device ANLZ path, or
-/// allocating.
+/// is `SchemaMismatch`), building its path or a device ANLZ path,
+/// allocating, or an OL-side id that exhausts its space.
 pub const OlMirrorError =
     std.Io.Dir.OpenError ||
     std.Io.Dir.AccessError ||
     dlp.LoadError ||
     std.mem.Allocator.Error ||
-    error{ CwdUnavailable, InvalidUtf8 };
+    error{ CwdUnavailable, InvalidUtf8, IdSpaceExhausted };
 
 /// `bitmask` value on fresh Rekordbox Track rows (`0x000c0700`); the
 /// OneLibrary db mirrors it as `contentLink`. Copy exactly.
@@ -1188,7 +1188,6 @@ pub const DeviceExport = struct {
                 return .{ .id = id, .is_new = false };
         }
         try e.primeOlStore();
-        const track_id = state.next_track_id;
 
         // The caller's data fails here or never: nothing below this point
         // is rolled back.
@@ -1197,6 +1196,7 @@ pub const DeviceExport = struct {
             if (slot.*) |*file| file.deinit(e.alloc);
         };
         const row = try e.buildTrackRow(track, track.analysis != null);
+        const track_id = try state.next_track_id.mint();
 
         const db = try e.openPdb();
         const artist_id = try getOrCreateArtist(state, db, track.artist);
@@ -1239,7 +1239,6 @@ pub const DeviceExport = struct {
         var row_union = pdb.Row{ .track = row };
         _ = try db.addRow(&row_union);
 
-        state.next_track_id += 1;
         state.track_ids.putAssumeCapacity(track_id, {});
         if (owned_path) |path| state.tracks_by_path.putAssumeCapacity(path, track_id);
         for (anlz_files) |slot| if (slot) |file|
@@ -1494,7 +1493,7 @@ pub const DeviceExport = struct {
         state: *WriterState,
         db: *pdb.Database,
         map: *std.StringHashMapUnmanaged(u32),
-        counter: *u32,
+        counter: *IdMint(u32),
         comptime build_row: fn (
             std.mem.Allocator,
             u32,
@@ -1505,13 +1504,12 @@ pub const DeviceExport = struct {
         if (name.len == 0) return 0;
         if (map.get(name)) |id| return id;
 
-        const id = counter.*;
+        const id = try counter.mint();
         const sa = state.arena.allocator();
         const owned = try sa.dupe(u8, name);
         try map.ensureUnusedCapacity(sa, 1);
         var row = try build_row(db.arena.allocator(), id, name);
         _ = try db.addRow(&row);
-        counter.* = id + 1;
         map.putAssumeCapacity(owned, id);
         return id;
     }
@@ -1529,7 +1527,7 @@ pub const DeviceExport = struct {
         if (state.albums_by_artist_and_name.get(.{ .artist_id = artist_id, .name = name })) |id|
             return id;
 
-        const id = state.next_album_id;
+        const id = try state.next_album_id.mint();
         const sa = state.arena.allocator();
         const owned = try sa.dupe(u8, name);
         try state.albums_by_artist_and_name.ensureUnusedCapacity(sa, 1);
@@ -1542,7 +1540,6 @@ pub const DeviceExport = struct {
         };
         var row = pdb.Row{ .album = boxed };
         _ = try db.addRow(&row);
-        state.next_album_id += 1;
         state.albums_by_artist_and_name.putAssumeCapacity(
             AlbumKey{ .artist_id = artist_id, .name = owned },
             id,
@@ -1559,7 +1556,7 @@ pub const DeviceExport = struct {
         const canonical = try canonicalKeyName(sa, name);
         if (state.keys_by_canonical.get(canonical)) |id| return id;
 
-        const id = state.next_key_id;
+        const id = try state.next_key_id.mint();
         try state.keys_by_canonical.ensureUnusedCapacity(sa, 1);
         const a = db.arena.allocator();
         // The row stores the canonical spelling so later lookups collide
@@ -1574,7 +1571,6 @@ pub const DeviceExport = struct {
         };
         var row = pdb.Row{ .key = boxed };
         _ = try db.addRow(&row);
-        state.next_key_id += 1;
         state.keys_by_canonical.putAssumeCapacity(canonical, id);
         return id;
     }
@@ -1606,9 +1602,9 @@ pub const DeviceExport = struct {
     }
 
     /// Inserts the node row and records it in the writer state. The name
-    /// encodes before anything is inserted, so a too-long name leaves
-    /// the export untouched; the id counter bumps only after the insert,
-    /// so a failed call mints no id.
+    /// encodes and the id mints before anything is inserted, so a failed
+    /// call leaves the export untouched — a failure past the mint may
+    /// burn an id, never mint a duplicate.
     fn createPlaylistNode(
         e: *DeviceExport,
         name: []const u8,
@@ -1625,20 +1621,20 @@ pub const DeviceExport = struct {
         }
 
         const db = try e.openPdb();
-        const id = state.next_playlist_node_id;
         const a = db.arena.allocator();
+        const name_str = try pdb.DeviceSQLString.fromUtf8(a, name);
+        const id = try state.next_playlist_node_id.mint();
         const boxed = try a.create(pdb.PlaylistTreeNode);
         boxed.* = .{
             .parent_id = parent_id,
             .id = id,
             .node_is_folder = if (is_folder) 1 else 0,
-            .name = try pdb.DeviceSQLString.fromUtf8(a, name),
+            .name = name_str,
         };
         try state.playlist_nodes.ensureUnusedCapacity(state.arena.allocator(), 1);
         var row = pdb.Row{ .playlist_tree_node = boxed };
         _ = try db.addRow(&row);
 
-        state.next_playlist_node_id = id + 1;
         state.playlist_nodes.putAssumeCapacity(id, is_folder);
 
         if (try e.olStore()) |store|
@@ -1666,7 +1662,9 @@ pub const DeviceExport = struct {
         if (node_is_folder) return error.UnknownForeignKey;
         if (!state.track_ids.contains(track_id)) return error.UnknownForeignKey;
 
-        const entry_index = state.playlist_entry_counts.get(playlist_id) orelse 0;
+        var entry_mint: IdMint(u32) =
+            state.playlist_entry_counts.get(playlist_id) orelse .{ .next = 0 };
+        const entry_index = try entry_mint.mint();
 
         const db = try e.openPdb();
         const a = db.arena.allocator();
@@ -1681,7 +1679,7 @@ pub const DeviceExport = struct {
         _ = try db.addRow(&row);
 
         const gop = state.playlist_entry_counts.getOrPutAssumeCapacity(playlist_id);
-        gop.value_ptr.* = entry_index + 1;
+        gop.value_ptr.* = entry_mint;
 
         if (try e.olStore()) |store| {
             try store.playlist_pairs.append(store.arena.allocator(), .{
@@ -1701,9 +1699,9 @@ pub const DeviceExport = struct {
         const state = try e.writerState();
         try e.primeOlStore();
         const db = try e.extDb();
-        const id = state.next_tag_id;
-        const row_index = state.next_tag_row_index;
-        const position = state.next_category_position;
+        const id = try state.next_tag_id.mint();
+        const row_index = try state.next_tag_row_index.mint();
+        const position = try state.next_category_position.mint();
         const a = db.arena.allocator();
         const boxed = try buildTagRow(a, .{
             .parent_id = 0,
@@ -1716,9 +1714,6 @@ pub const DeviceExport = struct {
         var row = pdb.Row{ .tag = boxed };
         _ = try db.addRow(&row);
 
-        state.next_tag_id = id + 1;
-        state.next_tag_row_index = row_index + 1;
-        state.next_category_position += 1;
         state.tag_categories.putAssumeCapacity(id, {});
 
         if (try e.olStore()) |store|
@@ -1788,8 +1783,8 @@ pub const DeviceExport = struct {
     }
 
     /// Resolves `(category_id, label)` to a leaf tag, inserting one when
-    /// no scanned or previously created leaf matches. The id counter and
-    /// `index_shift` row counter bump only after the insert.
+    /// no scanned or previously created leaf matches. The id, row index,
+    /// and leaf position mint before the insert.
     fn getOrCreateTag(
         e: *DeviceExport,
         state: *WriterState,
@@ -1800,9 +1795,11 @@ pub const DeviceExport = struct {
         if (state.tags_by_key.get(.{ .category_id = category_id, .label = label })) |id|
             return id;
 
-        const id = state.next_tag_id;
-        const row_index = state.next_tag_row_index;
-        const position = state.tag_leaf_counts.get(category_id) orelse 0;
+        const id = try state.next_tag_id.mint();
+        const row_index = try state.next_tag_row_index.mint();
+        var leaf_position: IdMint(u32) =
+            state.tag_leaf_counts.get(category_id) orelse .{ .next = 0 };
+        const position = try leaf_position.mint();
         const a = db.arena.allocator();
         const boxed = try buildTagRow(a, .{
             .parent_id = category_id,
@@ -1822,14 +1819,12 @@ pub const DeviceExport = struct {
         var row = pdb.Row{ .tag = boxed };
         _ = try db.addRow(&row);
 
-        state.next_tag_id = id + 1;
-        state.next_tag_row_index = row_index + 1;
         state.tags_by_key.putAssumeCapacity(
             .{ .category_id = category_id, .label = owned_label },
             id,
         );
         const gop = state.tag_leaf_counts.getOrPutAssumeCapacity(category_id);
-        gop.value_ptr.* = position + 1;
+        gop.value_ptr.* = leaf_position;
 
         if (try e.olStore()) |store|
             try mirrorMyTagRow(store, label, id, position, false, category_id);
@@ -2219,7 +2214,7 @@ const OlStore = struct {
     /// Parent id → next per-child `sequenceNo` (dense from 0, max + 1
     /// over existing rows) — the sibling ordinal, like the ext tag
     /// positions.
-    playlist_child_counts: std.AutoHashMapUnmanaged(i64, i64) = .empty,
+    playlist_child_counts: std.AutoHashMapUnmanaged(i64, IdMint(i64)) = .empty,
     /// Bridged ext tag ids whose `myTag` row exists or pends.
     my_tag_ids: std.AutoHashMapUnmanaged(i64, void) = .empty,
 
@@ -2227,7 +2222,7 @@ const OlStore = struct {
     /// one mirrored row with no pdb id to bridge. Seeded at
     /// `first_minted_artist_id` and raised past every artist id an
     /// existing db carries.
-    next_minted_artist_id: i64 = first_minted_artist_id,
+    next_minted_artist_id: IdMint(i64) = .{ .next = first_minted_artist_id },
 
     fn hasPending(store: *const OlStore) bool {
         return store.artists.items.len > 0 or
@@ -2301,14 +2296,17 @@ pub const OlAlbumsByArtistAndName = std.HashMapUnmanaged(
 /// inserts reuse the db's own ids where they collide by name (a db
 /// written in lockstep resolves to the bridged pdb id) and never
 /// duplicate a row the db already carries. A NULL album artist keys as 0,
-/// the pdb-side null convention.
-fn scanOlStore(lib: *const dlp.Library, store: *OlStore) std.mem.Allocator.Error!void {
+/// the pdb-side null convention. An id that exhausts its space fails the
+/// scan (see `IdMint`).
+fn scanOlStore(
+    lib: *const dlp.Library,
+    store: *OlStore,
+) (std.mem.Allocator.Error || error{IdSpaceExhausted})!void {
     const a = store.arena.allocator();
     for (lib.artists) |row| {
         if (row.name) |name|
             try putIfAbsent(&store.artists_by_name, a, try a.dupe(u8, name), row.artist_id);
-        store.next_minted_artist_id =
-            @max(store.next_minted_artist_id, row.artist_id + 1);
+        try store.next_minted_artist_id.raisePast(row.artist_id);
     }
     for (lib.albums) |row| {
         if (row.name) |name| try putIfAbsent(
@@ -2338,8 +2336,9 @@ fn scanOlStore(lib: *const dlp.Library, store: *OlStore) std.mem.Allocator.Error
     for (lib.playlists) |row| {
         try store.playlist_ids.put(a, row.playlist_id, {});
         const gop = try store.playlist_child_counts.getOrPut(a, row.playlist_id_parent orelse 0);
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* = @max(gop.value_ptr.*, (row.sequenceNo orelse -1) + 1);
+        if (!gop.found_existing) gop.value_ptr.* = .{ .next = 0 };
+        // A NULL sequenceNo occupies nothing: the high water stays at 0.
+        try gop.value_ptr.raisePast(row.sequenceNo orelse -1);
     }
     for (lib.my_tags) |row| try store.my_tag_ids.put(a, row.myTag_id, {});
 }
@@ -2406,17 +2405,16 @@ const first_minted_artist_id: i64 = 0x1_0000_0000;
 fn olLyricistId(
     store: *OlStore,
     name: []const u8,
-) std.mem.Allocator.Error!?i64 {
+) (std.mem.Allocator.Error || error{IdSpaceExhausted})!?i64 {
     if (name.len == 0) return null;
     if (store.artists_by_name.get(name)) |id| return id;
 
     const a = store.arena.allocator();
     const owned = try a.dupe(u8, name);
     try store.artists_by_name.ensureUnusedCapacity(a, 1);
-    const id = store.next_minted_artist_id;
+    const id = try store.next_minted_artist_id.mint();
     try store.artists.append(a, .{ .artist_id = id, .name = owned, .nameForSearch = null });
     store.artists_by_name.putAssumeCapacity(owned, id);
-    store.next_minted_artist_id = id + 1;
     return id;
 }
 
@@ -2507,11 +2505,13 @@ fn mirrorPlaylistRow(
     parent_id: u32,
     id: u32,
     is_folder: bool,
-) std.mem.Allocator.Error!void {
+) (std.mem.Allocator.Error || error{IdSpaceExhausted})!void {
     if (store.playlist_ids.contains(id)) return;
 
     const a = store.arena.allocator();
-    const sequence_no = store.playlist_child_counts.get(parent_id) orelse 0;
+    var sequence_mint: IdMint(i64) =
+        store.playlist_child_counts.get(parent_id) orelse .{ .next = 0 };
+    const sequence_no = try sequence_mint.mint();
     try store.playlist_ids.ensureUnusedCapacity(a, 1);
     try store.playlist_child_counts.ensureUnusedCapacity(a, 1);
     try store.playlists.append(a, .{
@@ -2524,7 +2524,7 @@ fn mirrorPlaylistRow(
     });
     store.playlist_ids.putAssumeCapacity(id, {});
     const gop = store.playlist_child_counts.getOrPutAssumeCapacity(parent_id);
-    gop.value_ptr.* = sequence_no + 1;
+    gop.value_ptr.* = sequence_mint;
 }
 
 /// Mirrors a my-tag row: the ext tag id bridges — the fixture's ext Tag
@@ -2675,9 +2675,44 @@ pub const TagsByKey = std.HashMapUnmanaged(
     std.hash_map.default_max_load_percentage,
 );
 
-/// The writer's cached view of an export: one `next_*` id counter per
-/// table it appends to, plus the dedup maps that let later inserts reuse
-/// an existing row instead of duplicating it. Everything the state
+/// A high-water id counter that cannot overflow: a scan raises it past
+/// ids observed in an untrusted database — rejecting an id that exhausts
+/// the space instead of saturating past it, which would collide every
+/// later mint with the observed row — and the writer mints from it,
+/// failing the call when the space runs out instead of wrapping into
+/// duplicate or null ids. `maxInt` is the never-minted boundary, so a
+/// minted id can never equal one a scan would reject.
+pub fn IdMint(comptime Int: type) type {
+    return struct {
+        /// The next id to mint; every id below it is taken. Ids mint
+        /// from 1 (id 0 is the null foreign key) unless the counter
+        /// names a 0-based position or sequence instead.
+        next: Int = 1,
+
+        const Self = @This();
+
+        /// Raises the high water past `id`, an id observed in an
+        /// untrusted database.
+        pub fn raisePast(m: *Self, id: Int) error{IdSpaceExhausted}!void {
+            if (id == std.math.maxInt(Int)) return error.IdSpaceExhausted;
+            m.next = @max(m.next, id + 1);
+        }
+
+        /// Returns the next id and advances, or fails when the space is
+        /// exhausted. Called before the insert it names: a later failure
+        /// may burn an id, never mint a duplicate.
+        pub fn mint(m: *Self) error{IdSpaceExhausted}!Int {
+            const id = m.next;
+            if (id == std.math.maxInt(Int)) return error.IdSpaceExhausted;
+            m.next = id + 1;
+            return id;
+        }
+    };
+}
+
+/// The writer's cached view of an export: one `IdMint` counter per table
+/// it appends to, plus the dedup maps that let later inserts reuse an
+/// existing row instead of duplicating it. Everything the state
 /// allocates — map entries and string keys alike — comes from its arena
 /// and is reclaimed whole by `deinit`; a key that duplicates an existing
 /// one simply stays in the arena until then. Rebuilt from a plain
@@ -2688,22 +2723,22 @@ pub const WriterState = struct {
     /// Next free id per table. Id 0 is the null foreign key, so the
     /// counters start at 1 and a scan leaves each one past the highest
     /// id that table carries.
-    next_track_id: u32 = 1,
-    next_artist_id: u32 = 1,
-    next_album_id: u32 = 1,
-    next_genre_id: u32 = 1,
-    next_key_id: u32 = 1,
-    next_label_id: u32 = 1,
-    next_artwork_id: u32 = 1,
-    next_playlist_node_id: u32 = 1,
+    next_track_id: IdMint(u32) = .{},
+    next_artist_id: IdMint(u32) = .{},
+    next_album_id: IdMint(u32) = .{},
+    next_genre_id: IdMint(u32) = .{},
+    next_key_id: IdMint(u32) = .{},
+    next_label_id: IdMint(u32) = .{},
+    next_artwork_id: IdMint(u32) = .{},
+    next_playlist_node_id: IdMint(u32) = .{},
     /// Shared id space for tag categories and leaf tags.
-    next_tag_id: u32 = 1,
+    next_tag_id: IdMint(u32) = .{},
     /// Next `position` for a top-level category (0-based, as on real
     /// exports).
-    next_category_position: u32 = 0,
+    next_category_position: IdMint(u32) = .{ .next = 0 },
     /// Per-row monotonic counter driving tag `index_shift` (`0x20` per
     /// row, as observed on real exports).
-    next_tag_row_index: u32 = 0,
+    next_tag_row_index: IdMint(u32) = .{ .next = 0 },
 
     /// Known track ids, for playlist-membership FK checks.
     track_ids: std.AutoHashMapUnmanaged(u32, void) = .empty,
@@ -2713,7 +2748,7 @@ pub const WriterState = struct {
     /// Next `entry_index` per playlist: `max(entry_index) + 1`, not the
     /// row count, so a reopened export with sparse indices doesn't
     /// collide.
-    playlist_entry_counts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    playlist_entry_counts: std.AutoHashMapUnmanaged(u32, IdMint(u32)) = .empty,
     /// Track ids by device file path (non-empty paths only; `addTrack`
     /// dedups on this key).
     tracks_by_path: std.StringHashMapUnmanaged(u32) = .empty,
@@ -2731,7 +2766,7 @@ pub const WriterState = struct {
     tags_by_key: TagsByKey = .empty,
     /// `category -> next leaf position` (dense from 0 within a
     /// category).
-    tag_leaf_counts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    tag_leaf_counts: std.AutoHashMapUnmanaged(u32, IdMint(u32)) = .empty,
 
     pub fn deinit(state: *WriterState) void {
         state.arena.deinit();
@@ -2739,9 +2774,10 @@ pub const WriterState = struct {
 };
 
 /// Error of the writer-state scans: walking a table's page chain hit
-/// structural corruption, or an allocation failed. A table the database
-/// doesn't carry is not an error — `rowsOrEmpty` resolves tables up
-/// front and scans them as empty; `NoTable` is only in the set because
+/// structural corruption, an allocation failed, or a row carried an id
+/// that exhausts its space (see `IdMint`). A table the database doesn't
+/// carry is not an error — `rowsOrEmpty` resolves tables up front and
+/// scans them as empty; `NoTable` is only in the set because
 /// `RowIterator` shares one.
 pub const ScanError = error{
     OutOfMemory,
@@ -2749,6 +2785,7 @@ pub const ScanError = error{
     PageNotPresent,
     PageOrderViolation,
     UnparsedPage,
+    IdSpaceExhausted,
 };
 
 /// `Database.rows`, treating a table the database doesn't carry as empty
@@ -2901,7 +2938,7 @@ fn scanTracks(
 fn visitTrack(ctx: anytype, row: *const pdb.Row) ScanError!void {
     const track = row.track;
     try ctx.state.track_ids.put(ctx.alloc, track.id, {});
-    ctx.state.next_track_id = @max(ctx.state.next_track_id, track.id +| 1);
+    try ctx.state.next_track_id.raisePast(track.id);
     if (try decodeOrSkip(track.offsets.inner.file_path, ctx.alloc)) |path| {
         if (path.len > 0)
             try putIfAbsent(&ctx.state.tracks_by_path, ctx.alloc, path, track.id);
@@ -2922,12 +2959,12 @@ fn scanStringKeyed(
     comptime tag: []const u8,
     comptime field_path: []const []const u8,
     map: *std.StringHashMapUnmanaged(u32),
-    counter: *u32,
+    counter: *IdMint(u32),
 ) ScanError!void {
     var it = (try rowsOrEmpty(db, page_type)) orelse return;
     while (try it.next()) |row| {
         const payload = @field(row.*, tag);
-        counter.* = @max(counter.*, payload.id +| 1);
+        try counter.raisePast(payload.id);
         if (try decodeOrSkip(stringField(payload, field_path), alloc)) |key| {
             try putIfAbsent(map, alloc, key, payload.id);
         }
@@ -2954,7 +2991,7 @@ fn scanAlbums(
 
 fn visitAlbum(ctx: anytype, row: *const pdb.Row) ScanError!void {
     const album = row.album;
-    ctx.state.next_album_id = @max(ctx.state.next_album_id, album.id +| 1);
+    try ctx.state.next_album_id.raisePast(album.id);
     if (try decodeOrSkip(album.offsets.inner.name, ctx.alloc)) |name| {
         try putIfAbsent(
             &ctx.state.albums_by_artist_and_name,
@@ -2978,7 +3015,7 @@ fn scanKeys(
 
 fn visitKey(ctx: anytype, row: *const pdb.Row) ScanError!void {
     const key = row.key;
-    ctx.state.next_key_id = @max(ctx.state.next_key_id, key.id +| 1);
+    try ctx.state.next_key_id.raisePast(key.id);
     if (try decodeOrSkip(key.name, ctx.alloc)) |name| {
         const canonical = try canonicalKeyName(ctx.alloc, name);
         try putIfAbsent(&ctx.state.keys_by_canonical, ctx.alloc, canonical, key.id);
@@ -2997,7 +3034,7 @@ fn scanPlaylistTree(
 
 fn visitPlaylistTreeNode(ctx: anytype, row: *const pdb.Row) ScanError!void {
     const node = row.playlist_tree_node;
-    ctx.state.next_playlist_node_id = @max(ctx.state.next_playlist_node_id, node.id +| 1);
+    try ctx.state.next_playlist_node_id.raisePast(node.id);
     try ctx.state.playlist_nodes.put(ctx.alloc, node.id, node.isFolder());
 }
 
@@ -3014,8 +3051,8 @@ fn scanPlaylistEntries(
 fn visitPlaylistEntry(ctx: anytype, row: *const pdb.Row) ScanError!void {
     const entry = row.playlist_entry;
     const gop = try ctx.state.playlist_entry_counts.getOrPut(ctx.alloc, entry.playlist_id);
-    if (!gop.found_existing) gop.value_ptr.* = 0;
-    gop.value_ptr.* = @max(gop.value_ptr.*, entry.entry_index +| 1);
+    if (!gop.found_existing) gop.value_ptr.* = .{ .next = 0 };
+    try gop.value_ptr.raisePast(entry.entry_index);
 }
 
 /// Scans a plain database into a fresh `WriterState`: one pass per
@@ -3067,14 +3104,11 @@ pub fn scanExtTags(
 
 fn visitTag(ctx: anytype, row: *const pdb.Row) ScanError!void {
     const tag = row.tag;
-    ctx.state.next_tag_id = @max(ctx.state.next_tag_id, tag.id +| 1);
-    ctx.state.next_tag_row_index = @max(
-        ctx.state.next_tag_row_index,
-        @as(u32, tag.index_shift) / 0x20 +| 1,
-    );
+    try ctx.state.next_tag_id.raisePast(tag.id);
+    try ctx.state.next_tag_row_index.raisePast(@as(u32, tag.index_shift) / 0x20);
     if (tag.raw_is_category != 0) {
         try ctx.state.tag_categories.put(ctx.alloc, tag.id, {});
-        ctx.state.next_category_position = @max(ctx.state.next_category_position, tag.position +| 1);
+        try ctx.state.next_category_position.raisePast(tag.position);
     } else {
         if (try decodeOrSkip(tag.offsets.inner.name, ctx.alloc)) |label| {
             try putIfAbsent(
@@ -3085,7 +3119,7 @@ fn visitTag(ctx: anytype, row: *const pdb.Row) ScanError!void {
             );
         }
         const gop = try ctx.state.tag_leaf_counts.getOrPut(ctx.alloc, tag.parent_id);
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* = @max(gop.value_ptr.*, tag.position +| 1);
+        if (!gop.found_existing) gop.value_ptr.* = .{ .next = 0 };
+        try gop.value_ptr.raisePast(tag.position);
     }
 }
