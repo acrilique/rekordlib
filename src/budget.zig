@@ -19,12 +19,13 @@ const std = @import("std");
 /// Default proportional-limit policy shared by the format loaders: a
 /// decode may allocate up to `multiplier` bytes per input byte, and never
 /// less than `min_limit` (a minimal honest database still materializes a
-/// few hundred kilobytes of pages and rows). Honest databases decode to
-/// less than twice their encoded size — every string and row lives in
-/// the file's own pages — so four times leaves margin while catching the
-/// thousands-fold amplification aliased offsets and presence slots
-/// produce.
-pub const multiplier: usize = 4;
+/// few hundred kilobytes of pages and rows). Sparse honest files decode
+/// to about their encoded size, but row-dense ones — many tiny rows,
+/// each carrying structs and a duped string against ~30 wire bytes —
+/// measure close to 4x, so eight times leaves margin over the worst
+/// honest shape while catching the hundreds-fold amplification aliased
+/// offsets, presence slots, and generated rows produce.
+pub const multiplier: usize = 8;
 pub const min_limit: usize = 1 << 20;
 
 /// The ceiling for a decode of `input_len` input bytes.

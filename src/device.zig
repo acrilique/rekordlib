@@ -897,7 +897,7 @@ pub const DeviceExport = struct {
     /// ownership rules).
     pub fn getPlaylists(
         e: *DeviceExport,
-    ) (OpenPdbError || PlaylistTreeError)!std.ArrayList(PlaylistNode) {
+    ) (OpenPdbError || PlaylistTreeError)!PlaylistTree {
         return getPlaylistsDb(e.alloc, try e.openPdb());
     }
 
@@ -2048,21 +2048,26 @@ pub const PlaylistFolder = struct {
     children: std.ArrayList(PlaylistNode),
 };
 
-/// Either a playlist folder or a playlist.
+/// Either a playlist folder or a playlist. Nodes are owned by the
+/// `PlaylistTree` they were built into — its arena holds every name and
+/// children list — so nothing frees them individually.
 pub const PlaylistNode = union(enum) {
     folder: PlaylistFolder,
     playlist: Playlist,
+};
 
-    /// Frees the node's name and, for a folder, its children recursively.
-    pub fn deinit(node: *PlaylistNode, alloc: std.mem.Allocator) void {
-        switch (node.*) {
-            .folder => |*folder| {
-                for (folder.children.items) |*child| child.deinit(alloc);
-                folder.children.deinit(alloc);
-                alloc.free(folder.name);
-            },
-            .playlist => |*playlist| alloc.free(playlist.name),
-        }
+/// A playlist tree, whole-owned: every node, name, and children list came
+/// from one arena, so `deinit` frees the entire tree — of any nesting
+/// depth — without walking it.
+pub const PlaylistTree = struct {
+    arena: *std.heap.ArenaAllocator,
+    /// The top-level nodes, in row order.
+    roots: []PlaylistNode,
+
+    pub fn deinit(tree: *PlaylistTree) void {
+        const child = tree.arena.child_allocator;
+        tree.arena.deinit();
+        child.destroy(tree.arena);
     }
 };
 
@@ -2072,88 +2077,109 @@ pub const PlaylistTreeError = pdb.RowIterError || error{ InvalidEncoding, OutOfM
 /// Playlist-tree rows grouped by their parent id.
 const PlaylistGroups = std.AutoHashMap(u32, std.ArrayList(*const pdb.PlaylistTreeNode));
 
-/// Frees the grouping map built by `getPlaylistsDb`.
-fn deinitGroups(alloc: std.mem.Allocator, groups: *PlaylistGroups) void {
-    var it = groups.iterator();
-    while (it.next()) |entry| entry.value_ptr.deinit(alloc);
-    groups.deinit();
-}
+/// One level of the iterative tree build: the rows parented to one
+/// folder, the next unprocessed row, the nodes collected so far, and —
+/// except at the root — the folder they belong to.
+const PlaylistLevel = struct {
+    rows: []const *const pdb.PlaylistTreeNode,
+    next: usize = 0,
+    nodes: std.ArrayList(PlaylistNode) = .empty,
+    /// The folder whose children this level collects; null at the root.
+    folder: ?struct { id: u32, name: []u8 } = null,
+};
 
-/// Appends the children of `parent` to `out`, in row order, recursing into
-/// folders.
-fn buildChildren(
-    alloc: std.mem.Allocator,
+/// Builds the tree over an explicit level stack instead of recursion: a
+/// folder row pushes a level for its children and joins its parent's
+/// nodes only when that level drains. The visitation order — rows in
+/// order, a folder expanded at first encounter, the `visited` skip — is
+/// exactly the recursive walk's, but a folder chain of any depth costs
+/// heap, never call-stack frames.
+fn buildTree(
+    a: std.mem.Allocator,
     groups: *const PlaylistGroups,
     visited: *std.AutoHashMap(u32, void),
-    parent: u32,
-    out: *std.ArrayList(PlaylistNode),
-) PlaylistTreeError!void {
-    const nodes = groups.get(parent) orelse return;
-    for (nodes.items) |node| {
-        if (node.isFolder() and (try visited.getOrPut(node.id)).found_existing) continue;
-        const name = try node.name.utf8(alloc);
-        errdefer alloc.free(name);
-        if (node.isFolder()) {
-            var children = std.ArrayList(PlaylistNode).empty;
-            errdefer {
-                for (children.items) |*child| child.deinit(alloc);
-                children.deinit(alloc);
+) PlaylistTreeError!std.ArrayList(PlaylistNode) {
+    const root_rows = if (groups.get(0)) |group| group.items else &.{};
+    var levels: std.ArrayList(PlaylistLevel) = .empty;
+    try levels.append(a, .{ .rows = root_rows });
+
+    var roots = std.ArrayList(PlaylistNode).empty;
+    while (levels.items.len > 0) {
+        const top = &levels.items[levels.items.len - 1];
+        if (top.next >= top.rows.len) {
+            const done = levels.pop().?;
+            if (done.folder) |folder| {
+                const parent = &levels.items[levels.items.len - 1];
+                try parent.nodes.append(a, .{ .folder = .{
+                    .id = folder.id,
+                    .name = folder.name,
+                    .children = done.nodes,
+                } });
+            } else {
+                roots = done.nodes;
             }
-            try buildChildren(alloc, groups, visited, node.id, &children);
-            try out.append(alloc, .{ .folder = .{
-                .id = node.id,
-                .name = name,
-                .children = children,
-            } });
+            continue;
+        }
+        const node = top.rows[top.next];
+        top.next += 1;
+        if (node.isFolder()) {
+            if ((try visited.getOrPut(node.id)).found_existing) continue;
+            const name = try node.name.utf8(a);
+            const child_rows = if (groups.get(node.id)) |group| group.items else &.{};
+            // `top` dangles past this append; the loop re-derives it.
+            try levels.append(a, .{
+                .rows = child_rows,
+                .folder = .{ .id = node.id, .name = name },
+            });
         } else {
-            try out.append(alloc, .{ .playlist = .{ .id = node.id, .name = name } });
+            const name = try node.name.utf8(a);
+            try top.nodes.append(a, .{ .playlist = .{ .id = node.id, .name = name } });
         }
     }
+    return roots;
 }
 
 /// Builds the playlist tree from a database's playlist-tree rows: nodes
-/// parented to 0 form the top level, folders recurse into their children,
-/// and names are decoded to owned UTF-8. Nodes unreachable from the root
+/// parented to 0 form the top level, folders expand into their children,
+/// and names are decoded to UTF-8. Nodes unreachable from the root
 /// (parented to a missing id) do not appear; a folder id is expanded at
-/// most once, so parent-id cycles in corrupt data cannot recurse
-/// forever.
+/// most once, so parent-id cycles in corrupt data cannot double-include
+/// a subtree. The build is iterative and the whole tree lives in one
+/// arena, so nesting of any depth builds and tears down without
+/// touching the call stack.
 ///
-/// The caller owns the returned list; free it by deinitializing every
-/// element and then the list itself:
+/// The caller owns the tree; `deinit` frees everything:
 ///
 ///     const device = @import("rekordlib").device;
-///     var playlists = try device.getPlaylistsDb(alloc, &db);
-///     defer {
-///         for (playlists.items) |*node| node.deinit(alloc);
-///         playlists.deinit(alloc);
-///     }
+///     var tree = try device.getPlaylistsDb(alloc, &db);
+///     defer tree.deinit();
 pub fn getPlaylistsDb(
     alloc: std.mem.Allocator,
     db: *const pdb.Database,
-) PlaylistTreeError!std.ArrayList(PlaylistNode) {
-    var groups = PlaylistGroups.init(alloc);
-    defer deinitGroups(alloc, &groups);
+) PlaylistTreeError!PlaylistTree {
+    const arena = try alloc.create(std.heap.ArenaAllocator);
+    errdefer alloc.destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
 
+    // The grouping map, visited set, level stack, and node storage all
+    // come from the arena: a failed build is reclaimed wholesale.
+    var groups = PlaylistGroups.init(a);
     var it = try db.rows(.playlist_tree);
     while (try it.next()) |row| switch (row.*) {
         .playlist_tree_node => |node| {
             const gop = try groups.getOrPut(node.parent_id);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(alloc, node);
+            try gop.value_ptr.append(a, node);
         },
         else => {},
     };
 
-    var visited = std.AutoHashMap(u32, void).init(alloc);
-    defer visited.deinit();
+    var visited = std.AutoHashMap(u32, void).init(a);
+    var roots = try buildTree(a, &groups, &visited);
 
-    var roots = std.ArrayList(PlaylistNode).empty;
-    errdefer {
-        for (roots.items) |*node| node.deinit(alloc);
-        roots.deinit(alloc);
-    }
-    try buildChildren(alloc, &groups, &visited, 0, &roots);
-    return roots;
+    return .{ .arena = arena, .roots = try roots.toOwnedSlice(a) };
 }
 
 // --- OneLibrary mirror (O4) -----------------------------------------------------

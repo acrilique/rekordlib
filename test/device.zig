@@ -381,12 +381,9 @@ test "playlist trees match the fixtures" {
         defer ex.deinit();
 
         var playlists = try ex.getPlaylists();
-        defer {
-            for (playlists.items) |*node| node.deinit(alloc);
-            playlists.deinit(alloc);
-        }
-        try testing.expectEqual(fixture.playlists.len, playlists.items.len);
-        for (fixture.playlists, playlists.items) |want, *node| switch (node.*) {
+        defer playlists.deinit();
+        try testing.expectEqual(fixture.playlists.len, playlists.roots.len);
+        for (fixture.playlists, playlists.roots) |want, *node| switch (node.*) {
             .playlist => |playlist| {
                 try testing.expectEqual(want.id, playlist.id);
                 try testing.expectEqualStrings(want.name, playlist.name);
@@ -1032,15 +1029,12 @@ test "playlist tree nests folders in row order" {
     }
 
     var playlists = try device.getPlaylistsDb(alloc, &db);
-    defer {
-        for (playlists.items) |*node| node.deinit(alloc);
-        playlists.deinit(alloc);
-    }
+    defer playlists.deinit();
 
-    try testing.expectEqual(@as(usize, 2), playlists.items.len);
-    try testing.expectEqual(@as(u32, 1), playlists.items[0].playlist.id);
-    try testing.expectEqualStrings("aaaaa", playlists.items[0].playlist.name);
-    const folder = playlists.items[1].folder;
+    try testing.expectEqual(@as(usize, 2), playlists.roots.len);
+    try testing.expectEqual(@as(u32, 1), playlists.roots[0].playlist.id);
+    try testing.expectEqualStrings("aaaaa", playlists.roots[0].playlist.name);
+    const folder = playlists.roots[1].folder;
     try testing.expectEqual(@as(u32, 100), folder.id);
     try testing.expectEqualStrings("Folder", folder.name);
     try testing.expectEqual(@as(usize, 2), folder.children.items.len);
@@ -1080,23 +1074,74 @@ test "playlist tree cuts parent-id cycles" {
     }
 
     var playlists = try device.getPlaylistsDb(alloc, &db);
-    defer {
-        for (playlists.items) |*node| node.deinit(alloc);
-        playlists.deinit(alloc);
-    }
+    defer playlists.deinit();
 
     // The top level holds the real playlist and the id-0 folder; the
     // duplicated id 5 is expanded once (inside the id-0 folder) and skipped
     // at the top level.
-    try testing.expectEqual(@as(usize, 2), playlists.items.len);
-    try testing.expectEqual(@as(u32, 1), playlists.items[0].playlist.id);
-    const root_cycle = playlists.items[1].folder;
+    try testing.expectEqual(@as(usize, 2), playlists.roots.len);
+    try testing.expectEqual(@as(u32, 1), playlists.roots[0].playlist.id);
+    const root_cycle = playlists.roots[1].folder;
     try testing.expectEqual(@as(u32, 0), root_cycle.id);
     try testing.expectEqual(@as(usize, 2), root_cycle.children.items.len);
     try testing.expectEqual(@as(u32, 1), root_cycle.children.items[0].playlist.id);
     const inner = root_cycle.children.items[1].folder;
     try testing.expectEqual(@as(u32, 5), inner.id);
     try testing.expectEqual(@as(usize, 0), inner.children.items.len);
+}
+
+test "playlist tree handles nesting far beyond any call stack" {
+    const alloc = testing.allocator;
+    var db = try pdb.Database.create(alloc, .plain, &pdb.standard_table_page_types);
+    defer db.deinit();
+    const a = db.arena.allocator();
+
+    // The crash shape of the recursive walk: distinct folder ids parented
+    // linearly, so the cycle guard never fires and only the depth grows.
+    const depth = 100_000;
+    var i: u32 = 0;
+    while (i < depth) : (i += 1) {
+        const node = try a.create(pdb.PlaylistTreeNode);
+        node.* = .{
+            .parent_id = i, // node i+1 parented to node i
+            .id = i + 1,
+            .node_is_folder = 1,
+            .name = try pdb.DeviceSQLString.fromUtf8(a, "F"),
+        };
+        var row = pdb.Row{ .playlist_tree_node = node };
+        _ = try db.addRow(&row);
+    }
+
+    var tree = try device.getPlaylistsDb(alloc, &db);
+    defer tree.deinit();
+
+    // One root nesting `depth` deep; verify by walking iteratively, the
+    // way any consumer of an unbounded tree must.
+    try testing.expectEqual(@as(usize, 1), tree.roots.len);
+    var nodes: std.ArrayList(*const device.PlaylistNode) = .empty;
+    defer nodes.deinit(alloc);
+    var depths: std.ArrayList(usize) = .empty;
+    defer depths.deinit(alloc);
+    try nodes.append(alloc, &tree.roots[0]);
+    try depths.append(alloc, 1);
+    var max_depth: usize = 0;
+    var folder_count: usize = 0;
+    while (nodes.pop()) |node| {
+        const d = depths.pop().?;
+        max_depth = @max(max_depth, d);
+        switch (node.*) {
+            .folder => |folder| {
+                folder_count += 1;
+                for (folder.children.items) |*child| {
+                    try nodes.append(alloc, child);
+                    try depths.append(alloc, d + 1);
+                }
+            },
+            .playlist => {},
+        }
+    }
+    try testing.expectEqual(depth, max_depth);
+    try testing.expectEqual(depth, folder_count);
 }
 
 /// Counts the rows of one table through its page chain.
@@ -2221,12 +2266,9 @@ test "playlist tree enforces folder vs playlist roles" {
     var check = device.DeviceExport.open(tmp_path, io, alloc);
     defer check.deinit();
     var playlists = try check.getPlaylists();
-    defer {
-        for (playlists.items) |*node| node.deinit(alloc);
-        playlists.deinit(alloc);
-    }
-    try testing.expectEqual(@as(usize, 1), playlists.items.len);
-    const saved_folder = &playlists.items[0].folder;
+    defer playlists.deinit();
+    try testing.expectEqual(@as(usize, 1), playlists.roots.len);
+    const saved_folder = &playlists.roots[0].folder;
     try testing.expectEqual(folder, saved_folder.id);
     try testing.expectEqualStrings("Folder", saved_folder.name);
     try testing.expectEqual(@as(usize, 1), saved_folder.children.items.len);
