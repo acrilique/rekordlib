@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const bin = @import("bin.zig");
+const budget = @import("budget.zig");
 const util = @import("util.zig");
 
 /// Decoding error; `InvalidFormat` means the bytes do not follow the
@@ -2426,13 +2427,64 @@ fn parsedPageAt(slots: []PageSlot, page_index: u32) ?*Page {
     };
 }
 
-/// Decoding error of a whole database.
-pub const DatabaseDecodeError = bin.ReadError || error{UnexpectedValue};
+/// Decoding error of a whole database; `DatabaseTooLarge` means the
+/// decoded size was disproportionate to the input (see the parse budget
+/// below) rather than the host running out of memory.
+pub const DatabaseDecodeError =
+    bin.ReadError || error{ UnexpectedValue, DatabaseTooLarge };
 
 /// Encoding error of a whole database: the header, page, and content
 /// errors (whose `UnexpectedValue` covers content that does not fit its
 /// page).
 pub const DatabaseEncodeError = bin.WriteError || error{UnexpectedValue};
+
+/// Ceiling a parsed or freshly created database may grow to through its
+/// own writer — appended pages, rows, and strings, including the eager
+/// gap-page materialization `allocDataPage` performs for a `next_unused_page`
+/// counter beyond the pages present. The library appends a page at a
+/// time, so 64 MB bounds a session adding on the order of a hundred
+/// thousand rows (real fixtures grow by single pages) while refusing a
+/// hostile counter's multi-gigabyte demand.
+const writer_growth_allowance = 64 << 20;
+
+/// The decode half of `Database.parse`, extracted so the budget's
+/// error mapping wraps every fallible step in one place.
+const ParsedImage = struct {
+    header: Header,
+    pages: []PageSlot,
+    tail: []const u8,
+};
+
+fn parseImage(
+    a: std.mem.Allocator,
+    buf: []const u8,
+    db_type: DatabaseType,
+) DatabaseDecodeError!ParsedImage {
+    var c = bin.Cursor.initAlloc(a, buf);
+    const header = try Header.decode(&c, a);
+    const page_size: usize = header.page_size;
+    if (buf.len < page_size) return error.UnexpectedValue;
+
+    const num_pages = (buf.len - page_size) / page_size;
+    const pages = try a.alloc(PageSlot, num_pages);
+    for (pages, 0..) |*slot, i| {
+        const page_buf = buf[(i + 1) * page_size ..][0..page_size];
+        slot.* = parsePage(page_buf, page_size, db_type, a) catch |err|
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => .{ .raw = try a.dupe(u8, page_buf) },
+            };
+    }
+    const tail_len = buf.len - page_size - num_pages * page_size;
+    return .{
+        .header = header,
+        .pages = pages,
+        .tail = if (tail_len == 0) &.{} else try a.dupe(
+            u8,
+            buf[buf.len - tail_len ..],
+        ),
+    };
+}
 
 /// A whole `export.pdb`/`exportExt.pdb` image, parsed into an arena: the
 /// file header and every page after page 0. This is the deliberate
@@ -2444,6 +2496,10 @@ pub const Database = struct {
     /// strings parse directly into it; `serialize` never allocates from
     /// it.
     arena: *std.heap.ArenaAllocator,
+    /// The budget the arena draws through: parse set a ceiling
+    /// proportional to the input and, on success, raised it to the
+    /// writer allowance, so mutations stay bounded too.
+    budget: *budget.Budget,
     /// The type of database being parsed, which selects the meaning of
     /// the page-type values in tables and page headers.
     db_type: DatabaseType,
@@ -2463,43 +2519,49 @@ pub const Database = struct {
     /// `error.OutOfMemory` — is kept as raw bytes and written back
     /// verbatim instead of failing the database, mirroring the pages the
     /// format does not model.
+    ///
+    /// Every decoded byte draws through a `budget.Budget` capped at four
+    /// times the input: a hostile file whose declared structure amplifies
+    /// (offsets aliasing one string, one row decoded per presence slot)
+    /// fails with `DatabaseTooLarge` instead of exhausting memory. On
+    /// success the parsed rows are trusted content, so the ceiling rises
+    /// to the input plus the writer allowance for later mutations.
     pub fn parse(
         alloc: std.mem.Allocator,
         buf: []const u8,
         db_type: DatabaseType,
     ) DatabaseDecodeError!Database {
+        const budget_ptr = try alloc.create(budget.Budget);
+        errdefer alloc.destroy(budget_ptr);
+        budget_ptr.* = .{
+            .child = alloc,
+            .limit = budget.proportionalLimit(buf.len),
+        };
         const arena = try alloc.create(std.heap.ArenaAllocator);
         errdefer alloc.destroy(arena);
-        arena.* = std.heap.ArenaAllocator.init(alloc);
+        arena.* = std.heap.ArenaAllocator.init(budget_ptr.allocator());
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        var c = bin.Cursor.initAlloc(a, buf);
-        const header = try Header.decode(&c, a);
-        const page_size: usize = header.page_size;
-        if (buf.len < page_size) return error.UnexpectedValue;
-
-        const num_pages = (buf.len - page_size) / page_size;
-        const pages = try a.alloc(PageSlot, num_pages);
-        for (pages, 0..) |*slot, i| {
-            const page_buf = buf[(i + 1) * page_size ..][0..page_size];
-            slot.* = parsePage(page_buf, page_size, db_type, a) catch |err|
-                switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => .{ .raw = try a.dupe(u8, page_buf) },
-                };
-        }
-        const tail_len = buf.len - page_size - num_pages * page_size;
+        const image = parseImage(a, buf, db_type) catch |err| return switch (err) {
+            error.OutOfMemory => if (budget_ptr.exceeded)
+                error.DatabaseTooLarge
+            else
+                error.OutOfMemory,
+            else => err,
+        };
+        budget_ptr.limit = @max(
+            @max(budget_ptr.limit, budget_ptr.used),
+            buf.len + writer_growth_allowance,
+        );
         return .{
             .arena = arena,
+            .budget = budget_ptr,
             .db_type = db_type,
-            .header = header,
-            .pages = pages,
-            .pages_cap = pages.len,
-            .tail = if (tail_len == 0) &.{} else try a.dupe(
-                u8,
-                buf[buf.len - tail_len ..],
-            ),
+            .header = image.header,
+            .pages = image.pages,
+            .pages_cap = image.pages.len,
+            .tail = image.tail,
         };
     }
 
@@ -2508,6 +2570,7 @@ pub const Database = struct {
         const child = db.arena.child_allocator;
         db.arena.deinit();
         child.destroy(db.arena);
+        db.budget.child.destroy(db.budget);
     }
 
     /// Serializes the whole image — header page, every page slot, tail —
@@ -2673,6 +2736,13 @@ pub const Database = struct {
         if (db.pages.len >= page_index)
             return error.UnexpectedValue; // counter names an existing page
 
+        // A gap far beyond the remaining budget means a hostile counter:
+        // fail with the typed error before materializing zero pages the
+        // ceiling would refuse one allocation in.
+        const gap_pages: u64 = @as(u64, page_index) - 1 - db.pages.len;
+        if (gap_pages *| @as(u64, db.header.page_size) > db.budget.remaining())
+            return error.DatabaseTooLarge;
+
         const a = db.arena.allocator();
         // Grow to hold every page index up to and including `page_index`,
         // at least doubling the capacity (see `appendElem`).
@@ -2715,9 +2785,14 @@ pub const Database = struct {
         db_type: DatabaseType,
         table_page_types: []const PageType,
     ) DatabaseModifyError!Database {
+        const budget_ptr = try alloc.create(budget.Budget);
+        errdefer alloc.destroy(budget_ptr);
+        // No input to be proportional to: a created database lives under
+        // the writer allowance from the start.
+        budget_ptr.* = .{ .child = alloc, .limit = writer_growth_allowance };
         const arena = try alloc.create(std.heap.ArenaAllocator);
         errdefer alloc.destroy(arena);
-        arena.* = std.heap.ArenaAllocator.init(alloc);
+        arena.* = std.heap.ArenaAllocator.init(budget_ptr.allocator());
         errdefer arena.deinit();
         const a = arena.allocator();
 
@@ -2755,6 +2830,7 @@ pub const Database = struct {
 
         return .{
             .arena = arena,
+            .budget = budget_ptr,
             .db_type = db_type,
             .header = .{
                 .page_size = default_page_size,
@@ -2901,15 +2977,18 @@ const default_page_size: u32 = 4096;
 /// Error of the modification layer: `TableTypeNotFound` is a row whose
 /// page type no table in the header holds, `TrackRowTooSmall` a Track row
 /// below `min_track_allocated_size`, `TrackRowTooLarge` a Track row whose
-/// heap bytes exceed the `u16` page accounting, and `UnexpectedValue` a database
+/// heap bytes exceed the `u16` page accounting, `UnexpectedValue` a database
 /// whose page chains or allocation counters are inconsistent with the
-/// operation, or misuse of the allocate/commit pair.
+/// operation or misuse of the allocate/commit pair, and `DatabaseTooLarge`
+/// a mutation whose demand (typically a `next_unused_page` gap) exceeds
+/// the database's growth budget.
 pub const DatabaseModifyError = error{
     OutOfMemory,
     TableTypeNotFound,
     TrackRowTooSmall,
     TrackRowTooLarge,
     UnexpectedValue,
+    DatabaseTooLarge,
 };
 
 /// Locates an added row: the page holding it and the row's heap offset

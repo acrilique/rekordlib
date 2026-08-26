@@ -25,6 +25,7 @@
 //! with zig cc; `system` binds the consumer's own unprefixed SQLCipher.
 
 const std = @import("std");
+const budget = @import("budget.zig");
 const util = @import("util.zig");
 const opts = @import("options");
 const c = @import("c");
@@ -554,6 +555,16 @@ pub const Db = struct {
         return stmt.readInt(0);
     }
 
+    /// The main database file's size in bytes as SQLite accounts it: page
+    /// count times page size. WAL sidecar bulk is excluded — the loaders'
+    /// budget wants the bytes that declare the rows, not uncheckpointed
+    /// journal growth.
+    pub fn mainFileSize(self: Db) SqlError!u64 {
+        const page_size: u64 = @intCast(try self.scalarInt("PRAGMA page_size;"));
+        const page_count: u64 = @intCast(try self.scalarInt("PRAGMA page_count;"));
+        return page_size *| page_count;
+    }
+
     pub fn lastInsertRowid(self: Db) i64 {
         return api.last_insert_rowid(self.handle);
     }
@@ -572,9 +583,11 @@ pub fn sqliteVersion() [:0]const u8 {
 // OneLibrary read models
 // ---------------------------------------------------------------------------
 
-/// Loading error of `Library.load`: SQLite errors plus `SchemaMismatch`
-/// (a table's columns differ from the pinned schema).
-pub const LoadError = SqlError || error{SchemaMismatch};
+/// Loading error of `Library.load`: SQLite errors, `SchemaMismatch` (a
+/// table's columns differ from the pinned schema), and `LibraryTooLarge`
+/// — the decoded size was disproportionate to the database file (see the
+/// load budget) rather than the host running out of memory.
+pub const LoadError = SqlError || error{ SchemaMismatch, LibraryTooLarge };
 
 /// An `album` row. `isComplation` [sic] is Pioneer's typo, kept verbatim
 /// from the real schema.
@@ -917,6 +930,8 @@ const id_tables = filterTables(struct {
 /// reader layer interprets raw values.
 pub const Library = struct {
     arena: *std.heap.ArenaAllocator,
+    /// The budget the arena draws through, proportional to the db file.
+    budget: *budget.Budget,
     albums: []const Album = &.{},
     artists: []const Artist = &.{},
     categories: []const Category = &.{},
@@ -972,42 +987,37 @@ pub const Library = struct {
 
     /// Reads every table of an open db (keyed or plaintext — the models
     /// do not differ); more than one `property` row is a `SchemaMismatch`.
+    ///
+    /// Every decoded byte draws through a `budget.Budget` capped at four
+    /// times the main file's size: a same-schema source that generates
+    /// rows from thin air — a VIEW over a recursive CTE with matching
+    /// column aliases — fails with `LibraryTooLarge` instead of
+    /// exhausting memory, and so does any other amplifying source.
     pub fn load(alloc: std.mem.Allocator, db: Db) LoadError!Library {
         if (mode == .off) dlpDisabled();
+
+        const db_size = try db.mainFileSize();
+        const size: usize = std.math.cast(usize, db_size) orelse
+            std.math.maxInt(usize);
+        const budget_ptr = try alloc.create(budget.Budget);
+        errdefer alloc.destroy(budget_ptr);
+        budget_ptr.* = .{
+            .child = alloc,
+            .limit = budget.proportionalLimit(size),
+        };
         const arena = try alloc.create(std.heap.ArenaAllocator);
         errdefer alloc.destroy(arena);
-        arena.* = std.heap.ArenaAllocator.init(alloc);
+        arena.* = std.heap.ArenaAllocator.init(budget_ptr.allocator());
         errdefer arena.deinit();
-        const a = arena.allocator();
 
-        var lib = Library{ .arena = arena };
-        inline for (tables) |t|
-            try loadTable(t.row, t.table, a, db, &@field(lib, t.rows));
-
-        var props: []const Property = &.{};
-        try loadTable(Property, "property", a, db, &props);
-        if (props.len > 1) return error.SchemaMismatch;
-        lib.property = if (props.len == 1) props[0] else null;
-
-        inline for (id_tables) |t|
-            @field(lib, t.map.?) = try indexById(a, @field(lib, t.rows), t.id.?);
-
-        try lib.content_by_path.ensureTotalCapacity(a, @intCast(lib.contents.len));
-        for (lib.contents, 0..) |*row, i| {
-            const path = row.path orelse continue;
-            const gop = lib.content_by_path.getOrPutAssumeCapacity(path);
-            if (!gop.found_existing) gop.value_ptr.* = @intCast(i);
-        }
-
-        lib.playlist_contents_by_playlist =
-            try groupRows(a, lib.playlist_contents, "playlist_id", "sequenceNo");
-        lib.my_tag_contents_by_my_tag =
-            try groupRows(a, lib.my_tag_contents, "myTag_id", null);
-        lib.my_tag_contents_by_content =
-            try groupRows(a, lib.my_tag_contents, "content_id", null);
-        lib.hot_cue_bank_cues_by_list =
-            try groupRows(a, lib.hot_cue_bank_cues, "hotCueBankList_id", "sequenceNo");
-
+        var lib = Library{ .arena = arena, .budget = budget_ptr };
+        loadInto(arena.allocator(), db, &lib) catch |err| return switch (err) {
+            error.OutOfMemory => if (budget_ptr.exceeded)
+                error.LibraryTooLarge
+            else
+                error.OutOfMemory,
+            else => err,
+        };
         return lib;
     }
 
@@ -1037,6 +1047,7 @@ pub const Library = struct {
         const child = lib.arena.child_allocator;
         lib.arena.deinit();
         child.destroy(lib.arena);
+        lib.budget.child.destroy(lib.budget);
     }
 
     /// Model equality: same rows, field by field, in load order. Derived
@@ -1055,6 +1066,38 @@ pub const Library = struct {
         return rowEql(Property, &self.property.?, &other.property.?);
     }
 };
+
+/// The table-reading half of `Library.load`, extracted so the budget's
+/// error mapping wraps every fallible step in one place. Every field of
+/// `lib` except the arena and budget is set here.
+fn loadInto(a: std.mem.Allocator, db: Db, lib: *Library) LoadError!void {
+    inline for (tables) |t|
+        try loadTable(t.row, t.table, a, db, &@field(lib, t.rows));
+
+    var props: []const Property = &.{};
+    try loadTable(Property, "property", a, db, &props);
+    if (props.len > 1) return error.SchemaMismatch;
+    lib.property = if (props.len == 1) props[0] else null;
+
+    inline for (id_tables) |t|
+        @field(lib, t.map.?) = try indexById(a, @field(lib, t.rows), t.id.?);
+
+    try lib.content_by_path.ensureTotalCapacity(a, @intCast(lib.contents.len));
+    for (lib.contents, 0..) |*row, i| {
+        const path = row.path orelse continue;
+        const gop = lib.content_by_path.getOrPutAssumeCapacity(path);
+        if (!gop.found_existing) gop.value_ptr.* = @intCast(i);
+    }
+
+    lib.playlist_contents_by_playlist =
+        try groupRows(a, lib.playlist_contents, "playlist_id", "sequenceNo");
+    lib.my_tag_contents_by_my_tag =
+        try groupRows(a, lib.my_tag_contents, "myTag_id", null);
+    lib.my_tag_contents_by_content =
+        try groupRows(a, lib.my_tag_contents, "content_id", null);
+    lib.hot_cue_bank_cues_by_list =
+        try groupRows(a, lib.hot_cue_bank_cues, "hotCueBankList_id", "sequenceNo");
+}
 
 /// Loads one table's rows, validating the column layout (count then every
 /// name, in order) against the row type's declaration before reading —

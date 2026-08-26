@@ -377,6 +377,11 @@ pub const OpenPdbError =
 /// Size cap when reading an `export.pdb`; the largest fixture is 2.9 MB.
 const pdb_limit = std.Io.Limit.limited(1 << 26);
 
+/// Size cap when opening an `exportLibrary.db`, mirroring `pdb_limit`: a
+/// same-schema database larger than this is refused before SQLite reads
+/// it, regardless of how cheaply its rows would materialize.
+const ol_db_limit: u64 = 1 << 26;
+
 /// Error of `DeviceExport.create`: `ExportAlreadyExists` is the
 /// exists-guard refusing a root that already carries a
 /// `PIONEER/rekordbox/export.pdb`; the rest is opening the working
@@ -412,12 +417,14 @@ pub const SaveError =
 pub const WriterStateError = OpenPdbError || ScanError;
 
 /// Error of `DeviceExport.openOlLibrary`: pinning the working directory,
-/// examining or opening `exportLibrary.db`, loading its models (a drifted
-/// schema is `SchemaMismatch`), or building its path (the process cwd was
-/// unreadable when the handle pinned it).
+/// examining or opening `exportLibrary.db` (a file over the read cap is
+/// `LibraryTooLarge`), loading its models (a drifted schema is
+/// `SchemaMismatch`, a disproportionate decode also `LibraryTooLarge`),
+/// or building its path (the process cwd was unreadable when the handle
+/// pinned it).
 pub const OpenOlLibraryError =
     std.Io.Dir.OpenError ||
-    std.Io.Dir.AccessError ||
+    std.Io.Dir.StatFileError ||
     dlp.LoadError ||
     error{ CwdUnavailable, OutOfMemory };
 
@@ -876,7 +883,11 @@ pub const DeviceExport = struct {
                 const dir = try e.dirHandle();
                 const buf = try dir.readFileAlloc(e.io, path, e.alloc, pdb_limit);
                 defer e.alloc.free(buf);
-                e.pdb_state = .{ .loaded = try pdb.Database.parse(e.alloc, buf, .plain) };
+                // Load before tagging the union: a `.loaded = try ...`
+                // initializer can set the tag before the payload exists,
+                // leaving `deinit` a garbage pointer on failure.
+                const db = try pdb.Database.parse(e.alloc, buf, .plain);
+                e.pdb_state = .{ .loaded = db };
                 return &e.pdb_state.loaded;
             },
         }
@@ -909,20 +920,23 @@ pub const DeviceExport = struct {
                 const dir = try e.dirHandle();
                 const rel = try e.layout.exportLibraryDb(e.alloc);
                 defer e.alloc.free(rel);
-                if (dir.access(e.io, rel, .{})) |_| {} else |err| switch (err) {
+                const stat = dir.statFile(e.io, rel, .{}) catch |err| switch (err) {
                     error.FileNotFound => {
                         e.ol_library = .absent;
                         return null;
                     },
                     else => return err,
-                }
+                };
+                if (stat.size > ol_db_limit) return error.LibraryTooLarge;
 
                 const path = try e.olDbPath();
                 defer e.alloc.free(path);
                 var db = try dlp.Db.open(e.io, path);
                 errdefer db.close();
-                e.ol_library = .{ .loaded = try dlp.Library.load(e.alloc, db) };
+                // Same tag-then-payload hazard as `openPdb`: load first.
+                const lib = try dlp.Library.load(e.alloc, db);
                 db.close();
+                e.ol_library = .{ .loaded = lib };
                 return &e.ol_library.loaded;
             },
         }
@@ -1831,11 +1845,13 @@ pub const DeviceExport = struct {
     fn extDb(e: *DeviceExport) TagError!*pdb.Database {
         try e.ensureExtLoaded();
         if (e.ext_pdb_state == .absent) {
-            e.ext_pdb_state = .{ .loaded = try pdb.Database.create(
+            // Same tag-then-payload hazard as `openPdb`: create first.
+            const db = try pdb.Database.create(
                 e.alloc,
                 .ext,
                 &pdb.ext_table_page_types,
-            ) };
+            );
+            e.ext_pdb_state = .{ .loaded = db };
         }
         return &e.ext_pdb_state.loaded;
     }
