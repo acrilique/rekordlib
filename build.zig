@@ -5,7 +5,11 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const DlpMode = enum { off, vendored, system };
-    const dlp_mode = b.option(DlpMode, "dlp", "OneLibrary store backend: vendored (prefixed SQLCipher via zig cc), system (consumer-provided), or off") orelse .off;
+    const dlp_mode = b.option(
+        DlpMode,
+        "dlp",
+        "OneLibrary store backend: vendored (prefixed SQLCipher via zig cc), system (consumer-provided), or off",
+    ) orelse .vendored;
 
     const dlp_options = b.addOptions();
     dlp_options.addOption(DlpMode, "dlp", dlp_mode);
