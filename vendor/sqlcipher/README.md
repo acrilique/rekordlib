@@ -59,12 +59,15 @@ anyway). Flags:
 ## Symbol prefixing
 
 Every exported `sqlite3_*` / `sqlcipher_*` symbol is renamed to `rl_sqlite3_*`
-/ `rl_sqlcipher_*` (decision 10: the pilot consumer embeds its own
-SQLCipher). `rl_rename.h` is force-included into the single amalgamation TU
-so internal references rename consistently; consumers and `@translateC` use
+/ `rl_sqlcipher_*` (the pilot consumer embeds its own SQLCipher, and
+unprefixed symbols would resolve linker-order-dependent). `rl_rename.h` is
+force-included into the single amalgamation TU so internal references
+rename consistently; consumers and `@translateC` use
 `rl_sqlite3.h`. Verification: `nm` over the compiled object must show only
 `rl_`-prefixed defined globals (COFF `.debug$*` section symbols aside) —
-build.zig runs this check for every target it compiles.
+run `zig build dlp-symbols` (requires python3 + nm). Deliberately not part
+of `zig build test`, so day-to-day development needs no host tools; run it
+whenever the amalgamation or rename artifacts are regenerated.
 
 The crypto parameters this build must reproduce (pinned against the real
 `with_anlz` fixture and verified in `tools/dlp_decrypt.py`): SQLCipher v4

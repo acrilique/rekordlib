@@ -86,9 +86,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
 
     // Symbol-prefix verification for the vendored amalgamation: every defined
-    // global in the compiled object must be rl_-prefixed (decision 10). Runs
-    // as part of `zig build test` on native vendored builds; `zig build
-    // dlp-symbols` runs it standalone.
+    // global in the compiled object must be rl_-prefixed, so the vendored
+    // SQLCipher cannot collide with a consumer-embedded one. Runs
+    // only via `zig build dlp-symbols` (needs python3 + nm), so `zig build
+    // test` stays host-tool free; run it when regenerating the rename
+    // artifacts from a new upstream.
     const dlp_symbols_step = b.step("dlp-symbols", "Verify rl_ symbol prefixing of the vendored SQLCipher object");
     if (dlp_mode == .vendored) {
         const obj_mod = b.createModule(.{
@@ -107,9 +109,6 @@ pub fn build(b: *std.Build) void {
         const verify = b.addSystemCommand(&.{ "python3", "tools/gen_prefix.py", "--verify" });
         verify.addFileArg(obj.getEmittedBin());
         dlp_symbols_step.dependOn(&verify.step);
-        if (target.query.isNative()) {
-            test_step.dependOn(&verify.step);
-        }
     }
 
     const bench_mod = b.addModule("bench", .{
