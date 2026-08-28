@@ -303,6 +303,123 @@ test "O2 load: plaintext and encrypted paths yield identical models" {
     try testing.expect(plain_lib.eql(&enc_lib));
 }
 
+/// The WAL format's unkeyed u32-pair checksum, chained over the header
+/// and every frame. Words are read little-endian (magic 0x377f0682);
+/// every stored WAL integer is big-endian.
+fn walChecksum(sum: *[2]u32, bytes: []const u8) void {
+    std.debug.assert(bytes.len % 8 == 0);
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 8) {
+        sum[0] +%= std.mem.readInt(u32, bytes[i..][0..4], .little) +% sum[1];
+        sum[1] +%= std.mem.readInt(u32, bytes[i..][4..8], .little) +% sum[0];
+    }
+}
+
+/// Plants a forged `ol.db-wal` beside a closed WAL-mode db: a WAL header
+/// plus one commit frame carrying page 1 with the in-header page count
+/// patched, so both page-count sources — the page-1 header and the
+/// commit frame's dbsize — tell the same lie. Salts and the checksum
+/// chain are recomputed, so recovery adopts the frame and
+/// `PRAGMA page_count` reports `forged_pages` though the physical pair
+/// never grew. This is the vuln-0001 forge shape scaled down: 4096
+/// claimed pages (16 MiB) keep the post-test checkpoint's worst-case
+/// main-file growth bounded while still inflating the pre-clamp budget
+/// to 128 MiB, far past what the amplifying view below decodes to.
+fn forgeWalSidecar(io: std.Io, tmp: *testing.TmpDir, alloc: std.mem.Allocator, forged_pages: u32) !void {
+    const main = try tmp.dir.readFileAlloc(io, "ol.db", alloc, .limited(1 << 20));
+    defer alloc.free(main);
+
+    // page size from the db header (offset 16; the value 1 encodes 64 KiB)
+    const raw_ps = std.mem.readInt(u16, main[16..18], .big);
+    const page_size: usize = if (raw_ps == 1) 64 * 1024 else raw_ps;
+    try testing.expect(main.len >= page_size);
+    // the journal-mode bytes must already say WAL, or SQLite ignores -wal
+    try testing.expectEqual(@as(u8, 2), main[18]);
+    try testing.expectEqual(@as(u8, 2), main[19]);
+
+    // the frame's page image: page 1 with both count fields lying
+    const page1 = try alloc.dupe(u8, main[0..page_size]);
+    defer alloc.free(page1);
+    std.mem.writeInt(u32, page1[28..32], forged_pages, .big);
+    // keep change-counter == version-valid-for so the header count is trusted
+    @memcpy(page1[92..96], page1[24..28]);
+
+    const wal = try alloc.alloc(u8, 32 + 24 + page_size);
+    defer alloc.free(wal);
+    const salt1: u32 = 0x0BADC0DE; // any values; frames must copy them
+    const salt2: u32 = 0xFEEDFACE;
+
+    std.mem.writeInt(u32, wal[0..4], 0x377F0682, .big); // magic: LE checksum words
+    std.mem.writeInt(u32, wal[4..8], 3007000, .big); // format version
+    std.mem.writeInt(u32, wal[8..12], @intCast(page_size), .big);
+    std.mem.writeInt(u32, wal[12..16], 0, .big); // checkpoint sequence
+    std.mem.writeInt(u32, wal[16..20], salt1, .big);
+    std.mem.writeInt(u32, wal[20..24], salt2, .big);
+    var sum = [2]u32{ 0, 0 };
+    walChecksum(&sum, wal[0..24]);
+    std.mem.writeInt(u32, wal[24..28], sum[0], .big);
+    std.mem.writeInt(u32, wal[28..32], sum[1], .big);
+
+    const frame = wal[32..];
+    std.mem.writeInt(u32, frame[0..4], 1, .big); // page number
+    std.mem.writeInt(u32, frame[4..8], forged_pages, .big); // dbsize after commit
+    std.mem.writeInt(u32, frame[8..12], salt1, .big);
+    std.mem.writeInt(u32, frame[12..16], salt2, .big);
+    walChecksum(&sum, frame[0..8]); // continues the header's chain
+    walChecksum(&sum, page1);
+    std.mem.writeInt(u32, frame[16..20], sum[0], .big);
+    std.mem.writeInt(u32, frame[20..24], sum[1], .big);
+    @memcpy(frame[24..], page1);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "ol.db-wal", .data = wal });
+}
+
+test "O2 load: a forged WAL sidecar cannot inflate the decode budget" {
+    if (dlp.mode != .vendored) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    defer alloc.free(db_path);
+
+    // An honest writer db whose genre table is swapped for a view that
+    // mints rows from thin air — the amplifying source the budget exists
+    // to catch. 200k rows decode to well past a MiB.
+    {
+        var w = try dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-28" });
+        try w.db.exec(
+            \\DROP TABLE genre;
+            \\CREATE VIEW genre AS WITH RECURSIVE cnt(n) AS (
+            \\  SELECT 1 UNION ALL SELECT n + 1 FROM cnt WHERE n < 200000
+            \\) SELECT n AS genre_id, 'genre-' || n AS name FROM cnt;
+        );
+        try w.close();
+    }
+
+    // Control, no sidecar: the view alone trips LibraryTooLarge.
+    {
+        var db = try dlp.Db.openPlaintext(io, db_path);
+        defer db.close();
+        try testing.expectError(error.LibraryTooLarge, dlp.Library.load(alloc, db));
+    }
+
+    // The forge: claim 16 MiB from a 4 KiB sidecar. Before the
+    // physical-bytes clamp this sized the budget at 128 MiB and the
+    // load below ran to completion.
+    try forgeWalSidecar(io, &tmp, alloc, 4096);
+
+    var db = try dlp.Db.openPlaintext(io, db_path);
+    defer db.close();
+
+    // recovery adopted the forged size...
+    try testing.expectEqual(@as(i64, 4096), try db.scalarInt("PRAGMA page_count;"));
+    // ...but the budget anchor stays the physical pair, not the lie
+    try testing.expect(try db.mainFileSize() < 1024 * 1024);
+    try testing.expectError(error.LibraryTooLarge, dlp.Library.load(alloc, db));
+}
+
 test "O2 keyed: by-id maps and the path join" {
     if (dlp.mode != .vendored) return;
     const alloc = testing.allocator;

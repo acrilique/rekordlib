@@ -16,8 +16,8 @@
 //!   schema-pinned and arena-owned, with keyed access for the joins the
 //!   device reader needs;
 //! * the write layer (`Writer`): creates a fresh export's db (the real
-//!   schema plus its seeded defaults), inserts rows over the O2 models,
-//!   and closes in the on-disk shape of rb's exports.
+//!   schema plus its seeded defaults), inserts rows over the read
+//!   models, and closes in the on-disk shape of rb's exports.
 //!
 //! Build modes (`-Ddlp=off|vendored|system`): `off` compiles this module's
 //! types away from the binary (every runtime entry point is guarded by a
@@ -477,6 +477,13 @@ fn sqlite_transient() ?*const fn (?*anyopaque) callconv(.c) void {
 /// `openReadWriteCreate` also creates - both apply the DLP passphrase.
 pub const Db = struct {
     handle: *c.sqlite3,
+    /// Bytes physically present under the db's path at open time: the
+    /// main file plus any `-wal`/`-shm` sidecars. `mainFileSize` clamps
+    /// SQLite's reported size to this — a forged WAL commit frame or a
+    /// patched page-1 header can make `PRAGMA page_count` claim any
+    /// size, but the bytes on disk cannot lie about how much input a
+    /// decode proportional budget may draw from.
+    physical_bytes: u64 = 0,
 
     pub const OpenError = SqlError;
 
@@ -519,12 +526,34 @@ pub const Db = struct {
         }
         var db = Db{ .handle = handle.? };
         errdefer db.close();
+        db.physical_bytes = physicalSize(io, path);
         if (!keyed) return db;
         // key before any page read; the WAL-persisted fixture needs the
         // read-write open above to recover without sidecar files present
         const key_sql = "PRAGMA key = '" ++ passphrase ++ "';";
         try db.exec(key_sql);
         return db;
+    }
+
+    /// The on-disk byte sum of the db file and its journal sidecars,
+    /// missing files counting zero. Failures also count zero: an
+    /// understated size only tightens the decode budget (fail-closed).
+    fn physicalSize(io: std.Io, path: [:0]const u8) u64 {
+        const cwd = std.Io.Dir.cwd();
+        var total: u64 = sizeOf(cwd.statFile(io, path, .{}));
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        inline for (.{ "-wal", "-shm" }) |suffix| {
+            const side = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ path, suffix }) catch return total;
+            total += sizeOf(cwd.statFile(io, side, .{}));
+        }
+        return total;
+    }
+
+    fn sizeOf(stat: std.Io.Dir.StatFileError!std.Io.Dir.Stat) u64 {
+        return if (stat) |s| s.size else |err| switch (err) {
+            error.FileNotFound, error.NotDir => 0,
+            else => 0,
+        };
     }
 
     pub fn close(self: Db) void {
@@ -556,13 +585,18 @@ pub const Db = struct {
     }
 
     /// The main database file's size in bytes as SQLite accounts it: page
-    /// count times page size. WAL sidecar bulk is excluded — the loaders'
-    /// budget wants the bytes that declare the rows, not uncheckpointed
-    /// journal growth.
+    /// count times page size, clamped to the bytes physically on disk at
+    /// open time (main file plus `-wal`/`-shm` sidecars). SQLite's page
+    /// count is attacker-writable metadata — a forged WAL commit frame
+    /// raises it past any limit without moving a byte of real input — so
+    /// the decode budget draws from what the disk actually holds, never
+    /// from what the header claims. WAL sidecar bulk is otherwise
+    /// excluded from the account: the budget wants the bytes that
+    /// declare the rows, not uncheckpointed journal growth.
     pub fn mainFileSize(self: Db) SqlError!u64 {
         const page_size: u64 = @intCast(try self.scalarInt("PRAGMA page_size;"));
         const page_count: u64 = @intCast(try self.scalarInt("PRAGMA page_count;"));
-        return page_size *| page_count;
+        return @min(page_size *| page_count, self.physical_bytes);
     }
 
     pub fn lastInsertRowid(self: Db) i64 {
@@ -1421,11 +1455,12 @@ pub const CreateOptions = struct {
 
 /// A OneLibrary db opened for writing: `create` builds a fresh export's
 /// db (schema, seeded defaults, the property singleton), `open` attaches
-/// to an existing one, and both write through prepared SQL over the O2
-/// row models — borrowed input is fine. First-class mutation is
-/// append-only, mirroring the device writer's stance; there is no update.
-/// The schema carries no foreign keys, so no method validates ids — tree
-/// and junction semantics belong to the caller (the O4 device writer).
+/// to an existing one, and both write through prepared SQL over the
+/// read-side row models — borrowed input is fine. First-class mutation
+/// is append-only, mirroring the device writer's stance; there is no
+/// update. The schema carries no foreign keys, so no method validates
+/// ids — tree and junction semantics belong to the caller (the device
+/// writer).
 pub const Writer = struct {
     db: Db,
 
@@ -1491,7 +1526,8 @@ pub const Writer = struct {
     }
 
     /// Folds the WAL back into the main file and truncates it, landing a
-    /// complete db without closing the handle (the O4 save hook).
+    /// complete db without closing the handle (the device-export save
+    /// hook).
     pub fn checkpoint(self: Writer) SqlError!void {
         try self.db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
     }
