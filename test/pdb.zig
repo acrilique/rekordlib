@@ -1351,12 +1351,13 @@ test "page decode dispatches content by the index flag" {
 }
 
 /// Parses the database fixture at `path` (relative to `testdata`) of
-/// `db_type` and checks the P7 acceptance: the header page roundtrips
-/// byte-identical, the only allowed difference elsewhere is dead-space
-/// zeroing (every differing output byte is zero — deleted-row remnants
-/// the writer does not preserve, which real files also carry on pages
-/// without the `contains_deleted` flag), re-writing the first output is
-/// byte-stable, and re-parsing it yields the same database.
+/// `db_type` and checks the roundtrip acceptance: the header page
+/// roundtrips byte-identical, the only allowed difference elsewhere is
+/// dead-space zeroing (every differing output byte is zero —
+/// deleted-row remnants the writer does not preserve, which real files
+/// also carry on pages without the `contains_deleted` flag),
+/// re-writing the first output is byte-stable, and re-parsing it yields
+/// the same database.
 fn expectDatabaseRoundtrip(path: []const u8, db_type: pdb.DatabaseType) !void {
     const alloc = testing.allocator;
     const input = try testutil.readFixture(alloc, path, .limited(1 << 22));
@@ -1505,8 +1506,9 @@ test "deleted-row page fixture pins dead-space zeroing and idempotent writes" {
 }
 
 /// Perf budget of the full-image model on the largest fixture, in
-/// milliseconds of Debug build: the tripwire for the lazy-pages fallback
-/// (see PLAN.md, "Revisit triggers").
+/// milliseconds of Debug build: the tripwire for the fallback — if large
+/// real-world databases ever blow it, the design to move to is lazy
+/// pages, parsing and rewriting only the pages a session touches.
 const num_rows_perf_budget_ms = 2000;
 
 test "num_rows parses and serializes within the perf budget" {

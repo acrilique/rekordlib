@@ -1,8 +1,8 @@
 # Vendored SQLCipher amalgamation
 
 SQLCipher provides the b-tree layer for OneLibrary `exportLibrary.db`
-(PLAN.md decision 10: we compile SQLCipher with zig cc; we do not reimplement
-SQLite). The crypto provider is NOT vendored C — it is `src/dlp.zig`'s
+(the upstream amalgamation compiled with zig cc; SQLite itself is not
+reimplemented). The crypto provider is NOT vendored C — it is `src/dlp.zig`'s
 Zig implementation over `std.crypto`, registered through SQLCipher's
 documented `SQLCIPHER_CRYPTO_CUSTOM` hook. That choice retires the
 libtomcrypt/mbedTLS cross-build risk entirely: pure-Zig crypto compiles

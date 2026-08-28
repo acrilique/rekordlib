@@ -27,8 +27,8 @@ Usage:
   dlp_decrypt.py encrypt <in.db> <out.db>             salt = page-1 magic slot
   dlp_decrypt.py info <in.db>                         crypto facts + HMAC audit
 
-Mutating fixtures (O2+): edit a decrypted copy with the sqlite3 CLI, then
-`encrypt` it back - no oracle CLI needed.
+Mutating fixtures: edit a decrypted copy with the sqlite3 CLI, then
+`encrypt` it back - no external tool needed.
 """
 
 from __future__ import annotations

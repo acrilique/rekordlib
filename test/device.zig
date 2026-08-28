@@ -250,7 +250,7 @@ test "layout derives the exportLibrary.db path" {
     }
 }
 
-// --- device reader (D2) -------------------------------------------------------
+// --- device reader -----------------------------------------------------------------
 
 /// Fixture roots under `testdata`, with hand-checked track counts (the
 /// pdb's own rows) and playlist trees.
@@ -393,7 +393,7 @@ test "playlist trees match the fixtures" {
     }
 }
 
-// --- OneLibrary reader hook (O4) ----------------------------------------------
+// --- OneLibrary reader hook -------------------------------------------------------
 
 test "OL reader hook loads with_anlz and joins tracks by path" {
     if (dlp.mode != .vendored) return;
@@ -432,7 +432,7 @@ test "OL reader hook is null without an exportLibrary.db" {
     try testing.expect((try ex.openOlLibrary()) == null);
 }
 
-// --- OneLibrary writer mirror (O4) ---------------------------------------------
+// --- OneLibrary writer mirror --------------------------------------------------------
 
 /// Copies one file of a fixture export into the same place under a
 /// temp-dir export root.
@@ -1399,7 +1399,7 @@ test "opened export edits persist through save" {
     try testing.expectEqual(@as(usize, 1), try countTableRows(db2, .genres));
 }
 
-// --- writer: lazy scan (D5) ----------------------------------------------------
+// --- writer: lazy scan -----------------------------------------------------------
 
 /// Asserts `canonicalKeyName(in) == want`, freeing the owned result.
 fn expectCanonical(in: []const u8, want: []const u8) !void {
@@ -1600,9 +1600,8 @@ test "writer state ignores dead-row remnants" {
     const ws = try ex.writerState();
 
     // The demo_tracks page heaps carry four deleted-track paths
-    // (`/Contents/UnknownArtist/UnknownAlbum/*.wav`, P7's dead-space
-    // finding) — the scan walks present rows only, so they must not
-    // resolve.
+    // (`/Contents/UnknownArtist/UnknownAlbum/*.wav`) in dead space —
+    // the scan walks present rows only, so they must not resolve.
     try testing.expect(ws.tracks_by_path.get(
         "/Contents/UnknownArtist/UnknownAlbum/NOISE.wav",
     ) == null);
@@ -1841,7 +1840,7 @@ test "ext tag scan recovers the with_anlz fixture" {
     try testing.expectEqual(@as(u32, 1), state.tag_leaf_counts.get(4).?.next);
 }
 
-// --- writer: add_track (D6) ----------------------------------------------------
+// --- writer: add_track ------------------------------------------------------------
 
 /// Copies a fixture's `export.pdb` into a temp-dir export root — enough
 /// of the export for `open` + `addTrack` + `save` sessions.
@@ -2004,7 +2003,7 @@ test "add track stores the caller artwork path verbatim" {
     });
     try ex.save();
 
-    // No image files are written — the caller owns them (decision 5).
+    // No image files are written — the caller owns them.
     try testing.expectError(error.FileNotFound, tmp.dir.access(io, "PIONEER/Artwork", .{}));
 
     var check = device.DeviceExport.open(tmp_path, io, alloc);
@@ -2113,7 +2112,7 @@ test "add track with analysis writes anlz files" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    // The oracle's vector: one beat, one mono preview column, a
+    // Minimal analysis vector: one beat, one mono preview column, a
     // one-column color preview — enough for `.DAT` + `.EXT`, not `.2EX`.
     // The `AnlzInput` slices are mutable, so the columns live in vars.
     var beats = [1]anlz.Beat{.{ .beat_number = 1, .tempo = 12_800, .time = 0 }};
@@ -2195,7 +2194,7 @@ test "add track with analysis writes anlz files" {
     try testing.expectEqualStrings(want, analyze_path);
 }
 
-// --- D7: playlists + tags --------------------------------------------------------
+// --- writer: playlists + tags --------------------------------------------------------
 
 test "playlist methods reject unknown foreign keys" {
     const alloc = testing.allocator;
@@ -2449,7 +2448,7 @@ test "add tags creates category leaves and junctions" {
         }
     }
 
-    // One category. The encodings here fold the oracle's focused
+    // One category. The encodings here fold rekordcrate's focused
     // `tag_row_encodings` self-check: categories are `0x01000000`, not 1,
     // and `index_shift` is `row_index * 0x20` (0 for the first row, 0x60
     // for the leaf at row 3).

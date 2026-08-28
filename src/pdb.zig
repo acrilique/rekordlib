@@ -2505,10 +2505,14 @@ fn parseImage(
 }
 
 /// A whole `export.pdb`/`exportExt.pdb` image, parsed into an arena: the
-/// file header and every page after page 0. This is the deliberate
-/// whole-file-rewrite divergence from rekordcrate's lazy in-place page
-/// editor — see `docs/DIVERGENCES.md`; byte-identical roundtrips carry the
-/// safety argument and the perf budget the tripwire.
+/// file header and every page after page 0. A deliberate divergence:
+/// rekordcrate's editor demand-loads pages and rewrites only the touched
+/// ones in place, while this model re-serializes the whole image, with
+/// pages that fail to parse kept as raw byte slots written back
+/// verbatim. Byte-identical parse→serialize roundtrips on every fixture
+/// are the safety argument, and the perf-budget test on the largest
+/// fixture the tripwire for moving to lazy pages should large
+/// real-world databases ever need them.
 pub const Database = struct {
     /// Arena owning every value parsed into this instance. Rows and their
     /// strings parse directly into it; `serialize` never allocates from

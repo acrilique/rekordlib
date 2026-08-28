@@ -15,7 +15,8 @@ fn openFixtureDb(io: std.Io, tmp: *testing.TmpDir, alloc: std.mem.Allocator) !dl
 }
 
 /// Copies the decrypted `testdata/dlp/with_anlz_plain.db` into a temp dir
-/// and opens it without the DLP key — the fast O2 fixture path.
+/// and opens it without the DLP key — skipping key derivation, the fast
+/// fixture path.
 fn openPlaintextFixtureDb(io: std.Io, tmp: *testing.TmpDir, alloc: std.mem.Allocator) !dlp.Db {
     return openFixtureCopy(io, tmp, alloc, false);
 }
@@ -63,7 +64,7 @@ test "with_anlz fixture: integrity, provider wiring, table counts" {
     try testing.expectEqual(.row, try prov.step());
     try testing.expectEqualStrings("zig-std-crypto", prov.readText(0));
 
-    // hand-pinned counts (Phase O findings; O2 turns these into models)
+    // hand-pinned counts observed in the with_anlz fixture
     try testing.expectEqual(@as(i64, 2), try db.scalarInt("SELECT COUNT(*) FROM content;"));
     try testing.expectEqual(@as(i64, 1), try db.scalarInt("SELECT COUNT(*) FROM artist;"));
     try testing.expectEqual(@as(i64, 1), try db.scalarInt("SELECT COUNT(*) FROM album;"));
@@ -230,7 +231,7 @@ test "O2 load: fixture values, NULL versus empty string" {
     try testing.expect(bako.subtitle != null and bako.subtitle.?.len == 0);
 
     try testing.expectEqualStrings("Reboot", lib.artists[0].name.?);
-    // the album name's leading space is genuine (D5 finding)
+    // the album name's leading space is genuine (observed in the fixture)
     try testing.expectEqualStrings(" www.electronicfresh.com", lib.albums[0].name.?);
     try testing.expectEqual(@as(i64, 0), lib.albums[0].isComplation.?);
     try testing.expectEqualStrings("Pink", lib.colors[0].name.?);
@@ -391,7 +392,7 @@ test "O2 keyed: junction groupings order, skip, and first-win" {
 }
 
 // ---------------------------------------------------------------------------
-// O3 write layer
+// OneLibrary write layer
 // ---------------------------------------------------------------------------
 
 /// The cwd-relative, NUL-terminated path of a file inside `tmp`.
@@ -401,8 +402,8 @@ fn tmpDbPath(tmp: *testing.TmpDir, alloc: std.mem.Allocator, name: []const u8) !
     return std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ tmp_path, name }, 0);
 }
 
-/// Compares two schemas as name-ordered (type, name, sql) triples — the
-/// O3 acceptance's "schema diff empty modulo data".
+/// Compares two schemas as name-ordered (type, name, sql) triples —
+/// "schema diff empty modulo data".
 fn expectSchemaEql(a: dlp.Db, b: dlp.Db) !void {
     const sql = "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name;";
     var sa = try a.prepare(sql);
