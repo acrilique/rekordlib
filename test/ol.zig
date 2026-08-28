@@ -1,23 +1,23 @@
 const std = @import("std");
 const testing = std.testing;
 
-const dlp = @import("rekordlib").dlp;
+const ol = @import("rekordlib").ol;
 const testutil = @import("util.zig");
 
 test {
-    if (dlp.mode != .vendored) return; // fixture tests need the vendored build
+    if (ol.mode != .@"vendored-sqlcipher") return; // fixture tests need the vendored-sqlcipher build
 }
 
 /// Copies the with_anlz `exportLibrary.db` into a temp dir (the WAL-persisted
 /// fixture needs write access for recovery) and opens it keyed.
-fn openFixtureDb(io: std.Io, tmp: *testing.TmpDir, alloc: std.mem.Allocator) !dlp.Db {
+fn openFixtureDb(io: std.Io, tmp: *testing.TmpDir, alloc: std.mem.Allocator) !ol.Db {
     return openFixtureCopy(io, tmp, alloc, true);
 }
 
-/// Copies the decrypted `testdata/dlp/with_anlz_plain.db` into a temp dir
-/// and opens it without the DLP key — skipping key derivation, the fast
+/// Copies the decrypted `testdata/ol/with_anlz_plain.db` into a temp dir
+/// and opens it without the OL key — skipping key derivation, the fast
 /// fixture path.
-fn openPlaintextFixtureDb(io: std.Io, tmp: *testing.TmpDir, alloc: std.mem.Allocator) !dlp.Db {
+fn openPlaintextFixtureDb(io: std.Io, tmp: *testing.TmpDir, alloc: std.mem.Allocator) !ol.Db {
     return openFixtureCopy(io, tmp, alloc, false);
 }
 
@@ -26,11 +26,11 @@ fn openFixtureCopy(
     tmp: *testing.TmpDir,
     alloc: std.mem.Allocator,
     keyed: bool,
-) !dlp.Db {
+) !ol.Db {
     const rel = if (keyed)
         "complete_export/with_anlz/PIONEER/rekordbox/exportLibrary.db"
     else
-        "dlp/with_anlz_plain.db";
+        "ol/with_anlz_plain.db";
     const image = try testutil.readFixture(alloc, rel, .limited(1 << 20));
     defer alloc.free(image);
     const name = if (keyed) "exportLibrary.db" else "plain.db";
@@ -39,11 +39,11 @@ fn openFixtureCopy(
     defer alloc.free(tmp_path);
     const db_path = try std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ tmp_path, name }, 0);
     defer alloc.free(db_path);
-    return if (keyed) dlp.Db.open(io, db_path) else dlp.Db.openPlaintext(io, db_path);
+    return if (keyed) ol.Db.open(io, db_path) else ol.Db.openPlaintext(io, db_path);
 }
 
 test "with_anlz fixture: integrity, provider wiring, table counts" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -76,7 +76,7 @@ test "with_anlz fixture: integrity, provider wiring, table counts" {
 }
 
 test "create, write, read back through the provider" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -88,7 +88,7 @@ test "create, write, read back through the provider" {
     defer alloc.free(db_path);
 
     {
-        var db = try dlp.Db.openReadWriteCreate(io, db_path);
+        var db = try ol.Db.openReadWriteCreate(io, db_path);
         defer db.close();
         try db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL, data BLOB);");
         var stmt = try db.prepare("INSERT INTO t (name, score, data) VALUES (?1, ?2, ?3);");
@@ -106,7 +106,7 @@ test "create, write, read back through the provider" {
     defer alloc.free(raw);
     try testing.expect(raw.len >= 4096);
     try testing.expect(!std.mem.eql(u8, raw[0..16], "SQLite format 3\x00")); // salt, not magic
-    var db = try dlp.Db.open(io, db_path);
+    var db = try ol.Db.open(io, db_path);
     defer db.close();
     var stmt = try db.prepare("SELECT id, name, score, data FROM t;");
     defer stmt.finalize();
@@ -123,8 +123,8 @@ test "create, write, read back through the provider" {
 }
 
 test "sqliteVersion is reachable" {
-    if (dlp.mode == .off) return;
-    try testing.expect(std.mem.startsWith(u8, dlp.sqliteVersion(), "3."));
+    if (ol.mode == .off) return;
+    try testing.expect(std.mem.startsWith(u8, ol.sqliteVersion(), "3."));
 }
 
 test "cbc matches NIST SP 800-38A F.2.5 (AES-256-CBC)" {
@@ -145,14 +145,14 @@ test "cbc matches NIST SP 800-38A F.2.5 (AES-256-CBC)" {
     );
 
     var buf: [64]u8 = undefined;
-    try dlp.cbc(true, key, iv, &buf, &pt);
+    try ol.cbc(true, key, iv, &buf, &pt);
     try testing.expectEqualSlices(u8, &ct, buf[0..pt.len]);
-    try dlp.cbc(false, key, iv, &buf, &ct);
+    try ol.cbc(false, key, iv, &buf, &ct);
     try testing.expectEqualSlices(u8, &pt, buf[0..ct.len]);
 
     // the preconditions are real errors, not debug asserts
-    try testing.expectError(error.BufferTooSmall, dlp.cbc(true, key, iv, buf[0..8], &pt));
-    try testing.expectError(error.NotBlockAligned, dlp.cbc(true, key, iv, &buf, pt[0..20]));
+    try testing.expectError(error.BufferTooSmall, ol.cbc(true, key, iv, buf[0..8], &pt));
+    try testing.expectError(error.NotBlockAligned, ol.cbc(true, key, iv, &buf, pt[0..20]));
 }
 
 fn hex(comptime s: []const u8) [s.len / 2]u8 {
@@ -162,7 +162,7 @@ fn hex(comptime s: []const u8) [s.len / 2]u8 {
 }
 
 test "O2 load: every table with the fixture's row counts" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -171,7 +171,7 @@ test "O2 load: every table with the fixture's row counts" {
     var db = try openPlaintextFixtureDb(io, &tmp, alloc);
     defer db.close();
 
-    var lib = try dlp.Library.load(alloc, db);
+    var lib = try ol.Library.load(alloc, db);
     defer lib.deinit();
 
     try testing.expectEqual(@as(usize, 1), lib.albums.len);
@@ -199,7 +199,7 @@ test "O2 load: every table with the fixture's row counts" {
 }
 
 test "O2 load: fixture values, NULL versus empty string" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -208,7 +208,7 @@ test "O2 load: fixture values, NULL versus empty string" {
     var db = try openPlaintextFixtureDb(io, &tmp, alloc);
     defer db.close();
 
-    var lib = try dlp.Library.load(alloc, db);
+    var lib = try ol.Library.load(alloc, db);
     defer lib.deinit();
 
     const bako = lib.contents[1];
@@ -251,7 +251,7 @@ test "O2 load: fixture values, NULL versus empty string" {
 }
 
 test "O2 load: schema drift is rejected" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -263,26 +263,26 @@ test "O2 load: schema drift is rejected" {
         var db = try openPlaintextFixtureDb(io, &tmp, alloc);
         defer db.close();
         try db.exec("ALTER TABLE artist ADD COLUMN extra varchar;");
-        try testing.expectError(error.SchemaMismatch, dlp.Library.load(alloc, db));
+        try testing.expectError(error.SchemaMismatch, ol.Library.load(alloc, db));
     }
     // renamed column: name mismatch
     {
         var db = try openPlaintextFixtureDb(io, &tmp, alloc);
         defer db.close();
         try db.exec("ALTER TABLE menuItem RENAME COLUMN name TO nom;");
-        try testing.expectError(error.SchemaMismatch, dlp.Library.load(alloc, db));
+        try testing.expectError(error.SchemaMismatch, ol.Library.load(alloc, db));
     }
     // duplicated property row: the singleton rule
     {
         var db = try openPlaintextFixtureDb(io, &tmp, alloc);
         defer db.close();
         try db.exec("INSERT INTO property SELECT * FROM property;");
-        try testing.expectError(error.SchemaMismatch, dlp.Library.load(alloc, db));
+        try testing.expectError(error.SchemaMismatch, ol.Library.load(alloc, db));
     }
 }
 
 test "O2 load: plaintext and encrypted paths yield identical models" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -290,14 +290,14 @@ test "O2 load: plaintext and encrypted paths yield identical models" {
     defer plain_tmp.cleanup();
     var plain = try openPlaintextFixtureDb(io, &plain_tmp, alloc);
     defer plain.close();
-    var plain_lib = try dlp.Library.load(alloc, plain);
+    var plain_lib = try ol.Library.load(alloc, plain);
     defer plain_lib.deinit();
 
     var enc_tmp = testing.tmpDir(.{});
     defer enc_tmp.cleanup();
     var enc = try openFixtureDb(io, &enc_tmp, alloc);
     defer enc.close();
-    var enc_lib = try dlp.Library.load(alloc, enc);
+    var enc_lib = try ol.Library.load(alloc, enc);
     defer enc_lib.deinit();
 
     try testing.expect(plain_lib.eql(&enc_lib));
@@ -375,7 +375,7 @@ fn forgeWalSidecar(io: std.Io, tmp: *testing.TmpDir, alloc: std.mem.Allocator, f
 }
 
 test "O2 load: a forged WAL sidecar cannot inflate the decode budget" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -388,7 +388,7 @@ test "O2 load: a forged WAL sidecar cannot inflate the decode budget" {
     // mints rows from thin air — the amplifying source the budget exists
     // to catch. 200k rows decode to well past a MiB.
     {
-        var w = try dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-28" });
+        var w = try ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-28" });
         try w.db.exec(
             \\DROP TABLE genre;
             \\CREATE VIEW genre AS WITH RECURSIVE cnt(n) AS (
@@ -400,9 +400,9 @@ test "O2 load: a forged WAL sidecar cannot inflate the decode budget" {
 
     // Control, no sidecar: the view alone trips LibraryTooLarge.
     {
-        var db = try dlp.Db.openPlaintext(io, db_path);
+        var db = try ol.Db.openPlaintext(io, db_path);
         defer db.close();
-        try testing.expectError(error.LibraryTooLarge, dlp.Library.load(alloc, db));
+        try testing.expectError(error.LibraryTooLarge, ol.Library.load(alloc, db));
     }
 
     // The forge: claim 16 MiB from a 4 KiB sidecar. Before the
@@ -410,18 +410,18 @@ test "O2 load: a forged WAL sidecar cannot inflate the decode budget" {
     // load below ran to completion.
     try forgeWalSidecar(io, &tmp, alloc, 4096);
 
-    var db = try dlp.Db.openPlaintext(io, db_path);
+    var db = try ol.Db.openPlaintext(io, db_path);
     defer db.close();
 
     // recovery adopted the forged size...
     try testing.expectEqual(@as(i64, 4096), try db.scalarInt("PRAGMA page_count;"));
     // ...but the budget anchor stays the physical pair, not the lie
     try testing.expect(try db.mainFileSize() < 1024 * 1024);
-    try testing.expectError(error.LibraryTooLarge, dlp.Library.load(alloc, db));
+    try testing.expectError(error.LibraryTooLarge, ol.Library.load(alloc, db));
 }
 
 test "O2 keyed: by-id maps and the path join" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -429,7 +429,7 @@ test "O2 keyed: by-id maps and the path join" {
     defer tmp.cleanup();
     var db = try openPlaintextFixtureDb(io, &tmp, alloc);
     defer db.close();
-    var lib = try dlp.Library.load(alloc, db);
+    var lib = try ol.Library.load(alloc, db);
     defer lib.deinit();
 
     // the pdb-side join
@@ -439,22 +439,22 @@ test "O2 keyed: by-id maps and the path join" {
     try testing.expectEqual(@as(i64, 2), bako.content_id);
     try testing.expect(lib.contentByPath("/Contents/nope") == null);
 
-    try testing.expectEqualStrings("Reboot", lib.byId(dlp.Artist, 1).?.name.?);
-    try testing.expectEqualStrings("Tech House", lib.byId(dlp.Genre, 2).?.name.?);
-    try testing.expectEqualStrings("Cecille", lib.byId(dlp.Label, 1).?.name.?);
-    try testing.expectEqualStrings("Genre", lib.byId(dlp.MyTag, 1).?.name.?);
+    try testing.expectEqualStrings("Reboot", lib.byId(ol.Artist, 1).?.name.?);
+    try testing.expectEqualStrings("Tech House", lib.byId(ol.Genre, 2).?.name.?);
+    try testing.expectEqualStrings("Cecille", lib.byId(ol.Label, 1).?.name.?);
+    try testing.expectEqualStrings("Genre", lib.byId(ol.MyTag, 1).?.name.?);
     try testing.expectEqualStrings(
         "/PIONEER/Artwork/00001/b2.jpg",
-        lib.byId(dlp.Image, 2).?.path.?,
+        lib.byId(ol.Image, 2).?.path.?,
     );
-    try testing.expectEqual(@as(i64, 12900), lib.byId(dlp.Content, 2).?.bpmx100.?);
+    try testing.expectEqual(@as(i64, 12900), lib.byId(ol.Content, 2).?.bpmx100.?);
     // empty tables and the 0 = "no foreign key" convention
-    try testing.expect(lib.byId(dlp.Key, 1) == null);
-    try testing.expect(lib.byId(dlp.Content, 0) == null);
+    try testing.expect(lib.byId(ol.Key, 1) == null);
+    try testing.expect(lib.byId(ol.Content, 0) == null);
 }
 
 test "O2 keyed: junction groupings order, skip, and first-win" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -465,7 +465,7 @@ test "O2 keyed: junction groupings order, skip, and first-win" {
 
     // fixture order: sequenceNo 1, 2 -> contents 1, 2
     {
-        var lib = try dlp.Library.load(alloc, db);
+        var lib = try ol.Library.load(alloc, db);
         defer lib.deinit();
         const entries = lib.playlist_contents_by_playlist.get(1).?;
         try testing.expectEqual(@as(usize, 2), entries.len);
@@ -486,7 +486,7 @@ test "O2 keyed: junction groupings order, skip, and first-win" {
         \\VALUES (99, '/Contents/Reboot/www.electronicfresh.com/01. Reboot - Bako (Original Mix).mp3');
         \\
     );
-    var lib = try dlp.Library.load(alloc, db);
+    var lib = try ol.Library.load(alloc, db);
     defer lib.deinit();
     try testing.expectEqual(@as(usize, 5), lib.playlist_contents.len);
     const entries = lib.playlist_contents_by_playlist.get(1).?;
@@ -521,7 +521,7 @@ fn tmpDbPath(tmp: *testing.TmpDir, alloc: std.mem.Allocator, name: []const u8) !
 
 /// Compares two schemas as name-ordered (type, name, sql) triples —
 /// "schema diff empty modulo data".
-fn expectSchemaEql(a: dlp.Db, b: dlp.Db) !void {
+fn expectSchemaEql(a: ol.Db, b: ol.Db) !void {
     const sql = "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name;";
     var sa = try a.prepare(sql);
     defer sa.finalize();
@@ -556,7 +556,7 @@ fn expectTableEql(comptime T: type, expected: []const T, actual: []const T) !voi
 }
 
 test "O3 create: schema diff vs the real fixture is empty" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -564,7 +564,7 @@ test "O3 create: schema diff vs the real fixture is empty" {
     defer tmp.cleanup();
     const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
     defer alloc.free(db_path);
-    var w = try dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    var w = try ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
     defer w.db.close();
 
     var fix_tmp = testing.tmpDir(.{});
@@ -576,7 +576,7 @@ test "O3 create: schema diff vs the real fixture is empty" {
 }
 
 test "O3 create: seeded defaults and the property row" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -584,27 +584,27 @@ test "O3 create: seeded defaults and the property row" {
     defer tmp.cleanup();
     const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
     defer alloc.free(db_path);
-    var w = try dlp.Writer.create(io, db_path, .{
+    var w = try ol.Writer.create(io, db_path, .{
         .plaintext = true,
         .created_date = "2026-07-16",
         .my_tag_master_dbid = 3168300669,
     });
     defer w.db.close();
 
-    var lib = try dlp.Library.load(alloc, w.db);
+    var lib = try ol.Library.load(alloc, w.db);
     defer lib.deinit();
 
     var fix_tmp = testing.tmpDir(.{});
     defer fix_tmp.cleanup();
     var fixture = try openPlaintextFixtureDb(io, &fix_tmp, alloc);
     defer fixture.close();
-    var fix_lib = try dlp.Library.load(alloc, fixture);
+    var fix_lib = try ol.Library.load(alloc, fixture);
     defer fix_lib.deinit();
 
-    try expectTableEql(dlp.Color, fix_lib.colors, lib.colors);
-    try expectTableEql(dlp.MenuItem, fix_lib.menu_items, lib.menu_items);
-    try expectTableEql(dlp.Category, fix_lib.categories, lib.categories);
-    try expectTableEql(dlp.Sort, fix_lib.sorts, lib.sorts);
+    try expectTableEql(ol.Color, fix_lib.colors, lib.colors);
+    try expectTableEql(ol.MenuItem, fix_lib.menu_items, lib.menu_items);
+    try expectTableEql(ol.Category, fix_lib.categories, lib.categories);
+    try expectTableEql(ol.Sort, fix_lib.sorts, lib.sorts);
 
     // everything a fresh export leaves empty is empty
     try testing.expectEqual(@as(usize, 0), lib.contents.len);
@@ -626,7 +626,7 @@ test "O3 create: seeded defaults and the property row" {
 }
 
 test "O3 create: refuses to build over an existing db" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -634,17 +634,17 @@ test "O3 create: refuses to build over an existing db" {
     defer tmp.cleanup();
     const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
     defer alloc.free(db_path);
-    var w = try dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    var w = try ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
     try w.close();
 
     try testing.expectError(
         error.LibraryAlreadyExists,
-        dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" }),
+        ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" }),
     );
 }
 
 test "O3 close: WAL header flag like rb exports, no sidecars left" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -652,7 +652,7 @@ test "O3 close: WAL header flag like rb exports, no sidecars left" {
     defer tmp.cleanup();
     const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
     defer alloc.free(db_path);
-    var w = try dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    var w = try ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
     // one written row, so the checkpoint has WAL frames to fold
     try w.db.exec("INSERT INTO content (content_id, path) VALUES (1, '/Contents/a.mp3');");
     try w.close();
@@ -669,13 +669,13 @@ test "O3 close: WAL header flag like rb exports, no sidecars left" {
     try testing.expectError(error.FileNotFound, tmp.dir.access(io, "ol.db-shm", .{}));
 
     // and the db reopens without a recovery dance
-    var db = try dlp.Db.openPlaintext(io, db_path);
+    var db = try ol.Db.openPlaintext(io, db_path);
     defer db.close();
     try testing.expectEqual(@as(i64, 1), try db.scalarInt("SELECT COUNT(*) FROM content;"));
     try testing.expectEqualStrings("ok", try integrityCheck(db));
 }
 
-fn integrityCheck(db: dlp.Db) ![]const u8 {
+fn integrityCheck(db: ol.Db) ![]const u8 {
     var stmt = try db.prepare("PRAGMA integrity_check;");
     defer stmt.finalize();
     try testing.expectEqual(.row, try stmt.step());
@@ -683,7 +683,7 @@ fn integrityCheck(db: dlp.Db) ![]const u8 {
 }
 
 test "O3 round-trip: fixture models re-written into a fresh db are eql" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -691,14 +691,14 @@ test "O3 round-trip: fixture models re-written into a fresh db are eql" {
     defer fix_tmp.cleanup();
     var fixture = try openPlaintextFixtureDb(io, &fix_tmp, alloc);
     defer fixture.close();
-    var src = try dlp.Library.load(alloc, fixture);
+    var src = try ol.Library.load(alloc, fixture);
     defer src.deinit();
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
     defer alloc.free(db_path);
-    var w = try dlp.Writer.create(io, db_path, .{
+    var w = try ol.Writer.create(io, db_path, .{
         .plaintext = true,
         .created_date = "2026-07-16",
         .my_tag_master_dbid = 3168300669,
@@ -715,16 +715,16 @@ test "O3 round-trip: fixture models re-written into a fresh db are eql" {
     for (src.contents) |row| try w.insertContent(row);
     try w.close();
 
-    var db = try dlp.Db.openPlaintext(io, db_path);
+    var db = try ol.Db.openPlaintext(io, db_path);
     defer db.close();
     try testing.expectEqualStrings("ok", try integrityCheck(db));
-    var dst = try dlp.Library.load(alloc, db);
+    var dst = try ol.Library.load(alloc, db);
     defer dst.deinit();
     try testing.expect(src.eql(&dst));
 }
 
 test "O3 mutate: numberOfContents maintenance on insert and delete" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -732,16 +732,16 @@ test "O3 mutate: numberOfContents maintenance on insert and delete" {
     defer tmp.cleanup();
     const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
     defer alloc.free(db_path);
-    var w = try dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    var w = try ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
     defer w.db.close();
 
     try testing.expectEqual(@as(i64, 0), try w.numberOfContents());
-    try testing.expectEqual(@as(i64, 1), try w.nextId(dlp.Content));
+    try testing.expectEqual(@as(i64, 1), try w.nextId(ol.Content));
 
     try w.insertContent(.{ .content_id = 1, .path = "/Contents/a.mp3" });
     try w.insertContent(.{ .content_id = 2, .path = "/Contents/b.mp3", .rating = 3 });
     try testing.expectEqual(@as(i64, 2), try w.numberOfContents());
-    try testing.expectEqual(@as(i64, 3), try w.nextId(dlp.Content));
+    try testing.expectEqual(@as(i64, 3), try w.nextId(ol.Content));
 
     try w.deleteContent(1);
     try testing.expectEqual(@as(i64, 1), try w.numberOfContents());
@@ -749,11 +749,11 @@ test "O3 mutate: numberOfContents maintenance on insert and delete" {
     // count-derived: matches the table, and the property stays a singleton
     try testing.expectEqual(@as(i64, 1), try w.db.scalarInt("SELECT COUNT(*) FROM property;"));
     // MAX+1 reuses a deleted last id, like SQLite's own rowid assignment
-    try testing.expectEqual(@as(i64, 3), try w.nextId(dlp.Content));
+    try testing.expectEqual(@as(i64, 3), try w.nextId(ol.Content));
 }
 
 test "O3 mutate: playlist append is dense and 1-based" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -761,21 +761,21 @@ test "O3 mutate: playlist append is dense and 1-based" {
     defer tmp.cleanup();
     const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
     defer alloc.free(db_path);
-    var w = try dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    var w = try ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
     defer w.db.close();
 
     try w.insertContent(.{ .content_id = 1, .path = "/Contents/a.mp3" });
     try w.insertContent(.{ .content_id = 2, .path = "/Contents/b.mp3" });
 
-    try w.insert(dlp.Playlist{
-        .playlist_id = try w.nextId(dlp.Playlist),
+    try w.insert(ol.Playlist{
+        .playlist_id = try w.nextId(ol.Playlist),
         .sequenceNo = 0,
         .name = "pl",
         .attribute = 0,
         .playlist_id_parent = 0,
     });
-    try w.insert(dlp.Playlist{
-        .playlist_id = try w.nextId(dlp.Playlist),
+    try w.insert(ol.Playlist{
+        .playlist_id = try w.nextId(ol.Playlist),
         .sequenceNo = 1,
         .name = "other",
         .attribute = 0,
@@ -787,7 +787,7 @@ test "O3 mutate: playlist append is dense and 1-based" {
     try testing.expectEqual(@as(i64, 2), try w.addContentToPlaylist(1, 2));
     try testing.expectEqual(@as(i64, 1), try w.addContentToPlaylist(2, 1));
 
-    var lib = try dlp.Library.load(alloc, w.db);
+    var lib = try ol.Library.load(alloc, w.db);
     defer lib.deinit();
     try testing.expectEqual(@as(usize, 3), lib.playlist_contents.len);
     const entries = lib.playlist_contents_by_playlist.get(1).?;
@@ -796,7 +796,7 @@ test "O3 mutate: playlist append is dense and 1-based" {
 }
 
 test "O3 mutate: insertAll batches rows atomically through one statement" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -804,38 +804,38 @@ test "O3 mutate: insertAll batches rows atomically through one statement" {
     defer tmp.cleanup();
     const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
     defer alloc.free(db_path);
-    var w = try dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    var w = try ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
     defer w.db.close();
 
     try w.insertAll(&.{
-        dlp.Artist{ .artist_id = 1, .name = "A" },
-        dlp.Artist{ .artist_id = 2, .name = "B" },
-        dlp.Artist{ .artist_id = 3, .name = "C" },
+        ol.Artist{ .artist_id = 1, .name = "A" },
+        ol.Artist{ .artist_id = 2, .name = "B" },
+        ol.Artist{ .artist_id = 3, .name = "C" },
     });
     // a Content batch maintains numberOfContents once, like insertContent
     try w.insertAll(&.{
-        dlp.Content{ .content_id = 1, .path = "/Contents/a.mp3" },
-        dlp.Content{ .content_id = 2, .path = "/Contents/b.mp3" },
+        ol.Content{ .content_id = 1, .path = "/Contents/a.mp3" },
+        ol.Content{ .content_id = 2, .path = "/Contents/b.mp3" },
     });
     try testing.expectEqual(@as(i64, 2), try w.numberOfContents());
-    try testing.expectEqual(@as(i64, 4), try w.nextId(dlp.Artist));
+    try testing.expectEqual(@as(i64, 4), try w.nextId(ol.Artist));
 
-    var lib = try dlp.Library.load(alloc, w.db);
+    var lib = try ol.Library.load(alloc, w.db);
     defer lib.deinit();
     try testing.expectEqual(@as(usize, 3), lib.artists.len);
-    try testing.expectEqualStrings("B", lib.byId(dlp.Artist, 2).?.name.?);
+    try testing.expectEqualStrings("B", lib.byId(ol.Artist, 2).?.name.?);
 
     // a duplicate key rolls the whole batch back
     try testing.expectError(error.Sqlite, w.insertAll(&.{
-        dlp.Artist{ .artist_id = 4, .name = "D" },
-        dlp.Artist{ .artist_id = 4, .name = "D again" },
+        ol.Artist{ .artist_id = 4, .name = "D" },
+        ol.Artist{ .artist_id = 4, .name = "D again" },
     }));
     try testing.expectEqual(@as(i64, 3), w.db.scalarInt("SELECT COUNT(*) FROM artist;"));
-    try testing.expectEqual(@as(i64, 4), try w.nextId(dlp.Artist));
+    try testing.expectEqual(@as(i64, 4), try w.nextId(ol.Artist));
 }
 
 test "O3 mutate: addAllToPlaylist batches dense appends through one statement" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -843,17 +843,17 @@ test "O3 mutate: addAllToPlaylist batches dense appends through one statement" {
     defer tmp.cleanup();
     const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
     defer alloc.free(db_path);
-    var w = try dlp.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    var w = try ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
     defer w.db.close();
 
     try w.insertAll(&.{
-        dlp.Content{ .content_id = 1, .path = "/Contents/a.mp3" },
-        dlp.Content{ .content_id = 2, .path = "/Contents/b.mp3" },
-        dlp.Content{ .content_id = 3, .path = "/Contents/c.mp3" },
+        ol.Content{ .content_id = 1, .path = "/Contents/a.mp3" },
+        ol.Content{ .content_id = 2, .path = "/Contents/b.mp3" },
+        ol.Content{ .content_id = 3, .path = "/Contents/c.mp3" },
     });
     try w.insertAll(&.{
-        dlp.Playlist{ .playlist_id = 1, .sequenceNo = 0, .name = "pl", .attribute = 0, .playlist_id_parent = 0 },
-        dlp.Playlist{ .playlist_id = 2, .sequenceNo = 1, .name = "other", .attribute = 0, .playlist_id_parent = 0 },
+        ol.Playlist{ .playlist_id = 1, .sequenceNo = 0, .name = "pl", .attribute = 0, .playlist_id_parent = 0 },
+        ol.Playlist{ .playlist_id = 2, .sequenceNo = 1, .name = "other", .attribute = 0, .playlist_id_parent = 0 },
     });
 
     // The batch continues past a row already on disk, then stays dense
@@ -866,7 +866,7 @@ test "O3 mutate: addAllToPlaylist batches dense appends through one statement" {
         .{ .playlist_id = 2, .content_id = 1 },
     });
 
-    var lib = try dlp.Library.load(alloc, w.db);
+    var lib = try ol.Library.load(alloc, w.db);
     defer lib.deinit();
     try testing.expectEqual(@as(usize, 4), lib.playlist_contents.len);
     const pl1 = lib.playlist_contents_by_playlist.get(1).?;
@@ -878,7 +878,7 @@ test "O3 mutate: addAllToPlaylist batches dense appends through one statement" {
 }
 
 test "O3 create: keyed db is encrypted and reopens through the provider" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -887,7 +887,7 @@ test "O3 create: keyed db is encrypted and reopens through the provider" {
     const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
     defer alloc.free(db_path);
     {
-        var w = try dlp.Writer.create(io, db_path, .{ .created_date = "2026-08-23" });
+        var w = try ol.Writer.create(io, db_path, .{ .created_date = "2026-08-23" });
         try w.insertContent(.{ .content_id = 1, .path = "/Contents/a.mp3" });
         try w.close();
     }
@@ -898,7 +898,7 @@ test "O3 create: keyed db is encrypted and reopens through the provider" {
     try testing.expect(raw.len >= 4096);
     try testing.expect(!std.mem.eql(u8, raw[0..16], "SQLite format 3\x00"));
 
-    var w = try dlp.Writer.open(io, db_path);
+    var w = try ol.Writer.open(io, db_path);
     defer w.db.close();
     try testing.expectEqual(@as(i64, 1), try w.numberOfContents());
     try testing.expectEqualStrings("ok", try integrityCheck(w.db));

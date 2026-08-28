@@ -5,7 +5,7 @@
 const std = @import("std");
 const anlz = @import("rekordlib").anlz;
 const device = @import("rekordlib").device;
-const dlp = @import("rekordlib").dlp;
+const ol = @import("rekordlib").ol;
 const pdb = @import("rekordlib").pdb;
 const setting = @import("rekordlib").setting;
 const testutil = @import("util.zig");
@@ -396,14 +396,14 @@ test "playlist trees match the fixtures" {
 // --- OneLibrary reader hook -------------------------------------------------------
 
 test "OL reader hook loads with_anlz and joins tracks by path" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
     var ex = device.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
     defer ex.deinit();
 
-    const lib = (try ex.openOlLibrary()).?;
+    const lib = (try ex.openOL()).?;
     // The join: each pdb track's file_path names its OL content row,
     // carrying the fields the pdb lacks.
     const bako = lib.contentByPath(
@@ -417,19 +417,19 @@ test "OL reader hook loads with_anlz and joins tracks by path" {
     try testing.expect(lib.hot_cue_bank_lists.len == 0);
 
     // Cached: the second call returns the same models without re-reading.
-    try testing.expectEqual(lib, (try ex.openOlLibrary()).?);
+    try testing.expectEqual(lib, (try ex.openOL()).?);
 }
 
 test "OL reader hook is null without an exportLibrary.db" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
     var ex = device.DeviceExport.open("testdata/complete_export/demo_tracks", io, alloc);
     defer ex.deinit();
-    try testing.expect((try ex.openOlLibrary()) == null);
+    try testing.expect((try ex.openOL()) == null);
     // The absent verdict is cached too.
-    try testing.expect((try ex.openOlLibrary()) == null);
+    try testing.expect((try ex.openOL()) == null);
 }
 
 // --- OneLibrary writer mirror --------------------------------------------------------
@@ -483,7 +483,7 @@ fn tmpOlDbPath(tmp: *testing.TmpDir, alloc: std.mem.Allocator) ![:0]u8 {
 }
 
 test "create saves an OL db with defaults and zero contents" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -509,9 +509,9 @@ test "create saves an OL db with defaults and zero contents" {
 
     const db_path = try tmpOlDbPath(&tmp, alloc);
     defer alloc.free(db_path);
-    var db = try dlp.Db.open(io, db_path);
+    var db = try ol.Db.open(io, db_path);
     defer db.close();
-    var lib = try dlp.Library.load(alloc, db);
+    var lib = try ol.Library.load(alloc, db);
     defer lib.deinit();
 
     // The same seeded shape as a fresh rb export, and nothing else.
@@ -545,7 +545,7 @@ test "create saves an OL db with defaults and zero contents" {
 }
 
 test "off builds write no exportLibrary.db" {
-    if (dlp.mode != .off) return;
+    if (ol.mode != .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -566,7 +566,7 @@ test "off builds write no exportLibrary.db" {
 }
 
 test "addTrack mirrors a content row and its dimensions" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -621,9 +621,9 @@ test "addTrack mirrors a content row and its dimensions" {
 
     const db_path = try tmpOlDbPath(&tmp, alloc);
     defer alloc.free(db_path);
-    var db = try dlp.Db.open(io, db_path);
+    var db = try ol.Db.open(io, db_path);
     defer db.close();
-    var lib = try dlp.Library.load(alloc, db);
+    var lib = try ol.Library.load(alloc, db);
     defer lib.deinit();
 
     try testing.expectEqual(@as(usize, 2), lib.contents.len);
@@ -631,7 +631,7 @@ test "addTrack mirrors a content row and its dimensions" {
 
     // The content row: bridged id, mirrored facts, the fixture's NULL
     // versus empty-string conventions, and the cross-format constants.
-    const content = lib.byId(dlp.Content, first.id).?;
+    const content = lib.byId(ol.Content, first.id).?;
     try testing.expectEqualStrings("Bako", content.title.?);
     try testing.expectEqual(@as(i64, 12_900), content.bpmx100.?);
     try testing.expectEqual(@as(i64, 398), content.length.?);
@@ -688,7 +688,7 @@ test "addTrack mirrors a content row and its dimensions" {
 }
 
 test "addTrack authors OL-only columns and mints a lyricist artist" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -727,9 +727,9 @@ test "addTrack authors OL-only columns and mints a lyricist artist" {
 
     const db_path = try tmpOlDbPath(&tmp, alloc);
     defer alloc.free(db_path);
-    var db = try dlp.Db.open(io, db_path);
+    var db = try ol.Db.open(io, db_path);
     defer db.close();
-    var lib = try dlp.Library.load(alloc, db);
+    var lib = try ol.Library.load(alloc, db);
     defer lib.deinit();
 
     try testing.expectEqual(@as(usize, 1), lib.contents.len);
@@ -750,13 +750,13 @@ test "addTrack authors OL-only columns and mints a lyricist artist" {
     try testing.expectEqual(@as(usize, 2), lib.artists.len);
     try testing.expectEqualStrings("Ninja", lib.artists[0].name.?);
     try testing.expectEqual(@as(i64, 1), lib.artists[0].artist_id);
-    const lyricist = lib.byId(dlp.Artist, content.artist_id_lyricist.?).?;
+    const lyricist = lib.byId(ol.Artist, content.artist_id_lyricist.?).?;
     try testing.expectEqualStrings("Kuro", lyricist.name.?);
     try testing.expect(lyricist.artist_id >= 0x1_0000_0000);
 }
 
 test "a lyricist sharing the track artist resolves, never mints" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -778,9 +778,9 @@ test "a lyricist sharing the track artist resolves, never mints" {
 
     const db_path = try tmpOlDbPath(&tmp, alloc);
     defer alloc.free(db_path);
-    var db = try dlp.Db.open(io, db_path);
+    var db = try ol.Db.open(io, db_path);
     defer db.close();
-    var lib = try dlp.Library.load(alloc, db);
+    var lib = try ol.Library.load(alloc, db);
     defer lib.deinit();
 
     try testing.expectEqual(@as(usize, 1), lib.artists.len);
@@ -789,7 +789,7 @@ test "a lyricist sharing the track artist resolves, never mints" {
 }
 
 test "a failed OL batch rolls back whole and stays pending" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -809,8 +809,8 @@ test "a failed OL batch rolls back whole and stays pending" {
     const db_path = try tmpOlDbPath(&tmp, alloc);
     defer alloc.free(db_path);
     {
-        var w = try dlp.Writer.open(io, db_path);
-        try w.insert(dlp.Artist{ .artist_id = 3 });
+        var w = try ol.Writer.open(io, db_path);
+        try w.insert(ol.Artist{ .artist_id = 3 });
         try w.close();
     }
 
@@ -824,26 +824,26 @@ test "a failed OL batch rolls back whole and stays pending" {
     // ever duplicating a landed row.
     try testing.expectError(error.Sqlite, ex.save());
     {
-        var db = try dlp.Db.open(io, db_path);
+        var db = try ol.Db.open(io, db_path);
         defer db.close();
-        var lib = try dlp.Library.load(alloc, db);
+        var lib = try ol.Library.load(alloc, db);
         defer lib.deinit();
         try testing.expectEqual(@as(usize, 2), lib.artists.len);
         try testing.expectEqual(@as(usize, 1), lib.contents.len);
-        try testing.expect(lib.byId(dlp.Artist, 2) == null);
+        try testing.expect(lib.byId(ol.Artist, 2) == null);
     }
     try testing.expectError(error.Sqlite, ex.save());
-    var db = try dlp.Db.open(io, db_path);
+    var db = try ol.Db.open(io, db_path);
     defer db.close();
-    var lib = try dlp.Library.load(alloc, db);
+    var lib = try ol.Library.load(alloc, db);
     defer lib.deinit();
     try testing.expectEqual(@as(usize, 2), lib.artists.len);
     try testing.expectEqual(@as(usize, 1), lib.contents.len);
-    try testing.expect(lib.byId(dlp.Artist, 2) == null);
+    try testing.expect(lib.byId(ol.Artist, 2) == null);
 }
 
 test "a save blocked at the first OL batch recovers whole on retry" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -877,7 +877,7 @@ test "a save blocked at the first OL batch recovers whole on retry" {
     // BEGIN IMMEDIATE — nothing lands.
     const db_path = try tmpOlDbPath(&tmp, alloc);
     defer alloc.free(db_path);
-    var blocker = try dlp.Db.open(io, db_path);
+    var blocker = try ol.Db.open(io, db_path);
     try blocker.exec("BEGIN IMMEDIATE;");
     try testing.expectError(error.Sqlite, ex.save());
     try blocker.exec("ROLLBACK;");
@@ -886,9 +886,9 @@ test "a save blocked at the first OL batch recovers whole on retry" {
     // The still-pending rows land whole on the retry, exactly once, with
     // the playlist ordinals continuing past the rows already on disk.
     try ex.save();
-    var db = try dlp.Db.open(io, db_path);
+    var db = try ol.Db.open(io, db_path);
     defer db.close();
-    var lib = try dlp.Library.load(alloc, db);
+    var lib = try ol.Library.load(alloc, db);
     defer lib.deinit();
     try testing.expectEqual(@as(usize, 2), lib.artists.len);
     try testing.expectEqual(@as(usize, 2), lib.contents.len);
@@ -901,7 +901,7 @@ test "a save blocked at the first OL batch recovers whole on retry" {
 }
 
 test "addTrack mirrors the analysis path when analysis pends" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -924,9 +924,9 @@ test "addTrack mirrors the analysis path when analysis pends" {
 
     const db_path = try tmpOlDbPath(&tmp, alloc);
     defer alloc.free(db_path);
-    var db = try dlp.Db.open(io, db_path);
+    var db = try ol.Db.open(io, db_path);
     defer db.close();
-    var lib = try dlp.Library.load(alloc, db);
+    var lib = try ol.Library.load(alloc, db);
     defer lib.deinit();
 
     const content = lib.contents[0];
@@ -936,7 +936,7 @@ test "addTrack mirrors the analysis path when analysis pends" {
 }
 
 test "mirroring dedups against an existing OL db" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -965,9 +965,9 @@ test "mirroring dedups against an existing OL db" {
 
     const db_path = try tmpOlDbPath(&tmp, alloc);
     defer alloc.free(db_path);
-    var db = try dlp.Db.open(io, db_path);
+    var db = try ol.Db.open(io, db_path);
     defer db.close();
-    var lib = try dlp.Library.load(alloc, db);
+    var lib = try ol.Library.load(alloc, db);
     defer lib.deinit();
 
     try testing.expectEqual(@as(usize, 3), lib.contents.len);
@@ -993,9 +993,9 @@ test "mirroring dedups against an existing OL db" {
     try testing.expect(!again.is_new);
     try reopened.save();
 
-    var db2 = try dlp.Db.open(io, db_path);
+    var db2 = try ol.Db.open(io, db_path);
     defer db2.close();
-    var lib2 = try dlp.Library.load(alloc, db2);
+    var lib2 = try ol.Library.load(alloc, db2);
     defer lib2.deinit();
     try testing.expectEqual(@as(usize, 3), lib2.contents.len);
 }
@@ -2702,7 +2702,7 @@ test "a relative root stays pinned to the working directory of first use" {
 
     // SQLite resolves paths against the process cwd (now b), not the
     // pinned directory — the OL db must still land under a.
-    if (dlp.mode != .off) {
+    if (ol.mode != .off) {
         try tmp.dir.access(io, "a/root/PIONEER/rekordbox/exportLibrary.db", .{});
         try testing.expectError(
             error.FileNotFound,
@@ -2712,7 +2712,7 @@ test "a relative root stays pinned to the working directory of first use" {
 }
 
 test "playlist operations mirror into the OL db" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -2740,24 +2740,24 @@ test "playlist operations mirror into the OL db" {
 
     const db_path = try tmpOlDbPath(&tmp, alloc);
     defer alloc.free(db_path);
-    var db = try dlp.Db.open(io, db_path);
+    var db = try ol.Db.open(io, db_path);
     defer db.close();
-    var lib = try dlp.Library.load(alloc, db);
+    var lib = try ol.Library.load(alloc, db);
     defer lib.deinit();
 
     // Three nodes, ids bridged from the pdb side, folder marked
     // attribute 1, per-parent dense sequenceNo from 0.
     try testing.expectEqual(@as(usize, 3), lib.playlists.len);
-    const ol_folder = lib.byId(dlp.Playlist, folder).?;
+    const ol_folder = lib.byId(ol.Playlist, folder).?;
     try testing.expectEqualStrings("Folder", ol_folder.name.?);
     try testing.expectEqual(@as(i64, 1), ol_folder.attribute.?);
     try testing.expectEqual(@as(i64, 0), ol_folder.playlist_id_parent.?);
     try testing.expectEqual(@as(i64, 0), ol_folder.sequenceNo.?);
-    const ol_inside = lib.byId(dlp.Playlist, inside).?;
+    const ol_inside = lib.byId(ol.Playlist, inside).?;
     try testing.expectEqual(@as(i64, 0), ol_inside.attribute.?);
     try testing.expectEqual(folder, ol_inside.playlist_id_parent.?);
     try testing.expectEqual(@as(i64, 0), ol_inside.sequenceNo.?);
-    const ol_outside = lib.byId(dlp.Playlist, outside).?;
+    const ol_outside = lib.byId(ol.Playlist, outside).?;
     try testing.expectEqual(@as(i64, 0), ol_outside.playlist_id_parent.?);
     try testing.expectEqual(@as(i64, 1), ol_outside.sequenceNo.?);
 
@@ -2772,7 +2772,7 @@ test "playlist operations mirror into the OL db" {
 }
 
 test "tag operations mirror into the OL db" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -2795,16 +2795,16 @@ test "tag operations mirror into the OL db" {
 
     const db_path = try tmpOlDbPath(&tmp, alloc);
     defer alloc.free(db_path);
-    var db = try dlp.Db.open(io, db_path);
+    var db = try ol.Db.open(io, db_path);
     defer db.close();
-    var lib = try dlp.Library.load(alloc, db);
+    var lib = try ol.Library.load(alloc, db);
     defer lib.deinit();
 
     // Four myTag rows whose ids are exactly the ext tag ids (the id
     // bridge), the category attribute 1 with leaves 0 under it, and
     // sequenceNo reusing the ext positions.
     try testing.expectEqual(@as(usize, 4), lib.my_tags.len);
-    const ol_cat = lib.byId(dlp.MyTag, cat).?;
+    const ol_cat = lib.byId(ol.MyTag, cat).?;
     try testing.expectEqualStrings("My Tags", ol_cat.name.?);
     try testing.expectEqual(@as(i64, 1), ol_cat.attribute.?);
     try testing.expectEqual(@as(i64, 0), ol_cat.myTag_id_parent.?);
@@ -2816,7 +2816,7 @@ test "tag operations mirror into the OL db" {
     defer ext_rows.deinit(alloc);
     try testing.expectEqual(lib.my_tags.len, ext_rows.tags.items.len);
     for (ext_rows.tags.items) |tag| {
-        const mirrored = lib.byId(dlp.MyTag, tag.id) orelse {
+        const mirrored = lib.byId(ol.MyTag, tag.id) orelse {
             std.debug.print("ext tag {d} has no mirrored myTag row\n", .{tag.id});
             return error.TestUnexpectedResult;
         };
@@ -2833,12 +2833,12 @@ test "tag operations mirror into the OL db" {
     try testing.expectEqual(@as(usize, 4), lib.my_tag_contents.len);
     for (lib.my_tag_contents) |junction| {
         try testing.expectEqual(@as(i64, track), junction.content_id.?);
-        try testing.expect(lib.byId(dlp.MyTag, junction.myTag_id.?) != null);
+        try testing.expect(lib.byId(ol.MyTag, junction.myTag_id.?) != null);
     }
 }
 
 test "playlist and tag mirroring continues an existing OL db" {
-    if (dlp.mode != .vendored) return;
+    if (ol.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -2869,9 +2869,9 @@ test "playlist and tag mirroring continues an existing OL db" {
 
     const db_path = try tmpOlDbPath(&tmp, alloc);
     defer alloc.free(db_path);
-    var db = try dlp.Db.open(io, db_path);
+    var db = try ol.Db.open(io, db_path);
     defer db.close();
-    var lib = try dlp.Library.load(alloc, db);
+    var lib = try ol.Library.load(alloc, db);
     defer lib.deinit();
 
     // The existing label resolves on both sides: 28 myTag rows stay 28.

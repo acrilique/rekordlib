@@ -2,7 +2,7 @@
 // v. 2.0. If a copy of the MPL was not distributed with this file, You can
 // obtain one at https://mozilla.org/MPL/2.0/.
 
-//! OneLibrary / DeviceLibraryPlus storage (`exportLibrary.db`).
+//! OneLibrary storage (`exportLibrary.db`).
 //!
 //! The db is SQLCipher v4 defaults in passphrase mode; the SQLCipher
 //! amalgamation (vendored under `vendor/sqlcipher/`, see its README) provides
@@ -19,10 +19,10 @@
 //!   schema plus its seeded defaults), inserts rows over the read
 //!   models, and closes in the on-disk shape of rb's exports.
 //!
-//! Build modes (`-Ddlp=off|vendored|system`): `off` compiles this module's
+//! Build modes (`-Dol=off|vendored-sqlcipher|system-sqlcipher`): `off` compiles this module's
 //! types away from the binary (every runtime entry point is guarded by a
-//! comptime `@compileError`); `vendored` compiles the prefixed amalgamation
-//! with zig cc; `system` binds the consumer's own unprefixed SQLCipher.
+//! comptime `@compileError`); `vendored-sqlcipher` compiles the prefixed amalgamation
+//! with zig cc; `system-sqlcipher` binds the consumer's own unprefixed SQLCipher.
 
 const std = @import("std");
 const budget = @import("budget.zig");
@@ -30,18 +30,18 @@ const util = @import("util.zig");
 const opts = @import("options");
 const c = @import("c");
 
-pub const mode = opts.dlp;
+pub const mode = opts.ol;
 
-fn dlpDisabled() noreturn {
-    @compileError("rekordlib was built with -Ddlp=off; rebuild with -Ddlp=vendored (or =system) to use the OneLibrary store");
+fn olDisabled() noreturn {
+    @compileError("rekordlib was built with -Dol=off; rebuild with -Dol=vendored-sqlcipher (or =system-sqlcipher) to use the OneLibrary store");
 }
 
-/// off/vendored bind `rl_`-renamed symbols (typedefs included; `off`
-/// translates the renamed header without compiling any C); system binds
+/// off/vendored-sqlcipher bind `rl_`-renamed symbols (typedefs included; `off`
+/// translates the renamed header without compiling any C); system-sqlcipher binds
 /// the consumer's unprefixed SQLCipher.
 const prefix: []const u8 = switch (mode) {
-    .system => "",
-    .off, .vendored => "rl_",
+    .@"system-sqlcipher" => "",
+    .off, .@"vendored-sqlcipher" => "rl_",
 };
 
 fn cfn(comptime name: []const u8) @TypeOf(@field(c, prefix ++ name)) {
@@ -332,7 +332,7 @@ fn providerGetVersion(ctx: ?*anyopaque) callconv(.c) [*:0]const u8 {
 /// Called by the amalgamation at library init (SQLITE_EXTRA_INIT ->
 /// sqlcipher_extra_init -> SQLCIPHER_PROVIDER_SETUP) because the vendored
 /// build defines SQLCIPHER_CRYPTO_CUSTOM=rl_sqlcipher_zig_provider_setup.
-/// In `system` mode the consumer's own provider is used instead and this
+/// In `system-sqlcipher` mode the consumer's own provider is used instead and this
 /// export is unreferenced.
 pub export fn rl_sqlcipher_zig_provider_setup(p: *Provider) c_int {
     p.* = .{
@@ -369,7 +369,7 @@ comptime {
     // The passphrase is inlined into the key pragma's SQL string; a
     // single quote would break out of the literal.
     if (std.mem.indexOfScalar(u8, passphrase, '\'') != null)
-        @compileError("dlp.passphrase must not contain a single quote");
+        @compileError("ol.passphrase must not contain a single quote");
 }
 
 pub const SqlError = error{ Sqlite, OutOfMemory };
@@ -474,7 +474,7 @@ fn sqlite_transient() ?*const fn (?*anyopaque) callconv(.c) void {
 }
 
 /// An open OneLibrary database. `open` reads (recovering WAL state),
-/// `openReadWriteCreate` also creates - both apply the DLP passphrase.
+/// `openReadWriteCreate` also creates - both apply the OL passphrase.
 pub const Db = struct {
     handle: *c.sqlite3,
     /// Bytes physically present under the db's path at open time: the
@@ -497,21 +497,21 @@ pub const Db = struct {
         return openFlags(io, path, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE, true);
     }
 
-    /// Opens a db without applying the DLP passphrase: plaintext fixtures
-    /// (`testdata/dlp/`) and consumer-written plain SQLite files. SQLCipher
+    /// Opens a db without applying the OL passphrase: plaintext fixtures
+    /// (`testdata/ol/`) and consumer-written plain SQLite files. SQLCipher
     /// reads an unkeyed plaintext file exactly like stock SQLite.
     pub fn openPlaintext(io: std.Io, path: [:0]const u8) OpenError!Db {
         return openFlags(io, path, c.SQLITE_OPEN_READWRITE, false);
     }
 
-    /// Creates or opens a plaintext db without applying the DLP
+    /// Creates or opens a plaintext db without applying the OL
     /// passphrase (`Writer.create` with `plaintext` writes such files).
     pub fn openPlaintextReadWriteCreate(io: std.Io, path: [:0]const u8) OpenError!Db {
         return openFlags(io, path, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE, false);
     }
 
     fn openFlags(io: std.Io, path: [:0]const u8, flags: c_int, keyed: bool) OpenError!Db {
-        if (mode == .off) dlpDisabled();
+        if (mode == .off) olDisabled();
         // Hold the gate until the key pragma has copied the seed into
         // this db's provider ctx (plaintext opens need no seed, but the
         // library init inside the first open_v2 reads it too).
@@ -609,7 +609,7 @@ pub const Db = struct {
 };
 
 pub fn sqliteVersion() [:0]const u8 {
-    if (mode == .off) dlpDisabled();
+    if (mode == .off) olDisabled();
     return std.mem.span(@as([*:0]const u8, @ptrCast(api.libversion())));
 }
 
@@ -1028,7 +1028,7 @@ pub const Library = struct {
     /// column aliases — fails with `LibraryTooLarge` instead of
     /// exhausting memory, and so does any other amplifying source.
     pub fn load(alloc: std.mem.Allocator, db: Db) LoadError!Library {
-        if (mode == .off) dlpDisabled();
+        if (mode == .off) olDisabled();
 
         const db_size = try db.mainFileSize();
         const size: usize = std.math.cast(usize, db_size) orelse
@@ -1055,7 +1055,7 @@ pub const Library = struct {
         return lib;
     }
 
-    /// Row lookup for any primary-key table — `lib.byId(dlp.Artist, 3)`.
+    /// Row lookup for any primary-key table — `lib.byId(ol.Artist, 3)`.
     /// Ids absent from the table, including the 0 = "no foreign key"
     /// convention, return null.
     pub fn byId(self: *const Library, comptime T: type, id: i64) ?*const T {
@@ -1442,7 +1442,7 @@ const write_tables = filterTables(struct {
 
 /// Options of `Writer.create`.
 pub const CreateOptions = struct {
-    /// Writes the db without the DLP passphrase — the plaintext side of
+    /// Writes the db without the OL passphrase — the plaintext side of
     /// `Db.openPlaintext` (fixtures and plain-SQLite consumers).
     plaintext: bool = false,
     /// Written to `property.createdDate` (`'YYYY-MM-DD'` in real
@@ -1473,7 +1473,7 @@ pub const Writer = struct {
     /// Creates a fresh OneLibrary db at `path`: the real schema (see
     /// `schema_sql`), the four seeded tables' default rows, and the
     /// property singleton, all in one transaction — a failed create
-    /// leaves no file behind. The db is keyed with the DLP passphrase
+    /// leaves no file behind. The db is keyed with the OL passphrase
     /// unless `plaintext` is set, and starts in WAL journal mode like
     /// rb's exports.
     pub fn create(io: std.Io, path: [:0]const u8, options: CreateOptions) CreateError!Writer {

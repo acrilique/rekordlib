@@ -2,7 +2,7 @@
 
 SQLCipher provides the b-tree layer for OneLibrary `exportLibrary.db`
 (the upstream amalgamation compiled with zig cc; SQLite itself is not
-reimplemented). The crypto provider is NOT vendored C — it is `src/dlp.zig`'s
+reimplemented). The crypto provider is NOT vendored C — it is `src/ol.zig`'s
 Zig implementation over `std.crypto`, registered through SQLCipher's
 documented `SQLCIPHER_CRYPTO_CUSTOM` hook. That choice retires the
 libtomcrypt/mbedTLS cross-build risk entirely: pure-Zig crypto compiles
@@ -38,7 +38,7 @@ Regenerate the amalgamation (needs `tclsh`, a C compiler, autotools-ish
 The generated rename artifacts are committed so builds never need tclsh,
 network, or the upstream tree.
 
-## Compile flags (used by build.zig, `-Ddlp=vendored`)
+## Compile flags (used by build.zig, `-Dol=vendored-sqlcipher`)
 
 The compiled source is `rl_sqlcipher.c` — a two-line shim that includes
 `rl_rename.h` before `sqlite3.c` (zig 0.16's `build-obj` CLI mishandles the
@@ -65,12 +65,12 @@ force-included into the single amalgamation TU so internal references
 rename consistently; consumers and `@translateC` use
 `rl_sqlite3.h`. Verification: `nm` over the compiled object must show only
 `rl_`-prefixed defined globals (COFF `.debug$*` section symbols aside) —
-run `zig build dlp-symbols` (requires python3 + nm). Deliberately not part
+run `zig build ol-symbols` (requires python3 + nm). Deliberately not part
 of `zig build test`, so day-to-day development needs no host tools; run it
 whenever the amalgamation or rename artifacts are regenerated.
 
 The crypto parameters this build must reproduce (pinned against the real
-`with_anlz` fixture and verified in `tools/dlp_decrypt.py`): SQLCipher v4
+`with_anlz` fixture and verified in `tools/ol_decrypt.py`): SQLCipher v4
 defaults — PBKDF2-HMAC-SHA512 with 256000 iterations for the 32-byte key,
 a per-page `[ciphertext 4016][IV 16][HMAC-SHA512 64]` layout, HMAC key =
 PBKDF2-SHA512(key, salt ⊕ 0x3a, 2 iterations), page HMAC over

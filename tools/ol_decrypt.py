@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decrypt / re-encrypt a Pioneer DeviceLibraryPlus `exportLibrary.db`.
+"""Decrypt / re-encrypt a Pioneer OneLibrary `exportLibrary.db`.
 
 The db is SQLCipher v4 with default parameters in passphrase mode:
 
@@ -23,9 +23,9 @@ random (SQLCipher never reuses stored IVs on write; readers take the IV
 from the page itself).
 
 Usage:
-  dlp_decrypt.py decrypt <in.db> <out.db> [--check]   --check verifies page HMACs
-  dlp_decrypt.py encrypt <in.db> <out.db>             salt = page-1 magic slot
-  dlp_decrypt.py info <in.db>                         crypto facts + HMAC audit
+  ol_decrypt.py decrypt <in.db> <out.db> [--check]   --check verifies page HMACs
+  ol_decrypt.py encrypt <in.db> <out.db>             salt = page-1 magic slot
+  ol_decrypt.py info <in.db>                         crypto facts + HMAC audit
 
 Mutating fixtures: edit a decrypted copy with the sqlite3 CLI, then
 `encrypt` it back - no external tool needed.

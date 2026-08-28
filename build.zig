@@ -4,24 +4,24 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const DlpMode = enum { off, vendored, system };
-    const dlp_mode = b.option(
-        DlpMode,
-        "dlp",
-        "OneLibrary store backend: vendored (prefixed SQLCipher via zig cc), system (consumer-provided), or off",
-    ) orelse .vendored;
+    const OlMode = enum { off, @"vendored-sqlcipher", @"system-sqlcipher" };
+    const ol_mode = b.option(
+        OlMode,
+        "ol",
+        "OneLibrary store backend: vendored-sqlcipher (rl_-prefixed SQLCipher amalgamation, which embeds SQLite, via zig cc), system-sqlcipher (consumer-provided), or off",
+    ) orelse .@"vendored-sqlcipher";
 
-    const dlp_options = b.addOptions();
-    dlp_options.addOption(DlpMode, "dlp", dlp_mode);
+    const ol_options = b.addOptions();
+    ol_options.addOption(OlMode, "ol", ol_mode);
 
-    // The vendored build renames every sqlite3_/sqlcipher_ export to rl_*;
-    // the system build binds the consumer's own unprefixed SQLCipher.
-    const dlp_c_header = switch (dlp_mode) {
-        .system => "vendor/sqlcipher/sqlite3.h",
-        .off, .vendored => "vendor/sqlcipher/rl_sqlite3.h",
+    // The vendored-sqlcipher build renames every sqlite3_/sqlcipher_ export to rl_*;
+    // the system-sqlcipher build binds the consumer's own unprefixed SQLCipher.
+    const ol_c_header = switch (ol_mode) {
+        .@"system-sqlcipher" => "vendor/sqlcipher/sqlite3.h",
+        .off, .@"vendored-sqlcipher" => "vendor/sqlcipher/rl_sqlite3.h",
     };
-    const dlp_translate = b.addTranslateC(.{
-        .root_source_file = b.path(dlp_c_header),
+    const ol_translate = b.addTranslateC(.{
+        .root_source_file = b.path(ol_c_header),
         .target = target,
         .optimize = optimize,
     });
@@ -34,20 +34,20 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "c", .module = dlp_translate.createModule() },
-            .{ .name = "options", .module = dlp_options.createModule() },
+            .{ .name = "c", .module = ol_translate.createModule() },
+            .{ .name = "options", .module = ol_options.createModule() },
         },
     });
-    switch (dlp_mode) {
+    switch (ol_mode) {
         .off => {},
-        .vendored => {
+        .@"vendored-sqlcipher" => {
             rekordlib.addCSourceFile(.{
                 .file = b.path("vendor/sqlcipher/rl_sqlcipher.c"),
                 .flags = &sqlcipher_flags,
             });
             rekordlib.link_libc = true;
         },
-        .system => {
+        .@"system-sqlcipher" => {
             rekordlib.link_libc = true;
             rekordlib.linkSystemLibrary("sqlcipher", .{});
         },
@@ -88,11 +88,11 @@ pub fn build(b: *std.Build) void {
     // Symbol-prefix verification for the vendored amalgamation: every defined
     // global in the compiled object must be rl_-prefixed, so the vendored
     // SQLCipher cannot collide with a consumer-embedded one. Runs
-    // only via `zig build dlp-symbols` (needs python3 + nm), so `zig build
+    // only via `zig build ol-symbols` (needs python3 + nm), so `zig build
     // test` stays host-tool free; run it when regenerating the rename
     // artifacts from a new upstream.
-    const dlp_symbols_step = b.step("dlp-symbols", "Verify rl_ symbol prefixing of the vendored SQLCipher object");
-    if (dlp_mode == .vendored) {
+    const ol_symbols_step = b.step("ol-symbols", "Verify rl_ symbol prefixing of the vendored SQLCipher object");
+    if (ol_mode == .@"vendored-sqlcipher") {
         const obj_mod = b.createModule(.{
             .target = b.graph.host,
             .root_source_file = b.path("vendor/sqlcipher/check_root.zig"),
@@ -108,7 +108,7 @@ pub fn build(b: *std.Build) void {
         });
         const verify = b.addSystemCommand(&.{ "python3", "tools/gen_prefix.py", "--verify" });
         verify.addFileArg(obj.getEmittedBin());
-        dlp_symbols_step.dependOn(&verify.step);
+        ol_symbols_step.dependOn(&verify.step);
     }
 
     const bench_mod = b.addModule("bench", .{

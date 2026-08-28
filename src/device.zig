@@ -14,7 +14,7 @@
 const std = @import("std");
 const bin = @import("bin.zig");
 const anlz = @import("anlz.zig");
-const dlp = @import("dlp.zig");
+const ol = @import("ol.zig");
 const pdb = @import("pdb.zig");
 const setting = @import("setting.zig");
 const util = @import("util.zig");
@@ -408,24 +408,24 @@ pub const SaveError =
     std.Io.Dir.CreateDirPathError ||
     AtomicWriteError ||
     std.Io.Dir.DeleteFileError ||
-    dlp.Writer.CreateError ||
-    dlp.SqlError ||
+    ol.Writer.CreateError ||
+    ol.SqlError ||
     error{CwdUnavailable};
 
 /// Error of `DeviceExport.writerState`: reading or parsing
 /// `export.pdb`, or scanning it.
 pub const WriterStateError = OpenPdbError || ScanError;
 
-/// Error of `DeviceExport.openOlLibrary`: pinning the working directory,
+/// Error of `DeviceExport.openOL`: pinning the working directory,
 /// examining or opening `exportLibrary.db` (a file over the read cap is
 /// `LibraryTooLarge`), loading its models (a drifted schema is
 /// `SchemaMismatch`, a disproportionate decode also `LibraryTooLarge`),
 /// or building its path (the process cwd was unreadable when the handle
 /// pinned it).
-pub const OpenOlLibraryError =
+pub const OpenOLError =
     std.Io.Dir.OpenError ||
     std.Io.Dir.StatFileError ||
-    dlp.LoadError ||
+    ol.LoadError ||
     error{ CwdUnavailable, OutOfMemory };
 
 /// Error of the OL mirroring helpers: pinning the working directory,
@@ -435,7 +435,7 @@ pub const OpenOlLibraryError =
 pub const OlMirrorError =
     std.Io.Dir.OpenError ||
     std.Io.Dir.AccessError ||
-    dlp.LoadError ||
+    ol.LoadError ||
     std.mem.Allocator.Error ||
     error{ CwdUnavailable, InvalidUtf8, IdSpaceExhausted };
 
@@ -534,7 +534,7 @@ pub const TrackInput = struct {
 
     // OneLibrary-only data: columns that exist in `exportLibrary.db`
     // and never reach the pdb. Ignored when the export carries no OL db
-    // (an opened pdb-only export never gains one), in `-Ddlp=off`
+    // (an opened pdb-only export never gains one), in `-Dol=off`
     // builds, and on the dedup path — `addTrack` returning an existing
     // track never updates it (append-only). Every default equals the
     // fixture's convention, so a track authored without them writes the
@@ -615,7 +615,7 @@ const PendingAnlz = struct {
 };
 
 /// Reads the process working directory through libc. Only called in
-/// `-Ddlp` builds (which link libc) to snapshot the cwd a SQLite path can
+/// `-Dol` builds (which link libc) to snapshot the cwd a SQLite path can
 /// be made absolute against; a cwd longer than the path buffer, or one
 /// that cannot be read at all, reports `OutOfMemory` — callers treat that
 /// as "no snapshot" and fail later at path-build time.
@@ -632,7 +632,7 @@ fn captureCwd(alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
 /// writes; `deinit` discards whatever was never saved. Files the export
 /// carries but the handle does not model are ignored by design:
 /// `djprofile.nxs` (undocumented). The OneLibrary db
-/// (`exportLibrary.db`, newer exports) is read through `openOlLibrary`
+/// (`exportLibrary.db`, newer exports) is read through `openOL`
 /// and mirrored by the writer side of the handle.
 pub const DeviceExport = struct {
     layout: Layout,
@@ -646,7 +646,7 @@ pub const DeviceExport = struct {
     dir: ?std.Io.Dir,
     /// The process cwd at the moment `dir` was pinned — the absolute
     /// prefix SQLite paths are built on (they resolve against the process
-    /// cwd, not the pinned handle). Null in `-Ddlp=off` builds (nothing
+    /// cwd, not the pinned handle). Null in `-Dol=off` builds (nothing
     /// needs it), until the pin, or when the cwd was unreadable.
     dir_path: ?[]u8 = null,
     /// The export's pdb, loaded on the first pdb-touching call — `open`
@@ -665,7 +665,7 @@ pub const DeviceExport = struct {
     /// `save` — before `export.pdb`, so a crash leaves orphan analysis
     /// files players ignore, not rows naming missing ones.
     pending_anlz: std.ArrayList(PendingAnlz) = .empty,
-    /// The OneLibrary db read side (`openOlLibrary`), independent of the
+    /// The OneLibrary db read side (`openOL`), independent of the
     /// writer side.
     ol_library: OlLibraryState = .unloaded,
     /// The OneLibrary db write side: rows mirrored by the mutating
@@ -680,14 +680,14 @@ pub const DeviceExport = struct {
     };
 
     /// Lifecycle of the `exportLibrary.db` models, loaded on first
-    /// `openOlLibrary` call and cached for the handle's life.
+    /// `openOL` call and cached for the handle's life.
     const OlLibraryState = union(enum) {
         /// Not examined yet; the first call checks the disk.
         unloaded,
         /// No `exportLibrary.db` under the root (older exports).
         absent,
         /// Loaded and cached; owned by the handle.
-        loaded: dlp.Library,
+        loaded: ol.Library,
     };
 
     /// Lifecycle of the OneLibrary write side. Mirroring is a no-op in
@@ -734,13 +734,13 @@ pub const DeviceExport = struct {
     /// The pinned working directory, opening it on first use. `Dir.cwd()`
     /// is only an `AT_FDCWD` sentinel — every call resolves against the
     /// process cwd as it is *then* — so a real handle is opened once and
-    /// reused. `-Ddlp` builds also snapshot the cwd string: SQLite, which
+    /// reused. `-Dol` builds also snapshot the cwd string: SQLite, which
     /// the OneLibrary store goes through, resolves paths against the
     /// process cwd rather than a directory handle.
     fn dirHandle(e: *DeviceExport) (std.Io.Dir.OpenError || std.mem.Allocator.Error)!std.Io.Dir {
         if (e.dir == null) {
             e.dir = try std.Io.Dir.cwd().openDir(e.io, ".", .{});
-            if (dlp.mode != .off) {
+            if (ol.mode != .off) {
                 // A cwd that cannot be read leaves `dir_path` null; the
                 // OneLibrary paths then fail with `CwdUnavailable`.
                 e.dir_path = captureCwd(e.alloc) catch null;
@@ -763,7 +763,7 @@ pub const DeviceExport = struct {
         // Pin the working directory now: create is the export's first I/O.
         const dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
         errdefer dir.close(io);
-        const dir_path: ?[]u8 = if (dlp.mode != .off)
+        const dir_path: ?[]u8 = if (ol.mode != .off)
             captureCwd(alloc) catch null
         else
             null;
@@ -909,10 +909,10 @@ pub const DeviceExport = struct {
     /// the OL view of a track — including the fields the pdb lacks
     /// (remixer/composer/lyricist/original-artist ids, subtitle, bit
     /// depth, sampling rate, djPlayCount). Only compiled with
-    /// `-Ddlp=vendored` (or `=system`).
-    pub fn openOlLibrary(e: *DeviceExport) OpenOlLibraryError!?*const dlp.Library {
-        if (dlp.mode == .off)
-            @compileError("rekordlib was built with -Ddlp=off; rebuild with -Ddlp=vendored (or =system) to read the OneLibrary store");
+    /// `-Dol=vendored-sqlcipher` (or `=system-sqlcipher`).
+    pub fn openOL(e: *DeviceExport) OpenOLError!?*const ol.Library {
+        if (ol.mode == .off)
+            @compileError("rekordlib was built with -Dol=off; rebuild with -Dol=vendored-sqlcipher (or =system-sqlcipher) to read the OneLibrary store");
         switch (e.ol_library) {
             .loaded => |*lib| return lib,
             .absent => return null,
@@ -931,10 +931,10 @@ pub const DeviceExport = struct {
 
                 const path = try e.olDbPath();
                 defer e.alloc.free(path);
-                var db = try dlp.Db.open(e.io, path);
+                var db = try ol.Db.open(e.io, path);
                 errdefer db.close();
                 // Same tag-then-payload hazard as `openPdb`: load first.
-                const lib = try dlp.Library.load(e.alloc, db);
+                const lib = try ol.Library.load(e.alloc, db);
                 db.close();
                 e.ol_library = .{ .loaded = lib };
                 return &e.ol_library.loaded;
@@ -969,9 +969,9 @@ pub const DeviceExport = struct {
     /// state (the db is loaded and closed again — pending rows are the
     /// only mutations until `save`); an export without one never gains
     /// one, so mirroring is a no-op there. Null in the absent case — and
-    /// always, in `-Ddlp=off` builds, where mirroring is compiled out.
+    /// always, in `-Dol=off` builds, where mirroring is compiled out.
     fn olStore(e: *DeviceExport) OlMirrorError!?*OlStore {
-        if (dlp.mode == .off) return null;
+        if (ol.mode == .off) return null;
         switch (e.ol_state) {
             .store => |*store| return store,
             .absent => return null,
@@ -989,9 +989,9 @@ pub const DeviceExport = struct {
 
                 const path = try e.olDbPath();
                 defer e.alloc.free(path);
-                var db = try dlp.Db.open(e.io, path);
+                var db = try ol.Db.open(e.io, path);
                 errdefer db.close();
-                var lib = try dlp.Library.load(e.alloc, db);
+                var lib = try ol.Library.load(e.alloc, db);
                 defer lib.deinit();
                 db.close();
 
@@ -1007,7 +1007,7 @@ pub const DeviceExport = struct {
     /// Builds the OL store before a mutating method touches the pdb, so
     /// an unopenable or schema-drifted `exportLibrary.db` fails the call
     /// with the export untouched. A no-op on exports that carry no db
-    /// (and in `-Ddlp=off` builds).
+    /// (and in `-Dol=off` builds).
     fn primeOlStore(e: *DeviceExport) OlMirrorError!void {
         _ = try e.olStore();
     }
@@ -1926,9 +1926,9 @@ pub const DeviceExport = struct {
     /// and `create` takes no date). Later saves touch the file only when
     /// rows are pending. `close` checkpoints, so the landed file is
     /// complete with no `-wal`/`-shm` sidecars, exactly rb's shape.
-    /// Skipped entirely in `-Ddlp=off` builds.
+    /// Skipped entirely in `-Dol=off` builds.
     fn writeOl(e: *DeviceExport) SaveError!void {
-        if (dlp.mode == .off) return;
+        if (ol.mode == .off) return;
         const store = switch (e.ol_state) {
             .store => |*store| store,
             // Nothing mirrored — no db, or an untouched one: never write.
@@ -1941,7 +1941,7 @@ pub const DeviceExport = struct {
         const path = try e.olDbPath();
         defer e.alloc.free(path);
 
-        var w: dlp.Writer = undefined;
+        var w: ol.Writer = undefined;
         if (store.fresh) {
             // A created export starts from an empty db even over a
             // leftover file — the same overwrite stance as the ext pdb.
@@ -1950,9 +1950,9 @@ pub const DeviceExport = struct {
                 error.FileNotFound => {},
                 else => return err,
             };
-            w = try dlp.Writer.create(e.io, path, .{ .created_date = "" });
+            w = try ol.Writer.create(e.io, path, .{ .created_date = "" });
         } else {
-            w = try dlp.Writer.open(e.io, path);
+            w = try ol.Writer.open(e.io, path);
         }
         errdefer w.db.close();
 
@@ -2209,19 +2209,19 @@ const OlStore = struct {
     fresh: bool = false,
 
     /// Rows pending their first insert, in mirroring order.
-    artists: std.ArrayListUnmanaged(dlp.Artist) = .empty,
-    albums: std.ArrayListUnmanaged(dlp.Album) = .empty,
-    genres: std.ArrayListUnmanaged(dlp.Genre) = .empty,
-    labels: std.ArrayListUnmanaged(dlp.Label) = .empty,
-    keys: std.ArrayListUnmanaged(dlp.Key) = .empty,
-    images: std.ArrayListUnmanaged(dlp.Image) = .empty,
-    contents: std.ArrayListUnmanaged(dlp.Content) = .empty,
-    playlists: std.ArrayListUnmanaged(dlp.Playlist) = .empty,
+    artists: std.ArrayListUnmanaged(ol.Artist) = .empty,
+    albums: std.ArrayListUnmanaged(ol.Album) = .empty,
+    genres: std.ArrayListUnmanaged(ol.Genre) = .empty,
+    labels: std.ArrayListUnmanaged(ol.Label) = .empty,
+    keys: std.ArrayListUnmanaged(ol.Key) = .empty,
+    images: std.ArrayListUnmanaged(ol.Image) = .empty,
+    contents: std.ArrayListUnmanaged(ol.Content) = .empty,
+    playlists: std.ArrayListUnmanaged(ol.Playlist) = .empty,
     playlist_pairs: std.ArrayListUnmanaged(OlPlaylistPair) = .empty,
-    my_tags: std.ArrayListUnmanaged(dlp.MyTag) = .empty,
+    my_tags: std.ArrayListUnmanaged(ol.MyTag) = .empty,
     /// Pending `myTag_content` rows — the row type itself, since the
     /// junction carries nothing the insert derives.
-    my_tag_pairs: std.ArrayListUnmanaged(dlp.MyTagContent) = .empty,
+    my_tag_pairs: std.ArrayListUnmanaged(ol.MyTagContent) = .empty,
 
     /// Dedup state over the existing db (filled by `scanOlStore`) and the
     /// pending rows; values are OL ids. Name lookups make a reopened db
@@ -2276,7 +2276,7 @@ const OlStore = struct {
 /// row pending for the next `save`, so a retry never duplicates a landed
 /// one (nothing landed): the pending lists keep naming exactly the rows
 /// the db lacks, all-or-nothing per table rather than per row.
-fn olDrain(w: dlp.Writer, list: anytype) dlp.SqlError!void {
+fn olDrain(w: ol.Writer, list: anytype) ol.SqlError!void {
     try w.insertAll(list.items);
     list.clearRetainingCapacity();
 }
@@ -2285,7 +2285,7 @@ fn olDrain(w: dlp.Writer, list: anytype) dlp.SqlError!void {
 /// 1-based `sequenceNo`s are derived inside the transaction, continuing
 /// past rows already on disk. The same clear-only-after-commit contract
 /// as `olDrain`.
-fn olDrainPlaylistPairs(w: dlp.Writer, list: anytype) dlp.SqlError!void {
+fn olDrainPlaylistPairs(w: ol.Writer, list: anytype) ol.SqlError!void {
     try w.addAllToPlaylist(list.items);
     list.clearRetainingCapacity();
 }
@@ -2325,7 +2325,7 @@ pub const OlAlbumsByArtistAndName = std.HashMapUnmanaged(
 /// the pdb-side null convention. An id that exhausts its space fails the
 /// scan (see `IdMint`).
 fn scanOlStore(
-    lib: *const dlp.Library,
+    lib: *const ol.Library,
     store: *OlStore,
 ) (std.mem.Allocator.Error || error{IdSpaceExhausted})!void {
     const a = store.arena.allocator();
@@ -2370,19 +2370,19 @@ fn scanOlStore(
 }
 
 /// One mirrored `artist` row; see `olNamedRow`.
-fn olArtistRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!dlp.Artist {
+fn olArtistRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!ol.Artist {
     _ = a;
     return .{ .artist_id = id, .name = name, .nameForSearch = null };
 }
 
 /// One mirrored `genre` row; see `olNamedRow`.
-fn olGenreRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!dlp.Genre {
+fn olGenreRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!ol.Genre {
     _ = a;
     return .{ .genre_id = id, .name = name };
 }
 
 /// One mirrored `label` row; see `olNamedRow`.
-fn olLabelRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!dlp.Label {
+fn olLabelRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!ol.Label {
     _ = a;
     return .{ .label_id = id, .name = name };
 }
