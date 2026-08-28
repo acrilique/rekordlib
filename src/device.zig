@@ -8,7 +8,7 @@
 //! handle that opens an export's settings and database through that
 //! layout, and builds fresh ones.
 //!
-//! Ported from rekordcrate's `src/device/layout.rs` and
+//! Initially ported from rekordcrate's `src/device/layout.rs` and
 //! `src/device/reader.rs`/`writer.rs`.
 
 const std = @import("std");

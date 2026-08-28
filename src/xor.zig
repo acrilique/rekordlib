@@ -5,7 +5,7 @@
 //! Repeating-key XOR cipher used by Rekordbox to obfuscate data (for example
 //! the song-structure section of ANLZ files).
 //!
-//! Ported from rekordcrate's `src/xor.rs`
+//! Ported from rekordcrate's `src/xor.rs`.
 //!
 //! XOR is self-inverse, so the same `apply` covers both directions.
 

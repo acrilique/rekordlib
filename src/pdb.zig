@@ -2,22 +2,15 @@
 // v. 2.0. If a copy of the MPL was not distributed with this file, You can
 // obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Parser and writer for the rekordbox `export.pdb` database (DeviceSQL):
-//! the string type, the offset arrays that locate row tail data, page
-//! headers with index pages, data pages with their rows — including
-//! the tag rows of `exportExt.pdb` — and whole databases assembled from
-//! the file header, its table of contents, and every page. The
-//! modification layer allocates rows inside pages, appends rows to tables
-//! with page-chain relinking, and creates new databases with the default
-//! color, column, and menu rows.
+//! Parser and writer for the rekordbox `export.pdb` database (DeviceSQL).
 //!
-//! Ported from rekordcrate's `src/pdb/string.rs`, `src/pdb/offset_array.rs`,
-//! `src/pdb/bitfields.rs`, `src/pdb/ext.rs`, and `src/pdb/defaults.rs`,
-//! the page, index-page, data-page, row, header, and table parts of
-//! `src/pdb/mod.rs`, and the modification parts of `src/pdb/io.rs`
-//! (`create`, `add_row`, `allocate_row`).
+//! Initially ported from rekordcrate's `src/pdb/string.rs`,
+//! `src/pdb/offset_array.rs`, `src/pdb/bitfields.rs`, `src/pdb/ext.rs`, and
+//! `src/pdb/defaults.rs`, the page, index-page, data-page, row, header, and
+//! table parts of `src/pdb/mod.rs`, and the modification parts of
+//! `src/pdb/io.rs` (`create`, `add_row`, `allocate_row`).
 //!
-//! - <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/exports.html#devicesql-strings>
+//! - <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/exports.html>
 
 const std = @import("std");
 const bin = @import("bin.zig");

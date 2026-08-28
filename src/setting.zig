@@ -6,7 +6,7 @@
 //!
 //! The files are found in the `PIONEER` directory of a USB device export.
 //!
-//! Ported from rekordcrate's `src/setting.rs`
+//! Ported from rekordcrate's `src/setting.rs`.
 
 const std = @import("std");
 const bin = @import("bin.zig");
