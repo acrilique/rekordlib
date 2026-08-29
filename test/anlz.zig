@@ -1274,6 +1274,18 @@ test "detailExtents rounds half away from zero and rejects rate 0" {
     try testing.expect(anlz.detailExtents(1_000_000, 0) == null);
 }
 
+test "previewExtents reports the fixed color tier" {
+    // Fixed size whatever the track; each column spans sample_count/1200
+    // samples; rate 0 is rejected like detailExtents.
+    const e = anlz.previewExtents(1_200_000, 44100).?;
+    try testing.expectEqual(@as(u64, 1200), e.size);
+    try testing.expectEqual(@as(f64, 1000.0), e.samples_per_entry);
+    const e2 = anlz.previewExtents(2_400_000, 48_000).?;
+    try testing.expectEqual(@as(u64, 1200), e2.size);
+    try testing.expectEqual(@as(f64, 2000.0), e2.samples_per_entry);
+    try testing.expect(anlz.previewExtents(1_000_000, 0) == null);
+}
+
 /// The four ANLZ fixture tracks (two per rb generation), relative to
 /// `testdata`.
 const fixture_tracks = [_][]const u8{

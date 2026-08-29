@@ -1303,6 +1303,25 @@ pub fn detailExtents(sample_count: u64, sample_rate: u32) ?WaveformExtents {
     };
 }
 
+/// The preview companion of `detailExtents`: previews are fixed-width, so
+/// the size is `COLOR_PREVIEW_COLUMNS` whatever the track, and each column
+/// spans `sample_count / COLOR_PREVIEW_COLUMNS` samples. The 1200-column
+/// color tier is the tier reported because it is the one libdjinterop's
+/// rekordcrate adapter maps its own fixed-size (1024-column, 3-band)
+/// overview onto — `PWV6` carries the same three band energies, while the
+/// mono tiers carry heights and whiteness that an Engine overview cannot
+/// supply. The width rather than the samples-per-entry is what the format
+/// pins; the span follows from the track length. Null when `sample_rate`
+/// is 0, mirroring `detailExtents`.
+pub fn previewExtents(sample_count: u64, sample_rate: u32) ?WaveformExtents {
+    if (sample_rate == 0) return null;
+    return .{
+        .size = COLOR_PREVIEW_COLUMNS,
+        .samples_per_entry = @as(f64, @floatFromInt(sample_count)) /
+            @as(f64, @floatFromInt(COLOR_PREVIEW_COLUMNS)),
+    };
+}
+
 /// A marker of a sparse beatgrid: a beat number (possibly negative —
 /// Rekordbox grids start at -4) at a sample offset.
 pub const BeatMarker = struct {
