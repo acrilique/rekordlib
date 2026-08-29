@@ -1220,3 +1220,23 @@ test "built anlz input serializes and re-parses" {
         .energy_bottom_third_freq = 50,
     }, band3_detail.data[0]);
 }
+test "detailExtents reconstructs every fixture's detail column count" {
+    // sample_count = columns * 294 reconstructs the exact counts measured
+    // in the four ANLZ fixture sets (44.1 kHz, whole-second durations).
+    const e = anlz.detailExtents(77181 * 294, 44100).?;
+    try testing.expectEqual(@as(u64, 77181), e.size);
+    try testing.expectEqual(@as(f64, 294.0), e.samples_per_entry);
+    try testing.expectEqual(@as(u64, 59771), anlz.detailExtents(59771 * 294, 44100).?.size);
+    try testing.expectEqual(@as(u64, 25866), anlz.detailExtents(25866 * 294, 44100).?.size);
+    try testing.expectEqual(@as(u64, 19208), anlz.detailExtents(19208 * 294, 44100).?.size);
+    // 48 kHz divides evenly as well.
+    const e48 = anlz.detailExtents(320_000, 48000).?;
+    try testing.expectEqual(@as(u64, 1000), e48.size);
+    try testing.expectEqual(@as(f64, 320.0), e48.samples_per_entry);
+}
+
+test "detailExtents rounds half away from zero and rejects rate 0" {
+    // 294147 samples at 44.1 kHz = exactly 1000.5 columns.
+    try testing.expectEqual(@as(u64, 1001), anlz.detailExtents(294_147, 44100).?.size);
+    try testing.expect(anlz.detailExtents(1_000_000, 0) == null);
+}

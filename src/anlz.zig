@@ -1275,6 +1275,30 @@ pub const PREVIEW_HZ: f64 = 6.667;
 /// Integer detail columns aggregated into one preview column.
 pub const DETAIL_PER_PREVIEW: usize = @intFromFloat(@round(DETAIL_HZ / PREVIEW_HZ));
 
+/// The size of a waveform in libdjinterop's terms: how many columns it has,
+/// and how many audio samples each column spans.
+pub const WaveformExtents = struct {
+    /// Number of columns.
+    size: u64,
+    /// Audio samples represented by one column.
+    samples_per_entry: f64,
+};
+
+/// The extents of the 150 Hz detail input `PerformanceData` wants for a
+/// track: `size = round(sample_count / (sample_rate / DETAIL_HZ))` columns
+/// of `sample_rate / DETAIL_HZ` samples each. Pinned by every ANLZ fixture
+/// (demo_tracks 25866/19208, with_anlz 77181/59771 columns). Null when
+/// `sample_rate` is 0.
+pub fn detailExtents(sample_count: u64, sample_rate: u32) ?WaveformExtents {
+    if (sample_rate == 0) return null;
+    const samples_per_entry = @as(f64, @floatFromInt(sample_rate)) / DETAIL_HZ;
+    const columns = @as(f64, @floatFromInt(sample_count)) / samples_per_entry;
+    return .{
+        .size = @intFromFloat(@round(columns)),
+        .samples_per_entry = samples_per_entry,
+    };
+}
+
 /// A marker of a sparse beatgrid: a beat number (possibly negative —
 /// Rekordbox grids start at -4) at a sample offset.
 pub const BeatMarker = struct {
