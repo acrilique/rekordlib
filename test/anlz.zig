@@ -972,18 +972,19 @@ test "beatgrid tempo derives from the grid and saturates" {
     try testing.expectEqualSlices(anlz.Beat, derived, sorted);
 }
 
-test "preview downsample counts" {
-    // Port of rekordcrate's preview_downsample_count: 150 detail entries
-    // collapse to ~7 preview columns at 6.667 Hz (22 detail columns per
-    // preview column), plus spot checks pinning the band-to-column mapping.
+test "preview columns are fixed-width midpoint picks" {
+    // Ours (supersedes rekordcrate's preview_downsample_count): previews are
+    // fixed-width thumbnails (400 PWAV, 100 PWV2, 1200 PWV4/PWV6 — the
+    // widths every fixture carries), each column midpoint-sampling the
+    // detail vector; detail groups keep the input length.
     const alloc = testing.allocator;
     const bands = [_]anlz.Band{.{ .low = 10, .mid = 20, .high = 30 }} ** 150;
     const heights = [_]u8{16} ** 150;
 
     const columns = try anlz.buildBandColumns(alloc, &bands, &heights);
     defer columns.deinit(alloc);
-    try testing.expectEqual(@as(usize, 7), columns.color_preview.len);
-    try testing.expectEqual(@as(usize, 7), columns.band3_preview.len);
+    try testing.expectEqual(anlz.COLOR_PREVIEW_COLUMNS, columns.color_preview.len);
+    try testing.expectEqual(anlz.COLOR_PREVIEW_COLUMNS, columns.band3_preview.len);
     try testing.expectEqual(@as(usize, 150), columns.color_detail.len);
     try testing.expectEqual(@as(usize, 150), columns.band3_detail.len);
     // Constant bands mean to themselves; the PWV4 bottom half mirrors the
@@ -994,7 +995,7 @@ test "preview downsample counts" {
         .energy_mid_third_freq = 20,
         .energy_top_third_freq = 30,
     }, columns.color_preview[0]);
-    // 3-band preview reuses the PWV4 window means.
+    // 3-band preview reuses the picked band.
     try testing.expectEqual(anlz.Waveform3BandColumn{
         .energy_mid_third_freq = 20,
         .energy_top_third_freq = 30,
@@ -1015,17 +1016,46 @@ test "preview downsample counts" {
 
     const previews = try anlz.buildPreviewColumns(alloc, &heights);
     defer previews.deinit(alloc);
-    try testing.expectEqual(@as(usize, 7), previews.preview.len);
-    try testing.expectEqual(@as(usize, 7), previews.tiny.len);
+    try testing.expectEqual(anlz.MONO_PREVIEW_COLUMNS, previews.preview.len);
+    try testing.expectEqual(anlz.TINY_PREVIEW_COLUMNS, previews.tiny.len);
     for (previews.preview) |column| try testing.expect(column.height <= 31);
     for (previews.tiny) |column| try testing.expect(column.height <= 15);
     try testing.expectEqual(@as(u5, 16), previews.preview[0].height);
     try testing.expectEqual(@as(u4, 8), previews.tiny[0].height);
 
+    // A two-entry vector crosses from the first half to the second exactly
+    // at the preview's midpoint (hand-computed): with len 2 and size 400,
+    // floor(2*(2i+1)/800) is 0 through i = 199 and 1 from i = 200.
+    const two = [_]u8{ 5, 25 };
+    const split = try anlz.buildPreviewColumns(alloc, &two);
+    defer split.deinit(alloc);
+    try testing.expectEqual(@as(u5, 5), split.preview[199].height);
+    try testing.expectEqual(@as(u5, 25), split.preview[200].height);
+    // The tiny preview's midpoint lands at i = 50 of 100.
+    try testing.expectEqual(@as(u4, 2), split.tiny[49].height);
+    try testing.expectEqual(@as(u4, 12), split.tiny[50].height);
+
     const detail = try anlz.buildDetailMono(alloc, &heights);
     defer alloc.free(detail);
     try testing.expectEqual(@as(usize, 150), detail.len);
     try testing.expectEqual(@as(u5, 16), detail[0].height);
+}
+
+test "empty waveform input produces empty preview sections" {
+    // Nothing pins rb's behavior for a track without waveform data; the
+    // builders' documented choice is empty sections over padded ones.
+    const alloc = testing.allocator;
+    const previews = try anlz.buildPreviewColumns(alloc, &.{});
+    defer previews.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), previews.preview.len);
+    try testing.expectEqual(@as(usize, 0), previews.tiny.len);
+
+    const columns = try anlz.buildBandColumns(alloc, &.{}, &.{});
+    defer columns.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), columns.color_preview.len);
+    try testing.expectEqual(@as(usize, 0), columns.band3_preview.len);
+    try testing.expectEqual(@as(usize, 0), columns.color_detail.len);
+    try testing.expectEqual(@as(usize, 0), columns.band3_detail.len);
 }
 
 test "cue building point and loop" {
@@ -1092,8 +1122,10 @@ test "built anlz input assembles consistently" {
     try testing.expectEqual(@as(usize, 150), input.detail_mono.?.len);
     try testing.expectEqual(@as(usize, 150), input.color_detail.?.len);
     try testing.expectEqual(@as(usize, 150), input.band3_detail.?.len);
-    try testing.expectEqual(@as(usize, 7), input.preview_mono.len);
-    try testing.expectEqual(@as(usize, 7), input.tiny_preview.len);
+    try testing.expectEqual(anlz.MONO_PREVIEW_COLUMNS, input.preview_mono.len);
+    try testing.expectEqual(anlz.TINY_PREVIEW_COLUMNS, input.tiny_preview.len);
+    try testing.expectEqual(anlz.COLOR_PREVIEW_COLUMNS, input.color_preview.?.len);
+    try testing.expectEqual(anlz.COLOR_PREVIEW_COLUMNS, input.band3_preview.?.len);
 }
 
 test "built anlz input serializes and re-parses" {
@@ -1148,10 +1180,10 @@ test "built anlz input serializes and re-parses" {
     try testing.expectEqual(@as(u32, 0xFFFF_FFFF), dat_list.memory_count);
     try testing.expectEqualSlices(anlz.Cue, input.cues, dat_list.cues);
     const preview = &dat_parsed.findSection(.waveform_preview).?.waveform_preview;
-    try testing.expectEqual(@as(usize, 7), preview.data.len);
+    try testing.expectEqual(anlz.MONO_PREVIEW_COLUMNS, preview.data.len);
     try testing.expectEqual(@as(u5, 20), preview.data[0].height);
     try testing.expectEqual(@as(u3, 0), preview.data[0].whiteness);
-    try testing.expectEqual(@as(usize, 7), dat_parsed.findSection(.tiny_waveform_preview).?.tiny_waveform_preview.data.len);
+    try testing.expectEqual(anlz.TINY_PREVIEW_COLUMNS, dat_parsed.findSection(.tiny_waveform_preview).?.tiny_waveform_preview.data.len);
 
     // .EXT: extended cues, mono detail, color preview/detail.
     const ext_sections = [_]anlz.Content{
@@ -1180,7 +1212,7 @@ test "built anlz input serializes and re-parses" {
     try testing.expectEqual(@as(usize, 150), detail.data.len);
     try testing.expectEqual(@as(u5, 20), detail.data[0].height);
     const color_preview = &ext_parsed.findSection(.waveform_color_preview).?.waveform_color_preview;
-    try testing.expectEqual(@as(usize, 7), color_preview.data.len);
+    try testing.expectEqual(anlz.COLOR_PREVIEW_COLUMNS, color_preview.data.len);
     try testing.expectEqual(anlz.WaveformColorPreviewColumn{
         .energy_bottom_half_freq = 50,
         .energy_bottom_third_freq = 50,
@@ -1206,7 +1238,7 @@ test "built anlz input serializes and re-parses" {
     defer ex2_parsed.deinit();
     try testing.expectEqual(@as(usize, 3), ex2_parsed.sections.len);
     const band3_preview = &ex2_parsed.findSection(.waveform_3band_preview).?.waveform_3band_preview;
-    try testing.expectEqual(@as(usize, 7), band3_preview.data.len);
+    try testing.expectEqual(anlz.COLOR_PREVIEW_COLUMNS, band3_preview.data.len);
     const band3_detail = &ex2_parsed.findSection(.waveform_3band_detail).?.waveform_3band_detail;
     try testing.expectEqual(@as(usize, 150), band3_detail.data.len);
     try testing.expectEqual(anlz.Waveform3BandColumn{
@@ -1220,6 +1252,7 @@ test "built anlz input serializes and re-parses" {
         .energy_bottom_third_freq = 50,
     }, band3_detail.data[0]);
 }
+
 test "detailExtents reconstructs every fixture's detail column count" {
     // sample_count = columns * 294 reconstructs the exact counts measured
     // in the four ANLZ fixture sets (44.1 kHz, whole-second durations).
@@ -1239,4 +1272,90 @@ test "detailExtents rounds half away from zero and rejects rate 0" {
     // 294147 samples at 44.1 kHz = exactly 1000.5 columns.
     try testing.expectEqual(@as(u64, 1001), anlz.detailExtents(294_147, 44100).?.size);
     try testing.expect(anlz.detailExtents(1_000_000, 0) == null);
+}
+
+/// The four ANLZ fixture tracks (two per rb generation), relative to
+/// `testdata`.
+const fixture_tracks = [_][]const u8{
+    "complete_export/demo_tracks/PIONEER/USBANLZ/P016/0000875E",
+    "complete_export/demo_tracks/PIONEER/USBANLZ/P053/0001D21F",
+    "complete_export/with_anlz/PIONEER/USBANLZ/P002/0000D534",
+    "complete_export/with_anlz/PIONEER/USBANLZ/P01F/00004BC5",
+};
+
+test "builders pin preview widths and midpoint picks against fixtures" {
+    // rb's preview bytes are underivable from the detail sections (see
+    // docs/DIVERGENCES.md), so what the fixtures pin is the widths — 400
+    // PWAV, 100 PWV2, 1200 PWV4/PWV6 across all four tracks — and what
+    // this test pins is the resampling contract: fixture detail columns in,
+    // midpoint-picked preview columns out, byte-exact against the picked
+    // detail values.
+    const alloc = testing.allocator;
+    for (fixture_tracks) |dir| {
+        var path_buf: [128]u8 = undefined;
+        const dat = try readFixture(alloc, try std.fmt.bufPrint(&path_buf, "{s}/ANLZ0000.DAT", .{dir}));
+        defer alloc.free(dat);
+        const ext = try readFixture(alloc, try std.fmt.bufPrint(&path_buf, "{s}/ANLZ0000.EXT", .{dir}));
+        defer alloc.free(ext);
+        const ex2 = try readFixture(alloc, try std.fmt.bufPrint(&path_buf, "{s}/ANLZ0000.2EX", .{dir}));
+        defer alloc.free(ex2);
+
+        var dat_parsed = try anlz.Anlz.parse(alloc, dat);
+        defer dat_parsed.deinit();
+        var ext_parsed = try anlz.Anlz.parse(alloc, ext);
+        defer ext_parsed.deinit();
+        var ex2_parsed = try anlz.Anlz.parse(alloc, ex2);
+        defer ex2_parsed.deinit();
+
+        const pwav = &dat_parsed.findSection(.waveform_preview).?.waveform_preview;
+        const pwv2 = &dat_parsed.findSection(.tiny_waveform_preview).?.tiny_waveform_preview;
+        const pwv3 = &ext_parsed.findSection(.waveform_detail).?.waveform_detail;
+        const pwv4 = &ext_parsed.findSection(.waveform_color_preview).?.waveform_color_preview;
+        const pwv6 = &ex2_parsed.findSection(.waveform_3band_preview).?.waveform_3band_preview;
+        const pwv7 = &ex2_parsed.findSection(.waveform_3band_detail).?.waveform_3band_detail;
+
+        const heights = try alloc.alloc(u8, pwv3.data.len);
+        defer alloc.free(heights);
+        for (pwv3.data, 0..) |column, i| heights[i] = column.height;
+
+        const previews = try anlz.buildPreviewColumns(alloc, heights);
+        defer previews.deinit(alloc);
+        // The widths are the fixtures' own preview widths.
+        try testing.expectEqual(pwav.data.len, previews.preview.len);
+        try testing.expectEqual(pwv2.data.len, previews.tiny.len);
+        for (previews.preview, 0..) |column, i| {
+            const mid = pwv3.data.len * (2 * i + 1) / (2 * previews.preview.len);
+            try testing.expectEqual(pwv3.data[mid].height, column.height);
+            try testing.expectEqual(@as(u3, 0), column.whiteness);
+        }
+        for (previews.tiny, 0..) |column, i| {
+            const mid = pwv3.data.len * (2 * i + 1) / (2 * previews.tiny.len);
+            try testing.expectEqual(@as(u4, @intCast(pwv3.data[mid].height / 2)), column.height);
+        }
+
+        const bands = try alloc.alloc(anlz.Band, pwv7.data.len);
+        defer alloc.free(bands);
+        for (pwv7.data, 0..) |column, i| bands[i] = .{
+            .low = column.energy_bottom_third_freq,
+            .mid = column.energy_mid_third_freq,
+            .high = column.energy_top_third_freq,
+        };
+        const columns = try anlz.buildBandColumns(alloc, bands, heights);
+        defer columns.deinit(alloc);
+        try testing.expectEqual(pwv4.data.len, columns.color_preview.len);
+        try testing.expectEqual(pwv6.data.len, columns.band3_preview.len);
+        for (columns.band3_preview, 0..) |column, i| {
+            const mid = pwv7.data.len * (2 * i + 1) / (2 * columns.band3_preview.len);
+            try testing.expectEqual(bands[mid].mid, column.energy_mid_third_freq);
+            try testing.expectEqual(bands[mid].high, column.energy_top_third_freq);
+            try testing.expectEqual(bands[mid].low, column.energy_bottom_third_freq);
+        }
+        for (columns.color_preview, 0..) |column, i| {
+            const mid = pwv7.data.len * (2 * i + 1) / (2 * columns.color_preview.len);
+            try testing.expectEqual(bands[mid].low, column.energy_bottom_half_freq);
+            try testing.expectEqual(bands[mid].low, column.energy_bottom_third_freq);
+            try testing.expectEqual(bands[mid].mid, column.energy_mid_third_freq);
+            try testing.expectEqual(bands[mid].high, column.energy_top_third_freq);
+        }
+    }
 }

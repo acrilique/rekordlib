@@ -1267,13 +1267,17 @@ pub const BuildError = error{ OutOfMemory, InvalidUtf8 };
 /// format: 75 frames/sec × 2.
 pub const DETAIL_HZ: f64 = 150.0;
 
-/// Preview section columns per second (PWAV/PWV2/PWV4/PWV6). Not pinned by
-/// the format; Rekordbox uses ~1 column per 150 ms. Heuristic, matches
-/// observed fixtures within a few percent.
-pub const PREVIEW_HZ: f64 = 6.667;
+/// Columns of the mono preview (`PWAV`). Fixed by the format: every ANLZ
+/// fixture carries exactly this many, whatever the track length.
+pub const MONO_PREVIEW_COLUMNS: usize = 400;
 
-/// Integer detail columns aggregated into one preview column.
-pub const DETAIL_PER_PREVIEW: usize = @intFromFloat(@round(DETAIL_HZ / PREVIEW_HZ));
+/// Columns of the tiny mono preview (`PWV2`). Fixed by the format, like
+/// `MONO_PREVIEW_COLUMNS`.
+pub const TINY_PREVIEW_COLUMNS: usize = 100;
+
+/// Columns of the color (`PWV4`) and 3-band (`PWV6`) previews, which share
+/// one width. Fixed by the format, like `MONO_PREVIEW_COLUMNS`.
+pub const COLOR_PREVIEW_COLUMNS: usize = 1200;
 
 /// The size of a waveform in libdjinterop's terms: how many columns it has,
 /// and how many audio samples each column spans.
@@ -1343,10 +1347,11 @@ pub const CueInput = struct {
 /// `sample_rate`.
 ///
 /// `waveform_bands` and `waveform_heights` must be sampled at exactly
-/// `DETAIL_HZ`: the preview waveforms aggregate `DETAIL_PER_PREVIEW`
-/// consecutive detail columns, so a different input rate silently stretches
-/// or squashes every output waveform. Callers holding columns at another
-/// rate must resample to 150 Hz first.
+/// `DETAIL_HZ`: the detail sections copy the input columns verbatim, so a
+/// different input rate silently stretches or squashes every output
+/// waveform. Callers holding columns at another rate must resample to
+/// 150 Hz first. The preview sections are derived from these same columns
+/// at fixed widths (see `buildPreviewColumns`/`buildBandColumns`).
 pub const PerformanceData = struct {
     /// Audio sample rate in Hz, used for sample→ms conversion. Zero makes
     /// beat and cue times come out as zero.
@@ -1543,18 +1548,24 @@ pub fn expandBeatgrid(
     return beats.toOwnedSlice(alloc);
 }
 
-/// Consecutive `per`-entry window `w` of `columns`, the last possibly
-/// shorter; valid for `w` below `(columns.len + per - 1) / per`.
-fn window(comptime T: type, columns: []const T, per: usize, w: usize) []const T {
-    return columns[w * per .. @min(columns.len, (w + 1) * per)];
+/// Index of the detail column that preview column `i` of `size` samples:
+/// the midpoint of its span, `len * (2i + 1) / (2 * size)` in floor
+/// arithmetic over the actual input length `len`. Rekordbox's own
+/// derivation is unobservable (see `docs/DIVERGENCES.md`); this matches
+/// libdjinterop's Engine overview resampler, the documented precedent for
+/// the same two-tier design.
+fn midpointIndex(len: usize, size: usize, i: usize) usize {
+    return @intCast(@as(u64, len) * (2 * @as(u64, i) + 1) / (2 * @as(u64, size)));
 }
 
 /// Builds the four band-derived column groups (PWV4 color preview, PWV5
 /// color detail, PWV6/PWV7 3-band) from a single 150 Hz 3-band detail
-/// vector. The PWV4 preview is the integer mean of the detail bands over
-/// each preview window; the 3-band columns reuse the band energies
-/// directly (field order mid, top, bottom). `heights` drives the PWV5
-/// height (see `colorDetailColumn` for the missing-entry fallback).
+/// vector. The previews are fixed-width (`COLOR_PREVIEW_COLUMNS`) and
+/// midpoint-sample the detail bands; the detail groups copy the band
+/// energies directly (field order mid, top, bottom). `heights` drives the
+/// PWV5 height (see `colorDetailColumn` for the missing-entry fallback).
+/// Empty `bands` produce empty sections: nothing pins Rekordbox's behavior
+/// for a track with no waveform.
 ///
 /// Whiteness and the PWV4 bottom-half band are guesses: Rekordbox's exact
 /// derivation is proprietary and undocumented — whiteness stays zero
@@ -1565,44 +1576,29 @@ pub fn buildBandColumns(
     bands: []const Band,
     heights: []const u8,
 ) BuildError!BandColumns {
-    const per_preview = @max(DETAIL_PER_PREVIEW, 1);
-    const n_windows = (bands.len + per_preview - 1) / per_preview;
+    const n_previews: usize = if (bands.len == 0) 0 else COLOR_PREVIEW_COLUMNS;
 
-    const color_preview = try alloc.alloc(WaveformColorPreviewColumn, n_windows);
+    const color_preview = try alloc.alloc(WaveformColorPreviewColumn, n_previews);
     errdefer alloc.free(color_preview);
     const color_detail = try alloc.alloc(WaveformColorDetailColumn, bands.len);
     errdefer alloc.free(color_detail);
-    const band3_preview = try alloc.alloc(Waveform3BandColumn, n_windows);
+    const band3_preview = try alloc.alloc(Waveform3BandColumn, n_previews);
     errdefer alloc.free(band3_preview);
     const band3_detail = try alloc.alloc(Waveform3BandColumn, bands.len);
     errdefer alloc.free(band3_detail);
 
-    for (0..n_windows) |w| {
-        const chunk = window(Band, bands, per_preview, w);
-        var low: u32 = 0;
-        var mid: u32 = 0;
-        var high: u32 = 0;
-        for (chunk) |band| {
-            low += band.low;
-            mid += band.mid;
-            high += band.high;
-        }
-        const n: u32 = @intCast(chunk.len);
-        const mean = [3]u8{
-            @intCast(low / n),
-            @intCast(mid / n),
-            @intCast(high / n),
-        };
+    for (0..n_previews) |w| {
+        const band = bands[midpointIndex(bands.len, COLOR_PREVIEW_COLUMNS, w)];
         color_preview[w] = .{
-            .energy_bottom_half_freq = mean[0],
-            .energy_bottom_third_freq = mean[0],
-            .energy_mid_third_freq = mean[1],
-            .energy_top_third_freq = mean[2],
+            .energy_bottom_half_freq = band.low,
+            .energy_bottom_third_freq = band.low,
+            .energy_mid_third_freq = band.mid,
+            .energy_top_third_freq = band.high,
         };
         band3_preview[w] = .{
-            .energy_mid_third_freq = mean[1],
-            .energy_top_third_freq = mean[2],
-            .energy_bottom_third_freq = mean[0],
+            .energy_mid_third_freq = band.mid,
+            .energy_top_third_freq = band.high,
+            .energy_bottom_third_freq = band.low,
         };
     }
     for (bands, 0..) |band, i| {
@@ -1648,29 +1644,31 @@ fn colorDetailColumn(low: u8, mid: u8, high: u8, height: ?u8) WaveformColorDetai
     return .{ .height = @intCast(@min(h, 31)), .red = red, .green = green, .blue = blue };
 }
 
-/// Builds the preview and tiny mono columns (PWAV/PWV2) at `PREVIEW_HZ`
-/// from a per-column peak height vector. Each preview entry downsamples
-/// `DETAIL_PER_PREVIEW` detail columns by taking the max height, matching
-/// how a coarser view of the same peaks looks.
+/// Builds the fixed-width mono previews (PWAV at `MONO_PREVIEW_COLUMNS`,
+/// PWV2 at `TINY_PREVIEW_COLUMNS`) from a per-column peak height vector by
+/// midpoint-sampling the detail heights, the resampling `buildBandColumns`
+/// documents. The PWV2 height is the PWAV-scale height halved into its
+/// 4-bit field — the fixtures cannot pin the 5→4-bit rescale, so halves
+/// are chosen for symmetry. Empty `heights` produce empty sections:
+/// nothing pins Rekordbox's behavior for a track with no waveform.
 pub fn buildPreviewColumns(
     alloc: std.mem.Allocator,
     heights: []const u8,
 ) BuildError!PreviewColumns {
-    const per_preview = @max(DETAIL_PER_PREVIEW, 1);
-    const n_windows = (heights.len + per_preview - 1) / per_preview;
+    const n_previews: usize = if (heights.len == 0) 0 else MONO_PREVIEW_COLUMNS;
 
-    const preview = try alloc.alloc(WaveformPreviewColumn, n_windows);
+    const preview = try alloc.alloc(WaveformPreviewColumn, n_previews);
     errdefer alloc.free(preview);
-    const tiny = try alloc.alloc(TinyWaveformPreviewColumn, n_windows);
+    const tiny = try alloc.alloc(TinyWaveformPreviewColumn, if (heights.len == 0) 0 else TINY_PREVIEW_COLUMNS);
     errdefer alloc.free(tiny);
 
-    for (0..n_windows) |w| {
-        const chunk = window(u8, heights, per_preview, w);
-        var peak: u8 = 0;
-        for (chunk) |h| peak = @max(peak, h);
-        peak = @min(peak, 31);
+    for (0..n_previews) |w| {
+        const peak = @min(heights[midpointIndex(heights.len, MONO_PREVIEW_COLUMNS, w)], 31);
         // PWV2 carries a 4-bit height (0-15); PWAV carries 5 bits (0-31).
         preview[w] = .{ .height = @intCast(peak), .whiteness = 0 };
+    }
+    for (0..tiny.len) |w| {
+        const peak = @min(heights[midpointIndex(heights.len, TINY_PREVIEW_COLUMNS, w)], 31);
         tiny[w] = .{ .height = @intCast(peak / 2) };
     }
     return .{ .preview = preview, .tiny = tiny };
