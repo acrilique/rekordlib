@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
         OlMode,
         "ol",
         "OneLibrary store backend: vendored-sqlcipher (rl_-prefixed SQLCipher amalgamation, which embeds SQLite, via zig cc), system-sqlcipher (consumer-provided), or off",
-    ) orelse .@"vendored-sqlcipher";
+    ) orelse .@"system-sqlcipher";
 
     const ol_options = b.addOptions();
     ol_options.addOption(OlMode, "ol", ol_mode);
