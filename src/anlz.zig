@@ -176,9 +176,7 @@ pub const CueType = enum(u8) {
 /// the wire by a nested 12-byte entry header (tag `PCPT`, total entry
 /// length `wire_len`); its `size` field is `16` in older files and `28` in
 /// files written by newer Rekordbox versions, with an identical entry body
-/// either way (the containing `CueList` carries the style, since a virtual
-/// field here would be serialized by `bin.putStruct`). The remaining
-/// fields are serialized in one pass through `bin.takeStruct`/`bin.putStruct`.
+/// either way.
 pub const Cue = struct {
     /// Hot cue number (0 = not a hot cue, 1 = A, 2 = B, ...).
     hot_cue: u32 = 0,
@@ -269,9 +267,6 @@ pub const CueList = struct {
         const len_cues = try c.takeInt(u16, .big);
         const memory_count = try c.takeInt(u32, .big);
         if (memory_count != derivedMemoryCount(list_type, len_cues)) return error.UnexpectedValue;
-        // Each entry occupies exactly `Cue.wire_len` bytes; a count whose
-        // entries cannot fit the section is rejected before anything is
-        // allocated (the `takeStructSlice` discipline).
         if (@as(u64, len_cues) * Cue.wire_len > c.remaining()) return error.UnexpectedEof;
         const cues = try alloc.alloc(Cue, len_cues);
         var entry_header_size: ?u32 = null;
@@ -298,23 +293,13 @@ pub const CueList = struct {
     }
 };
 
-/// A length-prefixed wide (UTF-16BE) string.
-///
-/// The wire format is a big-endian `u32` length in bytes (including the
-/// trailing NUL terminator, zero when empty) followed by that many bytes of
-/// UTF-16BE encoded text:
-///
-/// ```text
-/// | <length> (u32) | UTF-16BE encoded text | 0x0000 |
-///                   <------------------------------>
-///                            <length> bytes
-/// ```
+/// A length-prefixed wide (UTF-16BE) string: a big-endian `u32` byte
+/// count (NUL terminator included, zero when empty) followed by that many
+/// bytes of UTF-16BE text.
 ///
 /// Diverging from rekordcrate, the payload is stored as raw bytes (NUL
-/// included) so that roundtrips are byte-identical even for unusual data;
-/// use `utf8` and `fromUtf8` to convert. Used for the `comment` field of
-/// `ExtendedCue` and the `path` field of `Path` (rekordcrate uses an
-/// equivalent `NullWideString` there).
+/// included) so roundtrips are byte-identical even for unusual data; use
+/// `utf8` and `fromUtf8` to convert.
 pub const LenPrefixedWideString = struct {
     /// Raw payload bytes, exactly as found on disk.
     raw: []const u8 = &.{},
@@ -370,10 +355,8 @@ pub const LenPrefixedWideString = struct {
 
 /// A memory or hot cue (or loop), a single entry of an extended cue list.
 /// Preceded on the wire by a nested 16-byte entry header (tag `PCP2`),
-/// derived on write from the comment and trailing lengths; the remaining
-/// fixed part (56 bytes including the comment's empty length prefix) is
-/// serialized in one pass through `bin.takeStruct`/`bin.putStruct`, the
-/// `comment` codec included.
+/// with `total_size` derived on write from the comment and trailing
+/// lengths.
 pub const ExtendedCue = struct {
     /// Hot cue number (0 = not a hot cue, 1 = A, 2 = B, ...).
     hot_cue: u32 = 0,
@@ -543,9 +526,8 @@ pub const ExtendedCueList = struct {
         const len_cues = try c.takeInt(u16, .big);
         const unknown = try c.takeInt(u16, .big);
         try bin.validateConstantFields(ExtendedCueList, .{ .list_type = list_type, .unknown = unknown });
-        // Entries are at least `fixed_wire_len` bytes each, their comment
-        // payload and trailing bytes add more; a count whose entries cannot
-        // fit the section is rejected before anything is allocated.
+        // Entries are at least `fixed_wire_len` bytes each; their comment
+        // payload and trailing bytes add more.
         if (@as(u64, len_cues) * ExtendedCue.fixed_wire_len > c.remaining()) return error.UnexpectedEof;
         const cues = try alloc.alloc(ExtendedCue, len_cues);
         for (cues) |*cue| cue.* = try ExtendedCue.parse(c, alloc);
@@ -673,7 +655,8 @@ pub const WaveformColorDetailColumn = packed struct(u16) {
 };
 
 /// Single column of a `waveform_3band_preview` or `waveform_3band_detail`
-/// section.
+/// section. Serialized in field order, the three bytes are the analyzer's
+/// low, mid, and high band values — whatever the field names suggest.
 pub const Waveform3BandColumn = struct {
     /// Sound energy in the mid of the frequency range.
     energy_mid_third_freq: u8 = 0,
@@ -696,9 +679,9 @@ const WaveformSpec = struct {
     /// Default value of the trailing unknown preamble field. `null` if the
     /// section has no such field.
     unknown: ?u32 = null,
-    /// Whether the unknown preamble field must hold its default value in all
-    /// known files; other values are rejected on parse (rekordcrate asserts
-    /// on read). Otherwise the field is stored verbatim.
+    /// Whether the unknown preamble field must hold its default value;
+    /// other values are rejected on parse. Otherwise the field is stored
+    /// verbatim.
     constant_unknown: bool = false,
 };
 
@@ -865,8 +848,8 @@ pub const Bank = enum(u8) {
     _,
 };
 
-/// A song structure entry that represents a phrase in the track. Serialized
-/// in one pass through `bin.takeStruct`/`bin.putStruct` (24 bytes).
+/// A song structure entry that represents a phrase in the track (24 bytes
+/// on the wire).
 pub const Phrase = struct {
     /// Phrase number (starting at 1).
     index: u16 = 0,
@@ -1020,8 +1003,6 @@ pub const SongStructure = struct {
 /// (or a `file`/`cue`/`extended_cue` header, which only appear nested or
 /// by mistake). The tag and the section's raw bytes are stored verbatim
 /// and re-emitted as-is, with header sizes derived from the blob lengths.
-/// This is how files keep roundtripping when they contain section types
-/// this library does not know about.
 pub const Unknown = struct {
     /// Kind of the unknown section.
     kind: Kind,
@@ -1124,11 +1105,8 @@ fn sectionKind(content: *const Content) Kind {
 }
 
 /// Derives the wire header of `content`: every section type declares its
-/// `kind` and canonical `header_size` and provides a `contentLen` method,
-/// so the header follows from the content; unknown sections keep their
-/// parsed kind and follow the blob lengths. Deriving headers from the data
-/// rather than storing parsed values keeps files consistent when parsed
-/// content is modified.
+/// `kind` and canonical `header_size` and provides a `contentLen` method;
+/// unknown sections keep their parsed kind and follow the blob lengths.
 pub fn sectionHeader(content: Content) WriteError!Header {
     return switch (content) {
         .unknown => |x| .{
@@ -1155,17 +1133,16 @@ fn writeSection(content: Content, e: *bin.Emitter) WriteError!void {
     }
 }
 
-/// The 16-byte preamble following the 12-byte `PMAI` prefix, observed on
-/// every known file. Meaning unknown; Rekordbox writes this exact
-/// sequence, and the device writer emits it for the files it builds.
+/// The 16-byte preamble following the 12-byte `PMAI` prefix; Rekordbox
+/// writes this exact sequence in every known file. Meaning unknown.
 pub const file_header_data = [16]u8{
     0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
     0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
-/// Writes a whole file: the `PMAI` header, `header_data`, and the sections,
-/// with every size derived from the content. The file header's `total_size`
-/// is patched in after the sections, since only then is it known.
+/// Writes a whole file: the `PMAI` header, `header_data`, and the sections.
+/// The file header's `total_size` is patched in after the sections, since
+/// only then is it known.
 fn writeFile(e: *bin.Emitter, header_data: []const u8, sections: []const Content) WriteError!void {
     const file_start = e.pos();
     try bin.putStruct(e, Header{
@@ -1267,8 +1244,8 @@ pub const BuildError = error{ OutOfMemory, InvalidUtf8 };
 /// format: 75 frames/sec × 2.
 pub const DETAIL_HZ: f64 = 150.0;
 
-/// Columns of the mono preview (`PWAV`). Fixed by the format: every ANLZ
-/// fixture carries exactly this many, whatever the track length.
+/// Columns of the mono preview (`PWAV`), fixed by the format whatever the
+/// track length.
 pub const MONO_PREVIEW_COLUMNS: usize = 400;
 
 /// Columns of the tiny mono preview (`PWV2`). Fixed by the format, like
@@ -1288,31 +1265,25 @@ pub const WaveformExtents = struct {
     samples_per_entry: f64,
 };
 
-/// The extents of the 150 Hz detail input `PerformanceData` wants for a
-/// track: `size = round(sample_count / (sample_rate / DETAIL_HZ))` columns
-/// of `sample_rate / DETAIL_HZ` samples each. Pinned by every ANLZ fixture
-/// (demo_tracks 25866/19208, with_anlz 77181/59771 columns). Null when
-/// `sample_rate` is 0.
+/// The extents of the 150 Hz band vector `buildColumnsFromStats` wants for
+/// a track: `size = ceil(sample_count / (sample_rate / DETAIL_HZ))` columns
+/// of `sample_rate / DETAIL_HZ` samples each. Null when `sample_rate` is 0.
 pub fn detailExtents(sample_count: u64, sample_rate: u32) ?WaveformExtents {
     if (sample_rate == 0) return null;
     const samples_per_entry = @as(f64, @floatFromInt(sample_rate)) / DETAIL_HZ;
     const columns = @as(f64, @floatFromInt(sample_count)) / samples_per_entry;
     return .{
-        .size = @intFromFloat(@round(columns)),
+        .size = @intFromFloat(@ceil(columns)),
         .samples_per_entry = samples_per_entry,
     };
 }
 
 /// The preview companion of `detailExtents`: previews are fixed-width, so
 /// the size is `COLOR_PREVIEW_COLUMNS` whatever the track, and each column
-/// spans `sample_count / COLOR_PREVIEW_COLUMNS` samples. The 1200-column
-/// color tier is the tier reported because it is the one libdjinterop's
-/// rekordcrate adapter maps its own fixed-size (1024-column, 3-band)
-/// overview onto — `PWV6` carries the same three band energies, while the
-/// mono tiers carry heights and whiteness that an Engine overview cannot
-/// supply. The width rather than the samples-per-entry is what the format
-/// pins; the span follows from the track length. Null when `sample_rate`
-/// is 0, mirroring `detailExtents`.
+/// spans `sample_count / COLOR_PREVIEW_COLUMNS` samples. The color tier is
+/// the one reported because libdjinterop's rekordbox adapter maps its own
+/// fixed-size 3-band overview onto `PWV6`. Null when `sample_rate` is 0,
+/// mirroring `detailExtents`.
 pub fn previewExtents(sample_count: u64, sample_rate: u32) ?WaveformExtents {
     if (sample_rate == 0) return null;
     return .{
@@ -1321,6 +1292,215 @@ pub fn previewExtents(sample_count: u64, sample_rate: u32) ?WaveformExtents {
             @as(f64, @floatFromInt(COLOR_PREVIEW_COLUMNS)),
     };
 }
+
+/// Rekordbox's quantization of a waveform detail column height from the
+/// peak sample magnitude of its 150 Hz window: `min(31, floor(31.5·p²))`,
+/// with full scale (≥ 0.992) reaching 31. `detailHeightCode` is the exact
+/// integer-domain form Rekordbox itself computes.
+pub fn detailHeight(peak: f64) u5 {
+    const level = 31.5 * peak * peak;
+    if (!(level < 31.0)) return 31; // saturates; also maps NaN to 31
+    return @intFromFloat(level);
+}
+
+/// Rekordbox's mono downmix for the s16 paths (PWV3/PWAV/PWV2): the
+/// arithmetic mean `(L + R) / 2`, not a max-channel pick — anti-phase
+/// input cancels. See `waveMonoMix` for the different float-path mix.
+pub fn monoMix(left: f64, right: f64) f64 {
+    return (left + right) / 2.0;
+}
+
+/// Rekordbox's quantizer for the 3-band sections (`PWV7`/`PWV6` band
+/// values and the `PWV5` color channels): `min(127, floor(127·env))` for
+/// a per-band envelope in 0..1 — linear in amplitude.
+pub fn bandValue(envelope: f64) u7 {
+    const level = 127.0 * envelope;
+    if (!(level < 127.0)) return 127; // saturates; also maps NaN to 127
+    if (level > 0.0) return @intFromFloat(level);
+    return 0; // maps NaN and negatives to the silence value
+}
+
+/// Rekordbox's 3-bit log-pitch "whiteness" code for a pure tone of the
+/// given frequency (the top bits of `PWV3`/`PWAV` columns; DC encodes 0,
+/// digital silence 7): a monotone step function thresholding at 111.1,
+/// 139.7, 168.7, 197.5, 238.6, 297.4 and 420.5 Hz. On program material
+/// the code tracks an internal filterbank; `whitenessRatio` is the coded
+/// column law.
+pub fn whitenessTone(freq_hz: f64) u3 {
+    if (freq_hz < 0.0 or freq_hz != freq_hz) return 7;
+    const thresholds = [7]f64{ 111.06, 139.69, 168.74, 197.51, 238.59, 297.42, 420.54 };
+    var code: u8 = 7;
+    for (thresholds, 0..) |t, i| {
+        if (freq_hz < t) {
+            code = @intCast(i);
+            break;
+        }
+    }
+    return @intCast(code);
+}
+
+/// Rekordbox's 3-bit quantizer for a `PWV5` color channel: given the
+/// channel's amplitude divided by the reference amplitude,
+/// `min(7, floor(7·ratio))` — the dominant channel (ratio 1) codes
+/// exactly 7. The reference is a maximum over Rekordbox's internal color
+/// filterbank, which has more channels than the three visible ones.
+/// Scale-free: unlike the 3-band path there is no adaptive gain.
+/// `pwv5Colors` is the complete coded law.
+pub fn colorShare(ratio: f64) u3 {
+    const level = 7.0 * ratio;
+    if (!(level < 7.0)) return 7; // saturates; also maps NaN to 7
+    if (level > 0.0) return @intFromFloat(level);
+    return 0;
+}
+
+// ------------------------------------------------------------------------
+// Code-verified quantizers, transcribed from Rekordbox 6.8.6's decompiled
+// analyzer: pure functions of caller-supplied filtered/enveloped
+// statistics. `analyzePcm` drives them end to end from raw audio.
+// ------------------------------------------------------------------------
+
+/// Rekordbox's "whiteness" code: the 8-level quantization of how much of
+/// a column's peak survives a 150 Hz lowpass. `filtered_peak` is the
+/// column peak of `|LPF150(mono)|` and `peak` the column peak of the s16
+/// mono mix; the code is the smallest `w` in 0..7 with
+/// `0.875 − 0.125·w ≤ ratio`, and a silent column (peak 0) encodes 7.
+pub fn whitenessRatio(filtered_peak: u16, peak: u16) u3 {
+    if (peak == 0) return 7;
+    const ratio = @as(f64, @floatFromInt(filtered_peak)) /
+        @as(f64, @floatFromInt(peak));
+    if (ratio >= 0.875) return 0;
+    var k: u8 = 1;
+    while (k < 8) : (k += 1) {
+        const threshold = 0.875 - 0.125 * @as(f64, @floatFromInt(k));
+        if (ratio >= threshold) return @intCast(k);
+    }
+    return 7;
+}
+
+/// The detail-height quantizer exactly as coded: `u = trunc(peak /
+/// track_peak · 32767)` then `h = trunc(u² · 2.9327451233027466e-08)` —
+/// the constant is 31.488/32767², the integer-domain form of
+/// `detailHeight`. `peak` and `track_peak` are s16 column / track peaks
+/// of the truncated `(L+R)/2` mix.
+pub fn detailHeightCode(peak: u16, track_peak: u16) u5 {
+    if (track_peak == 0) return 0;
+    const scaled = @as(f64, @floatFromInt(peak)) /
+        @as(f64, @floatFromInt(track_peak)) * 32767.0;
+    const u: u32 = @intFromFloat(@min(scaled, 32767.0));
+    const uf: f64 = @floatFromInt(u);
+    const level = uf * uf * 2.9327451233027466e-08;
+    if (level < 32.0) return @intFromFloat(level);
+    return 31;
+}
+
+/// The low/mid quantizer of `PWV7`: with `envelope` the per-ms-record
+/// band peak (u16) and `scale_hundredths` the per-track adaptive scale
+/// stored as u16·100, the byte is `trunc(env · 2⁻¹⁵ · scale/100 · 128)`
+/// — all factors in float32. Quiet tracks pin the scale at the 0.8
+/// clamp floor.
+pub fn pwv7BandLinear(envelope: u16, scale_hundredths: u16) u8 {
+    const env: f32 = @floatFromInt(envelope);
+    const scale: f32 = @as(f32, @floatFromInt(scale_hundredths)) * 0.01;
+    const v = env * (1.0 / 32768.0) * scale * 128.0;
+    const i: u32 = @intFromFloat(v);
+    return @truncate(i);
+}
+
+/// The high band of `PWV7`: `trunc((64 − cos(π·env·2⁻¹⁵)·64) · scale/100)`
+/// — quadratic for small envelopes, saturating. The envelope reduces to
+/// float32 before the float64 `cos`.
+pub fn pwv7BandQuadratic(envelope: u16, scale_hundredths: u16) u8 {
+    const env: f32 = @floatFromInt(envelope);
+    const scale: f32 = @as(f32, @floatFromInt(scale_hundredths)) * 0.01;
+    const arg: f64 = @as(f64, env * (1.0 / 32768.0)) * std.math.pi;
+    const v: f64 = (64.0 - @cos(arg) * 64.0) * @as(f64, scale);
+    const i: u32 = @intFromFloat(@max(v, 0.0));
+    return @truncate(i);
+}
+
+/// The `PWV5` color codes, complete law: the three color-channel values
+/// (u16 record peaks of the red/green/blue bands) are scaled by 255/max,
+/// then the two suppression corrections and the 1.3 blue boost are
+/// applied in float32, and the codes are `byte >> 5` — not
+/// `min(7, floor(7·A/A_ref))` (see `colorShare`): the >>5 quantizer lets
+/// non-dominant channels pin at 7 already at A/A_ref ≥ 0.878. All-zero
+/// input is digital silence and encodes (7,7,7).
+pub const ColorCodes = struct { red: u3, green: u3, blue: u3 };
+
+pub fn pwv5Colors(red: u16, green: u16, blue: u16) ColorCodes {
+    if (red == 0 and green == 0 and blue == 0)
+        return .{ .red = 7, .green = 7, .blue = 7 };
+    const aref: f32 = @floatFromInt(@max(red, @max(green, blue)));
+    const inv: f32 = 1.0 / aref;
+    var b_blue: f32 = inv * @as(f32, @floatFromInt(blue)) * 255.0;
+    var b_red: f32 = inv * @as(f32, @floatFromInt(red)) * 255.0;
+    var b_green: f32 = inv * @as(f32, @floatFromInt(green)) * 255.0;
+    b_blue = @min(@max(b_blue, 0.0), 255.0);
+    b_red = @min(@max(b_red, 0.0), 255.0);
+    if (b_blue < 64.0) {
+        const t = (0.00130718958 - b_blue * 2.04248372e-05) * b_green * b_red;
+        b_red -= t;
+        b_green -= t;
+    }
+    const m = @min(@max(b_blue, b_red), 128.0);
+    b_green = @min(@max(b_green - m * b_green * 0.00234375, 0.0), 255.0);
+    b_blue = @min(@max(b_blue * 1.29999995, 0.0), 255.0);
+    b_red = @min(@max(b_red, 0.0), 255.0);
+    const r_byte: u8 = @intFromFloat(b_red);
+    const g_byte: u8 = @intFromFloat(b_green);
+    const b_byte: u8 = @intFromFloat(b_blue);
+    var codes = ColorCodes{
+        .red = @intCast(r_byte >> 5),
+        .green = @intCast(g_byte >> 5),
+        .blue = @intCast(b_byte >> 5),
+    };
+    if (r_byte >> 5 == 0 and g_byte >> 5 == 0 and b_byte >> 5 == 0) {
+        const mx = @max(r_byte, @max(g_byte, b_byte));
+        if (r_byte == mx) codes.red = 1;
+        if (g_byte == mx) codes.green = 1;
+        if (b_byte == mx) codes.blue = 1;
+    }
+    return codes;
+}
+
+/// The WaveCreator's mono downmix — the mix behind
+/// `PWV4`/`PWV5`/`PWV7`, distinct from `monoMix` (the s16 paths, a plain
+/// mean). The branch operands are bit-masked absolutes, so the law is:
+/// if `||L|−|R|| ≥ 0.001` take the mean, else take the channel with the
+/// larger magnitude — anti-phase content survives here while `monoMix`
+/// cancels it.
+pub fn waveMonoMix(left: f64, right: f64) f64 {
+    const dl = @abs(left);
+    const dr = @abs(right);
+    if (@abs(dl - dr) >= 0.001) return (left + right) * 0.5;
+    return if (dl <= dr) right else left;
+}
+
+/// Rekordbox's encoding of digital silence: the mono previews floor at
+/// (height 2, whiteness 5) and 1 rather than 0, detail silence is
+/// (height 0, whiteness 7), the 3-band sections are all zero, and the
+/// color detail encodes colors (7, 7, 7) with height 0 — silence codes
+/// as "all bands 7", not 0. These are the values callers should emit for
+/// silent spans.
+pub const Silence = struct {
+    /// `PWAV` byte: height 2, whiteness 5.
+    pub const preview_byte: u8 = (5 << 5) | 2;
+    /// `PWV2` byte: height 1.
+    pub const tiny_byte: u8 = 1;
+    /// `PWV3` byte: height 0, whiteness 7.
+    pub const detail_byte: u8 = (7 << 5) | 0;
+    /// `PWV5` column: colors (7, 7, 7), height 0, unknown bits 0.
+    pub const color_detail_column: u16 = (7 << 13) | (7 << 10) | (7 << 7);
+};
+
+/// Samples by which Rekordbox's analysis windows lead a gapless-aware
+/// MP3 decode: column k of an MP3 import covers source samples
+/// `[294·k − 2257, 294·k + 294 − 2257)` instead of `[294·k, …)`.
+/// 1105 samples of LAME encoder delay plus one 1152-sample MDCT frame
+/// of decoder priming that Rekordbox does not strip. Gapless-tagged
+/// encodes decode without priming and align at ~0; WAV imports sit at
+/// exactly 0.
+pub const mp3_analysis_offset_samples: i32 = -2257;
 
 /// A marker of a sparse beatgrid: a beat number (possibly negative —
 /// Rekordbox grids start at -4) at a sample offset.
@@ -1332,7 +1512,11 @@ pub const BeatMarker = struct {
     sample_offset: f64,
 };
 
-/// One 150 Hz waveform detail column: peak band energies.
+/// One 150 Hz waveform detail column: peak band energies. The input of
+/// `buildColumnsFromStats` and the shape foreign waveform data maps onto —
+/// libdjinterop's `waveform_entry` (low/mid/high values; its per-band
+/// opacity fields are render alphas, not levels, and do not qualify)
+/// resampled to `DETAIL_HZ`.
 pub const Band = struct {
     /// Sound energy of the low frequency band (0-255).
     low: u8 = 0,
@@ -1340,6 +1524,11 @@ pub const Band = struct {
     mid: u8 = 0,
     /// Sound energy of the high frequency band (0-255).
     high: u8 = 0,
+    /// The column's overall amplitude (0-255) when the source format
+    /// carries one; 0 = not supplied, and the band max stands in — a lower
+    /// bound, since band energies spread a peak across bands. Drives the
+    /// mono heights and PWAV/PWV2 levels when present.
+    peak: u8 = 0,
 };
 
 /// A cue (point or loop) in sample units, before ANLZ encoding.
@@ -1361,16 +1550,11 @@ pub const CueInput = struct {
     b: u8 = 0,
 };
 
-/// Format-agnostic performance data for one track, the single input of
-/// `buildAnlzInput`. All positions are sample offsets interpreted at
-/// `sample_rate`.
-///
-/// `waveform_bands` and `waveform_heights` must be sampled at exactly
-/// `DETAIL_HZ`: the detail sections copy the input columns verbatim, so a
-/// different input rate silently stretches or squashes every output
-/// waveform. Callers holding columns at another rate must resample to
-/// 150 Hz first. The preview sections are derived from these same columns
-/// at fixed widths (see `buildPreviewColumns`/`buildBandColumns`).
+/// Format-agnostic performance data for one track: the metadata half of an
+/// ANLZ build — beats, cues, and the rates that place them in time. All
+/// positions are sample offsets interpreted at `sample_rate`. The waveform
+/// half travels separately in a `WaveformColumns`; `buildAnlzInput` joins the
+/// two.
 pub const PerformanceData = struct {
     /// Audio sample rate in Hz, used for sample→ms conversion. Zero makes
     /// beat and cue times come out as zero.
@@ -1388,11 +1572,6 @@ pub const PerformanceData = struct {
     main_cue: ?f64 = null,
     /// Cues (memory or hot, point or loop).
     cues: []const CueInput = &.{},
-    /// 3-band detail columns at `DETAIL_HZ`.
-    waveform_bands: []const Band = &.{},
-    /// Per-column peak height (0-31) at `DETAIL_HZ`, driving PWAV/PWV2/PWV3
-    /// and the PWV5 height. May be shorter than `waveform_bands`.
-    waveform_heights: []const u8 = &.{},
 };
 
 /// Caller-provided ANLZ content for a track, the output of
@@ -1441,29 +1620,36 @@ pub const AnlzInput = struct {
     }
 };
 
-/// The four band-derived column groups of `buildBandColumns`.
-pub const BandColumns = struct {
+/// The seven waveform column groups of an ANLZ file: the waveform half of
+/// an `AnlzInput` build, with field names matching `AnlzInput` one-to-one.
+/// Produced by `analyzePcm` (the byte-exact replication of Rekordbox's
+/// analysis, from decoded PCM) or `buildColumnsFromStats` (an approximation
+/// from foreign 3-band data), and moved into `buildAnlzInput`. All slices
+/// are owned by the caller's allocator and freed by `deinit`.
+pub const WaveformColumns = struct {
+    /// Fixed-width mono preview (`PWAV`, 400 columns).
+    preview_mono: []WaveformPreviewColumn = &.{},
+    /// Fixed-width tiny mono preview (`PWV2`, 100 columns).
+    tiny_preview: []TinyWaveformPreviewColumn = &.{},
+    /// Variable-width mono detail (`PWV3`, `ceil(samples/294)` columns).
+    detail_mono: []WaveformPreviewColumn = &.{},
+    /// Fixed-width color preview (`PWV4`, 1200 columns).
     color_preview: []WaveformColorPreviewColumn = &.{},
+    /// Variable-width color detail (`PWV5`, `ceil(samples/294)` columns).
     color_detail: []WaveformColorDetailColumn = &.{},
+    /// Fixed-width 3-band preview (`PWV6`, 1200 columns).
     band3_preview: []Waveform3BandColumn = &.{},
+    /// Variable-width 3-band detail (`PWV7`, `ceil(samples/294)` columns).
     band3_detail: []Waveform3BandColumn = &.{},
 
-    pub fn deinit(columns: *const BandColumns, alloc: std.mem.Allocator) void {
+    pub fn deinit(columns: *const WaveformColumns, alloc: std.mem.Allocator) void {
+        alloc.free(columns.preview_mono);
+        alloc.free(columns.tiny_preview);
+        alloc.free(columns.detail_mono);
         alloc.free(columns.color_preview);
         alloc.free(columns.color_detail);
         alloc.free(columns.band3_preview);
         alloc.free(columns.band3_detail);
-    }
-};
-
-/// The two preview column groups of `buildPreviewColumns`.
-pub const PreviewColumns = struct {
-    preview: []WaveformPreviewColumn = &.{},
-    tiny: []TinyWaveformPreviewColumn = &.{},
-
-    pub fn deinit(columns: *const PreviewColumns, alloc: std.mem.Allocator) void {
-        alloc.free(columns.preview);
-        alloc.free(columns.tiny);
     }
 };
 
@@ -1510,16 +1696,14 @@ fn barPosition(global_beat: i64) u16 {
     return @intCast(@mod(global_beat - 1, 4) + 1);
 }
 
-/// Expands a sparse 2-marker beatgrid into one `Beat` per beat. The markers
-/// need not be sorted; the format requires ascending sample offsets, so they
-/// are sorted first. Assumes **constant tempo between markers** (linear
-/// interpolation of sample offsets): no rubato, no tempo curves, no
-/// time-signature changes. `bpm` seeds the `tempo` field (see
-/// `PerformanceData.bpm`); `sample_count` clips the tail — no beats are
-/// emitted past the track end or before its start. Markers sharing a
-/// sample offset are skipped. The final marker only ends the last
-/// segment: the tempo beyond it is unknown, so no beat is emitted at or
-/// past it — a grid's last beat is the one before the final marker.
+/// Expands a sparse marker beatgrid into one `Beat` per beat; markers need
+/// not be sorted (the format requires ascending offsets, so they are
+/// sorted first), and markers sharing a sample offset are skipped. Assumes
+/// **constant tempo between markers** (linear interpolation of sample
+/// offsets). `bpm` seeds the `tempo` field (see `PerformanceData.bpm`);
+/// `sample_count` clips the tail — no beats are emitted past the track end
+/// or before its start. The final marker only ends the last segment: the
+/// tempo beyond it is unknown, so no beat is emitted at or past it.
 pub fn expandBeatgrid(
     alloc: std.mem.Allocator,
     markers: []const BeatMarker,
@@ -1567,141 +1751,233 @@ pub fn expandBeatgrid(
     return beats.toOwnedSlice(alloc);
 }
 
-/// Index of the detail column that preview column `i` of `size` samples:
-/// the midpoint of its span, `len * (2i + 1) / (2 * size)` in floor
-/// arithmetic over the actual input length `len`. Rekordbox's own
-/// derivation is unobservable (see `docs/DIVERGENCES.md`); this matches
-/// libdjinterop's Engine overview resampler, the documented precedent for
-/// the same two-tier design.
-fn midpointIndex(len: usize, size: usize, i: usize) usize {
-    return @intCast(@as(u64, len) * (2 * @as(u64, i) + 1) / (2 * @as(u64, size)));
+/// The PWV7 envelope replay over the stats grid. The analyzer reseeds at
+/// each column's first record minus W and samples at its last record, the
+/// recursion being `env = x if x ≥ env else (1−α)·x + α·env` per record;
+/// the column-grid form runs the same recursion once per column with the
+/// constants converted from the record grid (294 samples per column /
+/// 44.1 per record = 20/3 records per column): α per column =
+/// α per record ^ 20/3, and the 300/200/100-record windows are exactly
+/// 45/30/15 columns.
+fn statsEnvelopeAt(vals: []const [3]u16, band: usize, col: usize, win: usize, alpha: f64) f64 {
+    const seed: i64 = @as(i64, @intCast(col)) - @as(i64, @intCast(win));
+    var env: f64 = if (seed >= 0) @floatFromInt(vals[@intCast(seed)][band]) else 0.0;
+    var j = seed + 1;
+    while (j <= col) : (j += 1) {
+        const x: f64 = if (j >= 0) @floatFromInt(vals[@intCast(j)][band]) else 0.0;
+        env = if (x >= env) x else (1.0 - alpha) * x + alpha * env;
+    }
+    return env;
 }
 
-/// Builds the four band-derived column groups (PWV4 color preview, PWV5
-/// color detail, PWV6/PWV7 3-band) from a single 150 Hz 3-band detail
-/// vector. The previews are fixed-width (`COLOR_PREVIEW_COLUMNS`) and
-/// midpoint-sample the detail bands; the detail groups copy the band
-/// energies directly (field order mid, top, bottom). `heights` drives the
-/// PWV5 height (see `colorDetailColumn` for the missing-entry fallback).
-/// Empty `bands` produce empty sections: nothing pins Rekordbox's behavior
-/// for a track with no waveform.
+/// Builds the seven waveform column groups from a single 150 Hz 3-band
+/// detail vector — the route for callers holding foreign waveform data
+/// (e.g. an Engine overview resampled to `DETAIL_HZ`), not decoded audio
+/// (`analyzePcm` is that route, byte-exact). The input must be sampled at
+/// exactly `DETAIL_HZ`: the detail sections track the input columns
+/// one-to-one, so a different input rate silently stretches or squashes
+/// every output waveform; `detailExtents`/`previewExtents` report the
+/// target shape.
 ///
-/// Whiteness and the PWV4 bottom-half band are guesses: Rekordbox's exact
-/// derivation is proprietary and undocumented — whiteness stays zero
-/// throughout this module and the bottom-half energy mirrors the
-/// bottom-third energy.
-pub fn buildBandColumns(
-    alloc: std.mem.Allocator,
-    bands: []const Band,
-    heights: []const u8,
-) BuildError!BandColumns {
-    const n_previews: usize = if (bands.len == 0) 0 else COLOR_PREVIEW_COLUMNS;
+/// The derivations are the analyzer's own laws (the 6.8.6 transcriptions
+/// above) over one domain mapping: band energies and `Band.peak` become
+/// the s16 record peaks those laws consume, as `value · 128`. What band
+/// data cannot supply is proxied per group, as documented at each group's
+/// site in the body: detail heights take the column peak (`Band.peak`
+/// when supplied, else the band max, a lower bound), whiteness the low
+/// band, the PWV4/PWV5 colors share-weighted band peaks, and the
+/// PWAV/PWV2 ladders a per-span level calibrated so the loudest span
+/// reaches the analyzer's AGC ceiling. Digital silence encodes as
+/// `Silence` documents; empty `bands` produce empty sections.
+pub fn buildColumnsFromStats(alloc: std.mem.Allocator, bands: []const Band) BuildError!WaveformColumns {
+    if (bands.len == 0) return .{};
 
-    const color_preview = try alloc.alloc(WaveformColorPreviewColumn, n_previews);
-    errdefer alloc.free(color_preview);
-    const color_detail = try alloc.alloc(WaveformColorDetailColumn, bands.len);
-    errdefer alloc.free(color_detail);
-    const band3_preview = try alloc.alloc(Waveform3BandColumn, n_previews);
-    errdefer alloc.free(band3_preview);
-    const band3_detail = try alloc.alloc(Waveform3BandColumn, bands.len);
-    errdefer alloc.free(band3_detail);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = bands.len;
 
-    for (0..n_previews) |w| {
-        const band = bands[midpointIndex(bands.len, COLOR_PREVIEW_COLUMNS, w)];
-        color_preview[w] = .{
-            .energy_bottom_half_freq = band.low,
-            .energy_bottom_third_freq = band.low,
-            .energy_mid_third_freq = band.mid,
-            .energy_top_third_freq = band.high,
-        };
-        band3_preview[w] = .{
-            .energy_mid_third_freq = band.mid,
-            .energy_top_third_freq = band.high,
-            .energy_bottom_third_freq = band.low,
-        };
-    }
+    // The domain mapping: 0-255 energies onto the s16 record peaks
+    // (255 → 32640, full scale through the quantizers). `peaks` carries
+    // the mono peak proxy — `Band.peak` when supplied, the band max
+    // otherwise.
+    const vals = try a.alloc([3]u16, n);
+    const peaks = try a.alloc(u16, n);
     for (bands, 0..) |band, i| {
-        color_detail[i] = colorDetailColumn(
-            band.low,
-            band.mid,
-            band.high,
-            if (i < heights.len) heights[i] else null,
-        );
-        band3_detail[i] = .{
-            .energy_mid_third_freq = band.mid,
-            .energy_top_third_freq = band.high,
-            .energy_bottom_third_freq = band.low,
+        vals[i] = .{ @as(u16, band.low) * 128, @as(u16, band.mid) * 128, @as(u16, band.high) * 128 };
+        const p: u8 = if (band.peak != 0) band.peak else @max(@max(band.low, band.mid), band.high);
+        peaks[i] = @as(u16, p) * 128;
+    }
+    var track_peak: u16 = 0;
+    for (peaks) |p| track_peak = @max(track_peak, p);
+
+    const scales = try bandScalesAndPreview(a, vals, 150);
+
+    var out: WaveformColumns = .{};
+    errdefer out.deinit(alloc);
+    out.color_preview = try alloc.alloc(WaveformColorPreviewColumn, COLOR_PREVIEW_COLUMNS);
+    for (out.color_preview) |*col| col.* = .{}; // empty spans keep zeros
+    out.color_detail = try alloc.alloc(WaveformColorDetailColumn, n);
+    out.band3_preview = try alloc.alloc(Waveform3BandColumn, COLOR_PREVIEW_COLUMNS);
+    out.band3_detail = try alloc.alloc(Waveform3BandColumn, n);
+    out.preview_mono = try alloc.alloc(WaveformPreviewColumn, MONO_PREVIEW_COLUMNS);
+    out.tiny_preview = try alloc.alloc(TinyWaveformPreviewColumn, TINY_PREVIEW_COLUMNS);
+    out.detail_mono = try alloc.alloc(WaveformPreviewColumn, n);
+
+    // The analyzer's PWV7 constants converted to the column grid.
+    const rec_per_col: f64 = 20.0 / 3.0;
+    const alphas = [3]f64{
+        std.math.pow(f64, 0.99, rec_per_col),
+        std.math.pow(f64, 0.98, rec_per_col),
+        std.math.pow(f64, 0.97, rec_per_col),
+    };
+    const windows = [3]usize{ 45, 30, 15 };
+
+    for (0..n) |c| {
+        // PWV3: the mono height law and the whiteness ratio ladder.
+        out.detail_mono[c] = .{
+            .height = detailHeightCode(peaks[c], track_peak),
+            .whiteness = whitenessRatio(vals[c][0], peaks[c]),
+        };
+        // PWV5: the share-law colors over the low-widened bands, the same
+        // height law underneath.
+        var redw: u16 = 0;
+        const rlo = if (c >= 2) c - 2 else 0;
+        const rhi = @min(c + 2, n - 1);
+        var k = rlo;
+        while (k <= rhi) : (k += 1) redw = @max(redw, vals[k][0]);
+        const codes = pwv5Colors(redw, vals[c][1], vals[c][2]);
+        out.color_detail[c] = .{
+            .red = codes.red,
+            .green = codes.green,
+            .blue = codes.blue,
+            .height = detailHeightCode(peaks[c], track_peak),
+        };
+        // PWV7: the envelope replay through the linear (low/mid) and
+        // cosine (high) quantizers.
+        out.band3_detail[c] = .{
+            .energy_mid_third_freq = pwv7QuantLinear(@floatCast(statsEnvelopeAt(vals, 0, c, windows[0], alphas[0])), scales.scale_u16[0]),
+            .energy_top_third_freq = pwv7QuantLinear(@floatCast(statsEnvelopeAt(vals, 1, c, windows[1], alphas[1])), scales.scale_u16[1]),
+            .energy_bottom_third_freq = pwv7QuantQuadratic(@floatCast(statsEnvelopeAt(vals, 2, c, windows[2], alphas[2])), scales.scale_u16[2]),
         };
     }
-    return .{
-        .color_preview = color_preview,
-        .color_detail = color_detail,
-        .band3_preview = band3_preview,
-        .band3_detail = band3_detail,
-    };
-}
 
-/// Quantizes one color-detail column. The RGB values pick the dominant band
-/// (high→blue, mid→green, low→red; ties break high, so silence renders
-/// blue); a caller-supplied height is clamped to 0-31, a missing one falls
-/// back to the scaled band maximum.
-fn colorDetailColumn(low: u8, mid: u8, high: u8, height: ?u8) WaveformColorDetailColumn {
-    const h: u8 = height orelse blk: {
-        const band_max: f32 = @floatFromInt(@max(@max(low, mid), high));
-        break :blk std.math.lossyCast(u8, @round(band_max / 255.0 * 31.0));
-    };
-    var red: u3 = 0;
-    var green: u3 = 0;
-    var blue: u3 = 0;
-    if (high >= mid and high >= low) {
-        blue = 7;
-    } else if (mid >= low) {
-        green = 7;
-    } else {
-        red = 7;
+    // PWV6 from the shared scale derivation; wire order low/mid/high.
+    for (0..COLOR_PREVIEW_COLUMNS) |j| {
+        out.band3_preview[j] = .{
+            .energy_mid_third_freq = scales.pwv6[j][0],
+            .energy_top_third_freq = scales.pwv6[j][1],
+            .energy_bottom_third_freq = scales.pwv6[j][2],
+        };
     }
-    return .{ .height = @intCast(@min(h, 31)), .red = red, .green = green, .blue = blue };
-}
 
-/// Builds the fixed-width mono previews (PWAV at `MONO_PREVIEW_COLUMNS`,
-/// PWV2 at `TINY_PREVIEW_COLUMNS`) from a per-column peak height vector by
-/// midpoint-sampling the detail heights, the resampling `buildBandColumns`
-/// documents. The PWV2 height is the PWAV-scale height halved into its
-/// 4-bit field — the fixtures cannot pin the 5→4-bit rescale, so halves
-/// are chosen for symmetry. Empty `heights` produce empty sections:
-/// nothing pins Rekordbox's behavior for a track with no waveform.
-pub fn buildPreviewColumns(
-    alloc: std.mem.Allocator,
-    heights: []const u8,
-) BuildError!PreviewColumns {
-    const n_previews: usize = if (heights.len == 0) 0 else MONO_PREVIEW_COLUMNS;
-
-    const preview = try alloc.alloc(WaveformPreviewColumn, n_previews);
-    errdefer alloc.free(preview);
-    const tiny = try alloc.alloc(TinyWaveformPreviewColumn, if (heights.len == 0) 0 else TINY_PREVIEW_COLUMNS);
-    errdefer alloc.free(tiny);
-
-    for (0..n_previews) |w| {
-        const peak = @min(heights[midpointIndex(heights.len, MONO_PREVIEW_COLUMNS, w)], 31);
-        // PWV2 carries a 4-bit height (0-15); PWAV carries 5 bits (0-31).
-        preview[w] = .{ .height = @intCast(peak), .whiteness = 0 };
+    // PWV4: per-span maxima of the mono peak, the low band (the LPF400
+    // proxy), and the share-weighted bands, the low share widened ±2
+    // columns as the analyzer's ±12-record LOW window.
+    {
+        const share = try a.alloc([3]u16, n);
+        for (bands, 0..) |band, i| {
+            const energies = [3]u8{ band.low, band.mid, band.high };
+            const sum: u32 = @as(u32, band.low) + band.mid + band.high;
+            for (energies, 0..) |e, b| share[i][b] = if (sum == 0) 0 else @intCast(@as(u64, e) * e * 128 / sum);
+        }
+        for (0..COLOR_PREVIEW_COLUMNS) |j| {
+            const rs = spanStartOf(n, j, COLOR_PREVIEW_COLUMNS);
+            const re = spanEndOf(n, j, COLOR_PREVIEW_COLUMNS);
+            if (re < rs) continue; // empty span: zeros, as the analyzer leaves them
+            var mono_max: u16 = 0;
+            var low_max: u16 = 0;
+            var mid_share: u16 = 0;
+            var high_share: u16 = 0;
+            for (rs..re + 1) |c| {
+                mono_max = @max(mono_max, peaks[c]);
+                low_max = @max(low_max, vals[c][0]);
+                mid_share = @max(mid_share, share[c][1]);
+                high_share = @max(high_share, share[c][2]);
+            }
+            var low_share: u16 = 0;
+            const wlo = if (rs >= 2) rs - 2 else 0;
+            const whi = @min(re + 2, n - 1);
+            var c2 = wlo;
+            while (c2 <= whi) : (c2 += 1) low_share = @max(low_share, share[c2][0]);
+            const top: u8 = @intCast(mono_max / 256);
+            out.color_preview[j] = .{
+                .unknown1 = top,
+                .unknown2 = @truncate(@as(u16, 256) -% top),
+                .energy_bottom_half_freq = @intCast(low_max / 256),
+                .energy_bottom_third_freq = @intCast(low_share / 256),
+                .energy_mid_third_freq = @intCast(mid_share / 256),
+                .energy_top_third_freq = @intCast(high_share / 256),
+            };
+        }
     }
-    for (0..tiny.len) |w| {
-        const peak = @min(heights[midpointIndex(heights.len, TINY_PREVIEW_COLUMNS, w)], 31);
-        tiny[w] = .{ .height = @intCast(peak / 2) };
-    }
-    return .{ .preview = preview, .tiny = tiny };
-}
 
-/// Converts a caller-supplied per-column peak height vector (0-31) into the
-/// mono detail columns (PWV3, 150 Hz) used by `.EXT`.
-pub fn buildDetailMono(alloc: std.mem.Allocator, heights: []const u8) BuildError![]WaveformPreviewColumn {
-    const detail = try alloc.alloc(WaveformPreviewColumn, heights.len);
-    errdefer alloc.free(detail);
-    for (heights, 0..) |h, i| {
-        detail[i] = .{ .height = @intCast(@min(h, 31)), .whiteness = 0 };
+    // PWAV: the height ladder over a span-mean level, calibrated so the
+    // loudest span reaches the fixtures' AGC ceiling (23); the class bits
+    // from the band dB codes.
+    {
+        // Between pwav_ladder[20] and [21], clear of both boundaries.
+        const pwav_target: f32 = 35000;
+        var levels = [_]f32{0} ** MONO_PREVIEW_COLUMNS;
+        var max_level: f32 = 0;
+        for (0..MONO_PREVIEW_COLUMNS) |j| {
+            const rs = spanStartOf(n, j, MONO_PREVIEW_COLUMNS);
+            const re = spanEndOf(n, j, MONO_PREVIEW_COLUMNS);
+            if (re < rs) continue;
+            var sum: f64 = 0;
+            for (rs..re + 1) |c| sum += @floatFromInt(peaks[c]);
+            levels[j] = @floatCast(sum / @as(f64, @floatFromInt(re + 1 - rs)));
+            max_level = @max(max_level, levels[j]);
+        }
+        const cal: f32 = if (max_level > 0) pwav_target / max_level else 0;
+        for (0..MONO_PREVIEW_COLUMNS) |j| {
+            const rs = spanStartOf(n, j, MONO_PREVIEW_COLUMNS);
+            const re = spanEndOf(n, j, MONO_PREVIEW_COLUMNS);
+            var band_max = [3]u16{ 0, 0, 0 };
+            if (re >= rs) {
+                for (rs..re + 1) |c| {
+                    for (0..3) |b| band_max[b] = @max(band_max[b], vals[c][b]);
+                }
+            }
+            out.preview_mono[j] = .{
+                .height = @intCast(pwavLadder(levels[j] * cal)),
+                .whiteness = pwavClass(
+                    dbcode(@as(f32, @floatFromInt(band_max[0])) * 0.5),
+                    dbcode(@as(f32, @floatFromInt(band_max[1])) * 0.25),
+                    dbcode(@as(f32, @floatFromInt(band_max[2]))),
+                ),
+            };
+        }
     }
-    return detail;
+
+    // PWV2: its ladder over the span max of the low band, calibrated to 13
+    // at the loudest span; a zero accumulator encodes 1 (2 when the mid
+    // band is nonzero), the analyzer's band-2 tiebreak.
+    {
+        const acc = try a.alloc(u16, TINY_PREVIEW_COLUMNS);
+        const mid_max = try a.alloc(u16, TINY_PREVIEW_COLUMNS);
+        @memset(acc, 0);
+        @memset(mid_max, 0);
+        var max_acc: u16 = 0;
+        for (0..TINY_PREVIEW_COLUMNS) |j| {
+            const rs = spanStartOf(n, j, TINY_PREVIEW_COLUMNS);
+            const re = spanEndOf(n, j, TINY_PREVIEW_COLUMNS);
+            if (re < rs) continue;
+            for (rs..re + 1) |c| {
+                acc[j] = @max(acc[j], vals[c][0]);
+                mid_max[j] = @max(mid_max[j], vals[c][1]);
+            }
+            max_acc = @max(max_acc, acc[j]);
+        }
+        const cal: f64 = if (max_acc > 0) 15000.0 / @as(f64, @floatFromInt(max_acc)) else 0;
+        for (0..TINY_PREVIEW_COLUMNS) |j| {
+            const v: i64 = @intFromFloat(@trunc(@as(f64, @floatFromInt(acc[j])) * cal));
+            const code: i64 = if (v == 0) (if (mid_max[j] != 0) 2 else 1) else pwv2LadderVal(v);
+            out.tiny_preview[j] = .{ .height = @intCast(code) };
+        }
+    }
+
+    return out;
 }
 
 /// Builds the `.DAT` plain-cue list and the `.EXT` extended-cue list from
@@ -1752,20 +2028,22 @@ pub fn buildCues(alloc: std.mem.Allocator, cues: []const CueInput, sample_rate: 
     return .{ .cues = plain, .extended = extended, .list_type = if (has_hot_cue) .hot_cues else .memory_cues };
 }
 
-/// Assembles a complete `AnlzInput` from format-agnostic performance data:
-/// the single entry point for callers. Waveform columns for all seven
-/// sections are derived from `pd.waveform_bands`/`pd.waveform_heights` (see
-/// `PerformanceData` for the 150 Hz contract), the beatgrid is densified by
-/// `expandBeatgrid`, and `pd.main_cue` is prepended to `pd.cues` as a
-/// colorless memory point cue before `buildCues` sees one list. All output
-/// is owned by `alloc` and freed by `AnlzInput.deinit`.
-pub fn buildAnlzInput(alloc: std.mem.Allocator, pd: PerformanceData) BuildError!AnlzInput {
-    const bands = try buildBandColumns(alloc, pd.waveform_bands, pd.waveform_heights);
-    errdefer bands.deinit(alloc);
-    const previews = try buildPreviewColumns(alloc, pd.waveform_heights);
-    errdefer previews.deinit(alloc);
-    const detail_mono = try buildDetailMono(alloc, pd.waveform_heights);
-    errdefer alloc.free(detail_mono);
+/// Assembles a complete `AnlzInput` from format-agnostic performance data
+/// and a waveform column set: the single composition entry point. The
+/// beatgrid is densified by `expandBeatgrid`, `pd.main_cue` is prepended to
+/// `pd.cues` as a colorless memory point cue before `buildCues` sees one
+/// list, and all seven waveform column groups are **moved** out of
+/// `waveforms` (which is left empty, so an unconditional
+/// `defer waveforms.deinit(alloc)` stays correct). Produce the columns with
+/// `analyzePcm` (byte-exact, from decoded audio) or `buildColumnsFromStats`
+/// (approximate, from foreign band data); a default `WaveformColumns{}`
+/// leaves every waveform section empty, matching a waveform-less analysis.
+/// All output is owned by `alloc` and freed by `AnlzInput.deinit`.
+pub fn buildAnlzInput(
+    alloc: std.mem.Allocator,
+    pd: PerformanceData,
+    waveforms: *WaveformColumns,
+) BuildError!AnlzInput {
     const beats = try expandBeatgrid(alloc, pd.beatgrid, pd.sample_rate, pd.bpm, pd.sample_count);
     errdefer alloc.free(beats);
 
@@ -1776,17 +2054,1520 @@ pub fn buildAnlzInput(alloc: std.mem.Allocator, pd: PerformanceData) BuildError!
         break :blk try buildCues(alloc, combined, pd.sample_rate);
     } else try buildCues(alloc, pd.cues, pd.sample_rate);
 
-    return .{
+    const out = AnlzInput{
         .beats = beats,
         .cues = lists.cues,
         .cues_extended = lists.extended,
         .cue_list_type = lists.list_type,
-        .preview_mono = previews.preview,
-        .tiny_preview = previews.tiny,
-        .detail_mono = detail_mono,
-        .color_preview = bands.color_preview,
-        .color_detail = bands.color_detail,
-        .band3_preview = bands.band3_preview,
-        .band3_detail = bands.band3_detail,
+        .preview_mono = waveforms.preview_mono,
+        .tiny_preview = waveforms.tiny_preview,
+        .detail_mono = waveforms.detail_mono,
+        .color_preview = waveforms.color_preview,
+        .color_detail = waveforms.color_detail,
+        .band3_preview = waveforms.band3_preview,
+        .band3_detail = waveforms.band3_detail,
     };
+    waveforms.* = .{};
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// PCM analysis route
+// ---------------------------------------------------------------------------
+
+pub const AnalyzeError = error{ OutOfMemory, UnsupportedSampleRate, ChannelMismatch };
+
+/// Raw decoded PCM input: planar stereo f32 in [−1, 1) (NaN/inf are a
+/// contract violation — the analyzer's saturating casts assume finite
+/// samples). Mono sources must be duplicated to both channels, as
+/// Rekordbox's decode path always delivers stereo. The two channels must
+/// have equal length. The sample rate must be 44100 Hz as that's the only
+/// rate Rekordbox's analysis supports (it resamples everything to that
+/// before analysis). This library doesn't resample or decode.
+pub const PcmInput = struct {
+    left: []const f32,
+    right: []const f32,
+};
+
+// ---------------------------------------------------------------------------
+// Numerics
+// ---------------------------------------------------------------------------
+
+/// Pairwise summation (128-sample blocks split in half, 8-accumulator
+/// unroll). The association order is observable at truncation boundaries
+/// downstream, so the exact order matters.
+fn npSum(a: []const f64) f64 {
+    const n = a.len;
+    if (n < 8) {
+        var res: f64 = 0.0;
+        for (a) |v| res += v;
+        return res;
+    }
+    if (n <= 128) {
+        var r = [8]f64{ a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7] };
+        var i: usize = 8;
+        const lim = n - (n % 8);
+        while (i < lim) : (i += 8) {
+            r[0] += a[i];
+            r[1] += a[i + 1];
+            r[2] += a[i + 2];
+            r[3] += a[i + 3];
+            r[4] += a[i + 4];
+            r[5] += a[i + 5];
+            r[6] += a[i + 6];
+            r[7] += a[i + 7];
+        }
+        var res: f64 = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+        while (i < n) : (i += 1) res += a[i];
+        return res;
+    }
+    var n2 = n / 2;
+    n2 -= n2 % 8;
+    return npSum(a[0..n2]) + npSum(a[n2..]);
+}
+
+/// Record-write saturation: `trunc(v·32768)`, with v ≥ 1 → 0x7fff and
+/// v < −1 → 0x8000.
+fn sat16(v: f64) i16 {
+    if (v >= 1.0) return 32767;
+    if (v < -1.0) return -32768;
+    return @intFromFloat(@trunc(v * 32768.0));
+}
+
+/// `sat16` for the non-negative |window max| record fields.
+fn sat16u(v: f64) u16 {
+    return @intCast(sat16(v));
+}
+
+/// One direct-form-II-transposed biquad in float64; the exact operation
+/// order (`y = b0·x + z0; z0 = (z1 + b1·x) − a1·y; z1 = b2·x − a2·y`)
+/// is part of the bit-exact contract.
+const Biquad = struct {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    z0: f64 = 0.0,
+    z1: f64 = 0.0,
+
+    fn proc(q: *Biquad, x: f64) f64 {
+        const y = q.b0 * x + q.z0;
+        q.z0 = (q.z1 + q.b1 * x) - q.a1 * y;
+        q.z1 = q.b2 * x - q.a2 * y;
+        return y;
+    }
+};
+
+const fs: f64 = 44100.0;
+/// Q = 1/√2 — the stored literal, one ulp below `sqrt(2)/2`.
+const inv_sqrt2: f64 = 0.70710678118654746;
+/// 31.488/32767², the coded height constant.
+const height_c: f64 = 2.9327451233027466e-08;
+
+/// RBJ lowpass, Q = 1/√2.
+fn cookLpf(fc: f64) Biquad {
+    const w0 = 2.0 * std.math.pi * fc / fs;
+    const s = @sin(w0);
+    const c = @cos(w0);
+    const a = s * inv_sqrt2;
+    const d = 1.0 / (1.0 + a);
+    const b0 = (1.0 - c) * 0.5 * d;
+    return .{ .b0 = b0, .b1 = 2.0 * b0, .b2 = b0, .a1 = -2.0 * c * d, .a2 = (1.0 - a) * d };
+}
+
+/// RBJ highpass, Q = 1/√2.
+fn cookHpf(fc: f64) Biquad {
+    const w0 = 2.0 * std.math.pi * fc / fs;
+    const s = @sin(w0);
+    const c = @cos(w0);
+    const a = s * inv_sqrt2;
+    const d = 1.0 / (1.0 + a);
+    const b0 = (1.0 + c) * 0.5 * d;
+    return .{ .b0 = b0, .b1 = -2.0 * b0, .b2 = b0, .a1 = -2.0 * c * d, .a2 = (1.0 - a) * d };
+}
+
+/// LPF@150 in bilinear/tan form: fc from tan(π·150/fs), not sin/cos.
+fn cookLpf150Tan() Biquad {
+    const t = @tan(std.math.pi * 150.0 / fs);
+    const d = 1.0 / (t * @sqrt(2.0) + 1.0 + t * t);
+    const b0 = t * t * d;
+    return .{
+        .b0 = b0,
+        .b1 = 2.0 * b0,
+        .b2 = b0,
+        .a1 = (2.0 * t * t - 2.0) * d,
+        .a2 = (1.0 - @sqrt(2.0) * t + t * t) * d,
+    };
+}
+
+/// ceil(a/b) for non-negative integers.
+fn ceilDiv(a: usize, b: usize) usize {
+    if (b == 0) return 0;
+    return (a + b - 1) / b;
+}
+
+/// The PWV7 b0/b1 quantizer on the fractional f32 envelope:
+/// `trunc(env·2⁻¹⁵·scale/100·128)` — all float32. The public
+/// `anlz.pwv7BandLinear` is this same law specialized to integer u16
+/// record-bank envelopes; the engine's envelope decays between record
+/// values, so it needs the untruncated input.
+fn pwv7QuantLinear(env: f32, scale_hundredths: u16) u8 {
+    const scale: f32 = @as(f32, @floatFromInt(scale_hundredths)) * 0.01;
+    const v = env * (1.0 / 32768.0) * scale * 128.0;
+    const i: u32 = @intFromFloat(v);
+    return @truncate(i);
+}
+
+/// The PWV7 b2 transform on the fractional f32 envelope:
+/// `trunc((64 − cos(π·env·2⁻¹⁵)·64)·scale/100)`.
+fn pwv7QuantQuadratic(env: f32, scale_hundredths: u16) u8 {
+    const scale: f32 = @as(f32, @floatFromInt(scale_hundredths)) * 0.01;
+    const arg: f64 = @as(f64, env * (1.0 / 32768.0)) * std.math.pi;
+    const v: f64 = (64.0 - @cos(arg) * 64.0) * @as(f64, scale);
+    const i: u32 = @intFromFloat(@max(v, 0.0));
+    return @truncate(i);
+}
+
+// ---------------------------------------------------------------------------
+// WaveCreator: PWV4/PWV5/PWV6/PWV7 record bank and finalizers
+// ---------------------------------------------------------------------------
+
+/// The per-millisecond record bank. Record r covers samples
+/// [starts[r], starts[r+1]) of the track.
+const Rec = struct {
+    /// PWV7: per-band window |max|, sat16.
+    b: [3]u16 = .{ 0, 0, 0 },
+    /// Signed window max/min of the mono mix, sat16.
+    mmax: i16 = 0,
+    mmin: i16 = 0,
+    /// PWV5: per-band window |max|, sat16.
+    red: u16 = 0,
+    green: u16 = 0,
+    blue: u16 = 0,
+    /// PWV4: LPF400 window |max|, then the share-weighted band peaks
+    /// `sat16(cnt_k · peak_k / win)` over the raw pre-sat16 signals.
+    w400: u16 = 0,
+    s3: i16 = 0,
+    s4: i16 = 0,
+    s5: i16 = 0,
+};
+
+/// Accumulators of the currently open record window.
+const RecAcc = struct {
+    mmax: f64 = -std.math.inf(f64),
+    mmin: f64 = std.math.inf(f64),
+    w7b0: f64 = 0,
+    w7b1: f64 = 0,
+    w7b2: f64 = 0,
+    wred: f64 = 0,
+    wgreen: f64 = 0,
+    wblue: f64 = 0,
+    ww400: f64 = 0,
+    raw_lo: f64 = 0,
+    raw_mi: f64 = 0,
+    raw_hi: f64 = 0,
+    cnt_l: i64 = 0,
+    cnt_m: i64 = 0,
+    cnt_h: i64 = 0,
+};
+
+/// Record-window grid: starts[r] = min((441·r + 9)/10, n) — 44.1 samples
+/// per record.
+fn startsGrid(alloc: std.mem.Allocator, d: usize, n: usize) ![]usize {
+    const starts = try alloc.alloc(usize, d + 1);
+    for (starts, 0..) |*s, r| s.* = @min((441 * r + 9) / 10, n);
+    return starts;
+}
+
+/// The float-path WaveCreator: `push` streams one sample through the
+/// 18-biquad filterbank and folds it into the open record window;
+/// `closeRecord` seals a window at each boundary; the finalizers below
+/// consume the closed records.
+const WaveCreator = struct {
+    n: usize,
+    d: usize,
+    starts: []usize,
+    recs: []Rec,
+    acc: RecAcc = .{},
+    open: usize = 0,
+
+    // PWV7 bank: b0 = LPF300, b1 = HPF250∘LPF1200, b2 = HPF3000∘LPF9000.
+    f_v7b0: Biquad,
+    f_v7b1a: Biquad,
+    f_v7b1b: Biquad,
+    f_v7b2a: Biquad,
+    f_v7b2b: Biquad,
+    // PWV5 bank: red = LPF100, green = HPF300∘LPF3000, blue = HPF1500.
+    f_red: Biquad,
+    f_greena: Biquad,
+    f_greenb: Biquad,
+    f_blue: Biquad,
+    // PWV4 bank: wide = LPF400, LOW = LPF200², MID = HPF200²∘LPF2000², HIGH = HPF2000².
+    f_w400: Biquad,
+    f_lowa: Biquad,
+    f_lowb: Biquad,
+    f_mida: Biquad,
+    f_midb: Biquad,
+    f_midc: Biquad,
+    f_midd: Biquad,
+    f_higha: Biquad,
+    f_highb: Biquad,
+
+    fn init(alloc: std.mem.Allocator, n: usize) !WaveCreator {
+        const d = ceilDiv(n * 1000, 44100);
+        return .{
+            .n = n,
+            .d = d,
+            .starts = try startsGrid(alloc, d, n),
+            .recs = try alloc.alloc(Rec, d),
+            .f_v7b0 = cookLpf(300),
+            .f_v7b1a = cookHpf(250),
+            .f_v7b1b = cookLpf(1200),
+            .f_v7b2a = cookHpf(3000),
+            .f_v7b2b = cookLpf(9000),
+            .f_red = cookLpf(100),
+            .f_greena = cookHpf(300),
+            .f_greenb = cookLpf(3000),
+            .f_blue = cookHpf(1500),
+            .f_w400 = cookLpf(400),
+            .f_lowa = cookLpf(200),
+            .f_lowb = cookLpf(200),
+            .f_mida = cookHpf(200),
+            .f_midb = cookHpf(200),
+            .f_midc = cookLpf(2000),
+            .f_midd = cookLpf(2000),
+            .f_higha = cookHpf(2000),
+            .f_highb = cookHpf(2000),
+        };
+    }
+
+    fn push(w: *WaveCreator, mono: f64) void {
+        const a = &w.acc;
+        if (mono > a.mmax) a.mmax = mono;
+        if (mono < a.mmin) a.mmin = mono;
+        const v7b0 = w.f_v7b0.proc(mono);
+        const v7b1 = w.f_v7b1b.proc(w.f_v7b1a.proc(mono));
+        const v7b2 = w.f_v7b2b.proc(w.f_v7b2a.proc(mono));
+        const red = w.f_red.proc(mono);
+        const green = w.f_greenb.proc(w.f_greena.proc(mono));
+        const blue = w.f_blue.proc(mono);
+        const w400 = w.f_w400.proc(mono);
+        const lo = w.f_lowb.proc(w.f_lowa.proc(mono));
+        const mi = w.f_midd.proc(w.f_midc.proc(w.f_midb.proc(w.f_mida.proc(mono))));
+        const hi = w.f_highb.proc(w.f_higha.proc(mono));
+        a.w7b0 = @max(a.w7b0, @abs(v7b0));
+        a.w7b1 = @max(a.w7b1, @abs(v7b1));
+        a.w7b2 = @max(a.w7b2, @abs(v7b2));
+        a.wred = @max(a.wred, @abs(red));
+        a.wgreen = @max(a.wgreen, @abs(green));
+        a.wblue = @max(a.wblue, @abs(blue));
+        a.ww400 = @max(a.ww400, @abs(w400));
+        a.raw_lo = @max(a.raw_lo, @abs(lo));
+        a.raw_mi = @max(a.raw_mi, @abs(mi));
+        a.raw_hi = @max(a.raw_hi, @abs(hi));
+        // Share counts: argmax over the SIGNED band samples, ties LOW > HIGH > MID.
+        const m3 = @max(@max(lo, mi), hi);
+        if (lo == m3) {
+            a.cnt_l += 1;
+        } else if (hi == m3) {
+            a.cnt_h += 1;
+        } else {
+            a.cnt_m += 1;
+        }
+    }
+
+    /// Seals record `r` from the accumulators and reopens the next window.
+    fn closeRecord(w: *WaveCreator, r: usize) void {
+        var mmax = w.acc.mmax;
+        var mmin = w.acc.mmin;
+        if (std.math.isNegativeInf(mmax)) {
+            // Empty window: the zero-filled pad slot is its only content.
+            mmax = 0.0;
+            mmin = 0.0;
+        } else if (r == w.d - 1) {
+            // The final window extends one pad sample (0.0) past EOF.
+            mmax = @max(mmax, 0.0);
+            mmin = @min(mmin, 0.0);
+        }
+        const win: f64 = @floatFromInt(@max(w.starts[r + 1] - w.starts[r], 1));
+        const a = &w.acc;
+        w.recs[r] = .{
+            .b = .{ sat16u(a.w7b0), sat16u(a.w7b1), sat16u(a.w7b2) },
+            .mmax = sat16(mmax),
+            .mmin = sat16(mmin),
+            .red = sat16u(a.wred),
+            .green = sat16u(a.wgreen),
+            .blue = sat16u(a.wblue),
+            .w400 = sat16u(a.ww400),
+            .s3 = sat16(@as(f64, @floatFromInt(a.cnt_l)) * a.raw_lo / win),
+            .s4 = sat16(@as(f64, @floatFromInt(a.cnt_m)) * a.raw_mi / win),
+            .s5 = sat16(@as(f64, @floatFromInt(a.cnt_h)) * a.raw_hi / win),
+        };
+        w.acc = .{};
+        w.open = r + 1;
+    }
+
+    // ---- adaptive scales + PWV6 ----
+
+    /// The derivation over the record bank (`per_second = 1000` records);
+    /// `bandScalesAndPreview` carries the law.
+    fn scalesAndPwv6(w: *const WaveCreator, alloc: std.mem.Allocator) !AdaptiveScales {
+        const vals = try alloc.alloc([3]u16, w.d);
+        defer alloc.free(vals);
+        for (w.recs, 0..) |rec, i| vals[i] = rec.b;
+        return bandScalesAndPreview(alloc, vals, 1000);
+    }
+
+    // ---- PWV7 ----
+
+    /// Column c's value is the trailing-window attack/decay envelope (α =
+    /// 0.99/0.98/0.97 per ms-record, W = 300/200/100) reseeded at the
+    /// column's first record minus W and sampled at the column's last
+    /// record.
+    fn pwv7(w: *const WaveCreator, alloc: std.mem.Allocator, n_columns: usize, scale_u16: [3]u16) ![][3]u8 {
+        const d = w.d;
+        const out = try alloc.alloc([3]u8, n_columns);
+        errdefer alloc.free(out);
+        const alphas = [3]f64{ 0.99, 0.98, 0.97 };
+        const windows = [3]i64{ 300, 200, 100 };
+        const grid = try columnGrid(alloc, d, n_columns);
+        defer {
+            alloc.free(grid.r_f);
+            alloc.free(grid.r_c);
+        }
+        for (0..3) |b| {
+            const win = windows[b];
+            const al = alphas[b];
+            for (0..n_columns) |c| {
+                const seed: i64 = grid.r_f[c] - win;
+                var env: f64 = if (seed >= 0 and seed <= grid.r_c[c])
+                    @floatFromInt(w.recs[@intCast(seed)].b[b])
+                else
+                    0.0;
+                const width: i64 = grid.r_c[c] - grid.r_f[c] + win + 1;
+                var j: i64 = 1;
+                while (j < width) : (j += 1) {
+                    const p = seed + j;
+                    const xj: f64 = if (p >= 0 and p <= grid.r_c[c])
+                        @floatFromInt(w.recs[@intCast(p)].b[b])
+                    else
+                        0.0;
+                    env = if (xj >= env) xj else (1.0 - al) * xj + al * env;
+                }
+                // The envelope decay produces fractional values; the
+                // quantizer takes their float32 image, not a value
+                // truncated to the record grid.
+                const env32: f32 = @floatCast(env);
+                out[c][b] = if (b < 2)
+                    pwv7QuantLinear(env32, scale_u16[b])
+                else
+                    pwv7QuantQuadratic(env32, scale_u16[b]);
+            }
+        }
+        return out;
+    }
+
+    // ---- PWV5 ----
+
+    /// Returns the big-endian PWV5 words (red<<13 | green<<10 | blue<<7 |
+    /// h<<2). Red keeps a ±12-record sliding window over the column, green
+    /// ±1, blue and the mono peak run inside [r_f, r_c]; the height
+    /// normalizer P is the one-record-lagged column peak maximum.
+    fn pwv5(w: *const WaveCreator, alloc: std.mem.Allocator, n_columns: usize) ![]u16 {
+        const d = w.d;
+        const out = try alloc.alloc(u16, n_columns);
+        errdefer alloc.free(out);
+        const peaks = try alloc.alloc(u16, n_columns); // min(max(|ch0|,|ch1|), 32767)
+        defer alloc.free(peaks);
+        const grid = try columnGrid(alloc, d, n_columns);
+        defer {
+            alloc.free(grid.r_f);
+            alloc.free(grid.r_c);
+        }
+
+        var p5: u16 = 0;
+        for (0..n_columns) |c| {
+            var redw: u16 = 0;
+            var greenw: u16 = 0;
+            var blue: u16 = 0;
+            var ch0: i16 = std.math.minInt(i16);
+            var ch1: i16 = std.math.maxInt(i16);
+            {
+                const lo = clampToRecords(grid.r_f[c] - 12, d);
+                const hi = clampToRecords(grid.r_c[c] + 12, d);
+                var k: i64 = lo;
+                while (k <= hi) : (k += 1) redw = @max(redw, w.recs[@intCast(k)].red);
+            }
+            {
+                const lo = clampToRecords(grid.r_f[c] - 1, d);
+                const hi = clampToRecords(grid.r_c[c] + 1, d);
+                var k: i64 = lo;
+                while (k <= hi) : (k += 1) greenw = @max(greenw, w.recs[@intCast(k)].green);
+            }
+            if (grid.r_c[c] >= grid.r_f[c]) {
+                var k: i64 = grid.r_f[c];
+                while (k <= grid.r_c[c]) : (k += 1) {
+                    const rec = w.recs[@intCast(k)];
+                    blue = @max(blue, rec.blue);
+                    ch0 = @max(ch0, rec.mmax);
+                    ch1 = @min(ch1, rec.mmin);
+                }
+            } else {
+                // Single-degenerate column: the running maxima read as 0.
+                ch0 = 0;
+                ch1 = 0;
+            }
+            const codes = pwv5Colors(redw, greenw, blue);
+            // The lagged normalizer: peak over [r_f, r_c-1], one record
+            // behind the stores.
+            var lag: u16 = 0;
+            if (grid.r_c[c] > grid.r_f[c]) {
+                var mx0: i16 = std.math.minInt(i16);
+                var mn1: i16 = std.math.maxInt(i16);
+                var k: i64 = grid.r_f[c];
+                while (k < grid.r_c[c]) : (k += 1) {
+                    mx0 = @max(mx0, w.recs[@intCast(k)].mmax);
+                    mn1 = @min(mn1, w.recs[@intCast(k)].mmin);
+                }
+                lag = @intCast(@min(@max(@abs(mx0), @abs(mn1)), 32767));
+            }
+            p5 = @max(p5, lag);
+            peaks[c] = @intCast(@min(@max(@abs(ch0), @abs(ch1)), 32767));
+            out[c] = (@as(u16, codes.red) << 13) | (@as(u16, codes.green) << 10) |
+                (@as(u16, codes.blue) << 7); // height bits filled in pass 2
+        }
+        for (0..n_columns) |c| {
+            // h = trunc(u² · 31.488/32767²) with u = trunc(peak/P·32767),
+            // deliberately not clamped before the &0x1f: with the lagged
+            // P the ratio can exceed 1 and the excess wraps.
+            var h: u16 = 0;
+            if (p5 > 0) {
+                const u = @trunc(@as(f64, @floatFromInt(peaks[c])) / @as(f64, @floatFromInt(p5)) * 32767.0);
+                h = @truncate(@as(u64, @intFromFloat(@trunc(u * u * height_c))));
+            }
+            out[c] |= h << 2;
+        }
+        return out;
+    }
+
+    // ---- PWV4 ----
+
+    /// The six PWV4 bytes per span: {monoMax, monoMin, LPF400peak,
+    /// LOW·share, MID·share, HIGH·share}, each `(u8)(v/256)` of the
+    /// span-aggregated record fields (LOW widens to [r-12, r+12], MID to
+    /// [r-1, r+1] at span end).
+    fn pwv4(w: *const WaveCreator, alloc: std.mem.Allocator) ![][6]u8 {
+        const d = w.d;
+        const out = try alloc.alloc([6]u8, 1200);
+        errdefer alloc.free(out);
+        @memset(std.mem.sliceAsBytes(out), 0);
+        if (d == 0) return out;
+        for (0..1200) |j| {
+            const rs = spanStart(d, j);
+            const re_ = spanEnd(d, j);
+            if (re_ < rs) continue;
+            var vals = [6]f64{ 0, 0, 0, 0, 0, 0 };
+            var v0: i16 = std.math.minInt(i16);
+            var v1: i16 = std.math.maxInt(i16);
+            var v2: u16 = 0;
+            var v5: i16 = std.math.minInt(i16);
+            for (rs..re_ + 1) |k| {
+                v0 = @max(v0, w.recs[k].mmax);
+                v1 = @min(v1, w.recs[k].mmin);
+                v2 = @max(v2, w.recs[k].w400);
+                v5 = @max(v5, w.recs[k].s5);
+            }
+            vals[0] = @floatFromInt(v0);
+            vals[1] = @floatFromInt(v1);
+            vals[2] = @floatFromInt(v2);
+            vals[5] = @floatFromInt(v5);
+            {
+                const lo = clampToRecords(@as(i64, @intCast(rs)) - 12, d);
+                const hi = clampToRecords(@as(i64, @intCast(re_)) + 12, d);
+                var v3: i16 = std.math.minInt(i16);
+                var k: i64 = lo;
+                while (k <= hi) : (k += 1) v3 = @max(v3, w.recs[@intCast(k)].s3);
+                vals[3] = @floatFromInt(v3);
+            }
+            {
+                const lo = clampToRecords(@as(i64, @intCast(rs)) - 1, d);
+                const hi = clampToRecords(@as(i64, @intCast(re_)) + 1, d);
+                var v4: i16 = std.math.minInt(i16);
+                var k: i64 = lo;
+                while (k <= hi) : (k += 1) v4 = @max(v4, w.recs[@intCast(k)].s4);
+                vals[4] = @floatFromInt(v4);
+            }
+            for (0..6) |f| out[j][f] = @intCast(@as(i64, @intFromFloat(@trunc(vals[f] / 256.0))) & 0xFF);
+        }
+        return out;
+    }
+};
+
+/// First/last record of detail column c: r_c = min(ceil(D·(c+1)/N) − 1,
+/// D−1), r_f = min(ceil(D·c/N), D).
+const ColumnGrid = struct { r_f: []i64, r_c: []i64 };
+
+fn columnGrid(alloc: std.mem.Allocator, d: usize, n_columns: usize) !ColumnGrid {
+    const r_f = try alloc.alloc(i64, n_columns);
+    errdefer alloc.free(r_f);
+    const r_c = try alloc.alloc(i64, n_columns);
+    for (0..n_columns) |c| {
+        r_c[c] = @min(@as(i64, @intCast(ceilDiv(d * (c + 1), n_columns))) - 1, @as(i64, @intCast(d)) - 1);
+        r_f[c] = @min(@as(i64, @intCast(ceilDiv(d * c, n_columns))), @as(i64, @intCast(d)));
+    }
+    return .{ .r_f = r_f, .r_c = r_c };
+}
+
+/// First column of preview span `j` of `size` over a `d`-long grid, on the
+/// Bresenham partition the analyzer's own span helpers use; spans tile the
+/// grid (`spanEndOf` is inclusive).
+fn spanStartOf(d: usize, j: usize, size: usize) usize {
+    if (j == 0) return 0;
+    return spanEndOf(d, j - 1, size) + 1;
+}
+
+/// Last column of preview span `j` of `size`:
+/// `min(ceil(d·(j+1)/size) − 1, d − 1)`; empty spans (possible once
+/// `d < size`) end before their start.
+fn spanEndOf(d: usize, j: usize, size: usize) usize {
+    if (d == 0) return 0;
+    return @min(ceilDiv(d * (j + 1), size) - 1, d - 1);
+}
+
+/// The 1200-span PWAV/PWV4/PWV6 grid over the per-millisecond record bank.
+fn spanStart(d: usize, j: usize) usize {
+    return spanStartOf(d, j, 1200);
+}
+
+fn spanEnd(d: usize, j: usize) usize {
+    return spanEndOf(d, j, 1200);
+}
+
+/// The adaptive per-band scales and the PWV6 preview bytes, computed over
+/// a band-peak bank on either grid the library drives: the WaveCreator's
+/// per-millisecond records (`per_second = 1000`) or the stats route's
+/// 150 Hz columns (`per_second = 150`). Rekordbox's own derivation,
+/// transcribed: per-span band averages extended by trailing 1 s / ⅔ s /
+/// ⅓ s windows (zero-filled before the start), band-balance weights w_k
+/// plus a span-max gain g, per-band peak caps, the [0.8, lim] clamps — and
+/// PWV6's bytes `(u8)(clamp(w_k) · avg / 256)`.
+const AdaptiveScales = struct {
+    /// Per-band scale as u16·100 (the PWV7 quantizer's format).
+    scale_u16: [3]u16,
+    /// The 1200 PWV6 columns.
+    pwv6: [1200][3]u8,
+};
+
+fn bandScalesAndPreview(alloc: std.mem.Allocator, vals: []const [3]u16, per_second: usize) std.mem.Allocator.Error!AdaptiveScales {
+    const d = vals.len;
+    var vmax: u16 = 0;
+    for (vals) |v| {
+        for (v) |x| vmax = @max(vmax, x);
+    }
+    if (d == 0 or vmax == 0) {
+        // All-silence track: the scales stay at the ctor init (100 → 1.0)
+        // and PWV6 is all zero.
+        return .{ .scale_u16 = .{ 100, 100, 100 }, .pwv6 = [_][3]u8{.{ 0, 0, 0 }} ** 1200 };
+    }
+    const s_sec = d / per_second;
+    const widths = [3]usize{ s_sec, (s_sec * 2) / 3, s_sec / 3 };
+
+    const avg = try alloc.alloc([3]f64, 1200);
+    defer alloc.free(avg);
+    const scratch = try alloc.alloc(f64, d);
+    defer alloc.free(scratch);
+
+    for (0..1200) |j| {
+        const rs = spanStart(d, j);
+        const re_ = spanEnd(d, j);
+        for (0..3) |b| {
+            const wd = widths[b];
+            const lo_: usize = if (rs >= wd) rs - wd else 0;
+            for (lo_..re_ + 1) |k| scratch[k - lo_] = @floatFromInt(vals[k][b]);
+            const sums = npSum(scratch[0 .. re_ + 1 - lo_]);
+            const cnts: f64 = if (rs >= wd)
+                @floatFromInt(re_ + 1 - lo_)
+            else
+                // Pre-start zero-filled records count toward the average.
+                @floatFromInt(wd - rs + re_ + 1);
+            avg[j][b] = sums / cnts;
+        }
+    }
+
+    // Sum over rows sequentially; the order matters.
+    var s = [3]f64{ 0, 0, 0 };
+    for (avg) |row| {
+        s[0] += row[0];
+        s[1] += row[1];
+        s[2] += row[2];
+    }
+    var w_k: [3]f64 = undefined;
+    const pos = [3]bool{ s[0] > 0, s[1] > 0, s[2] > 0 };
+    if (pos[0] and pos[1] and pos[2]) {
+        const mx = @max(s[0], @max(s[1], s[2]));
+        for (0..3) |b| w_k[b] = mx / s[b];
+    } else {
+        var base: f64 = std.math.inf(f64);
+        for (0..3) |b| {
+            if (pos[b]) base = @min(base, s[b]);
+        }
+        for (0..3) |b| w_k[b] = if (pos[b]) base / @max(s[b], 1e-300) else 1.0;
+    }
+    // max over the row terms must propagate NaN (sub-1.2 s tracks have
+    // empty Bresenham spans whose 0/0 averages poison bands with w = 0),
+    // and `gspan > 0` then selects the g = 1.0 branch — unlike Zig's
+    // NaN-ignoring @max.
+    var gspan: f64 = -std.math.inf(f64);
+    for (avg) |row| {
+        const t = (w_k[0] * row[0] + w_k[1] * row[1]) + w_k[2] * row[2];
+        if (std.math.isNan(gspan)) break;
+        if (std.math.isNan(t)) {
+            gspan = std.math.nan(f64);
+        } else {
+            gspan = @max(gspan, t);
+        }
+    }
+    const g: f64 = if (gspan > 0) 32768.0 / gspan else 1.0;
+    for (0..3) |b| w_k[b] *= g;
+
+    var peaks = [3]f64{ 0, 0, 0 };
+    for (vals) |v| {
+        for (0..3) |b| peaks[b] = @max(peaks[b], @as(f64, @floatFromInt(v[b])));
+    }
+    const peak2p = 16384.0 * (1.0 - @cos(std.math.pi * peaks[2] * (1.0 / 32768.0)));
+    const lim_hi = [3]f64{ 3.0, 3.0, 5.0 };
+    const caps = [3]f64{ 32768.0 / peaks[0], 32768.0 / peaks[1], 32768.0 / peak2p };
+
+    var result: AdaptiveScales = .{ .scale_u16 = .{ 100, 100, 100 }, .pwv6 = undefined };
+    for (0..3) |b| {
+        var v = if (caps[b] > 0) @min(w_k[b], caps[b]) else w_k[b];
+        v = @min(@max(v, 0.8), lim_hi[b]);
+        result.scale_u16[b] = @intFromFloat(v * 100.0);
+        // PWV6 bytes: (char)(clamp(w_k) · avg / 256) — the clamped w_k
+        // without the peak caps.
+        const wc = @min(@max(w_k[b], 0.8), lim_hi[b]);
+        for (0..1200) |j| {
+            const t = @trunc(wc * avg[j][b] / 256.0);
+            // NaN averages (empty spans) encode as 0.
+            result.pwv6[j][b] = if (std.math.isNan(t)) 0 else @intCast(@as(i64, @intFromFloat(t)) & 0xFF);
+        }
+    }
+    return result;
+}
+
+/// clip(x, 0, D−1) over the record index space.
+fn clampToRecords(x: i64, d: usize) i64 {
+    return @min(@max(x, 0), @as(i64, @intCast(d)) - 1);
+}
+
+// ---------------------------------------------------------------------------
+// PWV3 + whiteness engine
+// ---------------------------------------------------------------------------
+
+/// The s16 path: per 294-sample column, the peak of the truncated
+/// `(L+R)/2` mix and the peak of its 150 Hz tan-form lowpass, quantized by
+/// `anlz.detailHeightCode` and `anlz.whitenessRatio`.
+const Pwv3Engine = struct {
+    n: usize,
+    n_columns: usize,
+    peak: []u16,
+    fpeak: []u16,
+    lpf: Biquad,
+    pk: u16 = 0, // open-column |mono16| peak
+    fp: u16 = 0, // open-column filtered peak
+    open: usize = 0,
+
+    fn init(alloc: std.mem.Allocator, n: usize) !Pwv3Engine {
+        const n_columns = ceilDiv(n, 294);
+        return .{
+            .n = n,
+            .n_columns = n_columns,
+            .peak = try alloc.alloc(u16, n_columns),
+            .fpeak = try alloc.alloc(u16, n_columns),
+            .lpf = cookLpf150Tan(),
+        };
+    }
+
+    /// `mono16` is the truncated s16 mono sample as an integer.
+    fn push(e: *Pwv3Engine, mono16: i32) void {
+        const m: f64 = @floatFromInt(mono16);
+        const ab: i32 = if (mono16 < 0) -mono16 else mono16;
+        e.pk = @max(e.pk, @as(u16, @intCast(@min(ab, 32767))));
+        const f = e.lpf.proc(m);
+        const fpv: i64 = @intFromFloat(@min(@abs(@trunc(f)), 32767.0));
+        e.fp = @max(e.fp, @as(u16, @intCast(fpv)));
+    }
+
+    fn closeColumn(e: *Pwv3Engine, c: usize) void {
+        e.peak[c] = e.pk;
+        e.fpeak[c] = e.fp;
+        e.pk = 0;
+        e.fp = 0;
+        e.open = c + 1;
+    }
+
+    /// The PWV3 bytes: whiteness in the top three bits, height below.
+    fn bytes(e: *const Pwv3Engine, alloc: std.mem.Allocator) ![]u8 {
+        const out = try alloc.alloc(u8, e.n_columns);
+        errdefer alloc.free(out);
+        var p: u16 = 0;
+        for (e.peak) |pk| p = @max(p, pk);
+        for (0..e.n_columns) |c| {
+            const w = whitenessRatio(e.fpeak[c], e.peak[c]);
+            const h = detailHeightCode(e.peak[c], p);
+            out[c] = (@as(u8, w) << 5) | h;
+        }
+        return out;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// PWAV/PWV2 writer engine
+// ---------------------------------------------------------------------------
+
+const chunk_samples = 588;
+/// Detector record capacity.
+const det_cap = 36000;
+const det_rec_len = det_cap + 4;
+
+/// The full-rate hysteresis peak tracker. The idle check is equality
+/// against the 0.01f marker itself; the run counter is stored as float
+/// and truncated on read; the ride path does not reset the 512-sample
+/// idle counter; the level decays ×0.993830323 after ≥ fs·1.714 samples
+/// idle.
+const DetA = struct {
+    tag: i32, // 0 band1, 1 band2, 2 band3
+    total: usize,
+    pos: usize = 0,
+    count: i32 = 0,
+    shadow: i32 = 0,
+    runf: f32 = 0.0,
+    idle: i32 = 0,
+    level: f32 = mark1,
+    rec: []f32,
+    counts: []i32,
+    raised: []i32, // only written for tag 0 (the group-cut flag)
+
+    const mark1: f32 = 0.009999999776482582; // exact f32 of 0.01
+    const thr1: f64 = 0.01;
+    const droop: f32 = 0.75;
+    const droop3: f32 = 0.660000026; // band 3
+    const decay: f32 = 0.993830323;
+    const idle_run: f64 = 44100.0 * 1.714;
+    const close_run: f64 = 44100.0 * 0.32;
+    const idle_lim: i32 = 512;
+
+    fn init(alloc: std.mem.Allocator, tag: i32, total: usize, n_slots: usize) !DetA {
+        const rec = try alloc.alloc(f32, det_rec_len);
+        @memset(rec, 0);
+        rec[0] = mark1;
+        const counts = try alloc.alloc(i32, n_slots);
+        @memset(counts, 0);
+        const raised = try alloc.alloc(i32, n_slots);
+        @memset(raised, 0);
+        return .{ .tag = tag, .total = total, .rec = rec, .counts = counts, .raised = raised };
+    }
+
+    /// Processes one chunk; `c` is the 1-based chunk index.
+    fn chunk(st: *DetA, s: []const f32, c: usize) void {
+        const drp: f32 = if (st.tag == 2) droop3 else droop;
+        var shadow = st.shadow;
+        for (s) |x| {
+            st.runf = @floatFromInt(@as(i32, @intFromFloat(st.runf)) + 1);
+            const run: i32 = @intFromFloat(st.runf);
+            if (st.rec[0] == mark1) { // idle
+                if (@as(f64, x) > thr1) {
+                    st.rec[0] = x;
+                    st.count = 1;
+                    shadow = 1;
+                    st.runf = 0.0;
+                    st.level = x;
+                    if (st.tag == 0) st.raised[c - 1] = 1;
+                }
+            } else {
+                const ride = if (@as(f64, st.level) <= thr1)
+                    @as(f64, x) >= thr1
+                else
+                    !(x < st.level * drp);
+                if (ride) {
+                    if (@as(f64, @floatFromInt(run)) < close_run) {
+                        if (st.level < x) st.level = x;
+                    } else {
+                        // Close.
+                        if (st.tag == 0) st.raised[c - 1] = 1;
+                        st.runf = 0.0;
+                        if (st.count >= 1 and shadow >= 1 and shadow - 1 < det_rec_len)
+                            st.rec[@intCast(shadow - 1)] = st.level;
+                        st.count += 1;
+                        shadow += 1;
+                        st.idle = 0;
+                        st.level = x;
+                    }
+                } else {
+                    // Droop / below-threshold path.
+                    if (@as(f64, @floatFromInt(run)) > idle_run) {
+                        st.idle += 1;
+                        if (!(st.idle < idle_lim)) {
+                            st.level = st.level * decay;
+                            if (@as(f64, st.level) <= thr1) st.level = mark1;
+                            st.idle = 0;
+                        }
+                    } else {
+                        st.idle = 0;
+                    }
+                }
+            }
+            st.pos += 1;
+            // End-of-track flush.
+            if (st.pos == st.total) {
+                if (shadow < det_rec_len) st.rec[@intCast(shadow)] = st.level;
+                st.count += 1;
+                shadow += 1;
+            }
+        }
+        st.shadow = shadow;
+        if (st.count < det_cap) st.rec[@intCast(st.count)] = st.level; // end-of-call working flush
+        st.counts[c - 1] = st.count;
+    }
+};
+
+/// The every-4th-sample variant driving PWV2. The phase counter doubles
+/// as the run and re-anchors the eval grid after each close; the window
+/// max is zeroed at every call entry (partial windows at chunk boundaries
+/// are dropped); the decay floor is the 327.679993 threshold itself, not
+/// the 0.01 marker.
+const DetB = struct {
+    total: usize,
+    pos: usize = 0,
+    count: i32 = 0,
+    shadow: i32 = 0,
+    phase: i32 = 0,
+    idle: i32 = 0,
+    wmax: f32 = 0.0,
+    level: f32 = DetA.mark1,
+    rec: []f32,
+    counts: []i32,
+
+    const thr2: f32 = 327.679993; // exact f32 of 327.68
+    const idle_lim: i32 = 512;
+
+    fn init(alloc: std.mem.Allocator, total: usize, n_slots: usize) !DetB {
+        const rec = try alloc.alloc(f32, det_rec_len);
+        @memset(rec, 0);
+        rec[0] = DetA.mark1;
+        const counts = try alloc.alloc(i32, n_slots);
+        @memset(counts, 0);
+        return .{ .total = total, .rec = rec, .counts = counts };
+    }
+
+    fn chunk(st: *DetB, s: []const f32, c: usize) void {
+        var shadow = st.shadow;
+        st.wmax = 0.0;
+        for (s, 0..) |x, i| {
+            st.phase += 1;
+            if (st.wmax < x) st.wmax = x;
+            var ev = @mod(st.phase, 4) == 0;
+            if (!ev and s.len < chunk_samples) {
+                // Last sample of the track?
+                if ((c - 1) * chunk_samples + i == st.total - 1) ev = true;
+            }
+            if (ev) {
+                const w = st.wmax;
+                if (st.rec[0] == DetA.mark1) { // idle
+                    if (thr2 < w) {
+                        st.rec[0] = w;
+                        st.count = 1;
+                        shadow = 1;
+                        st.phase = 0;
+                        st.level = w;
+                    }
+                } else {
+                    const ride = if (st.level <= thr2)
+                        thr2 <= w
+                    else
+                        !(w < st.level * DetA.droop);
+                    if (ride) {
+                        if (@as(f64, @floatFromInt(st.phase)) < DetA.close_run) {
+                            if (st.level <= w) st.level = w;
+                        } else {
+                            st.phase = 0;
+                            if (shadow < det_cap) st.rec[@intCast(shadow)] = st.level;
+                            st.count += 1;
+                            shadow += 1;
+                            st.idle = 0;
+                            st.level = w;
+                        }
+                    } else {
+                        if (@as(f64, @floatFromInt(st.phase)) > DetA.idle_run) {
+                            st.idle += 4;
+                            if (!(st.idle < idle_lim)) {
+                                st.level *= DetA.decay;
+                                if (st.level < thr2) st.level = thr2;
+                                st.idle = 0;
+                            }
+                        } else {
+                            st.idle = 0;
+                        }
+                    }
+                }
+                // End-of-track flush.
+                if (st.pos == st.total - 1) {
+                    if (shadow < det_cap) st.rec[@intCast(shadow)] = st.level;
+                    st.count += 1;
+                    shadow += 1;
+                }
+                st.wmax = 0.0;
+            }
+            st.pos += 1;
+        }
+        st.shadow = shadow;
+        if (st.count < det_cap) st.rec[@intCast(st.count)] = st.level;
+        st.counts[c - 1] = st.count;
+    }
+};
+
+/// One direct-form-1 biquad in float64.
+const Bq1 = struct {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    x1: f64 = 0.0,
+    x2: f64 = 0.0,
+    y1: f64 = 0.0,
+    y2: f64 = 0.0,
+
+    fn proc(q: *Bq1, x: f64) f64 {
+        const y = (((x * q.b0 + q.b1 * q.x1) + q.b2 * q.x2) - q.a1 * q.y1) - q.a2 * q.y2;
+        q.x2 = q.x1;
+        q.x1 = x;
+        q.y2 = q.y1;
+        q.y1 = y;
+        return y;
+    }
+
+    /// BP@150.
+    fn cookBp150() Bq1 {
+        const w = 942.477796076937 / fs;
+        const s = @sin(w);
+        const c = @cos(w);
+        const al = s * 0.5555555702727522;
+        const den = al + 1.0;
+        return .{
+            .b0 = al / den,
+            .b1 = 0.0,
+            .b2 = (-1.0 / den) * al,
+            .a1 = c * (-2.0 / den),
+            .a2 = (1.0 - al) / den,
+        };
+    }
+
+    /// HP cook: Q = 0.707106769 (stored, ≈1/√2); the 2π literal is the
+    /// stored constant, not `std.math.tau`.
+    fn cookHp(fc: f64) Bq1 {
+        const q = 0.707106769;
+        const w = (fc * 6.28318530717958) / fs;
+        const s = @sin(w);
+        const c = @cos(w);
+        const al = s * (0.5 / q);
+        const den = al + 1.0;
+        return .{
+            .b0 = ((c + 1.0) * 0.5) / den,
+            .b1 = (-1.0 - c) / den,
+            .b2 = ((c + 1.0) * 0.5) / den,
+            .a1 = c * (-2.0 / den),
+            .a2 = (1.0 - al) / den,
+        };
+    }
+
+    /// LP cook, same constants as `cookHp`.
+    fn cookLp(fc: f64) Bq1 {
+        const q = 0.707106769;
+        const w = (fc * 6.28318530717958) / fs;
+        const s = @sin(w);
+        const c = @cos(w);
+        const al = s * (0.5 / q);
+        const den = al + 1.0;
+        return .{
+            .b0 = (0.5 / den) * (1.0 - c),
+            .b1 = (1.0 - c) / den,
+            .b2 = (0.5 / den) * (1.0 - c),
+            .a1 = c * (-2.0 / den),
+            .a2 = (1.0 - al) / den,
+        };
+    }
+};
+
+/// PWAV height thresholds: height = 2 + #{T ≤ max(0, level)}.
+const pwav_ladder = [23]f64{
+    2195.4560546875, 3112.9599609375,  4096.0,          5079.0400390625,
+    6062.080078125,  7045.1201171875,  8028.16015625,   9011.2001953125,
+    9994.240234375,  10977.2802734375, 11960.3203125,   12943.3603515625,
+    13926.400390625, 14909.4404296875, 15892.48046875,  17367.0390625,
+    19333.119140625, 21299.19921875,   23265.279296875, 25886.720703125,
+    30801.919921875, 39321.6015625,    50790.3984375,
+};
+
+/// PWV2 height thresholds.
+const pwv2_ladder = [13]i64{ 1304, 1642, 2067, 2602, 3276, 4125, 5193, 6538, 8230, 10362, 13045, 16422, 20675 };
+
+fn pwavLadder(v_: f32) i64 {
+    const v = v_;
+    if (v <= 0) return 2;
+    var n: i64 = 0;
+    const vf: f64 = v;
+    for (pwav_ladder) |t| {
+        if (t <= vf) n += 1;
+    }
+    return 2 + n;
+}
+
+fn pwv2LadderVal(v: i64) i64 {
+    var n: i64 = 0;
+    for (pwv2_ladder) |t| {
+        if (t <= v) n += 1;
+    }
+    return 2 + n;
+}
+
+/// The band dB code (PWAV record fields F2/F3/F4):
+/// `(int)clamp((float)(log10(v·2⁻¹⁵)·20) + 30.5f, 0, 30)` — float32 steps
+/// around a float64 log10.
+fn dbcode(v32: f32) i64 {
+    const x = v32;
+    if (x > 0) {
+        const xv: f64 = @as(f64, x * @as(f32, 3.05175781e-05));
+        var d: f32 = @as(f32, @floatCast(std.math.log10(xv) * 20.0)) + @as(f32, 30.5);
+        if (d < 0) d = 0.0;
+        if (@as(f32, 30.0) <= d) d = 30.0;
+        return @intFromFloat(d);
+    }
+    return 0;
+}
+
+/// The PWAV top-3-bits class: with a = F2 and d = F3−F4,
+/// `a<14 → (d ≤ 3 ? 5 : 4)`; `d<0 → 2 + ((a−F4) ≤ 0)`; else `(a−F3) ≤ 0`.
+fn pwavClass(f2: i64, f3: i64, f4: i64) u3 {
+    const a = f2;
+    const d = f3 - f4;
+    if (a < 14) {
+        return if (d <= 3) 5 else 4;
+    }
+    if (d < 0) {
+        return @intCast(2 + @as(u3, @intFromBool(a - f4 <= 0)));
+    }
+    return @intFromBool(a - f3 <= 0);
+}
+
+/// Three band signals through exact DF1-double biquads, the two crossing
+/// detectors, and the span/level choreography that emits the PWAV/PWV2
+/// records: a 9-chunk group cadence beats against the 400-span time grid
+/// (band-1 record closes cut groups short and arm a one-group divert),
+/// the PWAV float is scaled by a band-1 activity gate, and the band spans
+/// live on a stride-2 pair grid.
+const PwavPwv2Engine = struct {
+    n: usize,
+    nceil: usize,
+    nchunks: usize,
+    cps: usize,
+    f38: f32,
+    span_credit: f32,
+    lvl_rescale: f32,
+    band_rescale: f32,
+
+    det_a: [3]DetA,
+    det_b: [2]DetB,
+
+    // Band filters: band1 = BP150², band2 = HP283→LP6000→HP283→LP6000,
+    // band3 = HP6000².
+    q1: [2]Bq1,
+    q2: [4]Bq1,
+    q3: [2]Bq1,
+
+    band: [3][chunk_samples]f32 = undefined,
+    mono_abs: [chunk_samples]f64 = undefined,
+    buf_len: usize = 0,
+
+    // Writer choreography state.
+    arr1b8: [400]f32 = [_]f32{0} ** 400,
+    grp_cnt: i64 = 0,
+    grp_sum: f64 = 0.0,
+    lvl_span: i64 = 0,
+    lvl_carry: f32 = 0.0,
+    armed: u8 = 0,
+    pending: u8 = 0,
+    last_add_span: i64 = 0,
+    b_acc: [3][400]f32 = [_][400]f32{[_]f32{0} ** 400} ** 3,
+    b_span: [3]i64 = .{ 0, 0, 0 },
+    b_credit: [3]f32 = .{ 0, 0, 0 },
+    b_cursor: [3]i64 = .{ 0, 0, 0 },
+    b_prev: [3]i64 = .{ 0, 0, 0 },
+    p_acc: [2][100]i64 = [_][100]i64{[_]i64{0} ** 100} ** 2,
+    p_span: [2]i64 = .{ 0, 0 },
+    p_prev: [2]i64 = .{ 0, 0 },
+    pwav_f: [400][5]i64 = [_][5]i64{[_]i64{0} ** 5} ** 400,
+    pwav_cursor: i64 = 0,
+    pwv2_code: [100]i64 = [_]i64{0} ** 100,
+    pwv2_cursor: i64 = 0,
+
+    fn init(alloc: std.mem.Allocator, n: usize) !PwavPwv2Engine {
+        // nceil comes from a float32 ceil of the chunk division; on
+        // rounding it can exceed the integer nchunks by one.
+        const nceil: usize = @intFromFloat(@ceil(@as(f32, @floatFromInt(n)) / @as(f32, chunk_samples)));
+        const nchunks = ceilDiv(n, chunk_samples);
+        const n_slots = @max(nceil, nchunks) + 2;
+        return .{
+            .n = n,
+            .nceil = nceil,
+            .nchunks = nchunks,
+            .cps = @max(1, n / chunk_samples / 100),
+            .f38 = divF32(400.0, nceil),
+            .span_credit = @as(f32, @floatFromInt(nceil)) * @as(f32, 0.005),
+            .lvl_rescale = divF32(15000.0, nceil),
+            .band_rescale = @as(f32, 0.5) / (@as(f32, @floatFromInt(nceil)) * @as(f32, 0.005)),
+            .det_a = .{
+                try DetA.init(alloc, 0, n, n_slots),
+                try DetA.init(alloc, 1, n, n_slots),
+                try DetA.init(alloc, 2, n, n_slots),
+            },
+            .det_b = .{
+                try DetB.init(alloc, n, n_slots),
+                try DetB.init(alloc, n, n_slots),
+            },
+            .q1 = .{ Bq1.cookBp150(), Bq1.cookBp150() },
+            .q2 = .{ Bq1.cookHp(283.0), Bq1.cookLp(6000.0), Bq1.cookHp(283.0), Bq1.cookLp(6000.0) },
+            .q3 = .{ Bq1.cookHp(6000.0), Bq1.cookHp(6000.0) },
+        };
+    }
+
+    fn divF32(a: f32, b: usize) f32 {
+        if (b == 0) return std.math.inf(f32);
+        return a / @as(f32, @floatFromInt(b));
+    }
+
+    /// Streams one sample: `mono32` is the f32 (L+R)·2⁻¹⁶ mix,
+    /// `mono20` its ×32768 f32 image.
+    fn push(e: *PwavPwv2Engine, mono32: f32, mono20: f32) void {
+        const x: f64 = mono32;
+        const y1 = e.q1[1].proc(e.q1[0].proc(x));
+        var t = e.q2[0].proc(x);
+        t = e.q2[1].proc(t);
+        t = e.q2[2].proc(t);
+        t = e.q2[3].proc(t);
+        const y3 = e.q3[1].proc(e.q3[0].proc(x));
+        e.band[0][e.buf_len] = absF32(y1) * 32768.0;
+        e.band[1][e.buf_len] = absF32(t) * 32768.0;
+        e.band[2][e.buf_len] = absF32(y3) * 32768.0;
+        e.mono_abs[e.buf_len] = @abs(@as(f64, mono20));
+        e.buf_len += 1;
+    }
+
+    fn absF32(y: f64) f32 {
+        const f: f32 = @floatCast(y);
+        return if (f < 0) -f else f;
+    }
+
+    fn bufferFull(e: *const PwavPwv2Engine) bool {
+        return e.buf_len == chunk_samples;
+    }
+
+    /// Runs the detectors and the writer choreography over the buffered
+    /// chunk; `c` is the 1-based chunk index.
+    fn endChunk(e: *PwavPwv2Engine, c: usize) void {
+        const s0 = e.band[0][0..e.buf_len];
+        e.det_a[0].chunk(s0, c);
+        e.det_a[1].chunk(e.band[1][0..e.buf_len], c);
+        e.det_a[2].chunk(e.band[2][0..e.buf_len], c);
+        e.det_b[0].chunk(s0, c);
+        e.det_b[1].chunk(e.band[1][0..e.buf_len], c);
+        e.runChunk(c);
+        e.buf_len = 0;
+    }
+
+    /// The writer body for chunk `c`. Also called with an empty buffer for
+    /// float32-rounding phantom chunks past the last real one.
+    fn runChunk(e: *PwavPwv2Engine, c: usize) void {
+        const islast = c == e.nceil;
+        const flag1ec = e.det_a[0].raised[c - 1] != 0;
+        const nch = e.nceil;
+
+        // 9-chunk group of |mono|·32768, cut short by band-1 record closes.
+        e.grp_cnt += 1;
+        e.grp_sum += npSum(e.mono_abs[0..e.buf_len]);
+        var completed = false;
+        var bufd8: f32 = 0.0;
+        if (e.grp_cnt > 8 or flag1ec) {
+            bufd8 = @floatCast(e.grp_sum / @as(f64, @as(f32, @floatFromInt(chunk_samples * @as(usize, @intCast(e.grp_cnt))))));
+            if (e.armed == 1) {
+                e.pending = 1;
+                e.armed = 0;
+            }
+            if (flag1ec) e.armed = 1;
+            e.grp_cnt = 0;
+            e.grp_sum = 0.0;
+            completed = true;
+        }
+
+        // Level accumulator arr1b8 on the time-driven 400-span grid.
+        var target: i64 = @intFromFloat(@as(f32, @floatFromInt(c)) * e.f38);
+        if (target > 399) target = 399;
+        if (islast) target = 400;
+        if (e.lvl_span + 1 <= target) {
+            e.arr1b8[@intCast(e.lvl_span)] = (e.lvl_carry * @as(f32, 75.0)) * divF32(200.0, nch);
+            var j = e.lvl_span + 1;
+            var sp = e.lvl_span;
+            while (j <= target) : (j += 1) {
+                sp += 1;
+                if (sp < 400) e.arr1b8[@intCast(j)] = 0.0;
+            }
+            e.lvl_span = sp;
+        } else if (e.lvl_span < 400) {
+            e.arr1b8[@intCast(e.lvl_span)] = e.lvl_carry;
+        }
+        if (completed and e.lvl_span < 400) {
+            if (e.pending == 1) {
+                const old = e.last_add_span;
+                var v = bufd8;
+                if (e.lvl_span != old) v = v * e.lvl_rescale;
+                e.arr1b8[@intCast(old)] = e.arr1b8[@intCast(old)] + v;
+            } else {
+                e.arr1b8[@intCast(e.lvl_span)] = e.arr1b8[@intCast(e.lvl_span)] + bufd8;
+                e.last_add_span = e.lvl_span;
+            }
+            e.pending = 0;
+        }
+        if (e.lvl_span < 400) e.lvl_carry = e.arr1b8[@intCast(e.lvl_span)];
+
+        // PWAV band accumulators (stride-2 pair grid).
+        for (0..3) |bix| {
+            if (e.b_span[bix] >= 400) continue;
+            const count: i64 = e.det_a[bix].counts[c - 1];
+            const tgt: i64 = if (islast) count else count - 1;
+            if (!(islast or e.b_prev[bix] < count - 1)) continue;
+            const acc = &e.b_acc[bix];
+            var span = e.b_span[bix];
+            var credit = @as(f32, @floatFromInt(@as(i64, @intCast(c)) - e.b_cursor[bix])) + e.b_credit[bix];
+            const lv = e.det_a[bix].rec;
+            var ri = e.b_prev[bix];
+            while (ri < @max(e.b_prev[bix], tgt)) : (ri += 1) {
+                if (credit >= e.span_credit) {
+                    if (span > 399) break;
+                    credit -= e.span_credit;
+                    const v = (acc[@intCast(span)] * @as(f32, 75.0)) * e.band_rescale;
+                    acc[@intCast(span)] = v;
+                    if (span + 1 < 400) acc[@intCast(span + 1)] = v;
+                    var ns = span + 2;
+                    while (credit >= e.span_credit) {
+                        if (ns > 399) break;
+                        credit -= e.span_credit;
+                        acc[@intCast(ns)] = 0.0;
+                        if (ns + 1 < 400) acc[@intCast(ns + 1)] = 0.0;
+                        ns += 2;
+                    }
+                    span = ns;
+                    if (span < 400) acc[@intCast(span)] = 0.0;
+                }
+                if (!(ri == tgt - 1 and islast)) {
+                    if (span < 400 and ri < det_cap) {
+                        acc[@intCast(span)] = acc[@intCast(span)] + @as(f32, @floatFromInt(@as(i64, @intFromFloat(@trunc(lv[@intCast(ri)])))));
+                    }
+                }
+            }
+            e.b_prev[bix] = @max(e.b_prev[bix], tgt);
+            e.b_cursor[bix] = @intCast(c);
+            e.b_credit[bix] = credit;
+            e.b_span[bix] = @min(span, 400);
+        }
+
+        // PWV2 accumulators.
+        for (0..2) |bix| {
+            if (e.p_span[bix] >= 100) continue;
+            const count: i64 = e.det_b[bix].counts[c - 1];
+            var target2: i64 = @as(i64, @intCast(c / e.cps));
+            if (target2 > 99) target2 = 99;
+            if (islast) target2 = 100;
+            const acc = &e.p_acc[bix];
+            var span = e.p_span[bix];
+            if (span + 1 <= target2) {
+                acc[@intCast(span)] = @divFloor(acc[@intCast(span)] * 75, @as(i64, @intCast(e.cps * 2)));
+                var j = span + 1;
+                var sp = span;
+                while (j <= target2) : (j += 1) {
+                    sp += 1;
+                    if (sp < 100) acc[@intCast(j)] = 0;
+                }
+                span = sp;
+            }
+            if (e.p_prev[bix] < count) {
+                if (span < 100 and c > 50 and e.p_prev[bix] < det_cap) {
+                    acc[@intCast(span)] += @intFromFloat(@trunc(e.det_b[bix].rec[@intCast(e.p_prev[bix])]));
+                }
+            }
+            e.p_prev[bix] = count;
+            e.p_span[bix] = span;
+        }
+
+        // PWAV span-record loop.
+        const n19c: i64 = if (islast) 400 else @min(@min(e.lvl_span, e.b_span[0]), @min(e.b_span[1], e.b_span[2]));
+        if (e.pwav_cursor < n19c) {
+            var i = e.pwav_cursor;
+            while (i < n19c) : (i += 1) {
+                const iu: usize = @intCast(i);
+                const f4f = e.arr1b8[iu];
+                const f2 = dbcode(e.b_acc[0][iu] * @as(f32, 0.5));
+                const f3 = dbcode(e.b_acc[1][iu] * @as(f32, 0.25));
+                const f4 = dbcode(e.b_acc[2][iu]);
+                var gate = (e.b_acc[0][iu] / @as(f32, 32768.0)) * @as(f32, 0.75) + @as(f32, 0.25);
+                if (@as(f32, 1.0) < gate) gate = 1.0;
+                const v = gate * f4f;
+                e.pwav_f[iu] = .{ pwavLadder(v), pwavLadder(f4f), f2, f3, f4 };
+            }
+            e.pwav_cursor = n19c;
+        }
+
+        // PWV2 record loop.
+        const n1ac: i64 = if (islast) 100 else @min(e.p_span[0], e.p_span[1]);
+        if (e.pwv2_cursor < n1ac) {
+            var i = e.pwv2_cursor;
+            while (i < n1ac) : (i += 1) {
+                const iu: usize = @intCast(i);
+                const v = e.p_acc[0][iu];
+                if (v == 0) {
+                    // A zero band-1 accumulator encodes 1, or 2 when the
+                    // band-2 accumulator is nonzero.
+                    e.pwv2_code[iu] = if (e.p_acc[1][iu] == 0) 1 else 2;
+                } else {
+                    e.pwv2_code[iu] = pwv2LadderVal(v);
+                }
+            }
+            e.pwv2_cursor = n1ac;
+        }
+    }
+
+    const Bytes = struct { pwav: [400]u8, pwv2: [100]u8 };
+
+    /// Final byte assembly: the class rule over the F2/F3/F4 band codes.
+    fn bytes(e: *const PwavPwv2Engine) Bytes {
+        var b: Bytes = .{ .pwav = undefined, .pwv2 = undefined };
+        for (0..400) |i| {
+            const f = e.pwav_f[i];
+            const cls = pwavClass(f[2], f[3], f[4]);
+            b.pwav[i] = (@as(u8, cls) << 5) | @as(u8, @intCast(f[0]));
+        }
+        for (0..100) |i| b.pwv2[i] = @intCast(e.pwv2_code[i]);
+        return b;
+    }
+};
+
+/// Analyzes decoded PCM and produces the `WaveformColumns` of an ANLZ file,
+/// replicating Rekordbox's analysis. Requires 44 100 Hz stereo f32 input in
+/// [−1, 1) (see `PcmInput`); Hand the result to `buildAnlzInput` with the
+/// track's performance data.
+///
+/// Known divergences from Rekordbox on real program material: the PWAV
+/// 3-bit class code (dense material), and fast transients whose first
+/// band-1 record close shifts the level accumulator's span phase. The
+/// fixtures under `testdata/analysis` pin everything else byte-for-byte.
+pub fn analyzePcm(alloc: std.mem.Allocator, pcm: PcmInput) AnalyzeError!WaveformColumns {
+    if (pcm.left.len != pcm.right.len) return error.ChannelMismatch;
+    const n = pcm.left.len;
+    const left = pcm.left;
+    const right = pcm.right;
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var wc = try WaveCreator.init(a, n);
+    var p3 = try Pwv3Engine.init(a, n);
+    var pp = try PwavPwv2Engine.init(a, n);
+
+    // One streaming pass: every engine consumes each sample exactly once,
+    // with record/column/chunk boundaries sealed as they pass.
+    var chunk: usize = 1; // 1-based PWAV/PWV2 chunk index
+    for (0..n) |i| {
+        const x: f64 = left[i];
+        const y: f64 = right[i];
+
+        // WaveCreator float path.
+        wc.push(waveMonoMix(x, y));
+        while (wc.open < wc.d and wc.starts[wc.open + 1] <= i + 1) {
+            wc.closeRecord(wc.open);
+        }
+
+        // PWV3 s16 path.
+        const l16: i32 = @intFromFloat(@trunc(x * 32768.0));
+        const r16: i32 = @intFromFloat(@trunc(y * 32768.0));
+        p3.push(@divTrunc(l16 + r16, 2));
+        if (i + 1 == n or @mod(i + 1, 294) == 0) {
+            if (p3.open < p3.n_columns) p3.closeColumn(p3.open);
+        }
+
+        // PWAV/PWV2 s16 path.
+        const mono32: f32 = @floatCast((@trunc(x * 32768.0) + @trunc(y * 32768.0)) * 0.0000152587890625);
+        const mono20: f32 = mono32 * 32768.0;
+        pp.push(mono32, mono20);
+        if (pp.bufferFull() or i + 1 == n) {
+            pp.endChunk(chunk);
+            chunk += 1;
+        }
+    }
+    // float32-rounding phantom chunks past the last real one (rare, long
+    // tracks): empty groups, zero counts.
+    while (chunk <= pp.nceil) : (chunk += 1) {
+        pp.runChunk(chunk);
+    }
+
+    const n_columns = p3.n_columns;
+    const pwv3_bytes = try p3.bytes(a);
+    const scales = try wc.scalesAndPwv6(a);
+    const pwv7_bytes = try wc.pwv7(a, n_columns, scales.scale_u16);
+    const pwv5_words = try wc.pwv5(a, n_columns);
+    const pwv4_bytes = try wc.pwv4(a);
+    const preview_bytes = pp.bytes();
+
+    var out: WaveformColumns = .{};
+    errdefer out.deinit(alloc);
+    out.preview_mono = try alloc.alloc(WaveformPreviewColumn, 400);
+    for (out.preview_mono, 0..) |*col, i| col.* = @bitCast(preview_bytes.pwav[i]);
+    out.tiny_preview = try alloc.alloc(TinyWaveformPreviewColumn, 100);
+    for (out.tiny_preview, 0..) |*col, i| col.* = @bitCast(preview_bytes.pwv2[i]);
+    out.detail_mono = try alloc.alloc(WaveformPreviewColumn, n_columns);
+    for (out.detail_mono, 0..) |*col, i| col.* = @bitCast(pwv3_bytes[i]);
+    out.color_preview = try alloc.alloc(WaveformColorPreviewColumn, 1200);
+    for (0..1200) |i| {
+        // Wire order {monoMax, monoMin, LPF400, LOW, MID, HIGH}.
+        out.color_preview[i] = .{
+            .unknown1 = pwv4_bytes[i][0],
+            .unknown2 = pwv4_bytes[i][1],
+            .energy_bottom_half_freq = pwv4_bytes[i][2],
+            .energy_bottom_third_freq = pwv4_bytes[i][3],
+            .energy_mid_third_freq = pwv4_bytes[i][4],
+            .energy_top_third_freq = pwv4_bytes[i][5],
+        };
+    }
+    out.color_detail = try alloc.alloc(WaveformColorDetailColumn, n_columns);
+    for (out.color_detail, 0..) |*col, i| col.* = @bitCast(pwv5_words[i]);
+    out.band3_preview = try alloc.alloc(Waveform3BandColumn, 1200);
+    for (0..1200) |i| {
+        // Wire order (LPF300, BP250–1200, BP3000–9000).
+        out.band3_preview[i] = .{
+            .energy_mid_third_freq = scales.pwv6[i][0],
+            .energy_top_third_freq = scales.pwv6[i][1],
+            .energy_bottom_third_freq = scales.pwv6[i][2],
+        };
+    }
+    out.band3_detail = try alloc.alloc(Waveform3BandColumn, n_columns);
+    for (0..n_columns) |i| {
+        out.band3_detail[i] = .{
+            .energy_mid_third_freq = pwv7_bytes[i][0],
+            .energy_top_third_freq = pwv7_bytes[i][1],
+            .energy_bottom_third_freq = pwv7_bytes[i][2],
+        };
+    }
+
+    arena.deinit();
+    return out;
 }

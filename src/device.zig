@@ -529,7 +529,7 @@ pub const TrackInput = struct {
     /// set carries data) and stores the device `.DAT` path in
     /// `analyze_path`. Beats and cues are always caller-provided — the
     /// library does not do beat detection; see `anlz.buildAnlzInput` for
-    /// assembling one from performance data.
+    /// assembling one from performance data and waveform columns.
     analysis: ?*const anlz.AnlzInput = null,
 
     // OneLibrary-only data: columns that exist in `exportLibrary.db`
@@ -2418,7 +2418,7 @@ fn olNamedRow(
 /// u32 and the bridge copies them verbatim, so ids from 2^32 upward can
 /// never collide with a bridged row — a lockstep db stays collision-free
 /// by construction. Unpinnable by the fixture (it carries no lyricist
-/// artist rows); recorded in `docs/DIVERGENCES.md`.
+/// artist rows).
 const first_minted_artist_id: i64 = 0x1_0000_0000;
 
 /// Resolves the lyricist name to a mirrored artist row. Unlike the

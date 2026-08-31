@@ -972,90 +972,189 @@ test "beatgrid tempo derives from the grid and saturates" {
     try testing.expectEqualSlices(anlz.Beat, derived, sorted);
 }
 
-test "preview columns are fixed-width midpoint picks" {
-    // Ours (supersedes rekordcrate's preview_downsample_count): previews are
-    // fixed-width thumbnails (400 PWAV, 100 PWV2, 1200 PWV4/PWV6 — the
-    // widths every fixture carries), each column midpoint-sampling the
-    // detail vector; detail groups keep the input length.
+test "column stats build drives the analyzer laws" {
+    // One 150 Hz 3-band vector in, all seven groups out, every derivation
+    // the transcribed analyzer law through the band→s16 domain mapping
+    // (×128): the quadratic track-normalized height law, the whiteness
+    // ratio ladder, the PWV5 share law, the PWV7 envelope quantizers, the
+    // span-max PWV4, and the two calibrated preview ladders.
     const alloc = testing.allocator;
     const bands = [_]anlz.Band{.{ .low = 10, .mid = 20, .high = 30 }} ** 150;
-    const heights = [_]u8{16} ** 150;
 
-    const columns = try anlz.buildBandColumns(alloc, &bands, &heights);
+    const columns = try anlz.buildColumnsFromStats(alloc, &bands);
     defer columns.deinit(alloc);
     try testing.expectEqual(anlz.COLOR_PREVIEW_COLUMNS, columns.color_preview.len);
     try testing.expectEqual(anlz.COLOR_PREVIEW_COLUMNS, columns.band3_preview.len);
     try testing.expectEqual(@as(usize, 150), columns.color_detail.len);
     try testing.expectEqual(@as(usize, 150), columns.band3_detail.len);
-    // Constant bands mean to themselves; the PWV4 bottom half mirrors the
-    // bottom third (documented guess) and whiteness stays zero.
+    try testing.expectEqual(anlz.MONO_PREVIEW_COLUMNS, columns.preview_mono.len);
+    try testing.expectEqual(anlz.TINY_PREVIEW_COLUMNS, columns.tiny_preview.len);
+    try testing.expectEqual(@as(usize, 150), columns.detail_mono.len);
+
+    // PWV3: constant bands make every column the track peak — height 31
+    // via the normalizer, whatever the absolute level — and whiteness
+    // whitenessRatio(10/30 ≈ 0.33) = 5.
+    try testing.expectEqual(anlz.WaveformPreviewColumn{ .height = 31, .whiteness = 5 }, columns.detail_mono[0]);
+
+    // PWV5: pwv5Colors(10·128, 20·128, 30·128) = (2, 3, 7) — the green
+    // suppression and blue boost of the share law — over the same 31.
+    try testing.expectEqual(
+        anlz.WaveformColorDetailColumn{ .red = 2, .green = 3, .blue = 7, .height = 31 },
+        columns.color_detail[0],
+    );
+
+    // PWV7: constant input is its own envelope, so every column is equal;
+    // values land in the quantizers' 0-128 domain (the input domain is
+    // 0-255, a straight copy would overshoot 2×).
+    try testing.expect(std.meta.eql(columns.band3_detail[0], columns.band3_detail[7]));
+    try testing.expect(columns.band3_detail[0].energy_mid_third_freq <= 128);
+    try testing.expect(columns.band3_detail[0].energy_top_third_freq <= 128);
+    try testing.expect(columns.band3_detail[0].energy_bottom_third_freq <= 128);
+
+    // PWV4: span maxima — mono 30 → 15 with the two's-complement min
+    // mirror, the low band 10 → 5, and the shares 10²/60·128 → 0,
+    // 20²/60·128 → 3, 30²/60·128 → 7.
     try testing.expectEqual(anlz.WaveformColorPreviewColumn{
-        .energy_bottom_half_freq = 10,
-        .energy_bottom_third_freq = 10,
-        .energy_mid_third_freq = 20,
-        .energy_top_third_freq = 30,
+        .unknown1 = 15,
+        .unknown2 = 241,
+        .energy_bottom_half_freq = 5,
+        .energy_bottom_third_freq = 0,
+        .energy_mid_third_freq = 3,
+        .energy_top_third_freq = 7,
     }, columns.color_preview[0]);
-    // 3-band preview reuses the picked band.
-    try testing.expectEqual(anlz.Waveform3BandColumn{
-        .energy_mid_third_freq = 20,
-        .energy_top_third_freq = 30,
-        .energy_bottom_third_freq = 10,
-    }, columns.band3_preview[0]);
-    // 3-band detail reuses the band energies directly, field order mid,
-    // top, bottom.
-    try testing.expectEqual(anlz.Waveform3BandColumn{
-        .energy_mid_third_freq = 20,
-        .energy_top_third_freq = 30,
-        .energy_bottom_third_freq = 10,
-    }, columns.band3_detail[0]);
-    // The dominant band (high) colors PWV5 blue with the supplied height.
-    try testing.expectEqual(anlz.WaveformColorDetailColumn{
-        .height = 16,
-        .blue = 7,
-    }, columns.color_detail[0]);
 
-    const previews = try anlz.buildPreviewColumns(alloc, &heights);
-    defer previews.deinit(alloc);
-    try testing.expectEqual(anlz.MONO_PREVIEW_COLUMNS, previews.preview.len);
-    try testing.expectEqual(anlz.TINY_PREVIEW_COLUMNS, previews.tiny.len);
-    for (previews.preview) |column| try testing.expect(column.height <= 31);
-    for (previews.tiny) |column| try testing.expect(column.height <= 15);
-    try testing.expectEqual(@as(u5, 16), previews.preview[0].height);
-    try testing.expectEqual(@as(u4, 8), previews.tiny[0].height);
-
-    // A two-entry vector crosses from the first half to the second exactly
-    // at the preview's midpoint (hand-computed): with len 2 and size 400,
-    // floor(2*(2i+1)/800) is 0 through i = 199 and 1 from i = 200.
-    const two = [_]u8{ 5, 25 };
-    const split = try anlz.buildPreviewColumns(alloc, &two);
-    defer split.deinit(alloc);
-    try testing.expectEqual(@as(u5, 5), split.preview[199].height);
-    try testing.expectEqual(@as(u5, 25), split.preview[200].height);
-    // The tiny preview's midpoint lands at i = 50 of 100.
-    try testing.expectEqual(@as(u4, 2), split.tiny[49].height);
-    try testing.expectEqual(@as(u4, 12), split.tiny[50].height);
-
-    const detail = try anlz.buildDetailMono(alloc, &heights);
-    defer alloc.free(detail);
-    try testing.expectEqual(@as(usize, 150), detail.len);
-    try testing.expectEqual(@as(u5, 16), detail[0].height);
+    // PWAV: a constant track calibrates every span to the AGC ceiling 23;
+    // the class is pwavClass(dbcode(640), dbcode(640), dbcode(3840)) =
+    // pwavClass(0, 0, 11) = 5. PWV2 calibrates to 13.
+    try testing.expectEqual(anlz.WaveformPreviewColumn{ .height = 23, .whiteness = 5 }, columns.preview_mono[0]);
+    try testing.expectEqual(anlz.TinyWaveformPreviewColumn{ .height = 13 }, columns.tiny_preview[0]);
 }
 
-test "empty waveform input produces empty preview sections" {
-    // Nothing pins rb's behavior for a track without waveform data; the
-    // builders' documented choice is empty sections over padded ones.
+test "column stats previews aggregate their spans" {
+    // rb's previews are span-resolution quantizations, not detail samples:
+    // a loud column away from any span midpoint still drives its span in
+    // every preview tier (the old midpoint resampler missed it), and the
+    // PWAV/PWV2 calibration maps the loudest span to 23/13.
     const alloc = testing.allocator;
-    const previews = try anlz.buildPreviewColumns(alloc, &.{});
-    defer previews.deinit(alloc);
-    try testing.expectEqual(@as(usize, 0), previews.preview.len);
-    try testing.expectEqual(@as(usize, 0), previews.tiny.len);
-
-    const columns = try anlz.buildBandColumns(alloc, &.{}, &.{});
+    var bands = [_]anlz.Band{.{ .low = 10, .mid = 10, .high = 10 }} ** 12000;
+    bands[3] = .{ .low = 200, .mid = 200, .high = 200 }; // span 0, not its midpoint (column 5)
+    const columns = try anlz.buildColumnsFromStats(alloc, &bands);
     defer columns.deinit(alloc);
+
+    // 12000 columns → 10 per PWV4 span.
+    try testing.expectEqual(@as(u8, 100), columns.color_preview[0].unknown1); // 200·128/256
+    try testing.expectEqual(@as(u8, 5), columns.color_preview[1].unknown1); // 10·128/256
+
+    // PWAV spans hold 30 columns: span 0's mean level is
+    // (29·1280 + 25600)/30 ≈ 2091 against 1280 elsewhere — the loudest
+    // span calibrates to 23 and the quiet spans land at
+    // pwavLadder(1280·35000/2091 ≈ 21427) = 20.
+    try testing.expectEqual(@as(u5, 23), columns.preview_mono[0].height);
+    try testing.expectEqual(@as(u5, 20), columns.preview_mono[3].height);
+
+    // PWV2 spans hold 120 columns: span 0 carries the loud column's low
+    // band (25600 → calibrated 13); the quiet spans fall to the ladder
+    // floor's neighborhood.
+    try testing.expectEqual(@as(u4, 13), columns.tiny_preview[0].height);
+    try testing.expectEqual(@as(u4, 2), columns.tiny_preview[1].height);
+}
+
+test "column stats heights are track-normalized and quadratic" {
+    const alloc = testing.allocator;
+    // The same shape at 2× scale renders identically: the track peak is
+    // the normalizer. And the law is quadratic — a half-peak column codes
+    // 7 where a linear law would give 15.
+    const loud = [_]anlz.Band{ .{ .low = 255 }, .{ .low = 128 }, .{ .high = 64 } };
+    const quiet = [_]anlz.Band{ .{ .low = 128 }, .{ .low = 64 }, .{ .high = 32 } };
+    const cols_loud = try anlz.buildColumnsFromStats(alloc, &loud);
+    defer cols_loud.deinit(alloc);
+    const cols_quiet = try anlz.buildColumnsFromStats(alloc, &quiet);
+    defer cols_quiet.deinit(alloc);
+    for (cols_loud.detail_mono, cols_quiet.detail_mono) |l, q| {
+        try testing.expectEqual(l, q);
+    }
+    // 31 at the peak; u = trunc(128·128/32640·32767) = 16447 →
+    // 16447²·31.488/32767² ≈ 7.9 → 7; third column
+    // u = 8223 → ≈ 1.99 → 1.
+    try testing.expectEqual(@as(u5, 31), cols_loud.detail_mono[0].height);
+    try testing.expectEqual(@as(u5, 7), cols_loud.detail_mono[1].height);
+    try testing.expectEqual(@as(u5, 1), cols_loud.detail_mono[2].height);
+    // Whiteness: low-only columns ratio 1 → 0; a treble-only column has
+    // no low-band energy → 7.
+    try testing.expectEqual(@as(u3, 0), cols_loud.detail_mono[0].whiteness);
+    try testing.expectEqual(@as(u3, 7), cols_loud.detail_mono[2].whiteness);
+}
+
+test "column stats Band.peak drives the mono heights" {
+    const alloc = testing.allocator;
+    // Band energies cannot express a column's true peak; `peak` can: with
+    // peaks supplied, the band-max fallback's uniform rendering gives way
+    // to the real amplitude ratio (quadratic law: band max 100 against a
+    // 255 peak codes 4).
+    var bands = [_]anlz.Band{.{ .low = 100, .mid = 100, .high = 100 }} ** 40;
+    const cols_fb = try anlz.buildColumnsFromStats(alloc, &bands);
+    defer cols_fb.deinit(alloc);
+    bands[20] = .{ .low = 100, .mid = 100, .high = 100, .peak = 255 };
+    const cols_pk = try anlz.buildColumnsFromStats(alloc, &bands);
+    defer cols_pk.deinit(alloc);
+    // Fallback: every column is its own track peak → 31 everywhere.
+    try testing.expectEqual(@as(u5, 31), cols_fb.detail_mono[0].height);
+    try testing.expectEqual(@as(u5, 31), cols_fb.detail_mono[20].height);
+    // With the peak: column 20 becomes the normalizer → 31; the others
+    // code trunc(100·128/32640·32767)²·31.488/32767² ≈ 4.84 → 4.
+    try testing.expectEqual(@as(u5, 31), cols_pk.detail_mono[20].height);
+    try testing.expectEqual(@as(u5, 4), cols_pk.detail_mono[0].height);
+}
+
+test "column stats PWV7 envelope decays like the analyzer" {
+    const alloc = testing.allocator;
+    var bands = [_]anlz.Band{.{}} ** 600;
+    bands[0] = .{ .high = 255 };
+    const columns = try anlz.buildColumnsFromStats(alloc, &bands);
+    defer columns.deinit(alloc);
+    // Instant attack, exponential decay: strictly decreasing after the
+    // impulse and silent by the tail. The high band rides the
+    // bottom-third field (wire order); the other bands stay silent.
+    try testing.expect(columns.band3_detail[0].energy_bottom_third_freq > columns.band3_detail[1].energy_bottom_third_freq);
+    try testing.expect(columns.band3_detail[1].energy_bottom_third_freq > columns.band3_detail[2].energy_bottom_third_freq);
+    try testing.expectEqual(@as(u8, 0), columns.band3_detail[500].energy_bottom_third_freq);
+    try testing.expectEqual(@as(u8, 0), columns.band3_detail[0].energy_mid_third_freq);
+    try testing.expectEqual(@as(u8, 0), columns.band3_detail[0].energy_top_third_freq);
+}
+
+test "empty waveform input produces empty sections" {
+    // Nothing pins rb's behavior for a track without waveform data; the
+    // builder's documented choice is empty sections over padded ones.
+    const alloc = testing.allocator;
+    const columns = try anlz.buildColumnsFromStats(alloc, &.{});
+    defer columns.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), columns.preview_mono.len);
+    try testing.expectEqual(@as(usize, 0), columns.tiny_preview.len);
+    try testing.expectEqual(@as(usize, 0), columns.detail_mono.len);
     try testing.expectEqual(@as(usize, 0), columns.color_preview.len);
-    try testing.expectEqual(@as(usize, 0), columns.band3_preview.len);
     try testing.expectEqual(@as(usize, 0), columns.color_detail.len);
+    try testing.expectEqual(@as(usize, 0), columns.band3_preview.len);
     try testing.expectEqual(@as(usize, 0), columns.band3_detail.len);
+}
+
+test "column stats silence encodes the analyzer floors" {
+    // Digital silence is not zero everywhere: the mono tiers floor at
+    // PWAV (2, 5) / PWV2 1, PWV3 is (0, 7), PWV5 colors (7, 7, 7) with
+    // height 0, and only PWV4/PWV6/PWV7 are all zero — `anlz.Silence`.
+    const alloc = testing.allocator;
+    const bands = [_]anlz.Band{.{}} ** 64;
+    const columns = try anlz.buildColumnsFromStats(alloc, &bands);
+    defer columns.deinit(alloc);
+    try testing.expectEqual(anlz.WaveformPreviewColumn{ .height = 0, .whiteness = 7 }, columns.detail_mono[7]);
+    try testing.expectEqual(
+        anlz.WaveformColorDetailColumn{ .red = 7, .green = 7, .blue = 7 },
+        columns.color_detail[7],
+    );
+    try testing.expectEqual(anlz.Waveform3BandColumn{}, columns.band3_detail[7]);
+    try testing.expectEqual(anlz.WaveformPreviewColumn{ .height = 2, .whiteness = 5 }, columns.preview_mono[0]);
+    try testing.expectEqual(anlz.TinyWaveformPreviewColumn{ .height = 1 }, columns.tiny_preview[0]);
+    try testing.expectEqual(anlz.WaveformColorPreviewColumn{}, columns.color_preview[0]);
+    try testing.expectEqual(anlz.Waveform3BandColumn{}, columns.band3_preview[0]);
 }
 
 test "cue building point and loop" {
@@ -1093,17 +1192,19 @@ test "cue building point and loop" {
 
 test "built anlz input assembles consistently" {
     // Port of rekordcrate's build_anlz_input_assembles_consistently: a
-    // populated performance data yields a non-empty AnlzInput whose
-    // waveform sections are internally consistent (detail == height count,
-    // preview ~1/22) and whose main cue was prepended to the cue list.
+    // populated performance data plus a column set yields a non-empty
+    // AnlzInput whose waveform sections are internally consistent (detail
+    // == band count, preview ~1/22) and whose main cue was prepended to the
+    // cue list.
     const alloc = testing.allocator;
     const sr: u32 = 44_100;
     const bands = [_]anlz.Band{.{ .low = 50, .mid = 100, .high = 150 }} ** 150;
-    const heights = [_]u8{20} ** 150;
     const markers = [_]anlz.BeatMarker{
         .{ .index = 1, .sample_offset = 0.0 },
         .{ .index = 5, .sample_offset = 60.0 / 120.0 * @as(f64, @floatFromInt(sr)) * 4.0 },
     };
+    var columns = try anlz.buildColumnsFromStats(alloc, &bands);
+    defer columns.deinit(alloc); // moved-from: no-op once buildAnlzInput runs
     const input = try anlz.buildAnlzInput(alloc, .{
         .sample_rate = sr,
         .sample_count = sr,
@@ -1111,9 +1212,7 @@ test "built anlz input assembles consistently" {
         .beatgrid = &markers,
         .main_cue = 0.0,
         .cues = &.{.{ .hot_cue = 1, .sample_offset = @floatFromInt(sr), .label = "x" }},
-        .waveform_bands = &bands,
-        .waveform_heights = &heights,
-    });
+    }, &columns);
     defer input.deinit(alloc);
     try testing.expect(input.beats.len > 0);
     try testing.expectEqual(@as(usize, 2), input.cues.len);
@@ -1137,11 +1236,12 @@ test "built anlz input serializes and re-parses" {
     const alloc = testing.allocator;
     const sr: u32 = 44_100;
     const bands = [_]anlz.Band{.{ .low = 50, .mid = 100, .high = 150 }} ** 150;
-    const heights = [_]u8{20} ** 150;
     const markers = [_]anlz.BeatMarker{
         .{ .index = 1, .sample_offset = 0.0 },
         .{ .index = 5, .sample_offset = 60.0 / 120.0 * @as(f64, @floatFromInt(sr)) * 4.0 },
     };
+    var columns = try anlz.buildColumnsFromStats(alloc, &bands);
+    defer columns.deinit(alloc); // moved-from: no-op once buildAnlzInput runs
     const input = try anlz.buildAnlzInput(alloc, .{
         .sample_rate = sr,
         .sample_count = sr,
@@ -1149,9 +1249,7 @@ test "built anlz input serializes and re-parses" {
         .beatgrid = &markers,
         .main_cue = 0.0,
         .cues = &.{.{ .hot_cue = 1, .sample_offset = @floatFromInt(sr), .label = "Brëak", .r = 0x4D, .b = 0xFF }},
-        .waveform_bands = &bands,
-        .waveform_heights = &heights,
-    });
+    }, &columns);
     defer input.deinit(alloc);
 
     const track_path = try anlz.LenPrefixedWideString.fromUtf8(alloc, "/Contents/track.mp3");
@@ -1181,8 +1279,10 @@ test "built anlz input serializes and re-parses" {
     try testing.expectEqualSlices(anlz.Cue, input.cues, dat_list.cues);
     const preview = &dat_parsed.findSection(.waveform_preview).?.waveform_preview;
     try testing.expectEqual(anlz.MONO_PREVIEW_COLUMNS, preview.data.len);
-    try testing.expectEqual(@as(u5, 20), preview.data[0].height);
-    try testing.expectEqual(@as(u3, 0), preview.data[0].whiteness);
+    // Constant bands: every span calibrates to the AGC ceiling 23, class
+    // pwavClass(dbcode(3200), dbcode(3200), dbcode(19200)) = 5.
+    try testing.expectEqual(@as(u5, 23), preview.data[0].height);
+    try testing.expectEqual(@as(u3, 5), preview.data[0].whiteness);
     try testing.expectEqual(anlz.TINY_PREVIEW_COLUMNS, dat_parsed.findSection(.tiny_waveform_preview).?.tiny_waveform_preview.data.len);
 
     // .EXT: extended cues, mono detail, color preview/detail.
@@ -1210,19 +1310,25 @@ test "built anlz input serializes and re-parses" {
     try testing.expectEqual([3]u8{ 0x4D, 0, 0xFF }, ext_list.cues[1].hot_cue_color_rgb);
     const detail = &ext_parsed.findSection(.waveform_detail).?.waveform_detail;
     try testing.expectEqual(@as(usize, 150), detail.data.len);
-    try testing.expectEqual(@as(u5, 20), detail.data[0].height);
+    // Constant bands: every column is the track peak → 31.
+    try testing.expectEqual(@as(u5, 31), detail.data[0].height);
     const color_preview = &ext_parsed.findSection(.waveform_color_preview).?.waveform_color_preview;
     try testing.expectEqual(anlz.COLOR_PREVIEW_COLUMNS, color_preview.data.len);
+    // Span maxima: mono 150·128/256 = 75 (mirror 181), low 50·128/256 = 25,
+    // shares 50²/300·128/256 = 4, 100²/300·128/256 = 16, 150²/300·128/256
+    // = 37.
     try testing.expectEqual(anlz.WaveformColorPreviewColumn{
-        .energy_bottom_half_freq = 50,
-        .energy_bottom_third_freq = 50,
-        .energy_mid_third_freq = 100,
-        .energy_top_third_freq = 150,
+        .unknown1 = 75,
+        .unknown2 = 181,
+        .energy_bottom_half_freq = 25,
+        .energy_bottom_third_freq = 4,
+        .energy_mid_third_freq = 16,
+        .energy_top_third_freq = 37,
     }, color_preview.data[0]);
     const color_detail = &ext_parsed.findSection(.waveform_color_detail).?.waveform_color_detail;
     try testing.expectEqual(@as(usize, 150), color_detail.data.len);
     try testing.expectEqual(@as(u3, 7), color_detail.data[0].blue);
-    try testing.expectEqual(@as(u5, 20), color_detail.data[0].height);
+    try testing.expectEqual(@as(u5, 31), color_detail.data[0].height);
 
     // .2EX: 3-band preview/detail.
     const ex2_sections = [_]anlz.Content{
@@ -1241,15 +1347,20 @@ test "built anlz input serializes and re-parses" {
     try testing.expectEqual(anlz.COLOR_PREVIEW_COLUMNS, band3_preview.data.len);
     const band3_detail = &ex2_parsed.findSection(.waveform_3band_detail).?.waveform_3band_detail;
     try testing.expectEqual(@as(usize, 150), band3_detail.data.len);
+    // Constant input through the scale derivation (unit scales): PWV6's
+    // span-0 averages of 6400/2, 12800, 19200 over 256 = (12, 50, 75)
+    // (only the low band's 1-second window zero-fills before the start);
+    // PWV7's envelope is the value itself — 128/32768·(6400, 12800) =
+    // (25, 50) linear, (64 − cos(π·19200/32768)·64) = 81 quadratic.
     try testing.expectEqual(anlz.Waveform3BandColumn{
-        .energy_mid_third_freq = 100,
-        .energy_top_third_freq = 150,
-        .energy_bottom_third_freq = 50,
+        .energy_mid_third_freq = 12,
+        .energy_top_third_freq = 50,
+        .energy_bottom_third_freq = 75,
     }, band3_preview.data[0]);
     try testing.expectEqual(anlz.Waveform3BandColumn{
-        .energy_mid_third_freq = 100,
-        .energy_top_third_freq = 150,
-        .energy_bottom_third_freq = 50,
+        .energy_mid_third_freq = 25,
+        .energy_top_third_freq = 50,
+        .energy_bottom_third_freq = 81,
     }, band3_detail.data[0]);
 }
 
@@ -1268,9 +1379,13 @@ test "detailExtents reconstructs every fixture's detail column count" {
     try testing.expectEqual(@as(f64, 320.0), e48.samples_per_entry);
 }
 
-test "detailExtents rounds half away from zero and rejects rate 0" {
+test "detailExtents ceils partial columns and rejects rate 0" {
     // 294147 samples at 44.1 kHz = exactly 1000.5 columns.
     try testing.expectEqual(@as(u64, 1001), anlz.detailExtents(294_147, 44100).?.size);
+    // Partial columns ceil: 15 752 931 samples = 53 581.04 columns.
+    try testing.expectEqual(@as(u64, 45069), anlz.detailExtents(13_250_199, 44100).?.size);
+    try testing.expectEqual(@as(u64, 53582), anlz.detailExtents(15_752_931, 44100).?.size);
+    try testing.expectEqual(@as(u64, 50565), anlz.detailExtents(14_866_077, 44100).?.size);
     try testing.expect(anlz.detailExtents(1_000_000, 0) == null);
 }
 
@@ -1295,13 +1410,13 @@ const fixture_tracks = [_][]const u8{
     "complete_export/with_anlz/PIONEER/USBANLZ/P01F/00004BC5",
 };
 
-test "builders pin preview widths and midpoint picks against fixtures" {
-    // rb's preview bytes are underivable from the detail sections (see
-    // docs/DIVERGENCES.md), so what the fixtures pin is the widths — 400
-    // PWAV, 100 PWV2, 1200 PWV4/PWV6 across all four tracks — and what
-    // this test pins is the resampling contract: fixture detail columns in,
-    // midpoint-picked preview columns out, byte-exact against the picked
-    // detail values.
+test "builders pin preview widths and analyzer-law ranges against fixtures" {
+    // rb's preview bytes are underivable from the detail sections, so
+    // what the fixtures pin is the widths — 400 PWAV, 100 PWV2, 1200
+    // PWV4/PWV6 across all four tracks — and what this test pins on top
+    // is the derived output's law-shaped ranges: PWAV/PWV2 heights inside
+    // the ladders (floors 2/1), the track-peak normalizer reaching 31
+    // somewhere in the detail, and the PWV7 quantizer domain ≤ 128.
     const alloc = testing.allocator;
     for (fixture_tracks) |dir| {
         var path_buf: [128]u8 = undefined;
@@ -1326,48 +1441,496 @@ test "builders pin preview widths and midpoint picks against fixtures" {
         const pwv6 = &ex2_parsed.findSection(.waveform_3band_preview).?.waveform_3band_preview;
         const pwv7 = &ex2_parsed.findSection(.waveform_3band_detail).?.waveform_3band_detail;
 
-        const heights = try alloc.alloc(u8, pwv3.data.len);
-        defer alloc.free(heights);
-        for (pwv3.data, 0..) |column, i| heights[i] = column.height;
-
-        const previews = try anlz.buildPreviewColumns(alloc, heights);
-        defer previews.deinit(alloc);
-        // The widths are the fixtures' own preview widths.
-        try testing.expectEqual(pwav.data.len, previews.preview.len);
-        try testing.expectEqual(pwv2.data.len, previews.tiny.len);
-        for (previews.preview, 0..) |column, i| {
-            const mid = pwv3.data.len * (2 * i + 1) / (2 * previews.preview.len);
-            try testing.expectEqual(pwv3.data[mid].height, column.height);
-            try testing.expectEqual(@as(u3, 0), column.whiteness);
-        }
-        for (previews.tiny, 0..) |column, i| {
-            const mid = pwv3.data.len * (2 * i + 1) / (2 * previews.tiny.len);
-            try testing.expectEqual(@as(u4, @intCast(pwv3.data[mid].height / 2)), column.height);
-        }
-
         const bands = try alloc.alloc(anlz.Band, pwv7.data.len);
         defer alloc.free(bands);
+        // The wire order puts the low band in the mid-third field (see
+        // analyzePcm's assembly note).
         for (pwv7.data, 0..) |column, i| bands[i] = .{
-            .low = column.energy_bottom_third_freq,
-            .mid = column.energy_mid_third_freq,
-            .high = column.energy_top_third_freq,
+            .low = column.energy_mid_third_freq,
+            .mid = column.energy_top_third_freq,
+            .high = column.energy_bottom_third_freq,
         };
-        const columns = try anlz.buildBandColumns(alloc, bands, heights);
+        const columns = try anlz.buildColumnsFromStats(alloc, bands);
         defer columns.deinit(alloc);
+        // The widths are the fixtures' own preview widths.
+        try testing.expectEqual(pwav.data.len, columns.preview_mono.len);
+        try testing.expectEqual(pwv2.data.len, columns.tiny_preview.len);
         try testing.expectEqual(pwv4.data.len, columns.color_preview.len);
         try testing.expectEqual(pwv6.data.len, columns.band3_preview.len);
-        for (columns.band3_preview, 0..) |column, i| {
-            const mid = pwv7.data.len * (2 * i + 1) / (2 * columns.band3_preview.len);
-            try testing.expectEqual(bands[mid].mid, column.energy_mid_third_freq);
-            try testing.expectEqual(bands[mid].high, column.energy_top_third_freq);
-            try testing.expectEqual(bands[mid].low, column.energy_bottom_third_freq);
+        try testing.expectEqual(pwv3.data.len, columns.detail_mono.len);
+        for (columns.preview_mono) |column| {
+            try testing.expect(column.height >= 2 and column.height <= 25);
         }
-        for (columns.color_preview, 0..) |column, i| {
-            const mid = pwv7.data.len * (2 * i + 1) / (2 * columns.color_preview.len);
-            try testing.expectEqual(bands[mid].low, column.energy_bottom_half_freq);
-            try testing.expectEqual(bands[mid].low, column.energy_bottom_third_freq);
-            try testing.expectEqual(bands[mid].mid, column.energy_mid_third_freq);
-            try testing.expectEqual(bands[mid].high, column.energy_top_third_freq);
+        for (columns.tiny_preview) |column| {
+            try testing.expect(column.height >= 1 and column.height <= 15);
+        }
+        var max_h: u5 = 0;
+        for (columns.detail_mono) |column| max_h = @max(max_h, column.height);
+        try testing.expectEqual(@as(u5, 31), max_h);
+        for (columns.band3_detail) |column| {
+            try testing.expect(column.energy_mid_third_freq <= 128);
+            try testing.expect(column.energy_top_third_freq <= 128);
+            try testing.expect(column.energy_bottom_third_freq <= 128);
         }
     }
+}
+
+test "detailHeight is Rekordbox's quadratic quantizer" {
+    // Bin edges at sqrt((h+1)/31.5): 0.1782²·31.5 = 1.0004 → 1.
+    try testing.expectEqual(@as(u5, 0), anlz.detailHeight(0.0));
+    try testing.expectEqual(@as(u5, 0), anlz.detailHeight(0.1781));
+    try testing.expectEqual(@as(u5, 1), anlz.detailHeight(0.1782));
+    try testing.expectEqual(@as(u5, 1), anlz.detailHeight(0.2519));
+    try testing.expectEqual(@as(u5, 2), anlz.detailHeight(0.2520));
+    try testing.expectEqual(@as(u5, 2), anlz.detailHeight(0.3086));
+    try testing.expectEqual(@as(u5, 3), anlz.detailHeight(0.3087));
+    try testing.expectEqual(@as(u5, 30), anlz.detailHeight(0.9920));
+    try testing.expectEqual(@as(u5, 31), anlz.detailHeight(0.9921));
+    try testing.expectEqual(@as(u5, 31), anlz.detailHeight(1.0));
+}
+
+test "monoMix is the arithmetic mean, not a channel max" {
+    try testing.expectEqual(@as(f64, 0.25), anlz.monoMix(0.5, 0.0));
+    try testing.expectEqual(@as(f64, 0.25), anlz.monoMix(0.0, 0.5));
+    try testing.expectEqual(@as(f64, 0.0), anlz.monoMix(0.5, -0.5));
+    try testing.expectEqual(@as(f64, 0.5), anlz.monoMix(0.5, 0.5));
+}
+
+test "bandValue is Rekordbox's 7-bit envelope quantizer" {
+    try testing.expectEqual(@as(u7, 0), anlz.bandValue(0.0));
+    try testing.expectEqual(@as(u7, 0), anlz.bandValue(1.0 / 127.0 - 1e-9));
+    try testing.expectEqual(@as(u7, 1), anlz.bandValue(1.0 / 127.0));
+    try testing.expectEqual(@as(u7, 63), anlz.bandValue(0.5));
+    try testing.expectEqual(@as(u7, 96), anlz.bandValue(96.0 / 127.0));
+    try testing.expectEqual(@as(u7, 126), anlz.bandValue(0.999));
+    try testing.expectEqual(@as(u7, 127), anlz.bandValue(1.0));
+    try testing.expectEqual(@as(u7, 127), anlz.bandValue(2.0));
+}
+
+test "whitenessTone reproduces every probe tone's code" {
+    try testing.expectEqual(@as(u3, 0), anlz.whitenessTone(0.0)); // DC
+    try testing.expectEqual(@as(u3, 0), anlz.whitenessTone(100.0));
+    try testing.expectEqual(@as(u3, 1), anlz.whitenessTone(120.0));
+    try testing.expectEqual(@as(u3, 2), anlz.whitenessTone(160.0));
+    try testing.expectEqual(@as(u3, 3), anlz.whitenessTone(190.0));
+    try testing.expectEqual(@as(u3, 4), anlz.whitenessTone(220.0));
+    try testing.expectEqual(@as(u3, 5), anlz.whitenessTone(250.0));
+    try testing.expectEqual(@as(u3, 6), anlz.whitenessTone(350.0));
+    try testing.expectEqual(@as(u3, 7), anlz.whitenessTone(500.0));
+    try testing.expectEqual(@as(u3, 7), anlz.whitenessTone(20000.0));
+}
+
+test "silence floors match the analyzer's own encoding" {
+    // Each section emits exactly one value throughout.
+    try testing.expectEqual(@as(u8, 162), anlz.Silence.preview_byte);
+    try testing.expectEqual(@as(u8, 1), anlz.Silence.tiny_byte);
+    try testing.expectEqual(@as(u8, 224), anlz.Silence.detail_byte);
+    try testing.expectEqual(@as(u16, 65408), anlz.Silence.color_detail_column);
+}
+
+test "mp3 analysis offset is LAME delay plus one decoder frame" {
+    try testing.expectEqual(@as(i32, -2257), anlz.mp3_analysis_offset_samples);
+    try testing.expectEqual(@as(i32, -(1105 + 1152)), anlz.mp3_analysis_offset_samples);
+}
+
+test "colorShare is Rekordbox's 3-bit share quantizer" {
+    try testing.expectEqual(@as(u3, 0), anlz.colorShare(0.0));
+    try testing.expectEqual(@as(u3, 0), anlz.colorShare(1.0 / 7.0 - 1e-9));
+    try testing.expectEqual(@as(u3, 1), anlz.colorShare(1.0 / 7.0));
+    try testing.expectEqual(@as(u3, 3), anlz.colorShare(0.5));
+    try testing.expectEqual(@as(u3, 6), anlz.colorShare(6.0 / 7.0));
+    try testing.expectEqual(@as(u3, 7), anlz.colorShare(1.0));
+    try testing.expectEqual(@as(u3, 7), anlz.colorShare(1.5));
+    // Just under the saturation edge.
+    try testing.expectEqual(@as(u3, 6), anlz.colorShare(6.0 / 7.0 + 1e-9));
+}
+
+test "whitenessRatio is the LPF150 peak-ratio ladder" {
+    // Real analyzer columns (tones, filtered noise, silence).
+    const cases = [_]struct { fp: u16, pk: u16, want: u3 }{
+        .{ .fp = 14971, .pk = 16383, .want = 0 }, // 100 Hz tone
+        .{ .fp = 13285, .pk = 16383, .want = 1 }, // 127 Hz
+        .{ .fp = 10634, .pk = 16383, .want = 2 }, // 162 Hz
+        .{ .fp = 7621, .pk = 16383, .want = 4 }, // 207 Hz
+        .{ .fp = 5044, .pk = 16383, .want = 5 }, // 264 Hz
+        .{ .fp = 3201, .pk = 16383, .want = 6 }, // 336 Hz
+        .{ .fp = 1995, .pk = 16383, .want = 7 }, // 428 Hz
+        .{ .fp = 3740, .pk = 19613, .want = 6 }, // LP1k noise column
+        .{ .fp = 1554, .pk = 22701, .want = 7 }, // LP10k noise column
+        .{ .fp = 0, .pk = 0, .want = 7 }, // digital silence
+    };
+    for (cases) |c| try testing.expectEqual(c.want, anlz.whitenessRatio(c.fp, c.pk));
+}
+
+test "detailHeightCode is the coded two-stage truncation" {
+    // Real analyzer columns (track peak 32767).
+    const cases = [_]struct { p: u16, t: u16, want: u5 }{
+        .{ .p = 16383, .t = 32767, .want = 7 },
+        .{ .p = 0, .t = 32767, .want = 0 },
+        .{ .p = 19613, .t = 32767, .want = 11 },
+        .{ .p = 22701, .t = 32767, .want = 15 },
+    };
+    for (cases) |c| try testing.expectEqual(c.want, anlz.detailHeightCode(c.p, c.t));
+    try testing.expectEqual(@as(u5, 31), anlz.detailHeightCode(32767, 32767));
+    try testing.expectEqual(@as(u5, 0), anlz.detailHeightCode(5, 0)); // silent track
+}
+
+test "pwv7BandLinear reproduces the coded b0/b1 quantizer" {
+    // Real (envelope, scale) pairs, scale at the 0.8 clamp floor.
+    const cases = [_]struct { env: u16, sc: u16, want: u8 }{
+        .{ .env = 318, .sc = 80, .want = 0 },
+        .{ .env = 6741, .sc = 80, .want = 21 },
+        .{ .env = 14439, .sc = 80, .want = 45 },
+        .{ .env = 624, .sc = 80, .want = 1 },
+        .{ .env = 15091, .sc = 80, .want = 47 },
+        .{ .env = 30609, .sc = 80, .want = 95 },
+    };
+    for (cases) |c| try testing.expectEqual(c.want, anlz.pwv7BandLinear(c.env, c.sc));
+}
+
+test "pwv7BandQuadratic reproduces the coded b2 transform" {
+    // Real pairs, adaptive scale 1.04: 64·(1−cos(π·x)) — quadratic at
+    // small x, saturating at 128·scale.
+    const cases = [_]struct { env: u16, sc: u16, want: u8 }{
+        .{ .env = 16, .sc = 500, .want = 0 },
+        .{ .env = 8867, .sc = 104, .want = 22 },
+        .{ .env = 10452, .sc = 104, .want = 30 },
+        .{ .env = 13246, .sc = 104, .want = 46 },
+        .{ .env = 14778, .sc = 104, .want = 56 },
+        .{ .env = 17972, .sc = 104, .want = 76 },
+        .{ .env = 17757, .sc = 104, .want = 75 },
+    };
+    for (cases) |c| try testing.expectEqual(c.want, anlz.pwv7BandQuadratic(c.env, c.sc));
+}
+
+test "pwv5Colors is the coded byte>>5 law with corrections" {
+    // Real channel triplets (tones, combos, silence).
+    const cases = [_]struct { r: u16, g: u16, b: u16, want: anlz.ColorCodes }{
+        .{ .r = 9536, .g = 726, .b = 149, .want = .{ .red = 7, .green = 0, .blue = 0 } },
+        .{ .r = 8283, .g = 3425, .b = 3602, .want = .{ .red = 7, .green = 2, .blue = 4 } },
+        .{ .r = 0, .g = 0, .b = 0, .want = .{ .red = 7, .green = 7, .blue = 7 } },
+        .{ .r = 455, .g = 9065, .b = 9220, .want = .{ .red = 0, .green = 5, .blue = 7 } },
+        .{ .r = 535, .g = 9719, .b = 3541, .want = .{ .red = 0, .green = 6, .blue = 3 } },
+    };
+    for (cases) |c| {
+        const got = anlz.pwv5Colors(c.r, c.g, c.b);
+        try testing.expectEqual(c.want.red, got.red);
+        try testing.expectEqual(c.want.green, got.green);
+        try testing.expectEqual(c.want.blue, got.blue);
+    }
+}
+
+test "waveMonoMix is the magnitude-branch WaveCreator mix" {
+    // Anti-phase keeps full magnitude (the larger-magnitude pick) where
+    // `monoMix` would cancel; near-identical channels pick the larger one.
+    try testing.expectEqual(@as(f64, 0.5), anlz.waveMonoMix(0.5, 0.5));
+    try testing.expectEqual(@as(f64, -0.5), anlz.waveMonoMix(0.5, -0.5));
+    try testing.expectEqual(@as(f64, 0.25), anlz.waveMonoMix(0.5, 0.0));
+    try testing.expectEqual(@as(f64, 0.25), anlz.waveMonoMix(0.0, 0.5));
+    try testing.expectEqual(@as(f64, 0.3005), anlz.waveMonoMix(0.3, 0.3005));
+    try testing.expectEqual(@as(f64, -0.2), anlz.waveMonoMix(-0.1995, -0.2));
+}
+
+// ------------------------------------------------------------------------
+// PCM analysis route (analysis.zig)
+// ------------------------------------------------------------------------
+
+/// Reads a PCM-analysis fixture pair: `sub_path` names the `.pcm` file,
+/// whose `.exp` sibling carries the expected section bytes.
+const AnalysisFixture = struct {
+    n: usize,
+    left: []f32,
+    right: []f32,
+    pwav: []u8,
+    pwv2: []u8,
+    pwv3: []u8,
+    pwv4: []u8, // 1200 columns x 6 bytes
+    pwv5: []u16, // big-endian words on disk, native here
+    pwv6: []u8, // 1200 x 3
+    pwv7: []u8, // N x 3
+
+    fn read(alloc: std.mem.Allocator, sub_path: []const u8) !AnalysisFixture {
+        const pcm = try readFixture(alloc, sub_path);
+        defer alloc.free(pcm);
+        var f: AnalysisFixture = undefined;
+        if (pcm.len < 4) return error.InvalidFormat;
+        f.n = std.mem.readInt(u32, pcm[0..4], .little);
+        const channels_bytes = f.n * 2 * 4;
+        if (pcm.len != 4 + channels_bytes) return error.InvalidFormat;
+        const lbytes = pcm[4 .. 4 + f.n * 4];
+        const rbytes = pcm[4 + f.n * 4 ..];
+        const left = try alloc.alloc(f32, f.n);
+        errdefer alloc.free(left);
+        const right = try alloc.alloc(f32, f.n);
+        errdefer alloc.free(right);
+        for (left, 0..) |*s, i| s.* = @bitCast(std.mem.readInt(u32, lbytes[i * 4 ..][0..4], .little));
+        for (right, 0..) |*s, i| s.* = @bitCast(std.mem.readInt(u32, rbytes[i * 4 ..][0..4], .little));
+        f.left = left;
+        f.right = right;
+
+        const stem = try std.fmt.allocPrint(alloc, "{s}.exp", .{sub_path[0 .. sub_path.len - 4]});
+        defer alloc.free(stem);
+        const exp = try readFixture(alloc, stem);
+        defer alloc.free(exp);
+        const n_columns = (f.n + 293) / 294;
+        const want_len = 4 + 400 + 100 + n_columns + 7200 + 2 * n_columns + 3600 + 3 * n_columns;
+        if (exp.len != want_len) return error.InvalidFormat;
+        if (std.mem.readInt(u32, exp[0..4], .little) != f.n) return error.InvalidFormat;
+        var off: usize = 4;
+        f.pwav = try alloc.dupe(u8, exp[off .. off + 400]);
+        errdefer alloc.free(f.pwav);
+        off += 400;
+        f.pwv2 = try alloc.dupe(u8, exp[off .. off + 100]);
+        errdefer alloc.free(f.pwv2);
+        off += 100;
+        f.pwv3 = try alloc.dupe(u8, exp[off .. off + n_columns]);
+        errdefer alloc.free(f.pwv3);
+        off += n_columns;
+        f.pwv4 = try alloc.dupe(u8, exp[off .. off + 7200]);
+        errdefer alloc.free(f.pwv4);
+        off += 7200;
+        const words = try alloc.alloc(u16, n_columns);
+        errdefer alloc.free(words);
+        for (words, 0..) |*wd, i| wd.* = std.mem.readInt(u16, exp[off + i * 2 ..][0..2], .big);
+        f.pwv5 = words;
+        off += 2 * n_columns;
+        f.pwv6 = try alloc.dupe(u8, exp[off .. off + 3600]);
+        errdefer alloc.free(f.pwv6);
+        off += 3600;
+        f.pwv7 = try alloc.dupe(u8, exp[off .. off + 3 * n_columns]);
+        errdefer alloc.free(f.pwv7);
+        return f;
+    }
+
+    fn deinit(f: *const AnalysisFixture, alloc: std.mem.Allocator) void {
+        alloc.free(f.left);
+        alloc.free(f.right);
+        alloc.free(f.pwav);
+        alloc.free(f.pwv2);
+        alloc.free(f.pwv3);
+        alloc.free(f.pwv4);
+        alloc.free(f.pwv5);
+        alloc.free(f.pwv6);
+        alloc.free(f.pwv7);
+    }
+};
+
+/// Compares one analysis against a fixture, printing the first differing
+/// section and column on failure.
+fn expectAnalysisMatches(analysis: *const anlz.WaveformColumns, f: *const AnalysisFixture) !void {
+    var failed: ?[]const u8 = null;
+    var bad_index: usize = 0;
+
+    for (analysis.preview_mono, 0..) |col, i| {
+        if ((@as(u8, col.whiteness) << 5) | col.height != f.pwav[i]) {
+            failed = "PWAV";
+            bad_index = i;
+            break;
+        }
+    }
+    if (failed == null) for (analysis.tiny_preview, 0..) |col, i| {
+        if (col.height != f.pwv2[i] or col.unused != 0) {
+            failed = "PWV2";
+            bad_index = i;
+            break;
+        }
+    };
+    if (failed == null) for (analysis.detail_mono, 0..) |col, i| {
+        if ((@as(u8, col.whiteness) << 5) | col.height != f.pwv3[i]) {
+            failed = "PWV3";
+            bad_index = i;
+            break;
+        }
+    };
+    if (failed == null) for (0..1200) |i| {
+        const col = analysis.color_preview[i];
+        const b = f.pwv4[i * 6 ..][0..6];
+        if (col.unknown1 != b[0] or col.unknown2 != b[1] or
+            col.energy_bottom_half_freq != b[2] or col.energy_bottom_third_freq != b[3] or
+            col.energy_mid_third_freq != b[4] or col.energy_top_third_freq != b[5])
+        {
+            failed = "PWV4";
+            bad_index = i;
+            break;
+        }
+    };
+    if (failed == null) for (analysis.color_detail, 0..) |col, i| {
+        if (@as(u16, @bitCast(col)) != f.pwv5[i]) {
+            failed = "PWV5";
+            bad_index = i;
+            break;
+        }
+    };
+    if (failed == null) for (0..1200) |i| {
+        const col = analysis.band3_preview[i];
+        const b = f.pwv6[i * 3 ..][0..3];
+        if (col.energy_mid_third_freq != b[0] or col.energy_top_third_freq != b[1] or
+            col.energy_bottom_third_freq != b[2])
+        {
+            failed = "PWV6";
+            bad_index = i;
+            break;
+        }
+    };
+    if (failed == null) for (0..analysis.band3_detail.len) |i| {
+        const col = analysis.band3_detail[i];
+        const b = f.pwv7[i * 3 ..][0..3];
+        if (col.energy_mid_third_freq != b[0] or col.energy_top_third_freq != b[1] or
+            col.energy_bottom_third_freq != b[2])
+        {
+            failed = "PWV7";
+            bad_index = i;
+            break;
+        }
+    };
+    if (failed) |section| {
+        std.debug.print("analysis mismatch: {s} column {d}\n", .{ section, bad_index });
+        return error.TestExpectedEqual;
+    }
+}
+
+test "analyzePcm reproduces the fixtures byte-for-byte" {
+    // Every fixture under testdata/analysis: small synthesized stereo
+    // signals (silence, DC, sines, boundary tones, an anti-phase track, a
+    // click train, amplitude steps); the .exp files hold the expected
+    // section bytes.
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, "testdata/analysis", .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(alloc);
+    defer walker.deinit();
+
+    var count: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".pcm")) continue;
+
+        const fixture_path = try std.fmt.allocPrint(alloc, "analysis/{s}", .{entry.path});
+        defer alloc.free(fixture_path);
+        var fixture = try AnalysisFixture.read(alloc, fixture_path);
+        defer fixture.deinit(alloc);
+        var analysis = try anlz.analyzePcm(alloc, .{
+            .left = fixture.left,
+            .right = fixture.right,
+        });
+        defer analysis.deinit(alloc);
+        errdefer std.debug.print("failing fixture: {s}\n", .{entry.path});
+        try expectAnalysisMatches(&analysis, &fixture);
+        count += 1;
+    }
+    // One per synthesized signal; keeps a stripped testdata honest.
+    try testing.expectEqual(@as(usize, 11), count);
+}
+
+test "analyzePcm encodes digital silence exactly like the analyzer" {
+    // A short all-zero track reproduces every section's silence encoding.
+    const alloc = testing.allocator;
+    const zeros = [_]f32{0} ** 11025; // 0.25 s
+    var analysis = try anlz.analyzePcm(alloc, .{
+        .left = &zeros,
+        .right = &zeros,
+    });
+    defer analysis.deinit(alloc);
+
+    try testing.expectEqual(@as(usize, 400), analysis.preview_mono.len);
+    for (analysis.preview_mono) |col| {
+        try testing.expectEqual(anlz.Silence.preview_byte, @as(u8, @bitCast(col)));
+    }
+    for (analysis.tiny_preview) |col| {
+        try testing.expectEqual(@as(u8, 1), col.height);
+        try testing.expectEqual(@as(u8, 0), col.unused);
+    }
+    try testing.expectEqual(@as(usize, 38), analysis.detail_mono.len); // ceil(11025/294)
+    for (analysis.detail_mono) |col| {
+        try testing.expectEqual(anlz.Silence.detail_byte, @as(u8, @bitCast(col)));
+    }
+    for (analysis.color_detail) |col| {
+        try testing.expectEqual(anlz.Silence.color_detail_column, @as(u16, @bitCast(col)));
+    }
+    for (analysis.color_preview) |col| {
+        try testing.expectEqual(@as(u8, 0), col.unknown1);
+        try testing.expectEqual(@as(u8, 0), col.unknown2);
+        try testing.expectEqual(@as(u8, 0), col.energy_bottom_half_freq);
+        try testing.expectEqual(@as(u8, 0), col.energy_mid_third_freq);
+    }
+    for (analysis.band3_preview) |col| {
+        try testing.expectEqual(@as(u8, 0), col.energy_mid_third_freq);
+        try testing.expectEqual(@as(u8, 0), col.energy_top_third_freq);
+        try testing.expectEqual(@as(u8, 0), col.energy_bottom_third_freq);
+    }
+    for (analysis.band3_detail) |col| {
+        try testing.expectEqual(@as(u8, 0), col.energy_mid_third_freq);
+    }
+}
+
+test "analyzePcm requires stereo" {
+    const alloc = testing.allocator;
+    const zeros = [_]f32{0} ** 128;
+    try testing.expectError(error.ChannelMismatch, anlz.analyzePcm(alloc, .{
+        .left = &zeros,
+        .right = zeros[0..64],
+    }));
+}
+
+test "PWV2 zero-code rule: 1 when both accumulators are zero, 2 when only band 2 is live" {
+    // A zero band-1 accumulator encodes 1, or 2 when band 2 fired. On
+    // click content band 1 stays under its threshold, so exactly the
+    // spans where band 2 fired read 2 — the clicks fixture has one
+    // (span 53), everything else reads 1.
+    const alloc = testing.allocator;
+    var fixture = try AnalysisFixture.read(alloc, "analysis/clicks.pcm");
+    defer fixture.deinit(alloc);
+    var analysis = try anlz.analyzePcm(alloc, .{
+        .left = fixture.left,
+        .right = fixture.right,
+    });
+    defer analysis.deinit(alloc);
+    try expectAnalysisMatches(&analysis, &fixture);
+
+    var twos: usize = 0;
+    for (analysis.tiny_preview, 0..) |col, i| {
+        if (i == 53) {
+            try testing.expectEqual(@as(u4, 2), col.height);
+            twos += 1;
+        } else {
+            try testing.expectEqual(@as(u4, 1), col.height);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), twos);
+}
+
+test "buildAnlzInput moves the analysis columns into an input" {
+    const alloc = testing.allocator;
+    var fixture = try AnalysisFixture.read(alloc, "analysis/sine440_a05.pcm");
+    defer fixture.deinit(alloc);
+    var columns = try anlz.analyzePcm(alloc, .{
+        .left = fixture.left,
+        .right = fixture.right,
+    });
+    defer columns.deinit(alloc); // moved-from: no-op once buildAnlzInput runs
+    const detail_len = columns.detail_mono.len;
+    const preview_ptr = columns.preview_mono.ptr;
+
+    var input = try anlz.buildAnlzInput(alloc, .{ .sample_rate = 44_100, .sample_count = fixture.n }, &columns);
+    defer input.deinit(alloc);
+
+    // The slices moved, not copied: the columns are empty and the input
+    // owns the same memory.
+    try testing.expectEqual(@as(usize, 0), columns.preview_mono.len);
+    try testing.expectEqual(@as(usize, 0), columns.detail_mono.len);
+    try testing.expectEqual(detail_len, input.detail_mono.?.len);
+    try testing.expectEqual(preview_ptr, input.preview_mono.ptr);
+    try testing.expectEqual(@as(usize, 400), input.preview_mono.len);
+    try testing.expectEqual(@as(usize, 100), input.tiny_preview.len);
+    try testing.expectEqual(@as(usize, 1200), input.color_preview.?.len);
+    try testing.expectEqual(@as(usize, 1200), input.band3_preview.?.len);
+
+    // The input serializes into a well-formed ANLZ set.
+    const dat = try anlz.serializeFile(alloc, &test_file_header_data, &.{
+        .{ .beat_grid = .{} },
+        .{ .cue_list = .{} },
+    });
+    defer alloc.free(dat);
+    try testing.expect(dat.len > 0);
 }
