@@ -1456,11 +1456,11 @@ pub const CreateOptions = struct {
 /// A OneLibrary db opened for writing: `create` builds a fresh export's
 /// db (schema, seeded defaults, the property singleton), `open` attaches
 /// to an existing one, and both write through prepared SQL over the
-/// read-side row models — borrowed input is fine. First-class mutation
-/// is append-only, mirroring the device writer's stance; there is no
-/// update. The schema carries no foreign keys, so no method validates
-/// ids — tree and junction semantics belong to the caller (the device
-/// writer).
+/// read-side row models — borrowed input is fine. Appends are
+/// first-class; `updateAllContents` rewrites whole `content` rows and
+/// `deleteContentCascadeAll` removes a track everywhere it appears. The
+/// schema carries no foreign keys, so no method validates ids — tree and
+/// junction semantics belong to the caller (the device writer).
 pub const Writer = struct {
     db: Db,
 
@@ -1591,6 +1591,62 @@ pub const Writer = struct {
         defer stmt.finalize();
         try stmt.bindInt(1, content_id);
         if ((try stmt.step()) != .done) return error.Sqlite;
+        try maintainNumberOfContents(tx.db);
+        try tx.commit();
+    }
+
+    /// Rewrites many `content` rows by primary key atomically: every
+    /// column of each row is written, so the caller builds the complete
+    /// new row — copy the current one, patch it, pass it here. Any
+    /// failure rolls the whole batch back; a `content_id` no row carries
+    /// updates nothing and is not an error.
+    pub fn updateAllContents(self: Writer, rows: []const Content) SqlError!void {
+        if (rows.len == 0) return;
+        var tx = try Tx.begin(self.db);
+        errdefer tx.deinit();
+        var stmt = try self.db.prepare(comptime updateSql("content", Content));
+        defer stmt.finalize();
+        for (rows) |row| {
+            inline for (@typeInfo(Content).@"struct".fields, 1..) |f, i|
+                try bindCell(stmt, i, @field(row, f.name));
+            // The WHERE key binds last: the primary key again.
+            try bindCell(
+                stmt,
+                @typeInfo(Content).@"struct".fields.len + 1,
+                row.content_id,
+            );
+            if ((try stmt.step()) != .done) return error.Sqlite;
+            try stmt.resetAndClear();
+        }
+        try tx.commit();
+    }
+
+    /// Removes many tracks everywhere they appear, all atomically per
+    /// batch: each `content_id` loses its `content` row plus its junction
+    /// rows in `playlist_content` and `myTag_content` (the schema carries
+    /// no FK, so the deletes are spelled out), and
+    /// `property.numberOfContents` follows the table count. Unlike
+    /// `deleteContent`, which mirrors rbox's leave-the-junctions stance
+    /// for single rows, this is the device writer's cascade for a removed
+    /// track — its junctions name nothing once the content row is gone.
+    pub fn deleteContentCascadeAll(self: Writer, content_ids: []const i64) SqlError!void {
+        if (content_ids.len == 0) return;
+        var tx = try Tx.begin(self.db);
+        errdefer tx.deinit();
+        const sqls = [_][:0]const u8{
+            "DELETE FROM playlist_content WHERE content_id = ?1;",
+            "DELETE FROM myTag_content WHERE content_id = ?1;",
+            "DELETE FROM content WHERE content_id = ?1;",
+        };
+        inline for (sqls) |sql| {
+            var stmt = try self.db.prepare(sql);
+            defer stmt.finalize();
+            for (content_ids) |content_id| {
+                try stmt.bindInt(1, content_id);
+                if ((try stmt.step()) != .done) return error.Sqlite;
+                try stmt.resetAndClear();
+            }
+        }
         try maintainNumberOfContents(tx.db);
         try tx.commit();
     }
@@ -1765,6 +1821,23 @@ fn insertSql(comptime table: []const u8, comptime T: type) [:0]const u8 {
             sql = sql ++ std.fmt.comptimePrint("?{d}", .{i + 1});
         }
         return sql ++ ");";
+    }
+}
+
+/// An `UPDATE ... SET` over every column, keyed by the first field — the
+/// primary key, bound once more after the last column (see
+/// `Writer.updateAllContents`).
+fn updateSql(comptime table: []const u8, comptime T: type) [:0]const u8 {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        const fields = @typeInfo(T).@"struct".fields;
+        var sql: []const u8 = "UPDATE " ++ table ++ " SET ";
+        for (fields, 0..) |f, i| {
+            if (i > 0) sql = sql ++ ", ";
+            sql = sql ++ f.name ++ " = " ++ std.fmt.comptimePrint("?{d}", .{i + 1});
+        }
+        return sql ++ " WHERE " ++ fields[0].name ++
+            " = " ++ std.fmt.comptimePrint("?{d}", .{fields.len + 1}) ++ ";";
     }
 }
 

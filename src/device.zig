@@ -367,8 +367,8 @@ fn loadSettingFile(
     return parsed.data;
 }
 
-/// Error of `DeviceExport.openPdb`: opening the pinned working directory,
-/// reading `export.pdb` off disk, or parsing it.
+/// Error of loading the export's `export.pdb`: opening the pinned working
+/// directory, reading it off disk, or parsing it.
 pub const OpenPdbError =
     std.Io.Dir.ReadFileAllocError ||
     std.Io.Dir.OpenError ||
@@ -394,11 +394,29 @@ pub const CreateError =
     bin.WriteError ||
     error{ExportAlreadyExists};
 
-/// Error of the temp-file-then-rename write `save` performs per file.
+/// Error of the temp-file-then-rename write `writeFileAtomic` (and every
+/// file `save` lands) performs.
 pub const AtomicWriteError =
     std.Io.Dir.CreateFileAtomicError ||
     std.Io.File.Writer.Error ||
     std.Io.Dir.RenameError;
+
+/// Writes `bytes` to `dir`'s `path` through a temp file plus a rename, so
+/// a crash mid-write can never leave a torn file behind — the same write
+/// every `DeviceExport.save` lands through. The write half of the manual
+/// pdb path: `pdb.Database.parse` the image, edit the rows, `serialize`,
+/// then land the result with this.
+pub fn writeFileAtomic(
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    bytes: []const u8,
+) AtomicWriteError!void {
+    var af = try dir.createFileAtomic(io, path, .{ .replace = true });
+    defer af.deinit(io);
+    try af.file.writeStreamingAll(io, bytes);
+    try af.replace(io);
+}
 
 /// Error of `DeviceExport.save`.
 pub const SaveError =
@@ -408,6 +426,7 @@ pub const SaveError =
     std.Io.Dir.CreateDirPathError ||
     AtomicWriteError ||
     std.Io.Dir.DeleteFileError ||
+    RelocateError ||
     ol.Writer.CreateError ||
     ol.SqlError ||
     error{CwdUnavailable};
@@ -435,6 +454,7 @@ pub const OpenOLError =
 pub const OlMirrorError =
     std.Io.Dir.OpenError ||
     std.Io.Dir.AccessError ||
+    OpenOLError ||
     ol.LoadError ||
     std.mem.Allocator.Error ||
     error{ CwdUnavailable, InvalidUtf8, IdSpaceExhausted };
@@ -453,8 +473,9 @@ const track_unknown5: u16 = 41;
 /// handles format quirks (the 221-byte minimum row size, centi-BPM
 /// tempo); when the export carries a OneLibrary db, the same facts
 /// mirror into it. Every slice is borrowed for the call only. Experts
-/// needing fields not exposed here should build a `pdb.Track` row
-/// directly through `openPdb`.
+/// needing fields not exposed here should parse `export.pdb` with
+/// `pdb.Database.parse`, edit the rows, and write the image back
+/// atomically with `writeFileAtomic`.
 pub const TrackInput = struct {
     title: []const u8 = "",
     /// Performing artist name.
@@ -524,12 +545,20 @@ pub const TrackInput = struct {
     /// Whether stored hotcues auto-load on a CDJ; maps to the pdb string
     /// `"ON"` / empty.
     autoload_hotcues: bool = false,
-    /// Pre-computed ANLZ content. When set, the writer queues the
-    /// `ANLZ0000` files for `save` (each sibling only when its section
-    /// set carries data) and stores the device `.DAT` path in
-    /// `analyze_path`. Beats and cues are always caller-provided — the
-    /// library does not do beat detection; see `anlz.buildAnlzInput` for
-    /// assembling one from performance data and waveform columns.
+    /// Whether Rekordbox publishes track information; maps to the pdb
+    /// string `"ON"` / empty. On, the fresh-export convention.
+    publish_track_information: bool = true,
+    /// Date the analysis was performed. Free text, commonly `YYYY-MM-DD`
+    /// (see `release_date`); empty = none.
+    analyze_date: []const u8 = "",
+    /// Pre-computed ANLZ content. Borrowed for the call only: the files
+    /// are serialized right away, so the input may be freed once
+    /// `addTrack` returns. When set, the writer queues the `ANLZ0000`
+    /// files for `save` (each sibling only when its section set carries
+    /// data) and stores the device `.DAT` path in `analyze_path`. Beats
+    /// and cues are always caller-provided — the library does not do
+    /// beat detection; see `anlz.buildAnlzInput` for assembling one from
+    /// performance data and waveform columns.
     analysis: ?*const anlz.AnlzInput = null,
 
     // OneLibrary-only data: columns that exist in `exportLibrary.db`
@@ -601,6 +630,203 @@ pub const PlaylistError =
 /// The tag methods fail for the same reasons as the playlist ones.
 pub const TagError = PlaylistError;
 
+/// Error of the unified track reads (`tracks`, `trackByPath`): opening or
+/// parsing the export's databases, scanning them, or the OL join's read
+/// of `exportLibrary.db`.
+pub const TrackViewError = OpenPdbError || ScanError || OpenOLError;
+
+/// Whether a track view found a OneLibrary counterpart. The pdb row is
+/// the spine either way; `pdb_only` means the export carries no OL db,
+/// or none of its `content` rows join by path.
+pub const TrackSource = enum {
+    pdb_only,
+    pdb_and_ol,
+};
+
+/// A track as a user thinks of it: one pdb Track row — its foreign keys
+/// resolved to names — overlaid with the OL `content` row joined by file
+/// path, when the export carries one. The field vocabulary is
+/// `TrackInput`'s read-side mirror, so what `addTrack` writes is what a
+/// view shows. Fields only the OL side carries are empty/null under
+/// `pdb_only`.
+///
+/// A view's strings are borrowed: from an iterator, until its next
+/// `next` call (dupe what must survive); from `trackByPath`, until the
+/// record's `deinit`.
+pub const TrackView = struct {
+    /// The pdb track id — the export's stable identity for the track.
+    id: u32,
+    title: []const u8,
+    artist: []const u8,
+    album: []const u8,
+    genre: []const u8,
+    /// Musical key, in the spelling the Key row stores.
+    key: []const u8,
+    label: []const u8,
+    composer: []const u8,
+    remixer: []const u8,
+    orig_artist: []const u8,
+    lyricist: []const u8,
+    comment: []const u8,
+    isrc: []const u8,
+    mix_name: []const u8,
+    release_date: []const u8,
+    date_added: []const u8,
+    message: []const u8,
+    /// Device-relative file path (`/Contents/...`); empty when the row
+    /// carries none.
+    file_path: []const u8,
+    filename: []const u8,
+    /// Device path the Artwork row names; empty = none.
+    artwork_device_path: []const u8,
+    /// Tempo in BPM, decoded from the pdb's centi-BPM.
+    tempo_bpm: f32,
+    bitrate: u32,
+    sample_rate: u32,
+    sample_depth: u16,
+    duration_secs: u16,
+    file_size: u32,
+    track_number: u32,
+    disc_number: u16,
+    year: u16,
+    play_count: u16,
+    /// Star rating, 0-5, the pdb byte.
+    rating: u8,
+    color: util.ColorIndex,
+    file_type: pdb.FileType,
+    /// Whether stored hotcues auto-load on a CDJ (the pdb `"ON"` string).
+    autoload_hotcues: bool,
+    /// Whether Rekordbox publishes track information (the pdb `"ON"`
+    /// string).
+    publish_track_information: bool,
+    /// Date the track analysis was performed, empty when the row carries
+    /// none.
+    analyze_date: []const u8,
+    /// Whether the row names an analysis file (`analyze_path` set).
+    has_analysis: bool,
+    source: TrackSource,
+
+    // OL-only fields; empty/null under `pdb_only`.
+
+    subtitle: []const u8 = "",
+    title_for_search: ?[]const u8 = null,
+    kuvo_delivery_on: bool = false,
+    kuvo_delivery_comment: []const u8 = "",
+    date_created: ?[]const u8 = null,
+    cue_update_count: ?i64 = null,
+    analysis_data_update_count: ?i64 = null,
+    information_update_count: ?i64 = null,
+};
+
+/// Field patches for `updateTrack`: `null` leaves the field exactly as
+/// it is, a value replaces it. An empty string is a value — patching
+/// `artist = ""` clears the foreign key, like `addTrack` with no artist.
+/// A non-null `file_path` renames the track — `updateTrack` carries the
+/// analysis relocation the move implies (see its doc).
+pub const TrackPatch = struct {
+    title: ?[]const u8 = null,
+    artist: ?[]const u8 = null,
+    album: ?[]const u8 = null,
+    genre: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    label: ?[]const u8 = null,
+    composer: ?[]const u8 = null,
+    remixer: ?[]const u8 = null,
+    orig_artist: ?[]const u8 = null,
+    comment: ?[]const u8 = null,
+    isrc: ?[]const u8 = null,
+    lyricist: ?[]const u8 = null,
+    mix_name: ?[]const u8 = null,
+    release_date: ?[]const u8 = null,
+    date_added: ?[]const u8 = null,
+    message: ?[]const u8 = null,
+    /// Device-absolute file path (`/Contents/...`) to rename to. The
+    /// row's `filename` follows (the new basename), so it has no patch
+    /// field of its own.
+    file_path: ?[]const u8 = null,
+    artwork_device_path: ?[]const u8 = null,
+    tempo: ?f32 = null,
+    bitrate: ?u32 = null,
+    sample_rate: ?u32 = null,
+    sample_depth: ?u16 = null,
+    duration_secs: ?u16 = null,
+    file_size: ?u32 = null,
+    track_number: ?u32 = null,
+    disc_number: ?u16 = null,
+    year: ?u16 = null,
+    play_count: ?u16 = null,
+    rating: ?u8 = null,
+    color: ?util.ColorIndex = null,
+    file_type: ?pdb.FileType = null,
+    autoload_hotcues: ?bool = null,
+    publish_track_information: ?bool = null,
+    analyze_date: ?[]const u8 = null,
+
+    // OL-only columns, applied when the track joined an OL row. These
+    // patch a value; setting a nullable one back to NULL is not
+    // expressible (the fresh-export shape writes NULL, an update has no
+    // need to).
+
+    subtitle: ?[]const u8 = null,
+    title_for_search: ?[]const u8 = null,
+    kuvo_delivery_on: ?bool = null,
+    kuvo_delivery_comment: ?[]const u8 = null,
+    date_created: ?[]const u8 = null,
+    cue_update_count: ?i64 = null,
+    analysis_data_update_count: ?i64 = null,
+    information_update_count: ?i64 = null,
+};
+
+/// Error of `updateTrack`: the writer state, the row replace, the
+/// dimension resolution, the OL mirror, or — when the patch renames —
+/// the path checks and the collision probe; `UnknownTrack` names an id
+/// no Track row carries.
+pub const UpdateTrackError =
+    WriterStateError ||
+    OlMirrorError ||
+    PathError ||
+    anlz.ParseError ||
+    anlz.WriteError ||
+    pdb.DatabaseModifyError ||
+    pdb.Database.RemoveRowError ||
+    std.Io.Dir.AccessError ||
+    error{
+        UnknownTrack,
+        TooLong,
+        InvalidEncoding,
+        DuplicatePath,
+        InvalidPath,
+        AnalysisPathCollision,
+    };
+
+/// Options of `removeTrack`.
+pub const RemoveTrackOptions = struct {
+    /// Delete the track's analysis directory (`PIONEER/USBANLZ/...`) at
+    /// the next save — after `export.pdb`, best effort. Off by default:
+    /// the directory is kept when another track's path hashes onto it
+    /// (a collision would lose the survivor's analysis).
+    delete_analysis_files: bool = false,
+};
+
+/// Error of `removeTrack`: the writer state, the row removals, or the OL
+/// cascade; `UnknownTrack` names an id no Track row carries.
+pub const RemoveTrackError =
+    WriterStateError ||
+    OlMirrorError ||
+    pdb.DatabaseModifyError ||
+    pdb.Database.RemoveRowError ||
+    PathError ||
+    error{UnknownTrack};
+
+/// Error of the ANLZ relocation pass of `save`.
+pub const RelocateError =
+    std.Io.Dir.ReadFileAllocError ||
+    std.Io.Dir.CreateDirPathError ||
+    AtomicWriteError ||
+    anlz.ParseError ||
+    anlz.WriteError ||
+    PathError;
+
 /// One serialized ANLZ file waiting for the next `save`: the host path it
 /// lands at, plus its image. `addTrack` serializes eagerly so the
 /// caller's `AnlzInput` can go away and `save` only moves bytes.
@@ -611,6 +837,24 @@ const PendingAnlz = struct {
     fn deinit(file: *PendingAnlz, alloc: std.mem.Allocator) void {
         alloc.free(file.path);
         alloc.free(file.image);
+    }
+};
+
+/// One queued ANLZ relocation, keyed by track id: at the next `save`,
+/// every sibling found under `from_dir` is re-serialized — its PPTH path
+/// section naming `device_path` — and written into `to_dir`; after
+/// `export.pdb` lands, `from_dir` goes away best-effort. `from_dir ==
+/// to_dir` (the two paths hash onto one directory) means only the PPTH
+/// rewrite, in place.
+const AnlzRelocation = struct {
+    from_dir: []u8,
+    to_dir: []u8,
+    device_path: []u8,
+
+    fn deinit(rel: *AnlzRelocation, alloc: std.mem.Allocator) void {
+        alloc.free(rel.from_dir);
+        alloc.free(rel.to_dir);
+        alloc.free(rel.device_path);
     }
 };
 
@@ -627,9 +871,9 @@ fn captureCwd(alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
 
 /// A handle to a Rekordbox device export on disk: the setting files and
 /// the pdb database, located through `Layout`. `open` points the handle
-/// at an existing export (reading; the `openPdb` escape hatch edits),
-/// `create` builds a fresh one in memory. `save` is the only call that
-/// writes; `deinit` discards whatever was never saved. Files the export
+/// at an existing export, `create` builds a fresh one in memory. `save`
+/// is the only call that writes; `deinit` discards whatever was never
+/// saved. Files the export
 /// carries but the handle does not model are ignored by design:
 /// `djprofile.nxs` (undocumented). The OneLibrary db
 /// (`exportLibrary.db`, newer exports) is read through `openOL`
@@ -671,6 +915,12 @@ pub const DeviceExport = struct {
     /// The OneLibrary db write side: rows mirrored by the mutating
     /// methods, buffered until `save` materializes them.
     ol_state: OlState = .unloaded,
+    /// ANLZ relocations queued by `updateTrack`'s rename, keyed by track id and
+    /// landed by the next `save` (see `AnlzRelocation`).
+    relocations: std.AutoHashMapUnmanaged(u32, AnlzRelocation) = .empty,
+    /// Analysis directories queued by `removeTrack` for deletion at the
+    /// next save, after `export.pdb` lands (best effort).
+    pending_dir_deletes: std.ArrayListUnmanaged([]u8) = .empty,
 
     const PdbState = union(enum) {
         /// An export opened at `root`; the pdb parses on first touch.
@@ -680,7 +930,8 @@ pub const DeviceExport = struct {
     };
 
     /// Lifecycle of the `exportLibrary.db` models, loaded on first
-    /// `openOL` call and cached for the handle's life.
+    /// `openOL` call and cached until the next `save` — which drops it,
+    /// the snapshot naming the pre-save disk — or `deinit`.
     const OlLibraryState = union(enum) {
         /// Not examined yet; the first call checks the disk.
         unloaded,
@@ -841,6 +1092,11 @@ pub const DeviceExport = struct {
         if (e.writer_state) |*state| state.deinit();
         for (e.pending_anlz.items) |*file| file.deinit(e.alloc);
         e.pending_anlz.deinit(e.alloc);
+        var rel = e.relocations.iterator();
+        while (rel.next()) |entry| entry.value_ptr.deinit(e.alloc);
+        e.relocations.deinit(e.alloc);
+        for (e.pending_dir_deletes.items) |dir| e.alloc.free(dir);
+        e.pending_dir_deletes.deinit(e.alloc);
         if (e.dir_path) |path| e.alloc.free(path);
         if (e.dir) |dir| dir.close(e.io);
     }
@@ -871,10 +1127,12 @@ pub const DeviceExport = struct {
         return settings;
     }
 
-    /// The export's database, parsing it off disk on first call. Also the
-    /// escape hatch for row surgery: edits made here bypass the writer's
-    /// id counters and dedup maps and reach the disk at the next `save`.
-    pub fn openPdb(e: *DeviceExport) OpenPdbError!*pdb.Database {
+    /// The export's database, parsing it off disk on first call. Private:
+    /// handing the handle-owned `Database` out would let edits bypass the
+    /// writer's id counters and dedup maps (silently colliding ids on the
+    /// next mutating call). Fields the typed methods don't expose belong
+    /// on the manual path: parse, edit, `writeFileAtomic`.
+    fn openPdb(e: *DeviceExport) OpenPdbError!*pdb.Database {
         switch (e.pdb_state) {
             .loaded => |*db| return db,
             .unloaded => {
@@ -901,9 +1159,89 @@ pub const DeviceExport = struct {
         return getPlaylistsDb(e.alloc, try e.openPdb());
     }
 
+    /// Iterates the export's tracks as `TrackView`s — one per pdb Track
+    /// row, foreign keys resolved to names, the OL counterpart joined by
+    /// file path when the export carries one. A view's strings live
+    /// until the iterator's next `next` call; dupe what must outlive it.
+    /// Mutating the export invalidates the iterator — finish iterating
+    /// first.
+    pub fn tracks(e: *DeviceExport) TrackViewError!TrackIter {
+        const db = try e.openPdb();
+        var dim_arena = std.heap.ArenaAllocator.init(e.alloc);
+        errdefer dim_arena.deinit();
+        const dims = try TrackDimensions.build(e, dim_arena.allocator());
+        return .{
+            .e = e,
+            .dim_arena = dim_arena,
+            .view_arena = std.heap.ArenaAllocator.init(e.alloc),
+            .dims = dims,
+            .it = try db.rows(.tracks),
+        };
+    }
+
+    /// The track ids of `playlist_id`'s entries, ordered by `entry_index`
+    /// — the order the player shows them in. A folder, or an id the
+    /// export does not carry, yields an empty slice. The caller owns the
+    /// slice.
+    pub fn getPlaylistTrackIds(
+        e: *DeviceExport,
+        alloc: std.mem.Allocator,
+        playlist_id: u32,
+    ) WriterStateError![]u32 {
+        const db = try e.openPdb();
+        const Entry = struct { index: u32, track_id: u32 };
+        var entries = std.ArrayList(Entry).empty;
+        defer entries.deinit(alloc);
+        var it = (try rowsOrEmpty(db, .playlist_entries)) orelse return &.{};
+        while (try it.next()) |row| switch (row.*) {
+            .playlist_entry => |entry| {
+                if (entry.playlist_id == playlist_id)
+                    try entries.append(alloc, .{
+                        .index = entry.entry_index,
+                        .track_id = entry.track_id,
+                    });
+            },
+            else => {},
+        };
+        std.mem.sort(Entry, entries.items, {}, struct {
+            fn before(_: void, a: Entry, b: Entry) bool {
+                return a.index < b.index;
+            }
+        }.before);
+        const ids = try alloc.alloc(u32, entries.items.len);
+        for (entries.items, ids) |entry, *id| id.* = entry.track_id;
+        return ids;
+    }
+
+    /// The track view for `path` (device-root-absolute, e.g.
+    /// `/Contents/Artist - Title.mp3`), or null when no track carries
+    /// it. Unlike an iterator's view, the record owns its strings — call
+    /// `deinit` when done.
+    pub fn trackByPath(e: *DeviceExport, path: []const u8) TrackViewError!?TrackRecord {
+        const db = try e.openPdb();
+        const arena = try e.alloc.create(std.heap.ArenaAllocator);
+        errdefer e.alloc.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(e.alloc);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const dims = try TrackDimensions.build(e, a);
+        var it = try db.rows(.tracks);
+        while (try it.next()) |row| {
+            const file_path = try decodeOrEmpty(row.track.offsets.inner.file_path, a);
+            if (std.mem.eql(u8, file_path, path))
+                return .{ .arena = arena, .view = try fillTrackView(e, &dims, a, row.track) };
+        }
+        arena.deinit();
+        e.alloc.destroy(arena);
+        return null;
+    }
+
     /// The export's OneLibrary db (`exportLibrary.db`, carried by newer
-    /// exports), loaded on first call and cached until `deinit`; null when
-    /// the export carries none. The join to the pdb side is by path:
+    /// exports), loaded on first call and cached; null when the export
+    /// carries none. `save` drops the cache — it names the pre-save disk —
+    /// so the returned pointer is valid until the next `save` or `deinit`,
+    /// and a later call reloads from disk. The join to the pdb side is by
+    /// path:
     /// `content.path` values are the device-root-absolute file paths the
     /// pdb Track rows store, so `lib.contentByPath(file_path)` hands back
     /// the OL view of a track — including the fields the pdb lacks
@@ -1143,14 +1481,27 @@ pub const DeviceExport = struct {
             .analysisDataUpdateCount = track.analysis_data_update_count,
             .informationUpdateCount = track.information_update_count,
         });
+        // Adds bridge by construction: the content row carries the pdb
+        // track's id (the fixture's lockstep convention).
+        try store.content_bridge.put(a, row.id, row.id);
+    }
+
+    /// A read-only view of the writer's cached scan of the export —
+    /// id counters and dedup maps, for introspection. The view stays
+    /// valid for the handle's life; its contents move as the handle
+    /// mutates. Mutation deliberately stays with the handle: edits
+    /// through a mutable pointer would desync the counters and maps
+    /// from the database (colliding ids, broken dedup) with no check
+    /// at `save`.
+    pub fn writerState(e: *DeviceExport) WriterStateError!*const WriterState {
+        return try e.writerStateMut();
     }
 
     /// The writer's cached scan of the export, built on first use
     /// (loading the pdb first if needed). The mutating methods call
     /// this before they touch the database, so read-only sessions
-    /// never pay for it. Rows added through the `openPdb` escape
-    /// hatch after the state was built are invisible to it.
-    pub fn writerState(e: *DeviceExport) WriterStateError!*WriterState {
+    /// never pay for it.
+    fn writerStateMut(e: *DeviceExport) WriterStateError!*WriterState {
         if (e.writer_state == null) {
             const db = try e.openPdb();
             e.writer_state = try scanWriterState(e.alloc, db);
@@ -1182,7 +1533,7 @@ pub const DeviceExport = struct {
     /// insert leaves the pdb side complete with the OL side partially
     /// pending (same risk class; the next `save` lands what pends).
     pub fn addTrack(e: *DeviceExport, track: TrackInput) AddTrackError!AddTrackOutcome {
-        const state = try e.writerState();
+        const state = try e.writerStateMut();
         if (track.file_path.len > 0) {
             if (state.tracks_by_path.get(track.file_path)) |id|
                 return .{ .id = id, .is_new = false };
@@ -1249,6 +1600,307 @@ pub const DeviceExport = struct {
         return .{ .id = track_id, .is_new = true };
     }
 
+    /// Updates track `id` with the non-null fields of `patch`; null
+    /// fields are left exactly as they are — including the row's unknown
+    /// constants (`bitmask`, `unknown5`, …), which a patch never touches,
+    /// unlike a fresh `addTrack` row. Dimension fields resolve like
+    /// `addTrack`'s: a new artist/album/genre/key/label/artwork name
+    /// creates its row under a fresh id, and the old dimension row stays
+    /// behind (unreferenced, ignored by players). An empty string is a
+    /// value — `artist = ""` clears the foreign key.
+    ///
+    /// A non-null `file_path` renames the track to it — the
+    /// device-absolute `/Contents/...` form; a path the row already
+    /// carries is a no-op on the path side (the other fields still
+    /// patch). The rename moves everything derived from the path (see
+    /// `pathHash`): the pdb row's `file_path`, `filename` (the new
+    /// basename), and `analyze_path`; the OL row's `path`, `fileName`,
+    /// and `analysisDataFilePath`; and the analysis files themselves,
+    /// relocated at the next `save` into the directory players compute
+    /// from the new path, each sibling's PPTH section rewritten —
+    /// players recompute the location from the path hash and ignore
+    /// `analyze_path`, so relocation is not optional. Placing the audio
+    /// file at the new location is the caller's; the library never
+    /// touches `Contents`. The old analysis directory outlives the
+    /// relocation until the new `export.pdb` has landed, then goes away
+    /// best-effort: a crash mid-save leaves the old index naming a
+    /// directory still populated. Renaming onto another track's path is
+    /// a `DuplicatePath`, a path without the leading device-root slash
+    /// an `InvalidPath`, and a target directory another track's analysis
+    /// already occupies an `AnalysisPathCollision` — two paths sharing
+    /// one directory is real, per the modulo in `pathHash`, and the
+    /// caller must pick another path: clobbering would destroy the
+    /// other track's analysis.
+    ///
+    /// When the export carries a OneLibrary db and the track joined a
+    /// `content` row, the mirrored columns move with the patch and the
+    /// OL-only fields (`subtitle`, the KUVO pair, the update counts)
+    /// patch the OL row directly. A track with no OL row is patched on
+    /// the pdb side only.
+    ///
+    /// Ordering follows `addTrack`'s discipline: caller data that can
+    /// fail (string encoding) fails before anything is mutated. The
+    /// dimension inserts come before the track row lands, so a failure
+    /// between them can orphan dimension rows — the same residual risk,
+    /// unrecovered and harmless to players. The replace itself inserts
+    /// the new row before removing the old, so a failure cannot lose
+    /// the track.
+    pub fn updateTrack(e: *DeviceExport, id: u32, patch: TrackPatch) UpdateTrackError!void {
+        // The path coordinate is device-absolute.
+        if (patch.file_path) |p| {
+            if (p.len == 0 or p[0] != '/')
+                return error.InvalidPath;
+            _ = std.unicode.Utf8View.init(p) catch return error.InvalidPath;
+        }
+
+        const state = try e.writerStateMut();
+        try e.primeOlStore();
+        const old = (try e.findTrackRow(id)) orelse return error.UnknownTrack;
+        const old_path = try decodedFilePath(e, old);
+        defer if (old_path) |p| e.alloc.free(p);
+        const db = try e.openPdb();
+        const a = db.arena.allocator();
+
+        // A rename: a new path that differs from the one the row
+        // carries. Its checks run while the old path still names the
+        // row, before anything is mutated.
+        const rename: ?[]const u8 = blk: {
+            const np = patch.file_path orelse break :blk null;
+            if (old_path) |p| {
+                if (std.mem.eql(u8, p, np)) break :blk null;
+            }
+            break :blk np;
+        };
+        if (rename) |np| {
+            if (state.tracks_by_path.get(np)) |other| {
+                if (other != id) return error.DuplicatePath;
+            }
+        }
+
+        // Where the analysis lives now and where the new path puts it.
+        // An undecodable old path has no locatable analysis: the row
+        // still renames, the files are left where they are.
+        const old_hash: ?PathHash = if (old_path) |p|
+            pathHash(p) catch null
+        else
+            null;
+        if (rename != null and old_hash != null) {
+            const new_hash = try pathHash(rename.?);
+            const dirs_change = old_hash.?.p_value != new_hash.p_value or
+                old_hash.?.hash != new_hash.hash;
+            if (dirs_change) {
+                const dir = try e.dirHandle();
+                const target = try e.layout.anlzDatFile(e.alloc, rename.?);
+                defer e.alloc.free(target);
+                if (dir.access(e.io, target, .{})) |_| {
+                    return error.AnalysisPathCollision;
+                } else |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                }
+            }
+        }
+
+        // Caller data fails here or never: every changed string encodes
+        // before anything is mutated.
+        const ps = try encodePatchedStrings(a, patch);
+        const file_path_str: ?pdb.DeviceSQLString = if (rename) |np|
+            try pdb.DeviceSQLString.fromUtf8(a, np)
+        else
+            null;
+        const filename_str: ?pdb.DeviceSQLString = if (rename) |np|
+            try pdb.DeviceSQLString.fromUtf8(a, std.fs.path.basename(np))
+        else
+            null;
+        const analyze_str: ?pdb.DeviceSQLString =
+            if (rename != null and !strEmpty(old.offsets.inner.analyze_path))
+                try pdb.DeviceSQLString.fromUtf8(a, try anlzDevicePath(a, rename.?))
+            else
+                null;
+
+        var ids = PatchDimensionIds{
+            .artist = old.artist_id,
+            .album = old.album_id,
+            .genre = old.genre_id,
+            .key = old.key_id,
+            .label = old.label_id,
+            .composer = old.composer_id,
+            .remixer = old.remixer_id,
+            .orig_artist = old.orig_artist_id,
+            .artwork = old.artwork_id,
+        };
+        if (patch.artist) |name| ids.artist = try getOrCreateArtist(state, db, name);
+        if (patch.album) |name| ids.album = try getOrCreateAlbum(state, db, name, ids.artist);
+        if (patch.genre) |name| ids.genre = try getOrCreateGenre(state, db, name);
+        if (patch.key) |name| ids.key = try getOrCreateKey(state, db, name);
+        if (patch.label) |name| ids.label = try getOrCreateLabel(state, db, name);
+        if (patch.composer) |name| ids.composer = try getOrCreateArtist(state, db, name);
+        if (patch.remixer) |name| ids.remixer = try getOrCreateArtist(state, db, name);
+        if (patch.orig_artist) |name| ids.orig_artist = try getOrCreateArtist(state, db, name);
+        if (patch.artwork_device_path) |path| ids.artwork = try getOrCreateArtwork(state, db, path);
+
+        const boxed = try a.create(pdb.Track);
+        boxed.* = old.*;
+        if (ps.title) |s| boxed.offsets.inner.title = s;
+        if (ps.comment) |s| boxed.offsets.inner.comment = s;
+        if (ps.isrc) |s| boxed.offsets.inner.isrc = s;
+        if (ps.lyricist) |s| boxed.offsets.inner.lyricist = s;
+        if (ps.mix_name) |s| boxed.offsets.inner.mix_name = s;
+        if (ps.release_date) |s| boxed.offsets.inner.release_date = s;
+        if (ps.date_added) |s| boxed.offsets.inner.date_added = s;
+        if (ps.message) |s| boxed.offsets.inner.message = s;
+        if (ps.autoload_hotcues) |s| boxed.offsets.inner.autoload_hotcues = s;
+        if (ps.publish_track_information) |s| boxed.offsets.inner.publish_track_information = s;
+        if (ps.analyze_date) |s| boxed.offsets.inner.analyze_date = s;
+        if (patch.tempo) |bpm| boxed.tempo = std.math.lossyCast(u32, @round(bpm * 100.0));
+        if (patch.bitrate) |v| boxed.bitrate = v;
+        if (patch.sample_rate) |v| boxed.sample_rate = v;
+        if (patch.sample_depth) |v| boxed.sample_depth = v;
+        if (patch.duration_secs) |v| boxed.duration = v;
+        if (patch.file_size) |v| boxed.file_size = v;
+        if (patch.track_number) |v| boxed.track_number = v;
+        if (patch.disc_number) |v| boxed.disc_number = v;
+        if (patch.year) |v| boxed.year = v;
+        if (patch.play_count) |v| boxed.play_count = v;
+        if (patch.rating) |v| boxed.rating = v;
+        if (patch.color) |v| boxed.color = v;
+        if (patch.file_type) |v| boxed.file_type = v;
+        if (file_path_str) |s| boxed.offsets.inner.file_path = s;
+        if (filename_str) |s| boxed.offsets.inner.filename = s;
+        if (analyze_str) |s| boxed.offsets.inner.analyze_path = s;
+        boxed.artist_id = ids.artist;
+        boxed.album_id = ids.album;
+        boxed.genre_id = ids.genre;
+        boxed.key_id = ids.key;
+        boxed.label_id = ids.label;
+        boxed.composer_id = ids.composer;
+        boxed.remixer_id = ids.remixer;
+        boxed.orig_artist_id = ids.orig_artist;
+        boxed.artwork_id = ids.artwork;
+        try pdb.padTrackCommentToMinimum(boxed, a);
+
+        // Add before remove: a failure past the add cannot lose the
+        // track, and the id stays taken either way.
+        var row_union = pdb.Row{ .track = boxed };
+        _ = try db.addRow(&row_union);
+        try db.removeRow(.tracks, @ptrCast(old));
+
+        if (rename) |np| {
+            // The dedup index follows the coordinate it keys on.
+            if (old_path) |p| {
+                if (p.len > 0) {
+                    if (state.tracks_by_path.get(p)) |mapped| {
+                        if (mapped == id) _ = state.tracks_by_path.remove(p);
+                    }
+                }
+            }
+            {
+                const sa = state.arena.allocator();
+                const owned = try sa.dupe(u8, np);
+                try state.tracks_by_path.ensureUnusedCapacity(sa, 1);
+                state.tracks_by_path.putAssumeCapacity(owned, id);
+            }
+
+            // The analysis: queued images retarget in memory, files on
+            // disk get a relocation the next `save` lands. Same hash
+            // directory means a relocation onto itself — the PPTH
+            // rewrite only.
+            if (old_path != null and old_hash != null) {
+                try e.retargetPendingAnlz(old_path.?, np);
+                const from_dir = try e.layout.anlzDir(e.alloc, old_path.?);
+                errdefer e.alloc.free(from_dir);
+                const to_dir = try e.layout.anlzDir(e.alloc, np);
+                errdefer e.alloc.free(to_dir);
+                const device_path = try e.alloc.dupe(u8, np);
+                errdefer e.alloc.free(device_path);
+                if (e.relocations.getPtr(id)) |rel| {
+                    e.alloc.free(rel.to_dir);
+                    e.alloc.free(rel.device_path);
+                    rel.to_dir = to_dir;
+                    rel.device_path = device_path;
+                    e.alloc.free(from_dir);
+                } else {
+                    try e.relocations.put(e.alloc, id, .{
+                        .from_dir = from_dir,
+                        .to_dir = to_dir,
+                        .device_path = device_path,
+                    });
+                }
+            }
+        }
+
+        if (old_path) |p|
+            try e.mirrorTrackUpdate(id, p, boxed, patch, ids, rename);
+    }
+
+    /// Removes track `id` from the export: the Track row, its playlist
+    /// entries, and its tag junctions go; the OneLibrary side follows —
+    /// a pending mirror row is dropped, a disk `content` row is
+    /// cascade-deleted (with its junction rows) at the next `save`.
+    /// Every reference goes with the cascade, so the id is free again
+    /// after a reopen (the writer's scan is max-based, like the format's
+    /// own writers); within the session the counters stay past it.
+    /// With `delete_analysis_files`, the analysis directory goes too at
+    /// the next save — unless another track's path hashes onto it.
+    /// Orphaned dimension rows (an artist no remaining track names) stay
+    /// behind, like `addTrack`'s failure residue: unreferenced, ignored
+    /// by players.
+    pub fn removeTrack(
+        e: *DeviceExport,
+        id: u32,
+        options: RemoveTrackOptions,
+    ) RemoveTrackError!void {
+        const state = try e.writerStateMut();
+        try e.primeOlStore();
+        if (!state.track_ids.contains(id)) return error.UnknownTrack;
+        const old = (try e.findTrackRow(id)) orelse return error.UnknownTrack;
+        const db = try e.openPdb();
+        const old_path = try decodedFilePath(e, old);
+        defer if (old_path) |p| e.alloc.free(p);
+
+        // The OL cascade resolves by the path the track still carries.
+        try e.removeOlTrack(id, old_path);
+
+        try e.removeRowsMatching(
+            db,
+            .playlist_entries,
+            TrackIdMatch{ .id = id },
+            playlistEntryNamesTrack,
+        );
+        try e.ensureExtLoaded();
+        if (e.ext_pdb_state == .loaded) {
+            const track_tag_page: pdb.PageType =
+                @enumFromInt(@intFromEnum(pdb.ExtPageType.track_tag));
+            try e.removeRowsMatching(
+                &e.ext_pdb_state.loaded,
+                track_tag_page,
+                TrackIdMatch{ .id = id },
+                trackTagNamesTrack,
+            );
+        }
+        try db.removeRow(.tracks, @ptrCast(old));
+
+        _ = state.track_ids.remove(id);
+        if (old_path) |p| {
+            if (state.tracks_by_path.get(p)) |mapped| {
+                if (mapped == id) _ = state.tracks_by_path.remove(p);
+            }
+            try e.dropPendingAnlzFor(p);
+        }
+
+        // A rename that never saved leaves a queued relocation behind;
+        // its source directory may hold files an earlier save landed.
+        if (e.relocations.fetchRemove(id)) |kv| {
+            var rel = kv.value;
+            if (options.delete_analysis_files)
+                try e.queueDirDeleteIfUnused(state, id, rel.from_dir);
+            rel.deinit(e.alloc);
+        }
+        if (options.delete_analysis_files) {
+            if (old_path) |p| try e.queueAnlzDirDelete(state, id, p);
+        }
+    }
+
     /// Builds the Track row for `track` in the database's arena — every
     /// string encoded, the device-derived constants set, and `comment`
     /// grown past the 221-byte CDJ minimum — allocating no ids and
@@ -1297,7 +1949,10 @@ pub const DeviceExport = struct {
                     .unknown_string2 = try pdb.DeviceSQLString.fromUtf8(a, "1"),
                     .unknown_string3 = try pdb.DeviceSQLString.fromUtf8(a, "1"),
                     .message = try pdb.DeviceSQLString.fromUtf8(a, track.message),
-                    .publish_track_information = try pdb.DeviceSQLString.fromUtf8(a, "ON"),
+                    .publish_track_information = if (track.publish_track_information)
+                        try pdb.DeviceSQLString.fromUtf8(a, "ON")
+                    else
+                        pdb.DeviceSQLString.empty(),
                     .autoload_hotcues = if (track.autoload_hotcues)
                         try pdb.DeviceSQLString.fromUtf8(a, "ON")
                     else
@@ -1306,6 +1961,7 @@ pub const DeviceExport = struct {
                     .release_date = try pdb.DeviceSQLString.fromUtf8(a, track.release_date),
                     .mix_name = try pdb.DeviceSQLString.fromUtf8(a, track.mix_name),
                     .analyze_path = analyze_path,
+                    .analyze_date = try pdb.DeviceSQLString.fromUtf8(a, track.analyze_date),
                     .comment = try pdb.DeviceSQLString.fromUtf8(a, track.comment),
                     .title = try pdb.DeviceSQLString.fromUtf8(a, track.title),
                     .filename = try pdb.DeviceSQLString.fromUtf8(a, track.filename),
@@ -1448,6 +2104,333 @@ pub const DeviceExport = struct {
             .two_ex => try e.layout.anlz2exFile(e.alloc, file_path),
         };
         return .{ .path = path, .image = image };
+    }
+
+    /// The Track row of `id`, or null when the export carries none. The
+    /// returned pointer is the row's boxed payload — arena-stable across
+    /// row-list shifts, and the identity `pdb.Database.removeRow` wants.
+    fn findTrackRow(e: *DeviceExport, id: u32) WriterStateError!?*pdb.Track {
+        const db = try e.openPdb();
+        var it = try db.rows(.tracks);
+        while (try it.next()) |row| {
+            if (row.track.id == id) return row.track;
+        }
+        return null;
+    }
+
+    /// The decoded device file path of `row`, or null when it does not
+    /// decode — the OL join and the path-keyed state have no key for it.
+    /// The caller frees.
+    fn decodedFilePath(e: *DeviceExport, row: *const pdb.Track) error{OutOfMemory}!?[]u8 {
+        return row.offsets.inner.file_path.utf8(e.alloc) catch |err| switch (err) {
+            error.InvalidEncoding => null,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    }
+
+    /// Locates the OL `content` row joined to pdb track `track_id` whose
+    /// pdb file path is `path`: the recorded bridge first (a rename has
+    /// already moved the path on), then pending inserts and queued
+    /// updates by path, then the loaded library by path. Every hit
+    /// records the bridge, so the next resolution survives a later path
+    /// change. An export without an OL db resolves nothing.
+    fn olContentRefForTrack(
+        e: *DeviceExport,
+        track_id: u32,
+        path: []const u8,
+    ) OlMirrorError!?OlContentRef {
+        const store = (try e.olStore()) orelse return null;
+
+        if (store.content_bridge.get(track_id)) |content_id| {
+            if (try contentRefById(e, store, content_id)) |ref| return ref;
+        }
+        if (path.len == 0) return null;
+        for (store.contents.items, 0..) |*c, i| {
+            if (std.mem.eql(u8, c.path orelse "", path)) {
+                try recordBridge(store, track_id, c.content_id);
+                return .{ .pending = i };
+            }
+        }
+        for (store.content_updates.items, 0..) |*c, i| {
+            if (std.mem.eql(u8, c.path orelse "", path)) {
+                try recordBridge(store, track_id, c.content_id);
+                return .{ .queued_update = i };
+            }
+        }
+        if (ol.mode != .off) {
+            const lib = (try e.openOL()) orelse return null;
+            if (lib.contentByPath(path)) |c| {
+                try recordBridge(store, track_id, c.content_id);
+                return .{ .disk = c };
+            }
+        }
+        return null;
+    }
+
+    /// The OL content row of `content_id` wherever it lives — pending,
+    /// queued for update, or on disk in the cached library.
+    fn contentRefById(
+        e: *DeviceExport,
+        store: *OlStore,
+        content_id: i64,
+    ) OlMirrorError!?OlContentRef {
+        for (store.contents.items, 0..) |*c, i| {
+            if (c.content_id == content_id) return .{ .pending = i };
+        }
+        for (store.content_updates.items, 0..) |*c, i| {
+            if (c.content_id == content_id) return .{ .queued_update = i };
+        }
+        if (ol.mode != .off) {
+            const lib = (try e.openOL()) orelse return null;
+            if (lib.byId(ol.Content, content_id)) |c| return .{ .disk = c };
+        }
+        return null;
+    }
+
+    /// Lands a `TrackPatch` on the OL side: the joined content row moves
+    /// only where the patch says, so a diverged db keeps its own values
+    /// elsewhere — and a rename (`rename` non-null) first moves the
+    /// row's `path`, `fileName`, and `analysisDataFilePath` to the new
+    /// path. A disk row queues a whole-row update (its current values
+    /// copied and patched); pending rows and queued updates mutate in
+    /// place.
+    fn mirrorTrackUpdate(
+        e: *DeviceExport,
+        track_id: u32,
+        old_path: []const u8,
+        new_row: *const pdb.Track,
+        patch: TrackPatch,
+        ids: PatchDimensionIds,
+        rename: ?[]const u8,
+    ) OlMirrorError!void {
+        const store = (try e.olStore()) orelse return;
+        const ref = (try e.olContentRefForTrack(track_id, old_path)) orelse return;
+        const sa = store.arena.allocator();
+
+        const moveRow = struct {
+            fn move(c: *ol.Content, a: std.mem.Allocator, new_path: []const u8, row: *const pdb.Track) OlMirrorError!void {
+                c.path = try a.dupe(u8, new_path);
+                c.fileName = try a.dupe(u8, std.fs.path.basename(new_path));
+                if (!strEmpty(row.offsets.inner.analyze_path))
+                    c.analysisDataFilePath = try anlzDevicePath(a, new_path);
+            }
+        }.move;
+
+        switch (ref) {
+            .pending => |i| {
+                if (rename) |np| try moveRow(&store.contents.items[i], sa, np, new_row);
+                try applyTrackPatchToContent(store, &store.contents.items[i], new_row, patch, ids);
+            },
+            .queued_update => |i| {
+                if (rename) |np| try moveRow(&store.content_updates.items[i], sa, np, new_row);
+                try applyTrackPatchToContent(store, &store.content_updates.items[i], new_row, patch, ids);
+            },
+            .disk => |c| {
+                var copy = try dupeContent(sa, c);
+                if (rename) |np| try moveRow(&copy, sa, np, new_row);
+                try applyTrackPatchToContent(store, &copy, new_row, patch, ids);
+                try queueContentUpdate(store, copy);
+            },
+        }
+    }
+
+    /// The OL half of a track removal: the joined content row goes — a
+    /// pending insert is dropped, a queued update is unqueued, a disk row
+    /// is queued for the cascade delete — and the pending junction rows
+    /// naming it never land.
+    fn removeOlTrack(
+        e: *DeviceExport,
+        track_id: u32,
+        old_path: ?[]const u8,
+    ) OlMirrorError!void {
+        const store = (try e.olStore()) orelse return;
+        const path = old_path orelse return;
+        const ref = (try e.olContentRefForTrack(track_id, path)) orelse return;
+        const content_id = switch (ref) {
+            .pending => |i| store.contents.items[i].content_id,
+            .queued_update => |i| store.content_updates.items[i].content_id,
+            .disk => |c| c.content_id,
+        };
+        _ = store.content_bridge.remove(track_id);
+
+        dropJunctionsForContent(&store.playlist_pairs, content_id);
+        dropJunctionsForContent(&store.my_tag_pairs, content_id);
+
+        switch (ref) {
+            .pending => |i| _ = store.contents.orderedRemove(i),
+            .queued_update => |i| {
+                _ = store.content_updates.orderedRemove(i);
+                try queueContentDelete(store, content_id);
+            },
+            .disk => try queueContentDelete(store, content_id),
+        }
+    }
+
+    /// Removes every row of `page_type`'s table that `matches` selects,
+    /// collecting the payload pointers first — removal shifts the row
+    /// list, but the boxed payloads are arena-stable (see
+    /// `pdb.Database.removeRow`). A table the database does not carry
+    /// removes nothing.
+    fn removeRowsMatching(
+        e: *DeviceExport,
+        db: *pdb.Database,
+        page_type: pdb.PageType,
+        ctx: TrackIdMatch,
+        comptime matches: fn (TrackIdMatch, *const pdb.Row) bool,
+    ) RemoveTrackError!void {
+        var it = (try rowsOrEmpty(db, page_type)) orelse return;
+        var payloads = std.ArrayList(*const anyopaque).empty;
+        defer payloads.deinit(e.alloc);
+        while (try it.next()) |row| {
+            if (matches(ctx, row)) try payloads.append(e.alloc, rowPayloadKey(row));
+        }
+        for (payloads.items) |payload| try db.removeRow(page_type, payload);
+    }
+
+    /// Drops every queued ANLZ image of the track at `audio_path` — a
+    /// track removed before its first save leaves nothing on disk.
+    fn dropPendingAnlzFor(e: *DeviceExport, audio_path: []const u8) PathError!void {
+        const siblings = try e.anlzSiblingHostPaths(audio_path);
+        defer for (&siblings) |*slot| {
+            if (slot.*) |p| e.alloc.free(p);
+        };
+        var i: usize = 0;
+        while (i < e.pending_anlz.items.len) {
+            const found = for (siblings) |slot| {
+                if (slot) |p| {
+                    if (std.mem.eql(u8, e.pending_anlz.items[i].path, p)) break true;
+                }
+            } else false;
+            if (found) {
+                var file = e.pending_anlz.orderedRemove(i);
+                file.deinit(e.alloc);
+            } else i += 1;
+        }
+    }
+
+    /// Rewrites the PPTH path section of every queued ANLZ image of the
+    /// track at `old_path` and retargets its host path to the new hash
+    /// directory — a track queued this session has nothing on disk to
+    /// move.
+    fn retargetPendingAnlz(
+        e: *DeviceExport,
+        old_path: []const u8,
+        new_path: []const u8,
+    ) (anlz.ParseError || anlz.WriteError || PathError)!void {
+        const siblings = try e.anlzSiblingHostPaths(old_path);
+        defer for (&siblings) |*slot| {
+            if (slot.*) |p| e.alloc.free(p);
+        };
+        for (e.pending_anlz.items) |*file| {
+            const is_ours = for (siblings) |slot| {
+                if (slot) |p| {
+                    if (std.mem.eql(u8, file.path, p)) break true;
+                }
+            } else false;
+            if (!is_ours) continue;
+
+            const image = try e.retargetAnlzImage(file.image, new_path);
+            e.alloc.free(file.image);
+            file.image = image;
+            const new_host = try e.anlzHostPathFor(new_path, std.fs.path.basename(file.path));
+            e.alloc.free(file.path);
+            file.path = new_host;
+        }
+    }
+
+    /// The host paths of `audio_path`'s three ANLZ siblings; an entry is
+    /// null when its path could not be built (an invalid path).
+    fn anlzSiblingHostPaths(e: *DeviceExport, audio_path: []const u8) PathError![3]?[]u8 {
+        var paths: [3]?[]u8 = undefined;
+        paths[0] = e.layout.anlzDatFile(e.alloc, audio_path) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidUtf8 => null,
+        };
+        errdefer if (paths[0]) |p| e.alloc.free(p);
+        paths[1] = e.layout.anlzExtFile(e.alloc, audio_path) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidUtf8 => null,
+        };
+        errdefer if (paths[1]) |p| e.alloc.free(p);
+        paths[2] = e.layout.anlz2exFile(e.alloc, audio_path) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidUtf8 => null,
+        };
+        return paths;
+    }
+
+    /// The host path of `filename` (an ANLZ sibling name) in the analysis
+    /// directory `audio_path` hashes onto.
+    fn anlzHostPathFor(
+        e: *DeviceExport,
+        audio_path: []const u8,
+        filename: []const u8,
+    ) PathError![]u8 {
+        const names = anlzFolderNames(try pathHash(audio_path));
+        return std.fs.path.join(e.alloc, &.{
+            e.layout.root, "PIONEER", "USBANLZ",
+            &names.p_folder, &names.leaf_folder,
+            filename,
+        });
+    }
+
+    /// Re-serializes an ANLZ image with every path section naming
+    /// `new_device_path` — byte-identical elsewhere, per the round-trip
+    /// guarantee. The caller owns the returned image and frees the old.
+    fn retargetAnlzImage(
+        e: *DeviceExport,
+        image: []const u8,
+        new_device_path: []const u8,
+    ) (anlz.ParseError || anlz.WriteError || PathError)![]u8 {
+        var m = try anlz.Anlz.parse(e.alloc, image);
+        defer m.deinit();
+        for (m.sections) |*section| switch (section.*) {
+            .path => |*p| p.path = try anlz.LenPrefixedWideString.fromUtf8(
+                m.arena.allocator(),
+                new_device_path,
+            ),
+            else => {},
+        };
+        return try anlz.serializeFile(e.alloc, m.header_data, m.sections);
+    }
+
+    /// Queues the analysis directory of the track at `path` for deletion
+    /// at the next save.
+    fn queueAnlzDirDelete(
+        e: *DeviceExport,
+        state: *WriterState,
+        except_id: u32,
+        path: []const u8,
+    ) PathError!void {
+        const dir = try e.layout.anlzDir(e.alloc, path);
+        defer e.alloc.free(dir);
+        try e.queueDirDeleteIfUnused(state, except_id, dir);
+    }
+
+    /// Queues `dir` for deletion — unless a surviving track's analysis
+    /// lives there too: another track's path may hash onto it, or a
+    /// queued write may target it. Sharing means keeping.
+    fn queueDirDeleteIfUnused(
+        e: *DeviceExport,
+        state: *WriterState,
+        except_id: u32,
+        dir: []const u8,
+    ) PathError!void {
+        var it = state.tracks_by_path.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == except_id) continue;
+            const other = e.layout.anlzDir(e.alloc, entry.key_ptr.*) catch continue;
+            defer e.alloc.free(other);
+            if (std.mem.eql(u8, other, dir)) return; // shared: keep it
+        }
+        for (e.pending_anlz.items) |file| {
+            if (isUnderDir(file.path, dir)) return;
+        }
+        var rt = e.relocations.iterator();
+        while (rt.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.to_dir, dir)) return;
+        }
+        try e.pending_dir_deletes.append(e.alloc, try e.alloc.dupe(u8, dir));
     }
 
     /// `getOrCreateStringRow` for Artist rows.
@@ -1611,7 +2594,7 @@ pub const DeviceExport = struct {
         parent_id: u32,
         is_folder: bool,
     ) PlaylistError!u32 {
-        const state = try e.writerState();
+        const state = try e.writerStateMut();
         try e.primeOlStore();
         // The root (id 0) is always a valid parent; any other id must
         // name an existing folder — a playlist cannot hold children.
@@ -1655,7 +2638,7 @@ pub const DeviceExport = struct {
         playlist_id: u32,
         track_id: u32,
     ) PlaylistError!void {
-        const state = try e.writerState();
+        const state = try e.writerStateMut();
         try e.primeOlStore();
         const node_is_folder = state.playlist_nodes.get(playlist_id) orelse
             return error.UnknownForeignKey;
@@ -1696,7 +2679,7 @@ pub const DeviceExport = struct {
     /// the export carries a OneLibrary db the category mirrors into its
     /// `myTag` tree under the same id.
     pub fn createTagCategory(e: *DeviceExport, name: []const u8) TagError!u32 {
-        const state = try e.writerState();
+        const state = try e.writerStateMut();
         try e.primeOlStore();
         const db = try e.extDb();
         const id = try state.next_tag_id.mint();
@@ -1743,7 +2726,7 @@ pub const DeviceExport = struct {
         category_id: u32,
         labels: []const []const u8,
     ) TagError!void {
-        const state = try e.writerState();
+        const state = try e.writerStateMut();
         try e.primeOlStore();
         // The category check needs the tag state an opened export's
         // `exportExt.pdb` carries, so the tag database loads (from disk
@@ -1871,7 +2854,7 @@ pub const DeviceExport = struct {
         defer e.alloc.free(buf);
         var db = try pdb.Database.parse(e.alloc, buf, .ext);
         errdefer db.deinit();
-        const state = try e.writerState();
+        const state = try e.writerStateMut();
         try scanExtTags(state.arena.allocator(), &db, state);
         e.ext_pdb_state = .{ .loaded = db };
     }
@@ -1881,7 +2864,9 @@ pub const DeviceExport = struct {
     /// model — parsing, track-row validation, serialization — happens
     /// before the first write, so a failed `save` leaves the disk
     /// untouched. Crash-safe write order: the default directory tree,
-    /// the four setting files, the queued ANLZ files, `exportExt.pdb`
+    /// the four setting files, the queued ANLZ files, the relocated
+    /// ANLZ files `updateTrack`'s rename queued (their old directories deleted
+    /// only after the new index lands), `exportExt.pdb`
     /// when the tag methods loaded or created one, `exportLibrary.db`
     /// when the OneLibrary side was created or carries pending rows,
     /// then `export.pdb` — the index everything else is reached
@@ -1902,18 +2887,20 @@ pub const DeviceExport = struct {
         const dir = try e.dirHandle();
         if (e.pending_settings) |pending| try e.writePendingSettings(dir, pending);
         if (e.pending_anlz.items.len > 0) try e.writePendingAnlz(dir);
+        try e.writeRelocatedAnlz(dir);
 
         if (ext_image) |bytes| {
             const ext_path = try e.layout.exportExtPdb(e.alloc);
             defer e.alloc.free(ext_path);
-            try e.writeFileAtomic(dir, ext_path, bytes);
+            try writeFileAtomic(e.io, dir, ext_path, bytes);
         }
 
         try e.writeOl();
 
         const pdb_path = try e.layout.exportPdb(e.alloc);
         defer e.alloc.free(pdb_path);
-        try e.writeFileAtomic(dir, pdb_path, image);
+        try writeFileAtomic(e.io, dir, pdb_path, image);
+        e.cleanupAfterSave(dir);
     }
 
     /// Lands the OneLibrary side on disk — between `exportExt.pdb` and
@@ -1969,6 +2956,11 @@ pub const DeviceExport = struct {
         try olDrainPlaylistPairs(w, &store.playlist_pairs);
         try olDrain(w, &store.my_tags);
         try olDrain(w, &store.my_tag_pairs);
+        // Updates and deletes name rows already on disk — ids the
+        // monotonic counters never re-emit — so their order against the
+        // inserts cannot collide.
+        try olDrainUpdates(w, &store.content_updates);
+        try olDrainContentDeletes(w, &store.content_deletes);
 
         try w.close();
         store.fresh = false;
@@ -1984,10 +2976,90 @@ pub const DeviceExport = struct {
     ) (std.mem.Allocator.Error || std.Io.Dir.CreateDirPathError || AtomicWriteError)!void {
         for (e.pending_anlz.items) |*file| {
             try dir.createDirPath(e.io, std.fs.path.dirname(file.path) orelse ".");
-            try e.writeFileAtomic(dir, file.path, file.image);
+            try writeFileAtomic(e.io, dir, file.path, file.image);
         }
         for (e.pending_anlz.items) |*file| file.deinit(e.alloc);
         e.pending_anlz.clearRetainingCapacity();
+    }
+
+    /// Size cap when reading one ANLZ sibling for relocation; the
+    /// largest analysis files run a few megabytes.
+    const anlz_limit = std.Io.Limit.limited(1 << 26);
+
+    /// Lands every queued relocation: each sibling found under its
+    /// `from_dir` is re-serialized — its path section naming the track's
+    /// new device path — and written, atomically, into `to_dir`. A
+    /// sibling with no file on disk skips silently: the track never had
+    /// that kind of analysis. Runs before `export.pdb`, so a crash
+    /// leaves the old index naming the old directory, still populated;
+    /// the old directories go away only after the new index has landed
+    /// (`cleanupAfterSave`). A failure leaves the queue intact — the
+    /// landed siblings are fixed bytes a retry rewrites identically.
+    fn writeRelocatedAnlz(e: *DeviceExport, dir: std.Io.Dir) RelocateError!void {
+        const siblings = [_][]const u8{ "ANLZ0000.DAT", "ANLZ0000.EXT", "ANLZ0000.2EX" };
+        var it = e.relocations.iterator();
+        while (it.next()) |entry| {
+            const rel = entry.value_ptr;
+            for (siblings) |name| {
+                const from_path = try std.fs.path.join(e.alloc, &.{ rel.from_dir, name });
+                defer e.alloc.free(from_path);
+                const image = dir.readFileAlloc(
+                    e.io,
+                    from_path,
+                    e.alloc,
+                    anlz_limit,
+                ) catch |err| switch (err) {
+                    error.FileNotFound => continue,
+                    else => return err,
+                };
+                defer e.alloc.free(image);
+                const patched = try e.retargetAnlzImage(image, rel.device_path);
+                defer e.alloc.free(patched);
+                try dir.createDirPath(e.io, rel.to_dir);
+                const to_path = try std.fs.path.join(e.alloc, &.{ rel.to_dir, name });
+                defer e.alloc.free(to_path);
+                try writeFileAtomic(e.io, dir, to_path, patched);
+            }
+        }
+    }
+
+    /// Best-effort cleanup once the new `export.pdb` has landed: the
+    /// relocation source directories and the directories `removeTrack`
+    /// queued. Nothing here can fail the save — a leftover directory is
+    /// an orphan no player reaches. A source equal to its own or another
+    /// relocation's target stays (that target was just filled from it).
+    /// Also drops the cached OL snapshot — it names the pre-save disk —
+    /// and releases the relocation and deletion queues.
+    fn cleanupAfterSave(e: *DeviceExport, dir: std.Io.Dir) void {
+        var it = e.relocations.iterator();
+        while (it.next()) |entry| {
+            const from_dir = entry.value_ptr.from_dir;
+            if (std.mem.eql(u8, from_dir, entry.value_ptr.to_dir)) continue;
+            var keep = false;
+            var other = e.relocations.iterator();
+            while (other.next()) |o| {
+                if (std.mem.eql(u8, from_dir, o.value_ptr.to_dir)) {
+                    keep = true;
+                    break;
+                }
+            }
+            if (!keep) dir.deleteTree(e.io, from_dir) catch {};
+        }
+        for (e.pending_dir_deletes.items) |del| dir.deleteTree(e.io, del) catch {};
+
+        var rel = e.relocations.iterator();
+        while (rel.next()) |entry| entry.value_ptr.deinit(e.alloc);
+        e.relocations.clearAndFree(e.alloc);
+        for (e.pending_dir_deletes.items) |del| e.alloc.free(del);
+        e.pending_dir_deletes.clearAndFree(e.alloc);
+
+        switch (e.ol_library) {
+            .loaded => |*lib| {
+                lib.deinit();
+                e.ol_library = .unloaded;
+            },
+            .unloaded, .absent => {},
+        }
     }
 
     /// Writes the default directory tree and the four pending setting
@@ -2013,24 +3085,10 @@ pub const DeviceExport = struct {
         inline for (dat_files, 0..) |dat, i| {
             const path = try e.layout.datPath(e.alloc, dat.name);
             defer e.alloc.free(path);
-            try e.writeFileAtomic(dir, path, pending[i]);
+            try writeFileAtomic(e.io, dir, path, pending[i]);
         }
         for (pending) |bytes| e.alloc.free(bytes);
         e.pending_settings = null;
-    }
-
-    /// Writes `bytes` to `path` through a same-directory temp file and an
-    /// atomic rename.
-    fn writeFileAtomic(
-        e: *DeviceExport,
-        dir: std.Io.Dir,
-        path: []const u8,
-        bytes: []const u8,
-    ) AtomicWriteError!void {
-        var af = try dir.createFileAtomic(e.io, path, .{ .replace = true });
-        defer af.deinit(e.io);
-        try af.file.writeStreamingAll(e.io, bytes);
-        try af.replace(e.io);
     }
 };
 
@@ -2182,6 +3240,369 @@ pub fn getPlaylistsDb(
     return .{ .arena = arena, .roots = try roots.toOwnedSlice(a) };
 }
 
+// --- unified track model (read views, patches, OL join) -------------------------
+
+/// Iterator over an export's tracks (see `DeviceExport.tracks`). Two
+/// arenas: one holds the dimension maps for the iterator's life, the
+/// other the current view's decoded strings, reset at every `next` — a
+/// view borrows from it until the next call.
+pub const TrackIter = struct {
+    e: *DeviceExport,
+    /// Holds the dimension maps; freed by `deinit`.
+    dim_arena: std.heap.ArenaAllocator,
+    /// Holds the current view's decoded strings; reset by every `next`.
+    view_arena: std.heap.ArenaAllocator,
+    dims: TrackDimensions,
+    it: pdb.RowIterator,
+
+    pub fn deinit(it: *TrackIter) void {
+        it.dim_arena.deinit();
+        it.view_arena.deinit();
+    }
+
+    /// The next track view, or null once the table is exhausted. The
+    /// previous view's strings die here.
+    pub fn next(it: *TrackIter) TrackViewError!?TrackView {
+        const row = (try it.it.next()) orelse return null;
+        _ = it.view_arena.reset(.retain_capacity);
+        return try fillTrackView(it.e, &it.dims, it.view_arena.allocator(), row.track);
+    }
+};
+
+/// A `TrackView` that owns its strings, from `DeviceExport.trackByPath`.
+/// `deinit` frees the view's every slice.
+pub const TrackRecord = struct {
+    arena: *std.heap.ArenaAllocator,
+    view: TrackView,
+
+    pub fn deinit(r: *TrackRecord) void {
+        const child = r.arena.child_allocator;
+        r.arena.deinit();
+        child.destroy(r.arena);
+    }
+};
+
+/// Where a joined OL content row lives, when one joined at all.
+const OlContentRef = union(enum) {
+    /// A row pending its first insert — an `OlStore.contents` index.
+    pending: usize,
+    /// A queued whole-row update — an `OlStore.content_updates` index.
+    queued_update: usize,
+    /// A row already on disk, borrowed from the cached library.
+    disk: *const ol.Content,
+};
+
+/// One id-keyed dimension table of a read view: row id -> decoded name.
+const DimensionMap = std.AutoHashMapUnmanaged(u32, []const u8);
+
+/// The name lookups a track view resolves its foreign keys through, all
+/// in one arena: artists, albums, genres, labels, keys, and the artwork
+/// table's device paths.
+const TrackDimensions = struct {
+    artists: DimensionMap = .empty,
+    albums: DimensionMap = .empty,
+    genres: DimensionMap = .empty,
+    labels: DimensionMap = .empty,
+    keys: DimensionMap = .empty,
+    /// Artwork row id -> device path of the image.
+    artwork: DimensionMap = .empty,
+
+    fn build(e: *DeviceExport, a: std.mem.Allocator) TrackViewError!TrackDimensions {
+        var dims = TrackDimensions{};
+        const db = try e.openPdb();
+        try scanDimension(db, .artists, "artist", &.{ "offsets", "inner", "name" }, a, &dims.artists);
+        try scanDimension(db, .albums, "album", &.{ "offsets", "inner", "name" }, a, &dims.albums);
+        try scanDimension(db, .genres, "genre", &.{"name"}, a, &dims.genres);
+        try scanDimension(db, .labels, "label", &.{"name"}, a, &dims.labels);
+        try scanDimension(db, .keys, "key", &.{"name"}, a, &dims.keys);
+        try scanDimension(db, .artwork, "artwork", &.{"path"}, a, &dims.artwork);
+        return dims;
+    }
+};
+
+/// Fills `map` with one dimension table's `id -> name`, first row wins
+/// on duplicate ids; an invalid encoding leaves the id nameless (the
+/// view shows an empty name), matching the writer-state scans.
+fn scanDimension(
+    db: *const pdb.Database,
+    page_type: pdb.PageType,
+    comptime tag: []const u8,
+    comptime field_path: []const []const u8,
+    a: std.mem.Allocator,
+    map: *DimensionMap,
+) ScanError!void {
+    var it = (try rowsOrEmpty(db, page_type)) orelse return;
+    while (try it.next()) |row| {
+        const payload = @field(row.*, tag);
+        const name = decodeOrEmpty(stringField(payload, field_path), a) catch
+            return error.OutOfMemory;
+        const gop = try map.getOrPut(a, payload.id);
+        if (!gop.found_existing) gop.value_ptr.* = name;
+    }
+}
+
+/// A dimension name, or "" for an id the map does not carry.
+fn dimName(map: *const DimensionMap, id: u32) []const u8 {
+    return map.get(id) orelse "";
+}
+
+/// Decodes a row string for a view, treating an invalid encoding as
+/// empty — a track the format cannot spell still counts.
+fn decodeOrEmpty(s: pdb.DeviceSQLString, a: std.mem.Allocator) error{OutOfMemory}![]const u8 {
+    return s.utf8(a) catch |err| switch (err) {
+        error.InvalidEncoding => "",
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+/// Whether a row string is the empty one.
+fn strEmpty(s: pdb.DeviceSQLString) bool {
+    return switch (s) {
+        .short_ascii => |bytes| bytes.len == 0,
+        .long => |body| switch (body) {
+            .isrc, .ascii => |chars| chars.len == 0,
+            .ucs2le => |units| units.len == 0,
+        },
+    };
+}
+
+/// Builds one track's view: every string decoded, foreign keys resolved
+/// through `dims`, the OL row joined by file path.
+fn fillTrackView(
+    e: *DeviceExport,
+    dims: *const TrackDimensions,
+    a: std.mem.Allocator,
+    row: *const pdb.Track,
+) TrackViewError!TrackView {
+    const s = row.offsets.inner;
+    var v: TrackView = .{
+        .id = row.id,
+        .title = try decodeOrEmpty(s.title, a),
+        .artist = dimName(&dims.artists, row.artist_id),
+        .album = dimName(&dims.albums, row.album_id),
+        .genre = dimName(&dims.genres, row.genre_id),
+        .key = dimName(&dims.keys, row.key_id),
+        .label = dimName(&dims.labels, row.label_id),
+        .composer = dimName(&dims.artists, row.composer_id),
+        .remixer = dimName(&dims.artists, row.remixer_id),
+        .orig_artist = dimName(&dims.artists, row.orig_artist_id),
+        .lyricist = try decodeOrEmpty(s.lyricist, a),
+        .comment = try decodeOrEmpty(s.comment, a),
+        .isrc = try decodeOrEmpty(s.isrc, a),
+        .mix_name = try decodeOrEmpty(s.mix_name, a),
+        .release_date = try decodeOrEmpty(s.release_date, a),
+        .date_added = try decodeOrEmpty(s.date_added, a),
+        .message = try decodeOrEmpty(s.message, a),
+        .file_path = try decodeOrEmpty(s.file_path, a),
+        .filename = try decodeOrEmpty(s.filename, a),
+        .artwork_device_path = dimName(&dims.artwork, row.artwork_id),
+        .tempo_bpm = @as(f32, @floatFromInt(row.tempo)) / 100.0,
+        .bitrate = row.bitrate,
+        .sample_rate = row.sample_rate,
+        .sample_depth = row.sample_depth,
+        .duration_secs = row.duration,
+        .file_size = row.file_size,
+        .track_number = row.track_number,
+        .disc_number = row.disc_number,
+        .year = row.year,
+        .play_count = row.play_count,
+        .rating = row.rating,
+        .color = row.color,
+        .file_type = row.file_type,
+        .autoload_hotcues = !strEmpty(s.autoload_hotcues),
+        .publish_track_information = !strEmpty(s.publish_track_information),
+        .analyze_date = try decodeOrEmpty(s.analyze_date, a),
+        .has_analysis = !strEmpty(s.analyze_path),
+        .source = .pdb_only,
+    };
+
+    if (v.file_path.len > 0) {
+        if (try olJoinForView(e, v.file_path)) |c| {
+            v.source = .pdb_and_ol;
+            v.subtitle = c.subtitle orelse "";
+            v.title_for_search = c.titleForSearch;
+            v.kuvo_delivery_on = (c.isKuvoDeliverStatusOn orelse 0) != 0;
+            v.kuvo_delivery_comment = c.kuvoDeliveryComment orelse "";
+            v.date_created = c.dateCreated;
+            v.cue_update_count = c.cueUpdateCount;
+            v.analysis_data_update_count = c.analysisDataUpdateCount;
+            v.information_update_count = c.informationUpdateCount;
+        }
+    }
+    return v;
+}
+
+/// The OL content row a view joins by `path`, when the export carries an
+/// OL db: rows this session queued first (a pending insert, or a queued
+/// update — a rename already carries its new path there), then the
+/// loaded library's snapshot of the disk. Read-side only — the store is
+/// consulted, never loaded, so a session that never mutates never pays
+/// for one.
+fn olJoinForView(e: *DeviceExport, path: []const u8) TrackViewError!?*const ol.Content {
+    if (e.ol_state == .store) {
+        const store = &e.ol_state.store;
+        for (store.contents.items) |*c| {
+            if (std.mem.eql(u8, c.path orelse "", path)) return c;
+        }
+        for (store.content_updates.items) |*c| {
+            if (std.mem.eql(u8, c.path orelse "", path)) return c;
+        }
+    }
+    if (ol.mode == .off) return null;
+    const lib = (try e.openOL()) orelse return null;
+    return lib.contentByPath(path);
+}
+
+/// The resolved dimension ids a `TrackPatch` asked for — seeded from the
+/// old row, so an unpatched dimension keeps its id untouched.
+const PatchDimensionIds = struct {
+    artist: u32 = 0,
+    album: u32 = 0,
+    genre: u32 = 0,
+    key: u32 = 0,
+    label: u32 = 0,
+    composer: u32 = 0,
+    remixer: u32 = 0,
+    orig_artist: u32 = 0,
+    artwork: u32 = 0,
+};
+
+/// The string fields of a `TrackPatch`, encoded up front so a bad one
+/// fails the call before anything is mutated.
+const PatchedTrackStrings = struct {
+    title: ?pdb.DeviceSQLString = null,
+    comment: ?pdb.DeviceSQLString = null,
+    isrc: ?pdb.DeviceSQLString = null,
+    lyricist: ?pdb.DeviceSQLString = null,
+    mix_name: ?pdb.DeviceSQLString = null,
+    release_date: ?pdb.DeviceSQLString = null,
+    date_added: ?pdb.DeviceSQLString = null,
+    message: ?pdb.DeviceSQLString = null,
+    autoload_hotcues: ?pdb.DeviceSQLString = null,
+    publish_track_information: ?pdb.DeviceSQLString = null,
+    analyze_date: ?pdb.DeviceSQLString = null,
+};
+
+fn encodePatchedStrings(
+    a: std.mem.Allocator,
+    patch: TrackPatch,
+) error{ TooLong, InvalidEncoding, OutOfMemory }!PatchedTrackStrings {
+    var ps = PatchedTrackStrings{};
+    if (patch.title) |v| ps.title = try pdb.DeviceSQLString.fromUtf8(a, v);
+    if (patch.comment) |v| ps.comment = try pdb.DeviceSQLString.fromUtf8(a, v);
+    if (patch.isrc) |v| ps.isrc = try pdb.DeviceSQLString.fromUtf8(a, v);
+    if (patch.lyricist) |v| ps.lyricist = try pdb.DeviceSQLString.fromUtf8(a, v);
+    if (patch.mix_name) |v| ps.mix_name = try pdb.DeviceSQLString.fromUtf8(a, v);
+    if (patch.release_date) |v| ps.release_date = try pdb.DeviceSQLString.fromUtf8(a, v);
+    if (patch.date_added) |v| ps.date_added = try pdb.DeviceSQLString.fromUtf8(a, v);
+    if (patch.message) |v| ps.message = try pdb.DeviceSQLString.fromUtf8(a, v);
+    if (patch.autoload_hotcues) |on|
+        ps.autoload_hotcues = if (on)
+            try pdb.DeviceSQLString.fromUtf8(a, "ON")
+        else
+            pdb.DeviceSQLString.empty();
+    if (patch.publish_track_information) |on|
+        ps.publish_track_information = if (on)
+            try pdb.DeviceSQLString.fromUtf8(a, "ON")
+        else
+            pdb.DeviceSQLString.empty();
+    if (patch.analyze_date) |v| ps.analyze_date = try pdb.DeviceSQLString.fromUtf8(a, v);
+    return ps;
+}
+
+/// Applies a `TrackPatch` to one OL content row in place: pdb-mirrored
+/// columns move only where the patch says — a diverged db keeps its own
+/// values elsewhere — and the OL-only columns patch directly. Dimension
+/// patches resolve through the mirror's own dedup state, bridging the
+/// pdb ids `ids` carries.
+fn applyTrackPatchToContent(
+    store: *OlStore,
+    c: *ol.Content,
+    row: *const pdb.Track,
+    patch: TrackPatch,
+    ids: PatchDimensionIds,
+) OlMirrorError!void {
+    const a = store.arena.allocator();
+    if (patch.title) |v| c.title = try a.dupe(u8, v);
+    if (patch.comment) |v| c.djComment = try a.dupe(u8, v);
+    if (patch.tempo != null) c.bpmx100 = row.tempo;
+    if (patch.duration_secs) |v| c.length = v;
+    if (patch.track_number) |v| c.trackNo = v;
+    if (patch.disc_number) |v| c.discNo = v;
+    if (patch.year) |v| c.releaseYear = v;
+    if (patch.rating) |v| c.rating = v;
+    if (patch.play_count) |v| c.djPlayCount = v;
+    if (patch.release_date) |v| c.releaseDate = try a.dupe(u8, v);
+    if (patch.date_added) |v| c.dateAdded = try a.dupe(u8, v);
+    if (patch.isrc) |v| c.isrc = try a.dupe(u8, v);
+    if (patch.bitrate) |v| c.bitrate = v;
+    if (patch.sample_depth) |v| c.bitDepth = v;
+    if (patch.sample_rate) |v| c.samplingRate = v;
+    if (patch.file_size) |v| c.fileSize = v;
+    if (patch.file_type) |v| c.fileType = @intFromEnum(v);
+    if (patch.autoload_hotcues) |v| c.isHotCueAutoLoadOn = if (v) 1 else 0;
+
+    if (patch.artist) |v|
+        c.artist_id_artist = try olNamedRow(store, &store.artists_by_name, &store.artists, olArtistRow, ids.artist, v);
+    if (patch.remixer) |v|
+        c.artist_id_remixer = try olNamedRow(store, &store.artists_by_name, &store.artists, olArtistRow, ids.remixer, v);
+    if (patch.orig_artist) |v|
+        c.artist_id_originalArtist = try olNamedRow(store, &store.artists_by_name, &store.artists, olArtistRow, ids.orig_artist, v);
+    if (patch.composer) |v|
+        c.artist_id_composer = try olNamedRow(store, &store.artists_by_name, &store.artists, olArtistRow, ids.composer, v);
+    if (patch.genre) |v|
+        c.genre_id = try olNamedRow(store, &store.genres_by_name, &store.genres, olGenreRow, ids.genre, v);
+    if (patch.label) |v|
+        c.label_id = try olNamedRow(store, &store.labels_by_name, &store.labels, olLabelRow, ids.label, v);
+    if (patch.key) |v| c.key_id = try olKeyId(store, v, ids.key);
+    if (patch.album) |v|
+        c.album_id = try olAlbumId(store, v, ids.album, c.artist_id_artist);
+
+    if (patch.subtitle) |v| c.subtitle = try a.dupe(u8, v);
+    if (patch.title_for_search) |v| c.titleForSearch = try a.dupe(u8, v);
+    if (patch.kuvo_delivery_on) |v| c.isKuvoDeliverStatusOn = if (v) 1 else 0;
+    if (patch.kuvo_delivery_comment) |v| c.kuvoDeliveryComment = try a.dupe(u8, v);
+    if (patch.date_created) |v| c.dateCreated = try a.dupe(u8, v);
+    if (patch.cue_update_count) |v| c.cueUpdateCount = v;
+    if (patch.analysis_data_update_count) |v| c.analysisDataUpdateCount = v;
+    if (patch.information_update_count) |v| c.informationUpdateCount = v;
+}
+
+/// The boxed payload pointer of `row` — a row's identity within its
+/// database; every variant boxes its payload in the arena (see
+/// `pdb.Database.removeRow`).
+fn rowPayloadKey(row: *const pdb.Row) *const anyopaque {
+    return switch (row.*) {
+        inline else => |p| @ptrCast(p),
+    };
+}
+
+/// Whether `path` is a file directly inside directory `dir`.
+fn isUnderDir(path: []const u8, dir: []const u8) bool {
+    return std.mem.startsWith(u8, path, dir) and
+        path.len > dir.len and
+        path[dir.len] == '/';
+}
+
+/// The removal predicate context: the track id being removed.
+const TrackIdMatch = struct {
+    id: u32,
+};
+
+fn playlistEntryNamesTrack(ctx: TrackIdMatch, row: *const pdb.Row) bool {
+    return switch (row.*) {
+        .playlist_entry => |entry| entry.track_id == ctx.id,
+        else => false,
+    };
+}
+
+fn trackTagNamesTrack(ctx: TrackIdMatch, row: *const pdb.Row) bool {
+    return switch (row.*) {
+        .track_tag => |junction| junction.track_id == ctx.id,
+        else => false,
+    };
+}
+
 // --- OneLibrary mirror (O4) -----------------------------------------------------
 
 /// A playlist membership waiting for `save`, inserted through
@@ -2222,6 +3643,17 @@ const OlStore = struct {
     /// Pending `myTag_content` rows — the row type itself, since the
     /// junction carries nothing the insert derives.
     my_tag_pairs: std.ArrayListUnmanaged(ol.MyTagContent) = .empty,
+    /// Complete replacement rows for `content` rows already on disk,
+    /// patched by `updateTrack` and rewritten by the next
+    /// `save` (see `ol.Writer.updateAllContents`). At most one per
+    /// content id.
+    content_updates: std.ArrayListUnmanaged(ol.Content) = .empty,
+    /// Content ids `removeTrack` cascade-deletes at the next `save`.
+    content_deletes: std.ArrayListUnmanaged(i64) = .empty,
+    /// pdb track id -> OL content id, recorded wherever the two sides
+    /// are first seen joined (by path), so a later resolution — after a
+    /// rename has moved the path on — still finds the OL row.
+    content_bridge: std.AutoHashMapUnmanaged(u32, i64) = .empty,
 
     /// Dedup state over the existing db (filled by `scanOlStore`) and the
     /// pending rows; values are OL ids. Name lookups make a reopened db
@@ -2261,7 +3693,9 @@ const OlStore = struct {
             store.playlists.items.len > 0 or
             store.playlist_pairs.items.len > 0 or
             store.my_tags.items.len > 0 or
-            store.my_tag_pairs.items.len > 0;
+            store.my_tag_pairs.items.len > 0 or
+            store.content_updates.items.len > 0 or
+            store.content_deletes.items.len > 0;
     }
 
     fn deinit(store: *OlStore) void {
@@ -2288,6 +3722,82 @@ fn olDrain(w: ol.Writer, list: anytype) ol.SqlError!void {
 fn olDrainPlaylistPairs(w: ol.Writer, list: anytype) ol.SqlError!void {
     try w.addAllToPlaylist(list.items);
     list.clearRetainingCapacity();
+}
+
+/// Drains queued whole-row content updates through one
+/// `Writer.updateAllContents` batch — the same clear-only-after-commit
+/// contract as `olDrain`.
+fn olDrainUpdates(w: ol.Writer, list: anytype) ol.SqlError!void {
+    try w.updateAllContents(list.items);
+    list.clearRetainingCapacity();
+}
+
+/// Drains queued content cascade-deletes through one
+/// `Writer.deleteContentCascadeAll` batch — the same
+/// clear-only-after-commit contract as `olDrain`.
+fn olDrainContentDeletes(w: ol.Writer, list: anytype) ol.SqlError!void {
+    try w.deleteContentCascadeAll(list.items);
+    list.clearRetainingCapacity();
+}
+
+/// Queues `row` as the pending replacement of its content row — at most
+/// one update per content id, so consecutive patches of one track
+/// compose instead of stacking.
+fn queueContentUpdate(store: *OlStore, row: ol.Content) std.mem.Allocator.Error!void {
+    for (store.content_updates.items) |*queued| {
+        if (queued.content_id == row.content_id) {
+            queued.* = row;
+            return;
+        }
+    }
+    try store.content_updates.append(store.arena.allocator(), row);
+}
+
+/// Queues `content_id` for the cascade delete at the next `save`;
+/// double-queuing is a no-op.
+fn queueContentDelete(store: *OlStore, content_id: i64) std.mem.Allocator.Error!void {
+    for (store.content_deletes.items) |queued| {
+        if (queued == content_id) return;
+    }
+    try store.content_deletes.append(store.arena.allocator(), content_id);
+}
+
+/// Records the pdb-track-id to OL-content-id bridge.
+fn recordBridge(
+    store: *OlStore,
+    track_id: u32,
+    content_id: i64,
+) std.mem.Allocator.Error!void {
+    try store.content_bridge.put(store.arena.allocator(), track_id, content_id);
+}
+
+/// Drops every junction row naming `content_id`, in place — the pending
+/// lists keep naming exactly the rows the db lacks.
+fn dropJunctionsForContent(list: anytype, content_id: i64) void {
+    var kept: usize = 0;
+    for (list.items) |item| {
+        const cid = switch (@TypeOf(item.content_id)) {
+            i64 => item.content_id,
+            ?i64 => item.content_id orelse continue,
+            else => @compileError("unexpected junction id column type"),
+        };
+        if (cid == content_id) continue;
+        list.items[kept] = item;
+        kept += 1;
+    }
+    list.shrinkRetainingCapacity(kept);
+}
+
+/// Copies `src`, duping every text column, so the copy outlives the
+/// library snapshot it came from.
+fn dupeContent(a: std.mem.Allocator, src: *const ol.Content) std.mem.Allocator.Error!ol.Content {
+    var c = src.*;
+    inline for (@typeInfo(ol.Content).@"struct".fields) |f| {
+        if (f.type == ?[]const u8) {
+            if (@field(c, f.name)) |v| @field(c, f.name) = try a.dupe(u8, v);
+        }
+    }
+    return c;
 }
 
 /// The dedup key of a mirrored album, like `AlbumKey` but over the OL id

@@ -2207,6 +2207,15 @@ fn appendElem(
     slice.*[slice.*.len - 1] = item;
 }
 
+/// The boxed payload pointer of `row` — a row's identity within its
+/// database, since every variant boxes its payload in the arena (see
+/// `Database.removeRow`).
+fn rowPayloadPtr(row: *const Row) *const anyopaque {
+    return switch (row.*) {
+        inline else => |p| @ptrCast(p),
+    };
+}
+
 /// A table page: the 0x20-byte page header plus the content selected by
 /// its flags. A serialized page is exactly the database's page size long.
 pub const Page = struct {
@@ -2720,6 +2729,89 @@ pub const Database = struct {
             return null;
         try page.commitRow(db.arena.allocator(), ticket, row.*);
         return .{ .page_index = page_index, .row_offset = ticket.row_offset };
+    }
+
+    /// Error of `Database.removeRow`: the structural walk errors of
+    /// `Database.rows`, plus `TableTypeNotFound` when no table holds the
+    /// page type, `RowNotFound` when no row of the table boxes `payload`,
+    /// and `UnexpectedValue` for a page whose row list does not line up
+    /// with its row groups.
+    pub const RemoveRowError = RowIterError || error{
+        TableTypeNotFound,
+        RowNotFound,
+        UnexpectedValue,
+    };
+
+    /// Removes the row of `page_type`'s table whose boxed payload is
+    /// `payload` — every `Row` variant boxes its payload in the database's
+    /// arena, so the pointer names exactly one row. The row leaves the
+    /// format's deleted-row footprint behind, the same state an uncommitted
+    /// `allocRow` leaves: the presence bit clears and `num_rows_valid`
+    /// drops, while the heap slot, the row-group offset slot, and
+    /// `num_rows` keep accounting for it — readers walk presence bits, so
+    /// the remnants are invisible, exactly as on real exports. The `Row`
+    /// value is dropped without `deinit`; its payload stays in the arena
+    /// until the database's own `deinit`.
+    ///
+    /// Rows must not be iterated while removing: the found page's row list
+    /// shifts. Collect the payload pointers first, then remove each — the
+    /// payload pointers are arena-stable across shifts, unlike `Row`
+    /// addresses.
+    pub fn removeRow(
+        db: *Database,
+        page_type: PageType,
+        payload: *const anyopaque,
+    ) RemoveRowError!void {
+        const table = db.header.findTableMut(page_type) orelse
+            return error.TableTypeNotFound;
+        var current = table.first_page;
+        while (true) {
+            const page = parsedPageAt(db.pages, current) orelse
+                return error.PageNotPresent;
+            switch (page.content) {
+                .data => |*content| for (content.rows, 0..) |*at, i| {
+                    if (@intFromPtr(rowPayloadPtr(&at.row)) != @intFromPtr(payload))
+                        continue;
+
+                    // The presence bit lives wherever the row's heap
+                    // offset does: allocation slots interleave with dead
+                    // ones on real exports (a slot's offset outlives its
+                    // cleared bit), so the list index names nothing. The
+                    // offset names exactly one live slot — a dead slot
+                    // carrying the same value has its bit clear and
+                    // cannot match.
+                    var cleared = false;
+                    for (content.row_groups) |*group| {
+                        for (group.row_offsets, 0..) |slot_offset, slot| {
+                            if (slot_offset != at.offset) continue;
+                            const bit: u4 = @intCast(row_group_max_rows - 1 - slot);
+                            if (group.row_presence_flags & (@as(u16, 1) << bit) == 0)
+                                continue;
+                            group.row_presence_flags &= ~(@as(u16, 1) << bit);
+                            cleared = true;
+                            break;
+                        }
+                        if (cleared) break;
+                    }
+                    if (!cleared) return error.UnexpectedValue;
+
+                    var j = i + 1;
+                    while (j < content.rows.len) : (j += 1)
+                        content.rows[j - 1] = content.rows[j];
+                    content.rows.len -= 1;
+
+                    if (page.header.packed_row_counts.num_rows_valid == 0)
+                        return error.UnexpectedValue;
+                    page.header.packed_row_counts.num_rows_valid -= 1;
+                    return;
+                },
+                .index => {},
+            }
+            if (current == table.last_page) return error.RowNotFound;
+            const next = page.header.next_page;
+            if (next <= current) return error.PageOrderViolation;
+            current = next;
+        }
     }
 
     /// Points page `previous_page_index`'s `next_page` at

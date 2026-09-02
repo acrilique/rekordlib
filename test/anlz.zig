@@ -981,7 +981,7 @@ test "column stats build drives the analyzer laws" {
     const alloc = testing.allocator;
     const bands = [_]anlz.Band{.{ .low = 10, .mid = 20, .high = 30 }} ** 150;
 
-    const columns = try anlz.buildColumnsFromStats(alloc, &bands);
+    const columns = try anlz.buildColumnsFromBands(alloc, &bands);
     defer columns.deinit(alloc);
     try testing.expectEqual(anlz.COLOR_PREVIEW_COLUMNS, columns.color_preview.len);
     try testing.expectEqual(anlz.COLOR_PREVIEW_COLUMNS, columns.band3_preview.len);
@@ -1038,7 +1038,7 @@ test "column stats previews aggregate their spans" {
     const alloc = testing.allocator;
     var bands = [_]anlz.Band{.{ .low = 10, .mid = 10, .high = 10 }} ** 12000;
     bands[3] = .{ .low = 200, .mid = 200, .high = 200 }; // span 0, not its midpoint (column 5)
-    const columns = try anlz.buildColumnsFromStats(alloc, &bands);
+    const columns = try anlz.buildColumnsFromBands(alloc, &bands);
     defer columns.deinit(alloc);
 
     // 12000 columns → 10 per PWV4 span.
@@ -1066,9 +1066,9 @@ test "column stats heights are track-normalized and quadratic" {
     // 7 where a linear law would give 15.
     const loud = [_]anlz.Band{ .{ .low = 255 }, .{ .low = 128 }, .{ .high = 64 } };
     const quiet = [_]anlz.Band{ .{ .low = 128 }, .{ .low = 64 }, .{ .high = 32 } };
-    const cols_loud = try anlz.buildColumnsFromStats(alloc, &loud);
+    const cols_loud = try anlz.buildColumnsFromBands(alloc, &loud);
     defer cols_loud.deinit(alloc);
-    const cols_quiet = try anlz.buildColumnsFromStats(alloc, &quiet);
+    const cols_quiet = try anlz.buildColumnsFromBands(alloc, &quiet);
     defer cols_quiet.deinit(alloc);
     for (cols_loud.detail_mono, cols_quiet.detail_mono) |l, q| {
         try testing.expectEqual(l, q);
@@ -1092,10 +1092,10 @@ test "column stats Band.peak drives the mono heights" {
     // to the real amplitude ratio (quadratic law: band max 100 against a
     // 255 peak codes 4).
     var bands = [_]anlz.Band{.{ .low = 100, .mid = 100, .high = 100 }} ** 40;
-    const cols_fb = try anlz.buildColumnsFromStats(alloc, &bands);
+    const cols_fb = try anlz.buildColumnsFromBands(alloc, &bands);
     defer cols_fb.deinit(alloc);
     bands[20] = .{ .low = 100, .mid = 100, .high = 100, .peak = 255 };
-    const cols_pk = try anlz.buildColumnsFromStats(alloc, &bands);
+    const cols_pk = try anlz.buildColumnsFromBands(alloc, &bands);
     defer cols_pk.deinit(alloc);
     // Fallback: every column is its own track peak → 31 everywhere.
     try testing.expectEqual(@as(u5, 31), cols_fb.detail_mono[0].height);
@@ -1110,7 +1110,7 @@ test "column stats PWV7 envelope decays like the analyzer" {
     const alloc = testing.allocator;
     var bands = [_]anlz.Band{.{}} ** 600;
     bands[0] = .{ .high = 255 };
-    const columns = try anlz.buildColumnsFromStats(alloc, &bands);
+    const columns = try anlz.buildColumnsFromBands(alloc, &bands);
     defer columns.deinit(alloc);
     // Instant attack, exponential decay: strictly decreasing after the
     // impulse and silent by the tail. The high band rides the
@@ -1126,7 +1126,7 @@ test "empty waveform input produces empty sections" {
     // Nothing pins rb's behavior for a track without waveform data; the
     // builder's documented choice is empty sections over padded ones.
     const alloc = testing.allocator;
-    const columns = try anlz.buildColumnsFromStats(alloc, &.{});
+    const columns = try anlz.buildColumnsFromBands(alloc, &.{});
     defer columns.deinit(alloc);
     try testing.expectEqual(@as(usize, 0), columns.preview_mono.len);
     try testing.expectEqual(@as(usize, 0), columns.tiny_preview.len);
@@ -1143,7 +1143,7 @@ test "column stats silence encodes the analyzer floors" {
     // height 0, and only PWV4/PWV6/PWV7 are all zero — `anlz.Silence`.
     const alloc = testing.allocator;
     const bands = [_]anlz.Band{.{}} ** 64;
-    const columns = try anlz.buildColumnsFromStats(alloc, &bands);
+    const columns = try anlz.buildColumnsFromBands(alloc, &bands);
     defer columns.deinit(alloc);
     try testing.expectEqual(anlz.WaveformPreviewColumn{ .height = 0, .whiteness = 7 }, columns.detail_mono[7]);
     try testing.expectEqual(
@@ -1203,7 +1203,7 @@ test "built anlz input assembles consistently" {
         .{ .index = 1, .sample_offset = 0.0 },
         .{ .index = 5, .sample_offset = 60.0 / 120.0 * @as(f64, @floatFromInt(sr)) * 4.0 },
     };
-    var columns = try anlz.buildColumnsFromStats(alloc, &bands);
+    var columns = try anlz.buildColumnsFromBands(alloc, &bands);
     defer columns.deinit(alloc); // moved-from: no-op once buildAnlzInput runs
     const input = try anlz.buildAnlzInput(alloc, .{
         .sample_rate = sr,
@@ -1240,7 +1240,7 @@ test "built anlz input serializes and re-parses" {
         .{ .index = 1, .sample_offset = 0.0 },
         .{ .index = 5, .sample_offset = 60.0 / 120.0 * @as(f64, @floatFromInt(sr)) * 4.0 },
     };
-    var columns = try anlz.buildColumnsFromStats(alloc, &bands);
+    var columns = try anlz.buildColumnsFromBands(alloc, &bands);
     defer columns.deinit(alloc); // moved-from: no-op once buildAnlzInput runs
     const input = try anlz.buildAnlzInput(alloc, .{
         .sample_rate = sr,
@@ -1444,13 +1444,13 @@ test "builders pin preview widths and analyzer-law ranges against fixtures" {
         const bands = try alloc.alloc(anlz.Band, pwv7.data.len);
         defer alloc.free(bands);
         // The wire order puts the low band in the mid-third field (see
-        // analyzePcm's assembly note).
+        // buildColumnsFromPcm's assembly note).
         for (pwv7.data, 0..) |column, i| bands[i] = .{
             .low = column.energy_mid_third_freq,
             .mid = column.energy_top_third_freq,
             .high = column.energy_bottom_third_freq,
         };
-        const columns = try anlz.buildColumnsFromStats(alloc, bands);
+        const columns = try anlz.buildColumnsFromBands(alloc, bands);
         defer columns.deinit(alloc);
         // The widths are the fixtures' own preview widths.
         try testing.expectEqual(pwav.data.len, columns.preview_mono.len);
@@ -1789,7 +1789,7 @@ fn expectAnalysisMatches(analysis: *const anlz.WaveformColumns, f: *const Analys
     }
 }
 
-test "analyzePcm reproduces the fixtures byte-for-byte" {
+test "buildColumnsFromPcm reproduces the fixtures byte-for-byte" {
     // Every fixture under testdata/analysis: small synthesized stereo
     // signals (silence, DC, sines, boundary tones, an anti-phase track, a
     // click train, amplitude steps); the .exp files hold the expected
@@ -1810,7 +1810,7 @@ test "analyzePcm reproduces the fixtures byte-for-byte" {
         defer alloc.free(fixture_path);
         var fixture = try AnalysisFixture.read(alloc, fixture_path);
         defer fixture.deinit(alloc);
-        var analysis = try anlz.analyzePcm(alloc, .{
+        var analysis = try anlz.buildColumnsFromPcm(alloc, .{
             .left = fixture.left,
             .right = fixture.right,
         });
@@ -1823,11 +1823,11 @@ test "analyzePcm reproduces the fixtures byte-for-byte" {
     try testing.expectEqual(@as(usize, 11), count);
 }
 
-test "analyzePcm encodes digital silence exactly like the analyzer" {
+test "buildColumnsFromPcm encodes digital silence exactly like the analyzer" {
     // A short all-zero track reproduces every section's silence encoding.
     const alloc = testing.allocator;
     const zeros = [_]f32{0} ** 11025; // 0.25 s
-    var analysis = try anlz.analyzePcm(alloc, .{
+    var analysis = try anlz.buildColumnsFromPcm(alloc, .{
         .left = &zeros,
         .right = &zeros,
     });
@@ -1864,10 +1864,10 @@ test "analyzePcm encodes digital silence exactly like the analyzer" {
     }
 }
 
-test "analyzePcm requires stereo" {
+test "buildColumnsFromPcm requires stereo" {
     const alloc = testing.allocator;
     const zeros = [_]f32{0} ** 128;
-    try testing.expectError(error.ChannelMismatch, anlz.analyzePcm(alloc, .{
+    try testing.expectError(error.ChannelMismatch, anlz.buildColumnsFromPcm(alloc, .{
         .left = &zeros,
         .right = zeros[0..64],
     }));
@@ -1881,7 +1881,7 @@ test "PWV2 zero-code rule: 1 when both accumulators are zero, 2 when only band 2
     const alloc = testing.allocator;
     var fixture = try AnalysisFixture.read(alloc, "analysis/clicks.pcm");
     defer fixture.deinit(alloc);
-    var analysis = try anlz.analyzePcm(alloc, .{
+    var analysis = try anlz.buildColumnsFromPcm(alloc, .{
         .left = fixture.left,
         .right = fixture.right,
     });
@@ -1904,7 +1904,7 @@ test "buildAnlzInput moves the analysis columns into an input" {
     const alloc = testing.allocator;
     var fixture = try AnalysisFixture.read(alloc, "analysis/sine440_a05.pcm");
     defer fixture.deinit(alloc);
-    var columns = try anlz.analyzePcm(alloc, .{
+    var columns = try anlz.buildColumnsFromPcm(alloc, .{
         .left = fixture.left,
         .right = fixture.right,
     });

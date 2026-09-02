@@ -1265,7 +1265,7 @@ pub const WaveformExtents = struct {
     samples_per_entry: f64,
 };
 
-/// The extents of the 150 Hz band vector `buildColumnsFromStats` wants for
+/// The extents of the 150 Hz band vector `buildColumnsFromBands` wants for
 /// a track: `size = ceil(sample_count / (sample_rate / DETAIL_HZ))` columns
 /// of `sample_rate / DETAIL_HZ` samples each. Null when `sample_rate` is 0.
 pub fn detailExtents(sample_count: u64, sample_rate: u32) ?WaveformExtents {
@@ -1356,7 +1356,7 @@ pub fn colorShare(ratio: f64) u3 {
 // ------------------------------------------------------------------------
 // Code-verified quantizers, transcribed from Rekordbox 6.8.6's decompiled
 // analyzer: pure functions of caller-supplied filtered/enveloped
-// statistics. `analyzePcm` drives them end to end from raw audio.
+// statistics. `buildColumnsFromPcm` drives them end to end from raw audio.
 // ------------------------------------------------------------------------
 
 /// Rekordbox's "whiteness" code: the 8-level quantization of how much of
@@ -1513,7 +1513,7 @@ pub const BeatMarker = struct {
 };
 
 /// One 150 Hz waveform detail column: peak band energies. The input of
-/// `buildColumnsFromStats` and the shape foreign waveform data maps onto —
+/// `buildColumnsFromBands` and the shape foreign waveform data maps onto —
 /// libdjinterop's `waveform_entry` (low/mid/high values; its per-band
 /// opacity fields are render alphas, not levels, and do not qualify)
 /// resampled to `DETAIL_HZ`.
@@ -1622,8 +1622,8 @@ pub const AnlzInput = struct {
 
 /// The seven waveform column groups of an ANLZ file: the waveform half of
 /// an `AnlzInput` build, with field names matching `AnlzInput` one-to-one.
-/// Produced by `analyzePcm` (the byte-exact replication of Rekordbox's
-/// analysis, from decoded PCM) or `buildColumnsFromStats` (an approximation
+/// Produced by `buildColumnsFromPcm` (the byte-exact replication of Rekordbox's
+/// analysis, from decoded PCM) or `buildColumnsFromBands` (an approximation
 /// from foreign 3-band data), and moved into `buildAnlzInput`. All slices
 /// are owned by the caller's allocator and freed by `deinit`.
 pub const WaveformColumns = struct {
@@ -1773,7 +1773,7 @@ fn statsEnvelopeAt(vals: []const [3]u16, band: usize, col: usize, win: usize, al
 /// Builds the seven waveform column groups from a single 150 Hz 3-band
 /// detail vector — the route for callers holding foreign waveform data
 /// (e.g. an Engine overview resampled to `DETAIL_HZ`), not decoded audio
-/// (`analyzePcm` is that route, byte-exact). The input must be sampled at
+/// (`buildColumnsFromPcm` is that route, byte-exact). The input must be sampled at
 /// exactly `DETAIL_HZ`: the detail sections track the input columns
 /// one-to-one, so a different input rate silently stretches or squashes
 /// every output waveform; `detailExtents`/`previewExtents` report the
@@ -1789,7 +1789,7 @@ fn statsEnvelopeAt(vals: []const [3]u16, band: usize, col: usize, win: usize, al
 /// PWAV/PWV2 ladders a per-span level calibrated so the loudest span
 /// reaches the analyzer's AGC ceiling. Digital silence encodes as
 /// `Silence` documents; empty `bands` produce empty sections.
-pub fn buildColumnsFromStats(alloc: std.mem.Allocator, bands: []const Band) BuildError!WaveformColumns {
+pub fn buildColumnsFromBands(alloc: std.mem.Allocator, bands: []const Band) BuildError!WaveformColumns {
     if (bands.len == 0) return .{};
 
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -2035,7 +2035,7 @@ pub fn buildCues(alloc: std.mem.Allocator, cues: []const CueInput, sample_rate: 
 /// list, and all seven waveform column groups are **moved** out of
 /// `waveforms` (which is left empty, so an unconditional
 /// `defer waveforms.deinit(alloc)` stays correct). Produce the columns with
-/// `analyzePcm` (byte-exact, from decoded audio) or `buildColumnsFromStats`
+/// `buildColumnsFromPcm` (byte-exact, from decoded audio) or `buildColumnsFromBands`
 /// (approximate, from foreign band data); a default `WaveformColumns{}`
 /// leaves every waveform section empty, matching a waveform-less analysis.
 /// All output is owned by `alloc` and freed by `AnlzInput.deinit`.
@@ -2075,7 +2075,7 @@ pub fn buildAnlzInput(
 // PCM analysis route
 // ---------------------------------------------------------------------------
 
-pub const AnalyzeError = error{ OutOfMemory, UnsupportedSampleRate, ChannelMismatch };
+pub const AnalyzeError = error{ OutOfMemory, ChannelMismatch };
 
 /// Raw decoded PCM input: planar stereo f32 in [−1, 1) (NaN/inf are a
 /// contract violation — the analyzer's saturating casts assume finite
@@ -3470,7 +3470,7 @@ const PwavPwv2Engine = struct {
 /// 3-bit class code (dense material), and fast transients whose first
 /// band-1 record close shifts the level accumulator's span phase. The
 /// fixtures under `testdata/analysis` pin everything else byte-for-byte.
-pub fn analyzePcm(alloc: std.mem.Allocator, pcm: PcmInput) AnalyzeError!WaveformColumns {
+pub fn buildColumnsFromPcm(alloc: std.mem.Allocator, pcm: PcmInput) AnalyzeError!WaveformColumns {
     if (pcm.left.len != pcm.right.len) return error.ChannelMismatch;
     const n = pcm.left.len;
     const left = pcm.left;

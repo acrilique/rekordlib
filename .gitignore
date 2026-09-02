@@ -1,2 +1,8 @@
 .zig-cache
 zig-out
+docs
+another-export-with-anlz
+.zcode
+strix_runs
+*.db-shm
+*.db-wal
