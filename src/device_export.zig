@@ -1863,17 +1863,15 @@ pub const DeviceExport = struct {
 
         try e.removeRowsMatching(
             db,
-            .playlist_entries,
+            pdb.PlaylistEntry,
             TrackIdMatch{ .id = id },
             playlistEntryNamesTrack,
         );
         try e.ensureExtLoaded();
         if (e.ext_pdb_state == .loaded) {
-            const track_tag_page: pdb.PageType =
-                @enumFromInt(@intFromEnum(pdb.ExtPageType.track_tag));
             try e.removeRowsMatching(
                 &e.ext_pdb_state.loaded,
-                track_tag_page,
+                pdb.TrackTag,
                 TrackIdMatch{ .id = id },
                 trackTagNamesTrack,
             );
@@ -2116,9 +2114,9 @@ pub const DeviceExport = struct {
     /// row-list shifts, and the identity `pdb.Database.removeRow` wants.
     fn findTrackRow(e: *DeviceExport, id: u32) WriterStateError!?*pdb.Track {
         const db = try e.openPdb();
-        var it = try db.rows(.tracks);
-        while (try it.next()) |row| {
-            if (row.track.id == id) return row.track;
+        var it = try db.rowsOf(pdb.Track);
+        while (try it.next()) |track| {
+            if (track.id == id) return track;
         }
         return null;
     }
@@ -2279,17 +2277,17 @@ pub const DeviceExport = struct {
     fn removeRowsMatching(
         e: *DeviceExport,
         db: *pdb.Database,
-        page_type: pdb.PageType,
+        comptime T: type,
         ctx: TrackIdMatch,
-        comptime matches: fn (TrackIdMatch, *const pdb.Row) bool,
+        comptime matches: fn (TrackIdMatch, *const T) bool,
     ) RemoveTrackError!void {
-        var it = (try rowsOrEmpty(db, page_type)) orelse return;
+        var it = (try rowsOfOrEmpty(db, T)) orelse return;
         var payloads = std.ArrayList(*const anyopaque).empty;
         defer payloads.deinit(e.alloc);
         while (try it.next()) |row| {
-            if (matches(ctx, row)) try payloads.append(e.alloc, rowPayloadKey(row));
+            if (matches(ctx, row)) try payloads.append(e.alloc, row);
         }
-        for (payloads.items) |payload| try db.removeRow(page_type, payload);
+        for (payloads.items) |payload| try db.removeRow(pdb.rowPageType(T), payload);
     }
 
     /// Drops every queued ANLZ image of the track at `audio_path` — a
@@ -3315,12 +3313,12 @@ const TrackDimensions = struct {
     fn build(e: *DeviceExport, a: std.mem.Allocator) TrackViewError!TrackDimensions {
         var dims = TrackDimensions{};
         const db = try e.openPdb();
-        try scanDimension(db, .artists, "artist", &.{ "offsets", "inner", "name" }, a, &dims.artists);
-        try scanDimension(db, .albums, "album", &.{ "offsets", "inner", "name" }, a, &dims.albums);
-        try scanDimension(db, .genres, "genre", &.{"name"}, a, &dims.genres);
-        try scanDimension(db, .labels, "label", &.{"name"}, a, &dims.labels);
-        try scanDimension(db, .keys, "key", &.{"name"}, a, &dims.keys);
-        try scanDimension(db, .artwork, "artwork", &.{"path"}, a, &dims.artwork);
+        try scanDimension(db, pdb.Artist, &.{ "offsets", "inner", "name" }, a, &dims.artists);
+        try scanDimension(db, pdb.Album, &.{ "offsets", "inner", "name" }, a, &dims.albums);
+        try scanDimension(db, pdb.Genre, &.{"name"}, a, &dims.genres);
+        try scanDimension(db, pdb.Label, &.{"name"}, a, &dims.labels);
+        try scanDimension(db, pdb.Key, &.{"name"}, a, &dims.keys);
+        try scanDimension(db, pdb.Artwork, &.{"path"}, a, &dims.artwork);
         return dims;
     }
 };
@@ -3330,15 +3328,13 @@ const TrackDimensions = struct {
 /// view shows an empty name), matching the writer-state scans.
 fn scanDimension(
     db: *const pdb.Database,
-    page_type: pdb.PageType,
-    comptime tag: []const u8,
+    comptime T: type,
     comptime field_path: []const []const u8,
     a: std.mem.Allocator,
     map: *DimensionMap,
 ) ScanError!void {
-    var it = (try rowsOrEmpty(db, page_type)) orelse return;
-    while (try it.next()) |row| {
-        const payload = @field(row.*, tag);
+    var it = (try rowsOfOrEmpty(db, T)) orelse return;
+    while (try it.next()) |payload| {
         const name = decodeOrEmpty(stringField(payload, field_path), a) catch
             return error.OutOfMemory;
         const gop = try map.getOrPut(a, payload.id);
@@ -3573,15 +3569,6 @@ fn applyTrackPatchToContent(
     if (patch.information_update_count) |v| c.informationUpdateCount = v;
 }
 
-/// The boxed payload pointer of `row` — a row's identity within its
-/// database; every variant boxes its payload in the arena (see
-/// `pdb.Database.removeRow`).
-fn rowPayloadKey(row: *const pdb.Row) *const anyopaque {
-    return switch (row.*) {
-        inline else => |p| @ptrCast(p),
-    };
-}
-
 /// Whether `path` is a file directly inside directory `dir`.
 fn isUnderDir(path: []const u8, dir: []const u8) bool {
     return std.mem.startsWith(u8, path, dir) and
@@ -3594,18 +3581,12 @@ const TrackIdMatch = struct {
     id: u32,
 };
 
-fn playlistEntryNamesTrack(ctx: TrackIdMatch, row: *const pdb.Row) bool {
-    return switch (row.*) {
-        .playlist_entry => |entry| entry.track_id == ctx.id,
-        else => false,
-    };
+fn playlistEntryNamesTrack(ctx: TrackIdMatch, entry: *const pdb.PlaylistEntry) bool {
+    return entry.track_id == ctx.id;
 }
 
-fn trackTagNamesTrack(ctx: TrackIdMatch, row: *const pdb.Row) bool {
-    return switch (row.*) {
-        .track_tag => |junction| junction.track_id == ctx.id,
-        else => false,
-    };
+fn trackTagNamesTrack(ctx: TrackIdMatch, junction: *const pdb.TrackTag) bool {
+    return junction.track_id == ctx.id;
 }
 
 // --- OneLibrary mirror (O4) -----------------------------------------------------
@@ -4315,11 +4296,11 @@ pub const WriterState = struct {
 };
 
 /// Error of the writer-state scans: walking a table's page chain hit
-/// structural corruption, an allocation failed, or a row carried an id
-/// that exhausts its space (see `IdMint`). A table the database doesn't
-/// carry is not an error — `rowsOrEmpty` resolves tables up front and
-/// scans them as empty; `NoTable` is only in the set because
-/// `RowIterator` shares one.
+/// structural corruption (a missing, raw, mis-typed, or looping page),
+/// an allocation failed, or a row carried an id that exhausts its space
+/// (see `IdMint`). A table the database doesn't carry is not an error —
+/// `rowsOfOrEmpty` resolves tables up front and scans them as empty;
+/// `NoTable` is only in the set because the row iterators share one.
 pub const ScanError = error{
     OutOfMemory,
     NoTable,
@@ -4329,6 +4310,19 @@ pub const ScanError = error{
     UnexpectedValue,
     IdSpaceExhausted,
 };
+
+/// `Database.rowsOf`, treating a table the database doesn't carry as
+/// empty (standard exports carry all 20 tables; this keeps the scan
+/// total over hand-built databases).
+fn rowsOfOrEmpty(
+    db: *const pdb.Database,
+    comptime T: type,
+) ScanError!?pdb.RowIter(T) {
+    return db.rowsOf(T) catch |err| switch (err) {
+        error.NoTable => null,
+        else => |e| return e,
+    };
+}
 
 /// `Database.rows`, treating a table the database doesn't carry as empty
 /// (standard exports carry all 20 tables; this keeps the scan total over
@@ -4453,16 +4447,16 @@ fn buildTagRow(
     return boxed;
 }
 
-/// Walks every row of `db`'s `page_type` table in row order, handing
-/// each to `visit(ctx, row)`; a table the database doesn't carry walks
-/// nothing (see `rowsOrEmpty`).
+/// Walks every row of `db`'s table for row type `T` in row order,
+/// handing each to `visit(ctx, row)`; a table the database doesn't carry
+/// walks nothing (see `rowsOfOrEmpty`).
 fn forEachRow(
     db: *const pdb.Database,
-    page_type: pdb.PageType,
+    comptime T: type,
     ctx: anytype,
     comptime visit: anytype,
 ) ScanError!void {
-    var it = (try rowsOrEmpty(db, page_type)) orelse return;
+    var it = (try rowsOfOrEmpty(db, T)) orelse return;
     while (try it.next()) |row| try visit(ctx, row);
 }
 
@@ -4474,11 +4468,10 @@ fn scanTracks(
     db: *const pdb.Database,
     state: *WriterState,
 ) ScanError!void {
-    try forEachRow(db, .tracks, .{ .alloc = alloc, .state = state }, visitTrack);
+    try forEachRow(db, pdb.Track, .{ .alloc = alloc, .state = state }, visitTrack);
 }
 
-fn visitTrack(ctx: anytype, row: *const pdb.Row) ScanError!void {
-    const track = row.track;
+fn visitTrack(ctx: anytype, track: *const pdb.Track) ScanError!void {
     try ctx.state.track_ids.put(ctx.alloc, track.id, {});
     try ctx.state.next_track_id.raisePast(track.id);
     if (try decodeOrSkip(track.offsets.inner.file_path, ctx.alloc)) |path| {
@@ -4490,22 +4483,19 @@ fn visitTrack(ctx: anytype, row: *const pdb.Row) ScanError!void {
 /// Scans a table whose rows are deduplicated by one string field (artists,
 /// genres, labels, artwork): the id counter past the highest row id, and
 /// every row's id into `map` under its decoded key — an invalid encoding
-/// skips the map entry but still advances the counter. `tag` selects the
-/// `Row` variant; `field_path` names the `DeviceSQLString` within the row
-/// payload, through nested structs (`.{"name"}`,
-/// `.{ "offsets", "inner", "name" }`).
+/// skips the map entry but still advances the counter. `T` is the row
+/// type; `field_path` names the `DeviceSQLString` within the row payload,
+/// through nested structs (`.{"name"}`, `.{"offsets", "inner", "name"}`).
 fn scanStringKeyed(
     alloc: std.mem.Allocator,
     db: *const pdb.Database,
-    page_type: pdb.PageType,
-    comptime tag: []const u8,
+    comptime T: type,
     comptime field_path: []const []const u8,
     map: *std.StringHashMapUnmanaged(u32),
     counter: *IdMint(u32),
 ) ScanError!void {
-    var it = (try rowsOrEmpty(db, page_type)) orelse return;
-    while (try it.next()) |row| {
-        const payload = @field(row.*, tag);
+    var it = (try rowsOfOrEmpty(db, T)) orelse return;
+    while (try it.next()) |payload| {
         try counter.raisePast(payload.id);
         if (try decodeOrSkip(stringField(payload, field_path), alloc)) |key| {
             try putIfAbsent(map, alloc, key, payload.id);
@@ -4528,11 +4518,10 @@ fn scanAlbums(
     db: *const pdb.Database,
     state: *WriterState,
 ) ScanError!void {
-    try forEachRow(db, .albums, .{ .alloc = alloc, .state = state }, visitAlbum);
+    try forEachRow(db, pdb.Album, .{ .alloc = alloc, .state = state }, visitAlbum);
 }
 
-fn visitAlbum(ctx: anytype, row: *const pdb.Row) ScanError!void {
-    const album = row.album;
+fn visitAlbum(ctx: anytype, album: *const pdb.Album) ScanError!void {
     try ctx.state.next_album_id.raisePast(album.id);
     if (try decodeOrSkip(album.offsets.inner.name, ctx.alloc)) |name| {
         try putIfAbsent(
@@ -4552,11 +4541,10 @@ fn scanKeys(
     db: *const pdb.Database,
     state: *WriterState,
 ) ScanError!void {
-    try forEachRow(db, .keys, .{ .alloc = alloc, .state = state }, visitKey);
+    try forEachRow(db, pdb.Key, .{ .alloc = alloc, .state = state }, visitKey);
 }
 
-fn visitKey(ctx: anytype, row: *const pdb.Row) ScanError!void {
-    const key = row.key;
+fn visitKey(ctx: anytype, key: *const pdb.Key) ScanError!void {
     try ctx.state.next_key_id.raisePast(key.id);
     if (try decodeOrSkip(key.name, ctx.alloc)) |name| {
         const canonical = try canonicalKeyName(ctx.alloc, name);
@@ -4571,11 +4559,10 @@ fn scanPlaylistTree(
     db: *const pdb.Database,
     state: *WriterState,
 ) ScanError!void {
-    try forEachRow(db, .playlist_tree, .{ .alloc = alloc, .state = state }, visitPlaylistTreeNode);
+    try forEachRow(db, pdb.PlaylistTreeNode, .{ .alloc = alloc, .state = state }, visitPlaylistTreeNode);
 }
 
-fn visitPlaylistTreeNode(ctx: anytype, row: *const pdb.Row) ScanError!void {
-    const node = row.playlist_tree_node;
+fn visitPlaylistTreeNode(ctx: anytype, node: *const pdb.PlaylistTreeNode) ScanError!void {
     try ctx.state.next_playlist_node_id.raisePast(node.id);
     try ctx.state.playlist_nodes.put(ctx.alloc, node.id, node.isFolder());
 }
@@ -4587,11 +4574,10 @@ fn scanPlaylistEntries(
     db: *const pdb.Database,
     state: *WriterState,
 ) ScanError!void {
-    try forEachRow(db, .playlist_entries, .{ .alloc = alloc, .state = state }, visitPlaylistEntry);
+    try forEachRow(db, pdb.PlaylistEntry, .{ .alloc = alloc, .state = state }, visitPlaylistEntry);
 }
 
-fn visitPlaylistEntry(ctx: anytype, row: *const pdb.Row) ScanError!void {
-    const entry = row.playlist_entry;
+fn visitPlaylistEntry(ctx: anytype, entry: *const pdb.PlaylistEntry) ScanError!void {
     const gop = try ctx.state.playlist_entry_counts.getOrPut(ctx.alloc, entry.playlist_id);
     if (!gop.found_existing) gop.value_ptr.* = .{ .next = 0 };
     try gop.value_ptr.raisePast(entry.entry_index);
@@ -4612,12 +4598,12 @@ pub fn scanWriterState(
 
     const a = state.arena.allocator();
     try scanTracks(a, db, &state);
-    try scanStringKeyed(a, db, .artists, "artist", &.{ "offsets", "inner", "name" }, &state.artists_by_name, &state.next_artist_id);
+    try scanStringKeyed(a, db, pdb.Artist, &.{ "offsets", "inner", "name" }, &state.artists_by_name, &state.next_artist_id);
     try scanAlbums(a, db, &state);
-    try scanStringKeyed(a, db, .genres, "genre", &.{"name"}, &state.genres_by_name, &state.next_genre_id);
+    try scanStringKeyed(a, db, pdb.Genre, &.{"name"}, &state.genres_by_name, &state.next_genre_id);
     try scanKeys(a, db, &state);
-    try scanStringKeyed(a, db, .labels, "label", &.{"name"}, &state.labels_by_name, &state.next_label_id);
-    try scanStringKeyed(a, db, .artwork, "artwork", &.{"path"}, &state.artwork_by_path, &state.next_artwork_id);
+    try scanStringKeyed(a, db, pdb.Label, &.{"name"}, &state.labels_by_name, &state.next_label_id);
+    try scanStringKeyed(a, db, pdb.Artwork, &.{"path"}, &state.artwork_by_path, &state.next_artwork_id);
     try scanPlaylistTree(a, db, &state);
     try scanPlaylistEntries(a, db, &state);
 
@@ -4637,15 +4623,10 @@ pub fn scanExtTags(
     ext_db: *const pdb.Database,
     state: *WriterState,
 ) ScanError!void {
-    // PageType 3 means albums in a plain database and Tag pages in an
-    // ext one; tables are looked up by raw value, so the ext table is
-    // found by passing the colliding value.
-    const page_type: pdb.PageType = @enumFromInt(@intFromEnum(pdb.ExtPageType.tag));
-    try forEachRow(ext_db, page_type, .{ .alloc = alloc, .state = state }, visitTag);
+    try forEachRow(ext_db, pdb.TagOrCategory, .{ .alloc = alloc, .state = state }, visitTag);
 }
 
-fn visitTag(ctx: anytype, row: *const pdb.Row) ScanError!void {
-    const tag = row.tag;
+fn visitTag(ctx: anytype, tag: *const pdb.TagOrCategory) ScanError!void {
     try ctx.state.next_tag_id.raisePast(tag.id);
     try ctx.state.next_tag_row_index.raisePast(@as(u32, tag.index_shift) / 0x20);
     if (tag.raw_is_category != 0) {
