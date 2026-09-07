@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const anlz = @import("rekordlib").anlz;
-const device = @import("rekordlib").device_export;
+const device_export = @import("rekordlib").device_export;
 const onelibrary = @import("rekordlib").onelibrary;
 const pdb = @import("rekordlib").pdb;
 const setting = @import("rekordlib").setting;
@@ -35,7 +35,7 @@ const with_anlz_tracks = [_]struct {
 // Checks `pathHash` against an expected `P{XXX}` folder and `{HHHHHHHH}`
 // leaf, formatted the way the on-disk directory names are.
 fn expectPathHash(audio_path: []const u8, want_folder: []const u8, want_leaf: []const u8) !void {
-    const h = try device.pathHash(audio_path);
+    const h = try device_export.pathHash(audio_path);
     const folder = try std.fmt.allocPrint(testing.allocator, "P{X:0>3}", .{h.p_value});
     defer testing.allocator.free(folder);
     const leaf = try std.fmt.allocPrint(testing.allocator, "{X:0>8}", .{h.hash});
@@ -81,7 +81,7 @@ test "path hash matches real rekordbox exports" {
 
 test "path hash matches the with_anlz analysis directories" {
     for (with_anlz_tracks) |track| {
-        const h = try device.pathHash(track.audio_path);
+        const h = try device_export.pathHash(track.audio_path);
         const dir = try std.fmt.allocPrint(testing.allocator, "PIONEER/USBANLZ/P{X:0>3}/{X:0>8}", .{ h.p_value, h.hash });
         defer testing.allocator.free(dir);
         try testing.expectEqualStrings(track.anlz_dir, dir);
@@ -90,7 +90,7 @@ test "path hash matches the with_anlz analysis directories" {
 
 test "anlz device path matches the stored analyze_path" {
     for (with_anlz_tracks) |track| {
-        const path = try device.anlzDevicePath(testing.allocator, track.audio_path);
+        const path = try device_export.anlzDevicePath(testing.allocator, track.audio_path);
         defer testing.allocator.free(path);
         try testing.expectEqualStrings(track.analyze_path, path);
     }
@@ -100,7 +100,7 @@ test "layout paths match the with_anlz export" {
     const alloc = testing.allocator;
     const io = testing.io;
     const dir = std.Io.Dir.cwd();
-    const layout = device.Layout{ .root = "testdata/complete_export/with_anlz" };
+    const layout = device_export.Layout{ .root = "testdata/complete_export/with_anlz" };
 
     // Every derived host path must exist in the fixture, exactly where the
     // fixture has it.
@@ -114,7 +114,7 @@ test "layout paths match the with_anlz export" {
     try testing.expectEqualStrings("testdata/complete_export/with_anlz/PIONEER/rekordbox/exportExt.pdb", ext_path);
     _ = try dir.statFile(io, ext_path, .{});
 
-    for (device.dat_files) |dat| {
+    for (device_export.dat_files) |dat| {
         const dat_path = try layout.datPath(alloc, dat.name);
         defer alloc.free(dat_path);
         _ = try dir.statFile(io, dat_path, .{});
@@ -147,14 +147,14 @@ test "layout paths match the with_anlz export" {
 
 test "dat files are in the order rekordbox writes them" {
     try testing.expectEqualSlices(
-        device.DatFile,
+        device_export.DatFile,
         &.{
             .{ .name = "DEVSETTING.DAT", .kind = .dev_setting },
             .{ .name = "DJMMYSETTING.DAT", .kind = .djm_my_setting },
             .{ .name = "MYSETTING.DAT", .kind = .my_setting },
             .{ .name = "MYSETTING2.DAT", .kind = .my_setting2 },
         },
-        &device.dat_files,
+        &device_export.dat_files,
     );
 }
 
@@ -163,7 +163,7 @@ test "artwork spec pins shard folders, file names, and resolutions" {
 
     // The with_anlz export stores id 1 and 2 under shard folder 00001; the
     // Artwork rows carry the thumbnail paths.
-    var spec = try device.artworkSpec(alloc, 1);
+    var spec = try device_export.artworkSpec(alloc, 1);
     defer spec.deinit(alloc);
     try testing.expectEqualStrings("/PIONEER/Artwork/00001/a1.jpg", spec.thumbnail_path);
     try testing.expectEqualStrings("/PIONEER/Artwork/00001/a1_m.jpg", spec.medium_path);
@@ -176,17 +176,17 @@ test "artwork spec pins shard folders, file names, and resolutions" {
         .{ .id = 39, .folder = "00002" },
     };
     for (shard_bounds) |case| {
-        const folder = try device.artworkFolder(alloc, case.id);
+        const folder = try device_export.artworkFolder(alloc, case.id);
         defer alloc.free(folder);
         try testing.expectEqualStrings(case.folder, folder);
     }
 
-    var spec2 = try device.artworkSpec(alloc, 20);
+    var spec2 = try device_export.artworkSpec(alloc, 20);
     defer spec2.deinit(alloc);
     try testing.expectEqualStrings("/PIONEER/Artwork/00002/a20.jpg", spec2.thumbnail_path);
     try testing.expectEqualStrings("/PIONEER/Artwork/00002/a20_m.jpg", spec2.medium_path);
 
-    try testing.expectEqual(device.ArtworkCodec.jpeg, spec.codec);
+    try testing.expectEqual(device_export.ArtworkCodec.jpeg, spec.codec);
     try testing.expectEqual(@as(u16, 80), spec.thumbnail_resolution.width);
     try testing.expectEqual(@as(u16, 80), spec.thumbnail_resolution.height);
     try testing.expectEqual(@as(u16, 240), spec.medium_resolution.width);
@@ -199,7 +199,7 @@ test "artwork spec carries the OneLibrary b-variant" {
 
     // Rekordbox writes both the a* and b* sets; the with_anlz export
     // carries all four files for artwork ids 1 and 2 under shard 00001.
-    var spec = try device.artworkSpec(alloc, 1);
+    var spec = try device_export.artworkSpec(alloc, 1);
     defer spec.deinit(alloc);
     try testing.expectEqualStrings("/PIONEER/Artwork/00001/b1.jpg", spec.ol_thumbnail_path);
     try testing.expectEqualStrings("/PIONEER/Artwork/00001/b1_m.jpg", spec.ol_medium_path);
@@ -220,7 +220,7 @@ test "artwork spec carries the OneLibrary b-variant" {
         _ = try std.Io.Dir.cwd().statFile(io, host, .{});
     }
 
-    var spec2 = try device.artworkSpec(alloc, 20);
+    var spec2 = try device_export.artworkSpec(alloc, 20);
     defer spec2.deinit(alloc);
     try testing.expectEqualStrings("/PIONEER/Artwork/00002/b20.jpg", spec2.ol_thumbnail_path);
     try testing.expectEqualStrings("/PIONEER/Artwork/00002/b20_m.jpg", spec2.ol_medium_path);
@@ -230,7 +230,7 @@ test "layout derives the exportLibrary.db path" {
     const alloc = testing.allocator;
     const io = testing.io;
 
-    const layout = device.Layout{ .root = "testdata/complete_export/with_anlz" };
+    const layout = device_export.Layout{ .root = "testdata/complete_export/with_anlz" };
     const path = try layout.exportLibraryDb(alloc);
     defer alloc.free(path);
     try testing.expectEqualStrings(
@@ -264,13 +264,13 @@ const fixtures = [_]struct {
     .{
         .name = "with_anlz",
         .tracks = 2,
-        .playlists = &.{.{ .id = 1, .name = "aaaaa" }},
+        .playlists = &.{.{ .id = @enumFromInt(1), .name = "aaaaa" }},
     },
 };
 
 /// One expected top-level playlist leaf.
 const PlaylistExpectation = struct {
-    id: u32,
+    id: device_export.PlaylistNodeId,
     name: []const u8,
 };
 
@@ -280,7 +280,7 @@ test "reader loads all four settings of every fixture" {
     for (fixtures) |fixture| {
         const path = try std.fmt.allocPrint(alloc, "testdata/complete_export/{s}", .{fixture.name});
         defer alloc.free(path);
-        var ex = device.DeviceExport.open(path, io, alloc);
+        var ex = try device_export.DeviceExport.open(path, io, alloc);
         defer ex.deinit();
         const settings = try ex.loadSettings();
         try testing.expect(settings.dev_setting != null);
@@ -310,7 +310,7 @@ test "settings loading tolerates missing and invalid files" {
     try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER/MYSETTING.DAT", .data = good });
     try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER/DJMMYSETTING.DAT", .data = "garbage" });
 
-    var ex = device.DeviceExport.open(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.open(tmp_path, io, alloc);
     defer ex.deinit();
     const settings = try ex.loadSettings();
     try testing.expect(settings.my_setting != null);
@@ -318,14 +318,11 @@ test "settings loading tolerates missing and invalid files" {
     try testing.expect(settings.dev_setting == null);
     try testing.expect(settings.my_setting2 == null);
 
-    // A root without any export content at all stays quiet and empty.
-    var empty_ex = device.DeviceExport.open(".zig-cache/definitely-not-here", io, alloc);
-    defer empty_ex.deinit();
-    const empty_settings = try empty_ex.loadSettings();
-    try testing.expect(empty_settings.dev_setting == null);
-    try testing.expect(empty_settings.djm_my_setting == null);
-    try testing.expect(empty_settings.my_setting == null);
-    try testing.expect(empty_settings.my_setting2 == null);
+    // A root without any export content at all fails classification.
+    try testing.expectError(
+        error.NotAnExport,
+        device_export.DeviceExport.open(".zig-cache/definitely-not-here", io, alloc),
+    );
 }
 
 test "loadSettings propagates a file that is not absence-shaped" {
@@ -345,7 +342,7 @@ test "loadSettings propagates a file that is not absence-shaped" {
     @memset(big, 0);
     try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER/DEVSETTING.DAT", .data = big });
 
-    var ex = device.DeviceExport.open(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.open(tmp_path, io, alloc);
     defer ex.deinit();
     try testing.expectError(error.StreamTooLong, ex.loadSettings());
 }
@@ -361,11 +358,8 @@ test "reader opens each fixture pdb and counts its tracks" {
         defer db.deinit();
 
         var tracks: usize = 0;
-        var it = try db.rows(.tracks);
-        while (try it.next()) |row| switch (row.*) {
-            .track => tracks += 1,
-            else => {},
-        };
+        var it = try db.rowsOf(pdb.Track);
+        while (try it.next()) |_| tracks += 1;
         try testing.expectEqual(fixture.tracks, tracks);
     }
 }
@@ -376,7 +370,7 @@ test "playlist trees match the fixtures" {
     for (fixtures) |fixture| {
         const path = try std.fmt.allocPrint(alloc, "testdata/complete_export/{s}", .{fixture.name});
         defer alloc.free(path);
-        var ex = device.DeviceExport.open(path, io, alloc);
+        var ex = try device_export.DeviceExport.open(path, io, alloc);
         defer ex.deinit();
 
         var playlists = try ex.getPlaylists();
@@ -399,7 +393,7 @@ test "OL reader hook loads with_anlz and joins tracks by path" {
     const alloc = testing.allocator;
     const io = testing.io;
 
-    var ex = device.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
+    var ex = try device_export.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
     defer ex.deinit();
 
     const lib = (try ex.openOneLibrary()).?;
@@ -424,7 +418,7 @@ test "OL reader hook is null without an exportLibrary.db" {
     const alloc = testing.allocator;
     const io = testing.io;
 
-    var ex = device.DeviceExport.open("testdata/complete_export/demo_tracks", io, alloc);
+    var ex = try device_export.DeviceExport.open("testdata/complete_export/demo_tracks", io, alloc);
     defer ex.deinit();
     try testing.expect((try ex.openOneLibrary()) == null);
     // The absent verdict is cached too.
@@ -491,7 +485,7 @@ test "create saves an OL db with defaults and zero contents" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     try ex.save();
 
@@ -553,7 +547,7 @@ test "off builds write no exportLibrary.db" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     _ = try ex.addTrack(.{ .title = "song", .file_path = "/Contents/song.mp3" });
     try ex.save();
@@ -574,7 +568,7 @@ test "addTrack mirrors a content row and its dimensions" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     const first = try ex.addTrack(.{
         .title = "Bako",
@@ -630,7 +624,7 @@ test "addTrack mirrors a content row and its dimensions" {
 
     // The content row: bridged id, mirrored facts, the fixture's NULL
     // versus empty-string conventions, and the cross-format constants.
-    const content = lib.byId(onelibrary.Content, first.id).?;
+    const content = lib.byId(onelibrary.Content, first.id.int()).?;
     try testing.expectEqualStrings("Bako", content.title.?);
     try testing.expectEqual(@as(i64, 12_900), content.bpmx100.?);
     try testing.expectEqual(@as(i64, 398), content.length.?);
@@ -696,7 +690,7 @@ test "addTrack authors OL-only columns and mints a lyricist artist" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     _ = try ex.addTrack(.{
         .title = "Cirrus",
@@ -764,7 +758,7 @@ test "a lyricist sharing the track artist resolves, never mints" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     _ = try ex.addTrack(.{
         .title = "Kite",
@@ -797,7 +791,7 @@ test "a failed OL batch rolls back whole and stays pending" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     _ = try ex.addTrack(.{ .title = "a", .artist = "Ar", .file_path = "/Contents/a.mp3" });
     try ex.save();
@@ -851,14 +845,14 @@ test "a save blocked at the first OL batch recovers whole on retry" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     const first = try ex.addTrack(.{
         .title = "first",
         .artist = "Ar",
         .file_path = "/Contents/first.mp3",
     });
-    const pl = try ex.createPlaylist("pl", 0);
+    const pl = try ex.createPlaylist("pl", .root);
     try ex.addTrackToPlaylist(pl, first.id);
     const cat = try ex.createTagCategory("Cats");
     try ex.addTagsToTrack(first.id, cat, &.{"fav"});
@@ -893,7 +887,7 @@ test "a save blocked at the first OL batch recovers whole on retry" {
     try testing.expectEqual(@as(usize, 2), lib.contents.len);
     try testing.expectEqual(@as(i64, 2), lib.property.?.numberOfContents.?);
     try testing.expectEqual(@as(usize, 2), lib.playlist_contents.len);
-    const entries = lib.playlist_contents_by_playlist.get(pl).?;
+    const entries = lib.playlist_contents_by_playlist.get(pl.int()).?;
     try testing.expectEqual(@as(i64, 1), lib.playlist_contents[entries[0]].sequenceNo.?);
     try testing.expectEqual(@as(i64, 2), lib.playlist_contents[entries[1]].sequenceNo.?);
     try testing.expectEqual(@as(usize, 2), lib.my_tag_contents.len);
@@ -912,7 +906,7 @@ test "addTrack mirrors the analysis path when analysis pends" {
     var beats = [1]anlz.Beat{.{ .beat_number = 1, .tempo = 12_800, .time = 0 }};
     const input = anlz.Analysis{ .beats = &beats };
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     _ = try ex.addTrack(.{
         .title = "analyzed",
@@ -929,7 +923,7 @@ test "addTrack mirrors the analysis path when analysis pends" {
     defer lib.deinit();
 
     const content = lib.contents[0];
-    const want = try device.anlzDevicePath(alloc, "/Contents/analyzed.mp3");
+    const want = try device_export.anlzDevicePath(alloc, "/Contents/analyzed.mp3");
     defer alloc.free(want);
     try testing.expectEqualStrings(want, content.analysisDataFilePath.?);
 }
@@ -946,7 +940,7 @@ test "mirroring dedups against an existing OL db" {
     try copyFixturePdb(&tmp, io, alloc, "with_anlz");
     try copyFixtureOlDb(&tmp, io, alloc);
 
-    var ex = device.DeviceExport.open(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.open(tmp_path, io, alloc);
     defer ex.deinit();
     // The fixture's own artist and genre, a new path: the mirror must
     // reuse the db's rows (artist 1 "Reboot", genre 2 "Tech House")
@@ -959,7 +953,7 @@ test "mirroring dedups against an existing OL db" {
         .filename = "03. new song.mp3",
     });
     try testing.expect(outcome.is_new);
-    try testing.expectEqual(@as(u32, 3), outcome.id);
+    try testing.expectEqual(@as(device_export.TrackId, @enumFromInt(3)), outcome.id);
     try ex.save();
 
     const db_path = try tmpOlDbPath(&tmp, alloc);
@@ -980,7 +974,7 @@ test "mirroring dedups against an existing OL db" {
 
     // Across the save/reopen boundary the pdb-side path dedup still
     // gates the mirror: re-adding inserts nothing anywhere.
-    var reopened = device.DeviceExport.open(tmp_path, io, alloc);
+    var reopened = try device_export.DeviceExport.open(tmp_path, io, alloc);
     defer reopened.deinit();
     const again = try reopened.addTrack(.{
         .title = "new song",
@@ -1027,19 +1021,19 @@ test "playlist tree nests folders in row order" {
         _ = try db.addRow(&row);
     }
 
-    var playlists = try device.getPlaylistsDb(alloc, &db);
+    var playlists = try device_export.getPlaylistsDb(alloc, &db);
     defer playlists.deinit();
 
     try testing.expectEqual(@as(usize, 2), playlists.roots.len);
-    try testing.expectEqual(@as(u32, 1), playlists.roots[0].playlist.id);
+    try testing.expectEqual(@as(device_export.PlaylistNodeId, @enumFromInt(1)), playlists.roots[0].playlist.id);
     try testing.expectEqualStrings("aaaaa", playlists.roots[0].playlist.name);
     const folder = playlists.roots[1].folder;
-    try testing.expectEqual(@as(u32, 100), folder.id);
+    try testing.expectEqual(@as(device_export.PlaylistNodeId, @enumFromInt(100)), folder.id);
     try testing.expectEqualStrings("Folder", folder.name);
     try testing.expectEqual(@as(usize, 2), folder.children.items.len);
-    try testing.expectEqual(@as(u32, 101), folder.children.items[0].playlist.id);
+    try testing.expectEqual(@as(device_export.PlaylistNodeId, @enumFromInt(101)), folder.children.items[0].playlist.id);
     try testing.expectEqualStrings("Leaf B", folder.children.items[0].playlist.name);
-    try testing.expectEqual(@as(u32, 102), folder.children.items[1].playlist.id);
+    try testing.expectEqual(@as(device_export.PlaylistNodeId, @enumFromInt(102)), folder.children.items[1].playlist.id);
     try testing.expectEqualStrings("Leaf A", folder.children.items[1].playlist.name);
 }
 
@@ -1072,20 +1066,20 @@ test "playlist tree cuts parent-id cycles" {
         _ = try db.addRow(&row);
     }
 
-    var playlists = try device.getPlaylistsDb(alloc, &db);
+    var playlists = try device_export.getPlaylistsDb(alloc, &db);
     defer playlists.deinit();
 
     // The top level holds the real playlist and the id-0 folder; the
     // duplicated id 5 is expanded once (inside the id-0 folder) and skipped
     // at the top level.
     try testing.expectEqual(@as(usize, 2), playlists.roots.len);
-    try testing.expectEqual(@as(u32, 1), playlists.roots[0].playlist.id);
+    try testing.expectEqual(@as(device_export.PlaylistNodeId, @enumFromInt(1)), playlists.roots[0].playlist.id);
     const root_cycle = playlists.roots[1].folder;
-    try testing.expectEqual(@as(u32, 0), root_cycle.id);
+    try testing.expectEqual(@as(device_export.PlaylistNodeId, @enumFromInt(0)), root_cycle.id);
     try testing.expectEqual(@as(usize, 2), root_cycle.children.items.len);
-    try testing.expectEqual(@as(u32, 1), root_cycle.children.items[0].playlist.id);
+    try testing.expectEqual(@as(device_export.PlaylistNodeId, @enumFromInt(1)), root_cycle.children.items[0].playlist.id);
     const inner = root_cycle.children.items[1].folder;
-    try testing.expectEqual(@as(u32, 5), inner.id);
+    try testing.expectEqual(@as(device_export.PlaylistNodeId, @enumFromInt(5)), inner.id);
     try testing.expectEqual(@as(usize, 0), inner.children.items.len);
 }
 
@@ -1111,13 +1105,13 @@ test "playlist tree handles nesting far beyond any call stack" {
         _ = try db.addRow(&row);
     }
 
-    var tree = try device.getPlaylistsDb(alloc, &db);
+    var tree = try device_export.getPlaylistsDb(alloc, &db);
     defer tree.deinit();
 
     // One root nesting `depth` deep; verify by walking iteratively, the
     // way any consumer of an unbounded tree must.
     try testing.expectEqual(@as(usize, 1), tree.roots.len);
-    var nodes: std.ArrayList(*const device.PlaylistNode) = .empty;
+    var nodes: std.ArrayList(*const device_export.PlaylistNode) = .empty;
     defer nodes.deinit(alloc);
     var depths: std.ArrayList(usize) = .empty;
     defer depths.deinit(alloc);
@@ -1154,7 +1148,7 @@ fn countTableRows(db: *const pdb.Database, page_type: pdb.PageType) !usize {
 /// Parses `root`'s `export.pdb` off disk — the manual path's read half,
 /// verifying the landed bytes rather than any in-handle state.
 fn parseExportPdb(alloc: std.mem.Allocator, io: std.Io, root_path: []const u8) !pdb.Database {
-    const layout = device.Layout{ .root = root_path };
+    const layout = device_export.Layout{ .root = root_path };
     const path = try layout.exportPdb(alloc);
     defer alloc.free(path);
     const dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
@@ -1178,7 +1172,7 @@ fn copyEmptyFixture(tmp: *testing.TmpDir, io: std.Io, alloc: std.mem.Allocator) 
         .sub_path = "PIONEER/rekordbox/export.pdb",
         .data = pdb_image,
     });
-    for (device.dat_files) |dat| {
+    for (device_export.dat_files) |dat| {
         const src = try std.fmt.allocPrint(
             alloc,
             "complete_export/empty/PIONEER/{s}",
@@ -1202,7 +1196,7 @@ test "create saves an export shaped like the empty fixture" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     try ex.save();
 
@@ -1273,7 +1267,7 @@ test "create without save leaves nothing on disk" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     ex.deinit();
 
     try testing.expectError(error.FileNotFound, tmp.dir.access(io, "PIONEER", .{}));
@@ -1289,7 +1283,7 @@ test "a save that fails validation writes nothing" {
     defer alloc.free(tmp_path);
 
     // A valid export on disk.
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     _ = try ex.addTrack(.{ .title = "Music", .file_path = "/Contents/music.mp3" });
     try ex.save();
@@ -1299,13 +1293,13 @@ test "a save that fails validation writes nothing" {
     {
         var db = try parseExportPdb(alloc, io, tmp_path);
         defer db.deinit();
-        var it = try db.rows(.tracks);
-        while (try it.next()) |row| {
-            row.track.offsets.inner.comment = pdb.DeviceSQLString.empty();
+        var it = try db.rowsOf(pdb.Track);
+        while (try it.next()) |track| {
+            track.offsets.inner.comment = pdb.DeviceSQLString.empty();
         }
         const image = try db.serialize(alloc);
         defer alloc.free(image);
-        try device.writeFileAtomic(io, tmp.dir, "PIONEER/rekordbox/export.pdb", image);
+        try device_export.writeFileAtomic(io, tmp.dir, "PIONEER/rekordbox/export.pdb", image);
     }
 
     // A handle over it refuses to save, leaving the file untouched.
@@ -1316,7 +1310,7 @@ test "a save that fails validation writes nothing" {
         .limited(1 << 26),
     );
     defer alloc.free(before);
-    var reopened = device.DeviceExport.open(tmp_path, io, alloc);
+    var reopened = try device_export.DeviceExport.open(tmp_path, io, alloc);
     defer reopened.deinit();
     try testing.expectError(error.TrackRowTooSmall, reopened.save());
     const after = try tmp.dir.readFileAlloc(
@@ -1342,7 +1336,7 @@ test "create refuses a root that already has an export" {
 
     try testing.expectError(
         error.ExportAlreadyExists,
-        device.DeviceExport.create(tmp_path, io, alloc),
+        device_export.DeviceExport.create(tmp_path, io, alloc),
     );
 }
 
@@ -1355,7 +1349,7 @@ test "save is byte-stable" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     try ex.save();
 
@@ -1406,10 +1400,10 @@ test "opened export edits persist through save" {
         _ = try db.addRow(&row);
         const image = try db.serialize(alloc);
         defer alloc.free(image);
-        try device.writeFileAtomic(io, tmp.dir, "PIONEER/rekordbox/export.pdb", image);
+        try device_export.writeFileAtomic(io, tmp.dir, "PIONEER/rekordbox/export.pdb", image);
     }
 
-    var ex = device.DeviceExport.open(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.open(tmp_path, io, alloc);
     defer ex.deinit();
 
     // An opened export never rewrites its setting files.
@@ -1440,7 +1434,7 @@ test "opened export edits persist through save" {
 /// Asserts `canonicalKeyName(in) == want`, freeing the owned result.
 fn expectCanonical(in: []const u8, want: []const u8) !void {
     const alloc = testing.allocator;
-    const got = try device.canonicalKeyName(alloc, in);
+    const got = try device_export.canonicalKeyName(alloc, in);
     defer alloc.free(got);
     try testing.expectEqualStrings(want, got);
 }
@@ -1571,7 +1565,7 @@ test "writer state scans each fixture" {
     for (scan_expectations) |want| {
         const path = try std.fmt.allocPrint(alloc, "testdata/complete_export/{s}", .{want.name});
         defer alloc.free(path);
-        var ex = device.DeviceExport.open(path, io, alloc);
+        var ex = try device_export.DeviceExport.open(path, io, alloc);
         defer ex.deinit();
         const ws = try ex.writerState();
 
@@ -1600,7 +1594,7 @@ test "writer state scans each fixture" {
 test "writer state pins with_anlz relationships" {
     const alloc = testing.allocator;
     const io = testing.io;
-    var ex = device.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
+    var ex = try device_export.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
     defer ex.deinit();
     const ws = try ex.writerState();
 
@@ -1631,7 +1625,7 @@ test "writer state pins with_anlz relationships" {
 test "writer state ignores dead-row remnants" {
     const alloc = testing.allocator;
     const io = testing.io;
-    var ex = device.DeviceExport.open("testdata/complete_export/demo_tracks", io, alloc);
+    var ex = try device_export.DeviceExport.open("testdata/complete_export/demo_tracks", io, alloc);
     defer ex.deinit();
     const ws = try ex.writerState();
 
@@ -1648,7 +1642,7 @@ test "writer state is lazy, cached, and pre-built by create" {
     const alloc = testing.allocator;
     const io = testing.io;
 
-    var ex = device.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
+    var ex = try device_export.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
     defer ex.deinit();
     try testing.expect(ex.writer_state == null);
     const ws = try ex.writerState();
@@ -1659,7 +1653,7 @@ test "writer state is lazy, cached, and pre-built by create" {
     defer tmp.cleanup();
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
-    var created = try device.DeviceExport.create(tmp_path, io, alloc);
+    var created = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer created.deinit();
     const fresh = try created.writerState();
     // Fresh counters — id 0 is the null FK — and empty maps; the default
@@ -1680,7 +1674,7 @@ test "writer state scans num_rows at scale" {
     var db = try pdb.Database.parse(alloc, input, .plain);
     defer db.deinit();
 
-    var state = try device.scanWriterState(alloc, &db);
+    var state = try device_export.scanWriterState(alloc, &db);
     defer state.deinit();
 
     try testing.expectEqual(@as(usize, 3886), state.track_ids.count());
@@ -1688,7 +1682,7 @@ test "writer state scans num_rows at scale" {
 }
 
 test "IdMint rejects an exhausted id space" {
-    var m = device.IdMint(u32){ .next = 5 };
+    var m = device_export.IdMint(u32){ .next = 5 };
     try testing.expectEqual(@as(u32, 5), try m.mint());
     try testing.expectEqual(@as(u32, 6), try m.mint());
 
@@ -1727,7 +1721,7 @@ test "writer state scan rejects a max track id" {
     // later mint with the hostile row (or panic on the bump).
     try testing.expectError(
         error.IdSpaceExhausted,
-        device.scanWriterState(alloc, &db),
+        device_export.scanWriterState(alloc, &db),
     );
 }
 
@@ -1747,7 +1741,7 @@ test "writer state scan rejects a max playlist entry index" {
 
     try testing.expectError(
         error.IdSpaceExhausted,
-        device.scanWriterState(alloc, &db),
+        device_export.scanWriterState(alloc, &db),
     );
 }
 
@@ -1793,9 +1787,9 @@ test "ext tag scan recovers a built ext database" {
     var techno_dup = try testTagRow(a, 7, 2, 20, false, 3, "Techno");
     _ = try db.addRow(&techno_dup);
 
-    var state = device.WriterState{ .arena = std.heap.ArenaAllocator.init(alloc) };
+    var state = device_export.WriterState{ .arena = std.heap.ArenaAllocator.init(alloc) };
     defer state.deinit();
-    try device.scanExtTags(state.arena.allocator(), &db, &state);
+    try device_export.scanExtTags(state.arena.allocator(), &db, &state);
 
     try testing.expectEqual(@as(u32, 21), state.next_tag_id.next);
     try testing.expectEqual(@as(u32, 4), state.next_tag_row_index.next);
@@ -1824,11 +1818,11 @@ test "ext tag scan rejects a max tag id" {
     var hostile = try testTagRow(a, 0, 0, std.math.maxInt(u32), true, 0, "X");
     _ = try db.addRow(&hostile);
 
-    var state = device.WriterState{ .arena = std.heap.ArenaAllocator.init(alloc) };
+    var state = device_export.WriterState{ .arena = std.heap.ArenaAllocator.init(alloc) };
     defer state.deinit();
     try testing.expectError(
         error.IdSpaceExhausted,
-        device.scanExtTags(state.arena.allocator(), &db, &state),
+        device_export.scanExtTags(state.arena.allocator(), &db, &state),
     );
 }
 
@@ -1843,9 +1837,9 @@ test "ext tag scan recovers the with_anlz fixture" {
     var db = try pdb.Database.parse(alloc, input, .ext);
     defer db.deinit();
 
-    var state = device.WriterState{ .arena = std.heap.ArenaAllocator.init(alloc) };
+    var state = device_export.WriterState{ .arena = std.heap.ArenaAllocator.init(alloc) };
     defer state.deinit();
-    try device.scanExtTags(state.arena.allocator(), &db, &state);
+    try device_export.scanExtTags(state.arena.allocator(), &db, &state);
 
     // Hand-checked against the fixture (2026-08-23): 4 categories —
     // Genre, Components, Situation, Untitled Column (ids 1-4, positions
@@ -1904,9 +1898,9 @@ fn copyFixturePdb(
 /// Counts Artist rows whose name decodes to exactly `name`.
 fn countArtistsNamed(db: *const pdb.Database, name: []const u8) !usize {
     var count: usize = 0;
-    var it = try db.rows(.artists);
-    while (try it.next()) |row| {
-        const got = try row.artist.offsets.inner.name.utf8(testing.allocator);
+    var it = try db.rowsOf(pdb.Artist);
+    while (try it.next()) |artist| {
+        const got = try artist.offsets.inner.name.utf8(testing.allocator);
         defer testing.allocator.free(got);
         if (std.mem.eql(u8, got, name)) count += 1;
     }
@@ -1922,13 +1916,13 @@ test "add track dedups on file path" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    const song = device.TrackInput{
+    const song = device_export.TrackInput{
         .title = "song",
         .filename = "song.mp3",
         .file_path = "/Contents/song.mp3",
     };
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     const first = try ex.addTrack(song);
     const second = try ex.addTrack(song);
@@ -1939,7 +1933,7 @@ test "add track dedups on file path" {
 
     // Across save/open: the scan reads the path back, so re-adding still
     // dedups instead of inserting a second row.
-    var reopened = device.DeviceExport.open(tmp_path, io, alloc);
+    var reopened = try device_export.DeviceExport.open(tmp_path, io, alloc);
     defer reopened.deinit();
     const third = try reopened.addTrack(song);
     try testing.expectEqual(first.id, third.id);
@@ -1960,7 +1954,7 @@ test "add track auto-pads under the minimum row size" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     const outcome = try ex.addTrack(.{
         .title = "tiny",
@@ -1971,8 +1965,8 @@ test "add track auto-pads under the minimum row size" {
 
     var db = try parseExportPdb(alloc, io, tmp_path);
     defer db.deinit();
-    var it = try db.rows(.tracks);
-    const track = (try it.next()).?.track;
+    var it = try db.rowsOf(pdb.Track);
+    const track = (try it.next()).?;
     const comment = try track.offsets.inner.comment.utf8(alloc);
     defer alloc.free(comment);
     try testing.expect(comment.len > 0);
@@ -1988,7 +1982,7 @@ test "a string that fails to encode leaves the export untouched" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
 
     // One byte over the long-form body cap: encoding fails before any id
@@ -2006,7 +2000,7 @@ test "a string that fails to encode leaves the export untouched" {
     // save then proves the failed one left no rows behind.
     const outcome = try ex.addTrack(.{ .title = "ok", .file_path = "/Contents/ok.mp3" });
     try testing.expect(outcome.is_new);
-    try testing.expectEqual(@as(u32, 1), outcome.id);
+    try testing.expectEqual(@as(device_export.TrackId, @enumFromInt(1)), outcome.id);
     try ex.save();
 
     var db = try parseExportPdb(alloc, io, tmp_path);
@@ -2025,7 +2019,7 @@ test "add track stores the caller artwork path verbatim" {
     defer alloc.free(tmp_path);
 
     const caller_path = "/PIONEER/Artwork/00007/a137.jpg";
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     _ = try ex.addTrack(.{
         .title = "song",
@@ -2048,16 +2042,16 @@ test "add track stores the caller artwork path verbatim" {
     var db = try parseExportPdb(alloc, io, tmp_path);
     defer db.deinit();
     try testing.expectEqual(@as(usize, 1), try countTableRows(&db, .artwork));
-    var it = try db.rows(.artwork);
-    const artwork = (try it.next()).?.artwork;
+    var it = try db.rowsOf(pdb.Artwork);
+    const artwork = (try it.next()).?;
     const path = try artwork.path.utf8(alloc);
     defer alloc.free(path);
     try testing.expectEqualStrings(caller_path, path);
 
-    var tracks = try db.rows(.tracks);
+    var tracks = try db.rowsOf(pdb.Track);
     var artwork_ids: [2]u32 = undefined;
     var i: usize = 0;
-    while (try tracks.next()) |row| : (i += 1) artwork_ids[i] = row.track.artwork_id;
+    while (try tracks.next()) |track| : (i += 1) artwork_ids[i] = track.artwork_id;
     try testing.expect(artwork_ids[0] != 0);
     try testing.expectEqual(artwork_ids[0], artwork_ids[1]);
     try testing.expectEqual(artwork.id, artwork_ids[0]);
@@ -2075,7 +2069,7 @@ test "open then add does not duplicate a named row" {
         const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
         defer alloc.free(tmp_path);
 
-        const song = device.TrackInput{
+        const song = device_export.TrackInput{
             .title = "song",
             .artist = "Dup Artist",
             .album = "Dup Album",
@@ -2083,12 +2077,12 @@ test "open then add does not duplicate a named row" {
             .filename = "song.mp3",
             .file_path = "/Contents/song.mp3",
         };
-        var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+        var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
         defer ex.deinit();
         _ = try ex.addTrack(song);
         try ex.save();
 
-        var reopened = device.DeviceExport.open(tmp_path, io, alloc);
+        var reopened = try device_export.DeviceExport.open(tmp_path, io, alloc);
         defer reopened.deinit();
         _ = try reopened.addTrack(song);
         try reopened.save();
@@ -2114,7 +2108,7 @@ test "open then add does not duplicate a named row" {
         defer alloc.free(tmp_path);
         try copyFixturePdb(&tmp, io, alloc, fixture.name);
 
-        var ex = device.DeviceExport.open(tmp_path, io, alloc);
+        var ex = try device_export.DeviceExport.open(tmp_path, io, alloc);
         defer ex.deinit();
         const outcome = try ex.addTrack(.{
             .title = "new song",
@@ -2131,10 +2125,10 @@ test "open then add does not duplicate a named row" {
         try testing.expectEqual(fixture.tracks + 1, try countTableRows(&db, .tracks));
 
         // The new track points at the pre-existing artist row.
-        var it = try db.rows(.tracks);
-        while (try it.next()) |row| {
-            if (row.track.id == outcome.id) {
-                try testing.expectEqual(@as(u32, 1), row.track.artist_id);
+        var it = try db.rowsOf(pdb.Track);
+        while (try it.next()) |track| {
+            if (track.id == outcome.id.int()) {
+                try testing.expectEqual(@as(u32, 1), track.artist_id);
             }
         }
     }
@@ -2167,7 +2161,7 @@ test "add track with analysis writes anlz files" {
         .color_preview = &color_preview,
     };
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     const outcome = try ex.addTrack(.{
         .title = "test",
@@ -2180,7 +2174,7 @@ test "add track with analysis writes anlz files" {
     // The analysis directory is keyed by the audio path exactly the way
     // players recompute it (`pathHash`).
     const audio_path = "/Contents/test.mp3";
-    const h = try device.pathHash(audio_path);
+    const h = try device_export.pathHash(audio_path);
     const dat_sub = try std.fmt.allocPrint(
         alloc,
         "PIONEER/USBANLZ/P{X:0>3}/{X:0>8}/ANLZ0000.DAT",
@@ -2222,13 +2216,71 @@ test "add track with analysis writes anlz files" {
     // audio path.
     var db = try parseExportPdb(alloc, io, tmp_path);
     defer db.deinit();
-    var it = try db.rows(.tracks);
-    const track = (try it.next()).?.track;
+    var it = try db.rowsOf(pdb.Track);
+    const track = (try it.next()).?;
     const analyze_path = try track.offsets.inner.analyze_path.utf8(alloc);
     defer alloc.free(analyze_path);
-    const want = try device.anlzDevicePath(alloc, audio_path);
+    const want = try device_export.anlzDevicePath(alloc, audio_path);
     defer alloc.free(want);
     try testing.expectEqualStrings(want, analyze_path);
+}
+
+test "2EX sections follow the writer's order and carry the scales" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    // 3-band analysis vector: one preview and one detail column plus the
+    // auto-gain scales — enough for a `.2EX` (the click probes' clamped
+    // scales).
+    var preview_mono = [1]anlz.WaveformPreviewColumn{.{ .height = 1, .whiteness = 0 }};
+    var band3_preview = [1]anlz.Waveform3BandColumn{.{ .energy_low = 1 }};
+    var band3_detail = [1]anlz.Waveform3BandColumn{.{ .energy_high = 2 }};
+    const input = anlz.Analysis{
+        .cue_list_type = .memory_cues,
+        .preview_mono = &preview_mono,
+        .band3_preview = &band3_preview,
+        .band3_detail = &band3_detail,
+        .band3_scales = .{ 300, 300, 470 },
+    };
+
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    _ = try ex.addTrack(.{
+        .title = "test",
+        .file_path = "/Contents/test.mp3",
+        .analysis = &input,
+    });
+    try ex.save();
+
+    const h = try device_export.pathHash("/Contents/test.mp3");
+    const two_ex_sub = try std.fmt.allocPrint(
+        alloc,
+        "PIONEER/USBANLZ/P{X:0>3}/{X:0>8}/ANLZ0000.2EX",
+        .{ h.p_value, h.hash },
+    );
+    defer alloc.free(two_ex_sub);
+    const two_ex = try tmp.dir.readFileAlloc(io, two_ex_sub, alloc, .limited(1 << 24));
+    defer alloc.free(two_ex);
+    var parsed = try anlz.Anlz.parse(alloc, two_ex);
+    defer parsed.deinit();
+
+    // The 6.8.6 writer's order: path, detail (PWV7), preview (PWV6),
+    // scales (PWVC) last.
+    const kinds = [_]anlz.Kind{ .path, .waveform_3band_detail, .waveform_3band_preview, .waveform_3band_scales };
+    try testing.expectEqual(@as(usize, 4), parsed.sections.len);
+    for (parsed.sections, kinds) |*section, want| {
+        const content_kind = anlz.sectionKind(section);
+        try testing.expectEqual(want, content_kind);
+    }
+    try testing.expectEqual(
+        [3]u16{ 300, 300, 470 },
+        parsed.findSection(.waveform_3band_scales).?.scales,
+    );
 }
 
 // --- writer: playlists + tags --------------------------------------------------------
@@ -2242,18 +2294,18 @@ test "playlist methods reject unknown foreign keys" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
 
     // The root (0) is always a valid parent; a folder groups a playlist.
     // Fresh counters start at 1: id 0 is the null foreign key.
-    const folder = try ex.createPlaylistFolder("Folder", 0);
+    const folder = try ex.createPlaylistFolder("Folder", .root);
     const playlist = try ex.createPlaylist("Playlist", folder);
-    try testing.expectEqual(@as(u32, 1), folder);
-    try testing.expectEqual(@as(u32, 2), playlist);
+    try testing.expectEqual(@as(device_export.PlaylistNodeId, @enumFromInt(1)), folder);
+    try testing.expectEqual(@as(device_export.PlaylistNodeId, @enumFromInt(2)), playlist);
 
     // Unknown parent: 999 was never created.
-    try testing.expectError(error.UnknownForeignKey, ex.createPlaylist("Orphan", 999));
+    try testing.expectError(error.UnknownForeignKey, ex.createPlaylist("Orphan", @enumFromInt(999)));
 
     // A valid track so the membership check has something to find.
     const track = (try ex.addTrack(.{
@@ -2263,8 +2315,8 @@ test "playlist methods reject unknown foreign keys" {
     })).id;
 
     // Unknown playlist id, unknown track id.
-    try testing.expectError(error.UnknownForeignKey, ex.addTrackToPlaylist(999, track));
-    try testing.expectError(error.UnknownForeignKey, ex.addTrackToPlaylist(playlist, 999));
+    try testing.expectError(error.UnknownForeignKey, ex.addTrackToPlaylist(@enumFromInt(999), track));
+    try testing.expectError(error.UnknownForeignKey, ex.addTrackToPlaylist(playlist, @enumFromInt(999)));
 
     // The happy path still works.
     try ex.addTrackToPlaylist(playlist, track);
@@ -2279,9 +2331,9 @@ test "playlist tree enforces folder vs playlist roles" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
-    const folder = try ex.createPlaylistFolder("Folder", 0);
+    const folder = try ex.createPlaylistFolder("Folder", .root);
     const playlist = try ex.createPlaylist("Playlist", folder);
 
     // The playlist exists, but it's a leaf, not a folder.
@@ -2299,7 +2351,7 @@ test "playlist tree enforces folder vs playlist roles" {
     // playlist, so `node_is_folder` was written the way the reader (and
     // players) interpret it.
     try ex.save();
-    var check = device.DeviceExport.open(tmp_path, io, alloc);
+    var check = try device_export.DeviceExport.open(tmp_path, io, alloc);
     defer check.deinit();
     var playlists = try check.getPlaylists();
     defer playlists.deinit();
@@ -2322,9 +2374,9 @@ test "add track to playlist auto-indexes" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
-    const playlist = try ex.createPlaylist("P", 0);
+    const playlist = try ex.createPlaylist("P", .root);
     const t0 = (try ex.addTrack(.{
         .title = "song0",
         .filename = "song0.mp3",
@@ -2347,7 +2399,7 @@ test "add track to playlist auto-indexes" {
 
     // After a save/open the entry counter is rebuilt from the rows, so
     // one more append lands at index 3.
-    var reopened = device.DeviceExport.open(tmp_path, io, alloc);
+    var reopened = try device_export.DeviceExport.open(tmp_path, io, alloc);
     defer reopened.deinit();
     const t3 = (try reopened.addTrack(.{
         .title = "song3",
@@ -2361,9 +2413,9 @@ test "add track to playlist auto-indexes" {
     defer db.deinit();
     var indices: [4]u32 = undefined;
     var count: usize = 0;
-    var it = try db.rows(.playlist_entries);
-    while (try it.next()) |row| {
-        indices[count] = row.playlist_entry.entry_index;
+    var it = try db.rowsOf(pdb.PlaylistEntry);
+    while (try it.next()) |entry| {
+        indices[count] = entry.entry_index;
         count += 1;
     }
     try testing.expectEqual(@as(usize, 4), count);
@@ -2402,16 +2454,10 @@ const ExtRows = struct {
 fn collectExtRows(alloc: std.mem.Allocator, db: *const pdb.Database) !ExtRows {
     var rows = ExtRows{ .tags = .empty, .track_tags = .empty };
     errdefer rows.deinit(alloc);
-    var tags = try db.rows(@enumFromInt(@intFromEnum(pdb.ExtPageType.tag)));
-    while (try tags.next()) |row| switch (row.*) {
-        .tag => |tag| try rows.tags.append(alloc, tag),
-        else => {},
-    };
-    var track_tags = try db.rows(@enumFromInt(@intFromEnum(pdb.ExtPageType.track_tag)));
-    while (try track_tags.next()) |row| switch (row.*) {
-        .track_tag => |tt| try rows.track_tags.append(alloc, tt),
-        else => {},
-    };
+    var tags = try db.rowsOf(pdb.TagOrCategory);
+    while (try tags.next()) |tag| try rows.tags.append(alloc, tag);
+    var track_tags = try db.rowsOf(pdb.TrackTag);
+    while (try track_tags.next()) |tt| try rows.track_tags.append(alloc, tt);
     return rows;
 }
 
@@ -2424,7 +2470,7 @@ test "tags are not written when unused" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     _ = try ex.addTrack(.{
         .title = "song",
@@ -2448,7 +2494,7 @@ test "add tags creates category leaves and junctions" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     const id1 = (try ex.addTrack(.{
         .title = "a",
@@ -2493,7 +2539,7 @@ test "add tags creates category leaves and junctions" {
     const category = categories.items[0];
     try testing.expectEqual(@as(u32, 1 << 24), category.raw_is_category);
     try testing.expectEqual(@as(u16, 0), category.index_shift);
-    try testing.expectEqual(cat, category.id);
+    try testing.expectEqual(cat.int(), category.id);
     try testing.expectEqual(@as(u32, 0), category.parent_id);
     const cat_name = try category.offsets.inner.name.utf8(alloc);
     defer alloc.free(cat_name);
@@ -2502,7 +2548,7 @@ test "add tags creates category leaves and junctions" {
     try testing.expectEqual(@as(usize, 3), leaves.items.len);
     for (leaves.items) |leaf| {
         try testing.expectEqual(@as(u32, 0), leaf.raw_is_category);
-        try testing.expectEqual(cat, leaf.parent_id);
+        try testing.expectEqual(cat.int(), leaf.parent_id);
     }
     for ([_][]const u8{ "Techno", "Dub", "House" }) |want| {
         var found = false;
@@ -2538,10 +2584,10 @@ test "add tags rejects unknown track" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     const cat = try ex.createTagCategory("My Tags");
-    try testing.expectError(error.UnknownForeignKey, ex.addTagsToTrack(999, cat, &.{"x"}));
+    try testing.expectError(error.UnknownForeignKey, ex.addTagsToTrack(@enumFromInt(999), cat, &.{"x"}));
 }
 
 test "add tags rejects unknown category" {
@@ -2553,7 +2599,7 @@ test "add tags rejects unknown category" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     const id = (try ex.addTrack(.{
         .title = "a",
@@ -2561,10 +2607,10 @@ test "add tags rejects unknown category" {
         .file_path = "/Contents/a.mp3",
     })).id;
 
-    try testing.expectError(error.UnknownForeignKey, ex.addTagsToTrack(id, 999, &.{"x"}));
+    try testing.expectError(error.UnknownForeignKey, ex.addTagsToTrack(id, @enumFromInt(999), &.{"x"}));
     // The track key is validated first (both keys bad reports the track
     // one; our errors carry no kind, so this pins only that it errors).
-    try testing.expectError(error.UnknownForeignKey, ex.addTagsToTrack(888, 999, &.{"x"}));
+    try testing.expectError(error.UnknownForeignKey, ex.addTagsToTrack(@enumFromInt(888), @enumFromInt(999), &.{"x"}));
 }
 
 test "add tags ignores empty labels" {
@@ -2576,7 +2622,7 @@ test "add tags ignores empty labels" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     const id = (try ex.addTrack(.{
         .title = "a",
@@ -2608,7 +2654,7 @@ test "open preserves existing tags" {
     defer alloc.free(tmp_path);
 
     {
-        var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+        var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
         defer ex.deinit();
         const id = (try ex.addTrack(.{
             .title = "a",
@@ -2625,14 +2671,14 @@ test "open preserves existing tags" {
     // at all is the assertion that the tag state was recovered) plus a
     // brand-new category. The leaf call runs first, so the opened tag
     // database must load before the category key is even checked.
-    var ex = device.DeviceExport.open(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.open(tmp_path, io, alloc);
     defer ex.deinit();
     const id = (try ex.addTrack(.{
         .title = "a",
         .filename = "a.mp3",
         .file_path = "/Contents/a.mp3",
     })).id;
-    try ex.addTagsToTrack(id, 1, &.{"House"});
+    try ex.addTagsToTrack(id, @enumFromInt(1), &.{"House"});
     const cat2 = try ex.createTagCategory("Mood");
     try ex.addTagsToTrack(id, cat2, &.{"Dark"});
     try ex.save();
@@ -2724,7 +2770,7 @@ test "a relative root stays pinned to the working directory of first use" {
     // moved and must still land the export under "a" — an unpinned
     // AT_FDCWD would resolve "root" under "b".
     try std.Io.Threaded.chdir(a);
-    var ex = try device.DeviceExport.create("root", io, alloc);
+    var ex = try device_export.DeviceExport.create("root", io, alloc);
     defer ex.deinit();
     _ = try ex.addTrack(.{ .title = "Pinned" });
 
@@ -2758,11 +2804,11 @@ test "playlist operations mirror into the OL db" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
-    const folder = try ex.createPlaylistFolder("Folder", 0);
+    const folder = try ex.createPlaylistFolder("Folder", .root);
     const inside = try ex.createPlaylist("Inside", folder);
-    const outside = try ex.createPlaylist("Outside", 0);
+    const outside = try ex.createPlaylist("Outside", .root);
     const t1 = (try ex.addTrack(.{
         .title = "one",
         .file_path = "/Contents/one.mp3",
@@ -2785,26 +2831,26 @@ test "playlist operations mirror into the OL db" {
     // Three nodes, ids bridged from the pdb side, folder marked
     // attribute 1, per-parent dense sequenceNo from 0.
     try testing.expectEqual(@as(usize, 3), lib.playlists.len);
-    const ol_folder = lib.byId(onelibrary.Playlist, folder).?;
+    const ol_folder = lib.byId(onelibrary.Playlist, folder.int()).?;
     try testing.expectEqualStrings("Folder", ol_folder.name.?);
     try testing.expectEqual(@as(i64, 1), ol_folder.attribute.?);
     try testing.expectEqual(@as(i64, 0), ol_folder.playlist_id_parent.?);
     try testing.expectEqual(@as(i64, 0), ol_folder.sequenceNo.?);
-    const ol_inside = lib.byId(onelibrary.Playlist, inside).?;
+    const ol_inside = lib.byId(onelibrary.Playlist, inside.int()).?;
     try testing.expectEqual(@as(i64, 0), ol_inside.attribute.?);
-    try testing.expectEqual(folder, ol_inside.playlist_id_parent.?);
+    try testing.expectEqual(@as(i64, folder.int()), ol_inside.playlist_id_parent.?);
     try testing.expectEqual(@as(i64, 0), ol_inside.sequenceNo.?);
-    const ol_outside = lib.byId(onelibrary.Playlist, outside).?;
+    const ol_outside = lib.byId(onelibrary.Playlist, outside.int()).?;
     try testing.expectEqual(@as(i64, 0), ol_outside.playlist_id_parent.?);
     try testing.expectEqual(@as(i64, 1), ol_outside.sequenceNo.?);
 
     // Memberships: the OL side's own dense 1-based sequenceNo, content
     // ids bridged.
     try testing.expectEqual(@as(usize, 2), lib.playlist_contents.len);
-    const entries = lib.playlist_contents_by_playlist.get(inside).?;
-    try testing.expectEqual(@as(i64, t1), lib.playlist_contents[entries[0]].content_id.?);
+    const entries = lib.playlist_contents_by_playlist.get(inside.int()).?;
+    try testing.expectEqual(@as(i64, t1.int()), lib.playlist_contents[entries[0]].content_id.?);
     try testing.expectEqual(@as(i64, 1), lib.playlist_contents[entries[0]].sequenceNo.?);
-    try testing.expectEqual(@as(i64, t2), lib.playlist_contents[entries[1]].content_id.?);
+    try testing.expectEqual(@as(i64, t2.int()), lib.playlist_contents[entries[1]].content_id.?);
     try testing.expectEqual(@as(i64, 2), lib.playlist_contents[entries[1]].sequenceNo.?);
 }
 
@@ -2818,7 +2864,7 @@ test "tag operations mirror into the OL db" {
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
 
-    var ex = try device.DeviceExport.create(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
     const track = (try ex.addTrack(.{
         .title = "a",
@@ -2841,7 +2887,7 @@ test "tag operations mirror into the OL db" {
     // bridge), the category attribute 1 with leaves 0 under it, and
     // sequenceNo reusing the ext positions.
     try testing.expectEqual(@as(usize, 4), lib.my_tags.len);
-    const ol_cat = lib.byId(onelibrary.MyTag, cat).?;
+    const ol_cat = lib.byId(onelibrary.MyTag, cat.int()).?;
     try testing.expectEqualStrings("My Tags", ol_cat.name.?);
     try testing.expectEqual(@as(i64, 1), ol_cat.attribute.?);
     try testing.expectEqual(@as(i64, 0), ol_cat.myTag_id_parent.?);
@@ -2869,7 +2915,7 @@ test "tag operations mirror into the OL db" {
     // "Techno" stacks a second junction for the same leaf — 4 total.
     try testing.expectEqual(@as(usize, 4), lib.my_tag_contents.len);
     for (lib.my_tag_contents) |junction| {
-        try testing.expectEqual(@as(i64, track), junction.content_id.?);
+        try testing.expectEqual(@as(i64, track.int()), junction.content_id.?);
         try testing.expect(lib.byId(onelibrary.MyTag, junction.myTag_id.?) != null);
     }
 }
@@ -2887,7 +2933,7 @@ test "playlist and tag mirroring continues an existing OL db" {
     try copyFixtureFile(&tmp, io, alloc, "with_anlz", "PIONEER/rekordbox/exportExt.pdb");
     try copyFixtureOlDb(&tmp, io, alloc);
 
-    var ex = device.DeviceExport.open(tmp_path, io, alloc);
+    var ex = try device_export.DeviceExport.open(tmp_path, io, alloc);
     defer ex.deinit();
     const track = (try ex.addTrack(.{
         .title = "new song",
@@ -2895,13 +2941,13 @@ test "playlist and tag mirroring continues an existing OL db" {
         .file_path = "/Contents/Reboot/03. new song.mp3",
         .filename = "03. new song.mp3",
     })).id;
-    try testing.expectEqual(@as(u32, 3), track);
+    try testing.expectEqual(@as(device_export.TrackId, @enumFromInt(3)), track);
     // The fixture's playlist 1 ("aaaaa") gains the track; its OL
     // sequenceNo continues past the existing 1 and 2.
-    try ex.addTrackToPlaylist(1, track);
+    try ex.addTrackToPlaylist(@enumFromInt(1), track);
     // "Techno" already exists under category 1 both sides: the junction
     // mirrors, no myTag row is added.
-    try ex.addTagsToTrack(track, 1, &.{"Techno"});
+    try ex.addTagsToTrack(track, @enumFromInt(1), &.{"Techno"});
     try ex.save();
 
     const db_path = try tmpOlDbPath(&tmp, alloc);
@@ -2962,7 +3008,7 @@ test "track views join both databases by path" {
     const alloc = testing.allocator;
     const io = testing.io;
 
-    var ex = device.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
+    var ex = try device_export.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
     defer ex.deinit();
 
     var it = try ex.tracks();
@@ -2974,7 +3020,7 @@ test "track views join both databases by path" {
         try testing.expect(track.source == .pdb_and_ol);
         if (std.mem.endsWith(u8, track.file_path, "01. Reboot - Bako (Original Mix).mp3")) {
             saw_bako = true;
-            try testing.expectEqual(@as(u32, 2), track.id);
+            try testing.expectEqual(@as(device_export.TrackId, @enumFromInt(2)), track.id);
             try testing.expectEqualStrings("Bako (Original Mix)", track.title);
             // Foreign keys resolved to names, not ids.
             try testing.expectEqualStrings("Reboot", track.artist);
@@ -2999,7 +3045,7 @@ test "track views are pdb_only without an OL db" {
     const alloc = testing.allocator;
     const io = testing.io;
 
-    var ex = device.DeviceExport.open("testdata/complete_export/demo_tracks", io, alloc);
+    var ex = try device_export.DeviceExport.open("testdata/complete_export/demo_tracks", io, alloc);
     defer ex.deinit();
 
     var it = try ex.tracks();
@@ -3018,32 +3064,521 @@ test "trackByPath resolves and misses" {
     const alloc = testing.allocator;
     const io = testing.io;
 
-    var ex = device.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
+    var ex = try device_export.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
     defer ex.deinit();
 
     var record = (try ex.trackByPath(
         "/Contents/Reboot/www.electronicfresh.com/01. Reboot - Bako (Original Mix).mp3",
     )).?;
     defer record.deinit();
-    try testing.expectEqual(@as(u32, 2), record.view.id);
+    try testing.expectEqual(@as(device_export.TrackId, @enumFromInt(2)), record.view.id);
     try testing.expectEqualStrings("Bako (Original Mix)", record.view.title);
 
     const missing = try ex.trackByPath("/Contents/nothing.mp3");
     try testing.expect(missing == null);
 }
 
+test "trackByTitle resolves and misses" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var ex = try device_export.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
+    defer ex.deinit();
+
+    var record = (try ex.trackByTitle("Bako (Original Mix)")).?;
+    defer record.deinit();
+    try testing.expectEqual(@as(device_export.TrackId, @enumFromInt(2)), record.view.id);
+    try testing.expectEqualStrings("Bako (Original Mix)", record.view.title);
+
+    const missing = try ex.trackByTitle("nothing by this name");
+    try testing.expect(missing == null);
+}
+
+test "addTrack derives filename from the file path basename" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    var ex = try device_export.DeviceExport.create(tmp_path, io, alloc);
+    defer ex.deinit();
+    _ = try ex.addTrack(.{
+        .title = "test",
+        .file_path = "/Contents/Some artist/01 Some track.mp3",
+    });
+    try ex.save();
+
+    var reopened = try device_export.DeviceExport.open(tmp_path, io, alloc);
+    defer reopened.deinit();
+    var record = (try reopened.trackByPath("/Contents/Some artist/01 Some track.mp3")).?;
+    defer record.deinit();
+    try testing.expectEqualStrings("01 Some track.mp3", record.view.filename);
+}
+
+// --- open-semantics classification -------------------------------------------------
+
+test "open classifies a root with no PIONEER as NotAnExport" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpExportPath(&tmp, alloc);
+    defer alloc.free(root);
+
+    try testing.expectError(error.NotAnExport, device_export.DeviceExport.open(root, io, alloc));
+}
+
+test "a PIONEER regular file is NotAnExport" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpExportPath(&tmp, alloc);
+    defer alloc.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER", .data = "not a directory" });
+
+    try testing.expectError(error.NotAnExport, device_export.DeviceExport.open(root, io, alloc));
+}
+
+test "a PIONEER-only root carries no database" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpExportPath(&tmp, alloc);
+    defer alloc.free(root);
+    try tmp.dir.createDirPath(io, "PIONEER");
+
+    var ex = try device_export.DeviceExport.open(root, io, alloc);
+    defer ex.deinit();
+    if (onelibrary.mode == .off) {
+        // The OL fallback is compiled out; the pdb's absence is the
+        // verdict.
+        try testing.expectError(error.FileNotFound, ex.tracks());
+        try testing.expectError(error.FileNotFound, ex.getPlaylists());
+        try testing.expectError(error.FileNotFound, ex.createPlaylist("p", .root));
+        // Nothing database-side can be pending, so a no-op save lands
+        // exactly what it has: nothing.
+        try ex.save();
+    } else {
+        try testing.expectError(error.DatabaseNotFound, ex.tracks());
+        try testing.expectError(error.DatabaseNotFound, ex.getPlaylists());
+        try testing.expectError(
+            error.DatabaseNotFound,
+            ex.getPlaylistTrackIds(alloc, @enumFromInt(1)),
+        );
+        try testing.expectError(error.DatabaseNotFound, ex.addTrack(.{ .title = "t" }));
+        try testing.expectError(error.DatabaseNotFound, ex.updateTrack(@enumFromInt(1), .{ .title = "t" }));
+        try testing.expectError(error.DatabaseNotFound, ex.removeTrack(@enumFromInt(1), .{}));
+        try testing.expectError(error.DatabaseNotFound, ex.createPlaylist("p", .root));
+        try testing.expectError(error.DatabaseNotFound, ex.addTrackToPlaylist(@enumFromInt(1), @enumFromInt(1)));
+        // Same as above: a no-op save on a database-less root succeeds.
+        try ex.save();
+    }
+}
+
+test "OL-only roots read tracks through the OL db" {
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpExportPath(&tmp, alloc);
+    defer alloc.free(root);
+    // PIONEER/rekordbox/exportLibrary.db and nothing else — no pdb.
+    try copyFixtureOlDb(&tmp, io, alloc);
+
+    var ex = try device_export.DeviceExport.open(root, io, alloc);
+    defer ex.deinit();
+
+    const bako_path = with_anlz_tracks[0].audio_path;
+    // The view derives its artwork path from the row's image id — the
+    // `artworkSpec` a-variant — or carries none with no image.
+    const bako_row = (try ex.openOneLibrary()).?.contentByPath(bako_path).?;
+    var spec: ?device_export.ArtworkSpec = null;
+    defer if (spec) |*s| s.deinit(alloc);
+    if (bako_row.image_id) |id| spec = try device_export.artworkSpec(alloc, @intCast(id));
+
+    var it = try ex.tracks();
+    defer it.deinit();
+    var count: usize = 0;
+    var saw_bako = false;
+    while (try it.next()) |track| {
+        count += 1;
+        // Built from the OL row outright, so the OL-only columns count.
+        try testing.expect(track.source == .pdb_and_ol);
+        if (std.mem.eql(u8, track.file_path, bako_path)) {
+            saw_bako = true;
+            // The content id doubles as the track id (lockstep).
+            try testing.expectEqual(@as(device_export.TrackId, @enumFromInt(2)), track.id);
+            try testing.expectEqualStrings("Bako (Original Mix)", track.title);
+            // Foreign keys resolved to names through the library's rows.
+            try testing.expectEqualStrings("Reboot", track.artist);
+            try testing.expectEqualStrings(" www.electronicfresh.com", track.album);
+            try testing.expectEqualStrings("Tech House", track.genre);
+            try testing.expectEqualStrings("Cecille", track.label);
+            try testing.expectEqual(@as(usize, 0), track.key.len);
+            try testing.expectEqual(@as(f32, 129.0), track.tempo);
+            try testing.expectEqual(@as(u16, 16), track.sample_depth);
+            try testing.expectEqual(@as(u32, 44100), track.sample_rate);
+            try testing.expectEqual(@as(u16, 0), track.play_count);
+            try testing.expect(track.has_analysis);
+            // The OL-only vocabulary reads back.
+            try testing.expectEqualStrings("2026-07-16", track.date_created.?);
+            try testing.expect(track.kuvo_delivery_on);
+            // pdb-only vocabulary stays empty — the ignore-vice-versa
+            // convention.
+            try testing.expectEqual(@as(usize, 0), track.message.len);
+            try testing.expectEqual(@as(usize, 0), track.mix_name.len);
+            try testing.expectEqual(@as(usize, 0), track.analyze_date.len);
+            try testing.expect(!track.publish_track_information);
+            if (spec) |s| {
+                try testing.expectEqualStrings(s.thumbnail_path, track.artwork_device_path);
+            } else {
+                try testing.expectEqual(@as(usize, 0), track.artwork_device_path.len);
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expect(saw_bako);
+
+    var record = (try ex.trackByPath(bako_path)).?;
+    defer record.deinit();
+    try testing.expectEqual(@as(device_export.TrackId, @enumFromInt(2)), record.view.id);
+    try testing.expectEqualStrings("Bako (Original Mix)", record.view.title);
+
+    const missing = try ex.trackByPath("/Contents/nothing.mp3");
+    try testing.expect(missing == null);
+}
+
+test "off builds read OL-only roots as FileNotFound" {
+    if (onelibrary.mode != .off) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpExportPath(&tmp, alloc);
+    defer alloc.free(root);
+    try copyFixtureOlDb(&tmp, io, alloc);
+
+    var ex = try device_export.DeviceExport.open(root, io, alloc);
+    defer ex.deinit();
+    // The fallback is not compiled in; the pdb's absence propagates.
+    try testing.expectError(error.FileNotFound, ex.tracks());
+    try testing.expectError(error.FileNotFound, ex.trackByPath("/Contents/a.mp3"));
+    try testing.expectError(error.FileNotFound, ex.getPlaylists());
+    try testing.expectError(error.FileNotFound, ex.createPlaylist("p", .root));
+    // Nothing database-side can be pending in an off build on this
+    // root; a no-op save succeeds.
+    try ex.save();
+    try testing.expectError(error.FileNotFound, ex.addTrack(.{ .title = "t" }));
+    try testing.expectError(error.FileNotFound, ex.updateTrack(@enumFromInt(1), .{ .title = "t" }));
+    try testing.expectError(error.FileNotFound, ex.removeTrack(@enumFromInt(1), .{}));
+}
+
+test "OL-only roots add tracks through the OL db" {
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpExportPath(&tmp, alloc);
+    defer alloc.free(root);
+    try copyFixtureOlDb(&tmp, io, alloc);
+
+    var ex = try device_export.DeviceExport.open(root, io, alloc);
+    defer ex.deinit();
+
+    // The db's own high-water ids, for the mint assertions.
+    const lib = (try ex.openOneLibrary()).?;
+    var max_content: i64 = 0;
+    for (lib.contents) |c| max_content = @max(max_content, c.content_id);
+    var max_genre: i64 = 0;
+    for (lib.genres) |g| max_genre = @max(max_genre, g.genre_id);
+    var reboot_id: ?i64 = null;
+    for (lib.artists) |a| {
+        if (a.name != null and std.mem.eql(u8, a.name.?, "Reboot")) reboot_id = a.artist_id;
+    }
+
+    // Dedup: a path the db carries returns its own id, unchanged.
+    const dup = try ex.addTrack(.{
+        .title = "Again",
+        .file_path = with_anlz_tracks[0].audio_path,
+    });
+    try testing.expect(!dup.is_new);
+    try testing.expectEqual(@as(device_export.TrackId, @enumFromInt(2)), dup.id);
+
+    // A new track: the existing artist resolves to the db's own row, a
+    // new genre mints past the db's own ids.
+    const genre = "Brand New Genre";
+    const added = try ex.addTrack(.{
+        .title = "New Track",
+        .artist = "Reboot",
+        .genre = genre,
+        .tempo = 120.5,
+        .file_path = "/Contents/new.mp3",
+        .filename = "new.mp3",
+        .sample_rate = 48_000,
+    });
+    try testing.expect(added.is_new);
+    try testing.expectEqual(@as(device_export.TrackId, @enumFromInt(@as(u32, @intCast(max_content + 1)))), added.id);
+
+    try ex.save();
+
+    // Reopen: the row landed with stable ids.
+    var ex2 = try device_export.DeviceExport.open(root, io, alloc);
+    defer ex2.deinit();
+    const lib2 = (try ex2.openOneLibrary()).?;
+    const c = lib2.contentByPath("/Contents/new.mp3").?;
+    try testing.expectEqual(max_content + 1, c.content_id);
+    try testing.expectEqualStrings("New Track", c.title.?);
+    try testing.expectEqual(@as(i64, 12_050), c.bpmx100.?);
+    try testing.expectEqual(@as(i64, 48_000), c.samplingRate.?);
+    // The fresh-row constants the mirror copies.
+    try testing.expectEqual(@as(i64, 788_224), c.contentLink.?);
+    try testing.expectEqual(@as(i64, 41), c.analysedBits.?);
+    // The artist deduped to the db's own row, the genre minted.
+    try testing.expectEqual(reboot_id.?, c.artist_id_artist.?);
+    var minted_genre = false;
+    for (lib2.genres) |g| {
+        if (g.name != null and std.mem.eql(u8, g.name.?, genre)) {
+            minted_genre = true;
+            try testing.expectEqual(max_genre + 1, g.genre_id);
+            try testing.expectEqual(g.genre_id, c.genre_id.?);
+        }
+    }
+    try testing.expect(minted_genre);
+    // No analysis input, no analysis path.
+    try testing.expect(c.analysisDataFilePath == null);
+
+    // A view on the OL-only export reads the new row back.
+    var record = (try ex2.trackByPath("/Contents/new.mp3")).?;
+    defer record.deinit();
+    try testing.expectEqual(added.id, record.view.id);
+    try testing.expectEqualStrings("New Track", record.view.title);
+    try testing.expectEqualStrings("Reboot", record.view.artist);
+    try testing.expectEqualStrings(genre, record.view.genre);
+}
+
+test "OL-only add then remove before save lands nothing" {
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpExportPath(&tmp, alloc);
+    defer alloc.free(root);
+    try copyFixtureOlDb(&tmp, io, alloc);
+
+    var ex = try device_export.DeviceExport.open(root, io, alloc);
+    defer ex.deinit();
+    const added = try ex.addTrack(.{
+        .title = "Gone",
+        .file_path = "/Contents/gone.mp3",
+    });
+    try testing.expect(added.is_new);
+    try ex.removeTrack(added.id, .{});
+    try ex.save();
+
+    var ex2 = try device_export.DeviceExport.open(root, io, alloc);
+    defer ex2.deinit();
+    try testing.expect((try ex2.openOneLibrary()).?.contentByPath("/Contents/gone.mp3") == null);
+}
+
+test "OL-only roots update, rename, and remove tracks" {
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpExportPath(&tmp, alloc);
+    defer alloc.free(root);
+    try copyFixtureOlDb(&tmp, io, alloc);
+    // The analysis files the rename relocates.
+    try copyFixtureFile(&tmp, io, alloc, "with_anlz", "PIONEER/USBANLZ/P01F/00004BC5/ANLZ0000.DAT");
+    try copyFixtureFile(&tmp, io, alloc, "with_anlz", "PIONEER/USBANLZ/P01F/00004BC5/ANLZ0000.EXT");
+
+    var ex = try device_export.DeviceExport.open(root, io, alloc);
+    defer ex.deinit();
+
+    try testing.expectError(error.UnknownTrack, ex.updateTrack(@enumFromInt(99), .{ .title = "x" }));
+
+    // Patch: pdb-mirrored and OL-only columns move.
+    try ex.updateTrack(@enumFromInt(2), .{ .title = "Renamed", .tempo = 140.0, .subtitle = "sub" });
+    // Rename: the analysis follows at save.
+    const new_path = "/Contents/Reboot/renamed.mp3";
+    try ex.updateTrack(@enumFromInt(2), .{ .file_path = new_path });
+    // Another track's path is taken.
+    try testing.expectError(
+        error.DuplicatePath,
+        ex.updateTrack(@enumFromInt(2), .{ .file_path = with_anlz_tracks[1].audio_path }),
+    );
+
+    try ex.save();
+
+    // The relocation landed: the old directory is gone, the new one
+    // carries the siblings with PPTH naming the new path.
+    const old_dir = "PIONEER/USBANLZ/P01F/00004BC5";
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, old_dir, .{}));
+    const h = try device_export.pathHash(new_path);
+    const new_dir = try std.fmt.allocPrint(
+        alloc,
+        "PIONEER/USBANLZ/P{X:0>3}/{X:0>8}",
+        .{ h.p_value, h.hash },
+    );
+    defer alloc.free(new_dir);
+    const dat_sub = try std.fmt.allocPrint(alloc, "{s}/ANLZ0000.DAT", .{new_dir});
+    defer alloc.free(dat_sub);
+    const dat = try tmp.dir.readFileAlloc(io, dat_sub, alloc, .limited(1 << 24));
+    defer alloc.free(dat);
+    var parsed = try anlz.Anlz.parse(alloc, dat);
+    defer parsed.deinit();
+    var ppth: ?[]u8 = null;
+    defer if (ppth) |p| alloc.free(p);
+    for (parsed.sections) |section| switch (section) {
+        .path => |p| ppth = try p.path.utf8(alloc),
+        else => {},
+    };
+    try testing.expectEqualStrings(new_path, ppth.?);
+
+    // The row landed with the stable id and the patched values.
+    var ex2 = try device_export.DeviceExport.open(root, io, alloc);
+    defer ex2.deinit();
+    const lib2 = (try ex2.openOneLibrary()).?;
+    const c = lib2.contentByPath(new_path).?;
+    try testing.expectEqual(@as(i64, 2), c.content_id);
+    try testing.expectEqualStrings("Renamed", c.title.?);
+    try testing.expectEqual(@as(i64, 14_000), c.bpmx100.?);
+    try testing.expectEqualStrings("sub", c.subtitle.?);
+    try testing.expectEqualStrings("renamed.mp3", c.fileName.?);
+    const want_anlz = try device_export.anlzDevicePath(alloc, new_path);
+    defer alloc.free(want_anlz);
+    try testing.expectEqualStrings(want_anlz, c.analysisDataFilePath.?);
+    try testing.expect(lib2.contentByPath(with_anlz_tracks[0].audio_path) == null);
+
+    // Removal: the disk row cascade-deletes at save. Before it lands,
+    // the session already counts the row gone — the read side and a
+    // second removal both see the tombstone, not the stale disk.
+    try ex2.removeTrack(@enumFromInt(2), .{});
+    try testing.expect((try ex2.trackByPath(new_path)) == null);
+    try testing.expectError(error.UnknownTrack, ex2.removeTrack(@enumFromInt(2), .{}));
+    try ex2.save();
+    var ex3 = try device_export.DeviceExport.open(root, io, alloc);
+    defer ex3.deinit();
+    try testing.expect((try ex3.openOneLibrary()).?.contentByPath(new_path) == null);
+}
+
+test "OL-only roots round-trip playlists" {
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpExportPath(&tmp, alloc);
+    defer alloc.free(root);
+    try copyFixtureOlDb(&tmp, io, alloc);
+
+    var ex = try device_export.DeviceExport.open(root, io, alloc);
+    defer ex.deinit();
+
+    // The db's own node reads back: one root-level leaf playlist.
+    {
+        var tree = try ex.getPlaylists();
+        defer tree.deinit();
+        try testing.expectEqual(@as(usize, 1), tree.roots.len);
+        const saved = &tree.roots[0].playlist;
+        try testing.expectEqual(@as(device_export.PlaylistNodeId, @enumFromInt(1)), saved.id);
+        try testing.expectEqualStrings("aaaaa", saved.name);
+    }
+    const fixture_entries = try ex.getPlaylistTrackIds(alloc, @enumFromInt(1));
+    defer alloc.free(fixture_entries);
+    try testing.expectEqualSlices(device_export.TrackId, &.{ @enumFromInt(1), @enumFromInt(2) }, fixture_entries);
+    const none = try ex.getPlaylistTrackIds(alloc, @enumFromInt(999));
+    defer alloc.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+
+    // Roles and unknown keys validate against the OL rows; the ids mint
+    // past the db's own (its high water is 1).
+    try testing.expectError(error.UnknownForeignKey, ex.createPlaylist("Orphan", @enumFromInt(999)));
+    const folder = try ex.createPlaylistFolder("Folder", .root);
+    const playlist = try ex.createPlaylist("Playlist", folder);
+    try testing.expectEqual(@as(device_export.PlaylistNodeId, @enumFromInt(2)), folder);
+    try testing.expectEqual(@as(device_export.PlaylistNodeId, @enumFromInt(3)), playlist);
+    try testing.expectError(error.UnknownForeignKey, ex.createPlaylist("Child", playlist));
+    try testing.expectError(error.UnknownForeignKey, ex.addTrackToPlaylist(folder, @enumFromInt(1)));
+    try testing.expectError(error.UnknownForeignKey, ex.addTrackToPlaylist(@enumFromInt(999), @enumFromInt(1)));
+    try testing.expectError(error.UnknownForeignKey, ex.addTrackToPlaylist(playlist, @enumFromInt(999)));
+
+    // Membership: a disk content id and a minted one.
+    const added = try ex.addTrack(.{
+        .title = "New",
+        .file_path = "/Contents/new.mp3",
+    });
+    try ex.addTrackToPlaylist(playlist, @enumFromInt(1));
+    try ex.addTrackToPlaylist(playlist, added.id);
+    try ex.save();
+
+    // Reopen: the tree and the entries landed with stable ids, and the
+    // fixture's own playlist is untouched.
+    var ex2 = try device_export.DeviceExport.open(root, io, alloc);
+    defer ex2.deinit();
+    {
+        var tree = try ex2.getPlaylists();
+        defer tree.deinit();
+        try testing.expectEqual(@as(usize, 2), tree.roots.len);
+        const saved_folder = &tree.roots[1].folder;
+        try testing.expectEqual(folder, saved_folder.id);
+        try testing.expectEqualStrings("Folder", saved_folder.name);
+        try testing.expectEqual(@as(usize, 1), saved_folder.children.items.len);
+        const saved_playlist = &saved_folder.children.items[0].playlist;
+        try testing.expectEqual(playlist, saved_playlist.id);
+        try testing.expectEqualStrings("Playlist", saved_playlist.name);
+    }
+    const entries = try ex2.getPlaylistTrackIds(alloc, playlist);
+    defer alloc.free(entries);
+    try testing.expectEqualSlices(device_export.TrackId, &.{ @enumFromInt(1), added.id }, entries);
+    const fixture_entries2 = try ex2.getPlaylistTrackIds(alloc, @enumFromInt(1));
+    defer alloc.free(fixture_entries2);
+    try testing.expectEqualSlices(device_export.TrackId, &.{ @enumFromInt(1), @enumFromInt(2) }, fixture_entries2);
+
+    // A removal tombstones its entries before the save lands the
+    // cascade, and the cascade carries them away.
+    try ex2.removeTrack(@enumFromInt(1), .{});
+    const tombstoned = try ex2.getPlaylistTrackIds(alloc, @enumFromInt(1));
+    defer alloc.free(tombstoned);
+    try testing.expectEqualSlices(device_export.TrackId, &.{@enumFromInt(2)}, tombstoned);
+    try ex2.save();
+    var ex3 = try device_export.DeviceExport.open(root, io, alloc);
+    defer ex3.deinit();
+    const cascaded = try ex3.getPlaylistTrackIds(alloc, @enumFromInt(1));
+    defer alloc.free(cascaded);
+    try testing.expectEqualSlices(device_export.TrackId, &.{@enumFromInt(2)}, cascaded);
+}
+
 test "getPlaylistTrackIds returns entries in order" {
     const alloc = testing.allocator;
     const io = testing.io;
 
-    var ex = device.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
+    var ex = try device_export.DeviceExport.open("testdata/complete_export/with_anlz", io, alloc);
     defer ex.deinit();
 
-    const entries = try ex.getPlaylistTrackIds(alloc, 1);
+    const entries = try ex.getPlaylistTrackIds(alloc, @enumFromInt(1));
     defer alloc.free(entries);
-    try testing.expectEqualSlices(u32, &.{ 1, 2 }, entries);
+    try testing.expectEqualSlices(device_export.TrackId, &.{ @enumFromInt(1), @enumFromInt(2) }, entries);
 
-    const none = try ex.getPlaylistTrackIds(alloc, 999);
+    const none = try ex.getPlaylistTrackIds(alloc, @enumFromInt(999));
     defer alloc.free(none);
     try testing.expectEqual(@as(usize, 0), none.len);
 }
@@ -3058,9 +3593,9 @@ test "updateTrack patches both databases and preserves untouched fields" {
     defer alloc.free(root);
     try copyWithAnlzFixture(&tmp, io, alloc);
 
-    var ex = device.DeviceExport.open(root, io, alloc);
+    var ex = try device_export.DeviceExport.open(root, io, alloc);
     defer ex.deinit();
-    try ex.updateTrack(2, .{
+    try ex.updateTrack(@enumFromInt(2), .{
         .title = "Bako (Remaster)",
         .artist = "Someone Else",
         .tempo = 130.0,
@@ -3073,14 +3608,14 @@ test "updateTrack patches both databases and preserves untouched fields" {
     try ex.save();
 
     // A fresh handle sees the landed state.
-    var reopened = device.DeviceExport.open(root, io, alloc);
+    var reopened = try device_export.DeviceExport.open(root, io, alloc);
     defer reopened.deinit();
     var record = (try reopened.trackByPath(
         "/Contents/Reboot/www.electronicfresh.com/01. Reboot - Bako (Original Mix).mp3",
     )).?;
     defer record.deinit();
     const v = &record.view;
-    try testing.expectEqual(@as(u32, 2), v.id);
+    try testing.expectEqual(@as(device_export.TrackId, @enumFromInt(2)), v.id);
     try testing.expectEqualStrings("Bako (Remaster)", v.title);
     try testing.expectEqualStrings("Someone Else", v.artist);
     try testing.expectEqual(@as(f32, 130.0), v.tempo);
@@ -3091,11 +3626,11 @@ test "updateTrack patches both databases and preserves untouched fields" {
     // The row's device constants survive a patch, unlike a fresh row's.
     var raw_db = try parseExportPdb(alloc, io, root);
     defer raw_db.deinit();
-    var track_it = try raw_db.rows(.tracks);
-    while (try track_it.next()) |row| {
-        if (row.track.id != 2) continue;
-        try testing.expectEqual(@as(u32, 788_224), row.track.bitmask);
-        try testing.expectEqual(@as(u16, 41), row.track.unknown5);
+    var track_it = try raw_db.rowsOf(pdb.Track);
+    while (try track_it.next()) |track| {
+        if (track.id != 2) continue;
+        try testing.expectEqual(@as(u32, 788_224), track.bitmask);
+        try testing.expectEqual(@as(u16, 41), track.unknown5);
     }
 
     if (onelibrary.mode != .off) {
@@ -3127,14 +3662,14 @@ test "updateTrack rejects an unknown track and a bad string" {
     defer alloc.free(root);
     try copyWithAnlzFixture(&tmp, io, alloc);
 
-    var ex = device.DeviceExport.open(root, io, alloc);
+    var ex = try device_export.DeviceExport.open(root, io, alloc);
     defer ex.deinit();
-    try testing.expectError(error.UnknownTrack, ex.updateTrack(999, .{ .rating = 5 }));
+    try testing.expectError(error.UnknownTrack, ex.updateTrack(@enumFromInt(999), .{ .rating = 5 }));
 
     const long_title = try alloc.alloc(u8, 32_768);
     defer alloc.free(long_title);
     @memset(long_title, 'a');
-    try testing.expectError(error.TooLong, ex.updateTrack(2, .{ .title = long_title }));
+    try testing.expectError(error.TooLong, ex.updateTrack(@enumFromInt(2), .{ .title = long_title }));
 
     // The failed patch changed nothing.
     var record = (try ex.trackByPath(
@@ -3157,45 +3692,45 @@ test "a file_path patch renames: the row, the mirror, and the analysis files mov
     const old_path = "/Contents/Reboot/www.electronicfresh.com/01. Reboot - Bako (Original Mix).mp3";
     const new_path = "/Contents/Renamed/Bako.mp3";
 
-    var ex = device.DeviceExport.open(root, io, alloc);
+    var ex = try device_export.DeviceExport.open(root, io, alloc);
     defer ex.deinit();
     // The rename rides along a field patch, in one call.
-    try ex.updateTrack(2, .{ .file_path = new_path, .title = "Bako" });
+    try ex.updateTrack(@enumFromInt(2), .{ .file_path = new_path, .title = "Bako" });
     // The dedup key already follows the new path, before any save.
     const dup = try ex.addTrack(.{ .title = "Bako (Original Mix)", .file_path = new_path });
     try testing.expect(!dup.is_new);
-    try testing.expectEqual(@as(u32, 2), dup.id);
+    try testing.expectEqual(@as(device_export.TrackId, @enumFromInt(2)), dup.id);
     try ex.save();
 
     // A fresh handle sees the landed rename.
-    var reopened = device.DeviceExport.open(root, io, alloc);
+    var reopened = try device_export.DeviceExport.open(root, io, alloc);
     defer reopened.deinit();
     try testing.expect((try reopened.trackByPath(old_path)) == null);
     var record = (try reopened.trackByPath(new_path)).?;
     defer record.deinit();
-    try testing.expectEqual(@as(u32, 2), record.view.id);
+    try testing.expectEqual(@as(device_export.TrackId, @enumFromInt(2)), record.view.id);
     try testing.expectEqualStrings("Bako", record.view.title);
     try testing.expectEqualStrings("Bako.mp3", record.view.filename);
     try testing.expect(record.view.has_analysis);
 
     // The pdb's analyze_path matches what players recompute from the
     // new path.
-    const want_anlz = try device.anlzDevicePath(alloc, new_path);
+    const want_anlz = try device_export.anlzDevicePath(alloc, new_path);
     defer alloc.free(want_anlz);
     var raw_db = try parseExportPdb(alloc, io, root);
     defer raw_db.deinit();
-    var track_it = try raw_db.rows(.tracks);
-    while (try track_it.next()) |row| {
-        if (row.track.id != 2) continue;
-        const got = try row.track.offsets.inner.analyze_path.utf8(alloc);
+    var track_it = try raw_db.rowsOf(pdb.Track);
+    while (try track_it.next()) |track| {
+        if (track.id != 2) continue;
+        const got = try track.offsets.inner.analyze_path.utf8(alloc);
         defer alloc.free(got);
         try testing.expectEqualStrings(want_anlz, got);
     }
 
     // The analysis files live where the new path hashes to, the PPTH
     // inside names the new path, and the old directory is gone.
-    const old_h = try device.pathHash(old_path);
-    const new_h = try device.pathHash(new_path);
+    const old_h = try device_export.pathHash(old_path);
+    const new_h = try device_export.pathHash(new_path);
     const old_dir = try std.fmt.allocPrint(
         alloc,
         "PIONEER/USBANLZ/P{X:0>3}/{X:0>8}",
@@ -3231,7 +3766,7 @@ test "a file_path patch renames: the row, the mirror, and the analysis files mov
         try testing.expectEqual(@as(i64, 2), content.content_id);
         try testing.expectEqualStrings("Bako", content.title.?);
         try testing.expectEqualStrings("Bako.mp3", content.fileName.?);
-        const want_ol_anlz = try device.anlzDevicePath(alloc, new_path);
+        const want_ol_anlz = try device_export.anlzDevicePath(alloc, new_path);
         defer alloc.free(want_ol_anlz);
         try testing.expectEqualStrings(want_ol_anlz, content.analysisDataFilePath.?);
     }
@@ -3247,26 +3782,26 @@ test "a file_path patch rejects duplicate paths, malformed paths, and occupied t
     defer alloc.free(root);
     try copyWithAnlzFixture(&tmp, io, alloc);
 
-    var ex = device.DeviceExport.open(root, io, alloc);
+    var ex = try device_export.DeviceExport.open(root, io, alloc);
     defer ex.deinit();
 
     // The other track's path is taken.
     try testing.expectError(
         error.DuplicatePath,
         ex.updateTrack(
-            2,
+            @enumFromInt(2),
             .{ .file_path = "/Contents/Reboot/www.electronicfresh.com/03. Reboot - Assign The Source (Remaster).mp3" },
         ),
     );
     // The path coordinate is device-absolute.
-    try testing.expectError(error.InvalidPath, ex.updateTrack(2, .{ .file_path = "Contents/Bako.mp3" }));
-    try testing.expectError(error.InvalidPath, ex.updateTrack(2, .{ .file_path = "" }));
+    try testing.expectError(error.InvalidPath, ex.updateTrack(@enumFromInt(2), .{ .file_path = "Contents/Bako.mp3" }));
+    try testing.expectError(error.InvalidPath, ex.updateTrack(@enumFromInt(2), .{ .file_path = "" }));
 
     // A target directory another analysis already occupies is refused,
     // without a way through: clobbering would destroy that analysis.
     const old_path = "/Contents/Reboot/www.electronicfresh.com/01. Reboot - Bako (Original Mix).mp3";
     const new_path = "/Contents/Renamed/Bako.mp3";
-    const h = try device.pathHash(new_path);
+    const h = try device_export.pathHash(new_path);
     const anlz_dir = try std.fmt.allocPrint(
         alloc,
         "PIONEER/USBANLZ/P{X:0>3}/{X:0>8}",
@@ -3277,12 +3812,12 @@ test "a file_path patch rejects duplicate paths, malformed paths, and occupied t
     const target_dat = try std.fmt.allocPrint(alloc, "{s}/ANLZ0000.DAT", .{anlz_dir});
     defer alloc.free(target_dat);
     try tmp.dir.writeFile(io, .{ .sub_path = target_dat, .data = "occupied" });
-    try testing.expectError(error.AnalysisPathCollision, ex.updateTrack(2, .{ .file_path = new_path }));
+    try testing.expectError(error.AnalysisPathCollision, ex.updateTrack(@enumFromInt(2), .{ .file_path = new_path }));
     // The refusal is final: the track keeps its old path.
     try testing.expect((try ex.trackByPath(new_path)) == null);
     var record = (try ex.trackByPath(old_path)).?;
     defer record.deinit();
-    try testing.expectEqual(@as(u32, 2), record.view.id);
+    try testing.expectEqual(@as(device_export.TrackId, @enumFromInt(2)), record.view.id);
 }
 
 test "a pending rename retargets queued analysis before the first save" {
@@ -3300,16 +3835,16 @@ test "a pending rename retargets queued analysis before the first save" {
     const first_path = "/Contents/test.mp3";
     const renamed_path = "/Contents/renamed.mp3";
 
-    var ex = try device.DeviceExport.create(root, io, alloc);
+    var ex = try device_export.DeviceExport.create(root, io, alloc);
     defer ex.deinit();
     _ = try ex.addTrack(.{ .title = "test", .file_path = first_path, .analysis = &input });
-    try ex.updateTrack(1, .{ .file_path = renamed_path });
+    try ex.updateTrack(@enumFromInt(1), .{ .file_path = renamed_path });
     try ex.save();
 
     // Nothing under the original hash; the DAT under the new hash names
     // the new path.
-    const old_h = try device.pathHash(first_path);
-    const new_h = try device.pathHash(renamed_path);
+    const old_h = try device_export.pathHash(first_path);
+    const new_h = try device_export.pathHash(renamed_path);
     const old_dir = try std.fmt.allocPrint(
         alloc,
         "PIONEER/USBANLZ/P{X:0>3}/{X:0>8}",
@@ -3350,13 +3885,13 @@ test "removeTrack cascades across both databases and deletes analysis on request
 
     const bako_path = "/Contents/Reboot/www.electronicfresh.com/01. Reboot - Bako (Original Mix).mp3";
 
-    var ex = device.DeviceExport.open(root, io, alloc);
+    var ex = try device_export.DeviceExport.open(root, io, alloc);
     defer ex.deinit();
-    try ex.removeTrack(2, .{ .delete_analysis_files = true });
-    try testing.expectError(error.UnknownTrack, ex.removeTrack(2, .{}));
+    try ex.removeTrack(@enumFromInt(2), .{ .delete_analysis_files = true });
+    try testing.expectError(error.UnknownTrack, ex.removeTrack(@enumFromInt(2), .{}));
     try ex.save();
 
-    var reopened = device.DeviceExport.open(root, io, alloc);
+    var reopened = try device_export.DeviceExport.open(root, io, alloc);
     defer reopened.deinit();
     try testing.expect((try reopened.trackByPath(bako_path)) == null);
     var it = try reopened.tracks();
@@ -3364,17 +3899,17 @@ test "removeTrack cascades across both databases and deletes analysis on request
     var count: usize = 0;
     while (try it.next()) |track| {
         count += 1;
-        try testing.expect(track.id != 2);
+        try testing.expect(track.id != @as(device_export.TrackId, @enumFromInt(2)));
     }
     try testing.expectEqual(@as(usize, 1), count);
 
     // The playlist entry went with the track.
-    const entries = try reopened.getPlaylistTrackIds(alloc, 1);
+    const entries = try reopened.getPlaylistTrackIds(alloc, @enumFromInt(1));
     defer alloc.free(entries);
-    try testing.expectEqualSlices(u32, &.{1}, entries);
+    try testing.expectEqualSlices(device_export.TrackId, &.{@enumFromInt(1)}, entries);
 
     // The analysis directory is gone; the survivor's stays.
-    const bako_h = try device.pathHash(bako_path);
+    const bako_h = try device_export.pathHash(bako_path);
     const bako_dir = try std.fmt.allocPrint(
         alloc,
         "PIONEER/USBANLZ/P{X:0>3}/{X:0>8}",
@@ -3389,7 +3924,7 @@ test "removeTrack cascades across both databases and deletes analysis on request
     // old row went with the cascade).
     const readded = try reopened.addTrack(.{ .title = "New", .file_path = "/Contents/new.mp3" });
     try testing.expect(readded.is_new);
-    try testing.expectEqual(@as(u32, 2), readded.id);
+    try testing.expectEqual(@as(device_export.TrackId, @enumFromInt(2)), readded.id);
 
     if (onelibrary.mode != .off) {
         const lib = (try reopened.openOneLibrary()).?;

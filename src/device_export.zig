@@ -368,19 +368,39 @@ fn loadSettingFile(
 }
 
 /// Error of loading the export's `export.pdb`: opening the pinned working
-/// directory, reading it off disk, or parsing it.
+/// directory, reading it off disk, parsing it, or `NotAnExport` — the root
+/// carries no `PIONEER` directory (or not a directory), so no readable
+/// structure exists anywhere under it.
 pub const OpenPdbError =
     std.Io.Dir.ReadFileAllocError ||
     std.Io.Dir.OpenError ||
-    pdb.DatabaseDecodeError;
+    std.Io.Dir.StatFileError ||
+    pdb.DatabaseDecodeError ||
+    error{NotAnExport};
 
-/// Size cap when reading an `export.pdb`; the largest fixture is 2.9 MB.
-const pdb_limit = std.Io.Limit.limited(1 << 26);
+/// Size cap when reading an `export.pdb` — the writer's own, published for
+/// the manual parse path; the largest fixture is 2.9 MB.
+pub const pdb_limit = std.Io.Limit.limited(1 << 26);
 
 /// Size cap when opening an `exportLibrary.db`, mirroring `pdb_limit`: a
 /// same-schema database larger than this is refused before SQLite reads
 /// it, regardless of how cheaply its rows would materialize.
-const ol_db_limit: u64 = 1 << 26;
+pub const ol_db_limit: u64 = 1 << 26;
+
+/// Size cap when reading one ANLZ sibling — the writer's own, published
+/// for the manual parse path; the largest analysis files run a few
+/// megabytes.
+pub const anlz_limit = std.Io.Limit.limited(1 << 26);
+
+/// Error of `DeviceExport.open`: opening the pinned working directory,
+/// statting the root's `PIONEER` directory, or `NotAnExport` — the root
+/// carries no `PIONEER` directory (or a non-directory there), so no
+/// readable structure exists anywhere under it.
+pub const OpenError =
+    std.Io.Dir.OpenError ||
+    std.Io.Dir.StatFileError ||
+    std.mem.Allocator.Error ||
+    error{NotAnExport};
 
 /// Error of `DeviceExport.create`: `ExportAlreadyExists` is the
 /// exists-guard refusing a root that already carries a
@@ -418,7 +438,21 @@ pub fn writeFileAtomic(
     try af.replace(io);
 }
 
-/// Error of `DeviceExport.save`.
+/// Whether `path` under `dir` names a directory; a missing path is false,
+/// anything else that blocks the stat is an error.
+fn isDir(dir: std.Io.Dir, io: std.Io, path: []const u8) std.Io.Dir.StatFileError!bool {
+    const stat = dir.statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return stat.kind == .directory;
+}
+
+/// Error of `DeviceExport.save`: the pdb encode-and-validate pass, and
+/// the landing of every file. A root carrying no database at all never
+/// fails here — every mutating call resolves a database before queueing
+/// anything, so such a save is settings-only or a no-op and lands
+/// exactly what it has.
 pub const SaveError =
     OpenPdbError ||
     pdb.DatabaseEncodeError ||
@@ -429,6 +463,7 @@ pub const SaveError =
     RelocateError ||
     onelibrary.Writer.CreateError ||
     onelibrary.SqlError ||
+    OlMirrorError ||
     error{CwdUnavailable};
 
 /// Error of `DeviceExport.writerState`: reading or parsing
@@ -467,8 +502,51 @@ const track_bitmask: u32 = 788_224;
 /// mirrors it as `analysedBits`. Copy exactly.
 const track_unknown5: u16 = 41;
 
-/// A track as a user thinks of it: plain UTF-8 string slices and scalars,
-/// no foreign-key ids. Input to `DeviceExport.addTrack`, which resolves
+/// A track's identity in the export — the pdb Track row's id, or the
+/// content id on an OL-only export (the lockstep identity). A thin
+/// wrapper over `u32`: it names no row on its own, it just keeps a
+/// playlist id from compiling where a track id is wanted. Any integer
+/// names a track: `@enumFromInt` builds one, `int` reads it back.
+pub const TrackId = enum(u32) {
+    _,
+
+    /// The underlying integer.
+    pub fn int(id: TrackId) u32 {
+        return @intFromEnum(id);
+    }
+};
+
+/// A node of the playlist tree — a folder or a playlist. Folders and
+/// playlists draw from one id space (`playlist_tree_node` rows), so which
+/// one an id names stays a runtime fact (`getPlaylists`,
+/// `UnknownForeignKey`); the wrapper only keeps it apart from `TrackId`.
+pub const PlaylistNodeId = enum(u32) {
+    /// The tree's root: the parent of every top-level node, not a node
+    /// itself.
+    root = 0,
+    _,
+
+    /// The underlying integer.
+    pub fn int(id: PlaylistNodeId) u32 {
+        return @intFromEnum(id);
+    }
+};
+
+/// A tag category or leaf tag — one id space (`exportExt.pdb`'s
+/// `TagOrCategory` rows); categories are the ones `createTagCategory`
+/// mints, leaves attach under one through `addTagsToTrack`.
+pub const TagId = enum(u32) {
+    _,
+
+    /// The underlying integer.
+    pub fn int(id: TagId) u32 {
+        return @intFromEnum(id);
+    }
+};
+
+/// The write-side track vocabulary: plain UTF-8 string slices and
+/// scalars, no foreign-key ids (`TrackView` is its read-side mirror).
+/// Input to `DeviceExport.addTrack`, which resolves
 /// artists/albums/genres/keys/labels/artwork into deduplicated rows and
 /// handles format quirks (the 221-byte minimum row size, centi-BPM
 /// tempo); when the export carries a OneLibrary db, the same facts
@@ -511,7 +589,8 @@ pub const TrackInput = struct {
     /// Dedup key when non-empty; tracks with an empty path are always
     /// inserted.
     file_path: []const u8 = "",
-    /// File name without path.
+    /// File name without path. Defaults to the basename of `file_path`
+    /// when left empty — the same rule `updateTrack`'s rename applies.
     filename: []const u8 = "",
     /// Device path stored verbatim in the Artwork row; empty = none. The
     /// caller owns placing the image files it names (see `artworkSpec`
@@ -596,8 +675,10 @@ pub const TrackInput = struct {
 /// The outcome of `DeviceExport.addTrack`: a freshly inserted track, or
 /// an existing one returned because its `file_path` was already present.
 pub const AddTrackOutcome = struct {
-    /// The track id in the export.
-    id: u32,
+    /// The track id in the export — the pdb Track row's id, or the
+    /// content id on an OL-only export (the lockstep identity) — the
+    /// value `updateTrack`, `removeTrack`, and the track views carry.
+    id: TrackId,
     /// True if a new row was inserted; false if an existing track was
     /// returned unchanged.
     is_new: bool,
@@ -605,12 +686,13 @@ pub const AddTrackOutcome = struct {
 
 /// Error of `DeviceExport.addTrack`: building the writer state, encoding
 /// the track's strings (too long, or invalid UTF-8 where a format string
-/// requires it), deriving its ANLZ paths, inserting the rows, or building
-/// the OneLibrary mirror's view of the export.
+/// requires it), deriving its ANLZ paths, inserting the rows, building
+/// the OneLibrary mirror's view of the export, or `DatabaseNotFound` —
+/// an OL-only call on a root carrying no database at all.
 pub const AddTrackError =
     WriterStateError ||
     PathError ||
-    error{ TooLong, InvalidEncoding } ||
+    error{ TooLong, InvalidEncoding, DatabaseNotFound } ||
     pdb.DatabaseModifyError ||
     anlz.WriteError ||
     OlMirrorError;
@@ -618,12 +700,13 @@ pub const AddTrackError =
 /// Error of the playlist and tag methods: building the writer state,
 /// loading or creating `exportExt.pdb`, encoding a name or label (too
 /// long, or invalid UTF-8 where a format string requires it), a foreign
-/// key that names no existing row, inserting the rows, or building the
-/// OneLibrary mirror's view of the export.
+/// key that names no existing row, inserting the rows, building the
+/// OneLibrary mirror's view of the export, or `DatabaseNotFound` — an
+/// OL-only call on a root carrying no database at all.
 pub const PlaylistError =
     WriterStateError ||
     OpenPdbError ||
-    error{ UnknownForeignKey, TooLong, InvalidEncoding } ||
+    error{ UnknownForeignKey, TooLong, InvalidEncoding, DatabaseNotFound } ||
     pdb.DatabaseModifyError ||
     OlMirrorError;
 
@@ -631,31 +714,38 @@ pub const PlaylistError =
 pub const TagError = PlaylistError;
 
 /// Error of the unified track reads (`tracks`, `trackByPath`): opening or
-/// parsing the export's databases, scanning them, or the OL join's read
-/// of `exportLibrary.db`.
-pub const TrackViewError = OpenPdbError || ScanError || OpenOLError;
+/// parsing the export's databases, scanning them, the OL join's read of
+/// `exportLibrary.db`, or `DatabaseNotFound` — the root carries a
+/// `PIONEER` directory but neither `export.pdb` nor `exportLibrary.db`.
+pub const TrackViewError = OpenPdbError || ScanError || OpenOLError || error{DatabaseNotFound};
 
 /// Whether a track view found a OneLibrary counterpart. The pdb row is
 /// the spine either way; `pdb_only` means the export carries no OL db,
-/// or none of its `content` rows join by path.
+/// or none of its `content` rows join by path. A view built on an
+/// OL-only export (no `export.pdb`) reports `pdb_and_ol`: it is taken
+/// from the OL row outright, so the field's useful fact — the OL-only
+/// columns are populated — holds there too.
 pub const TrackSource = enum {
     pdb_only,
     pdb_and_ol,
 };
 
-/// A track as a user thinks of it: one pdb Track row — its foreign keys
-/// resolved to names — overlaid with the OL `content` row joined by file
-/// path, when the export carries one. The field vocabulary is
-/// `TrackInput`'s read-side mirror, so what `addTrack` writes is what a
-/// view shows. Fields only the OL side carries are empty/null under
-/// `pdb_only`.
+/// The read-side counterpart of `TrackInput`: one pdb Track row — its
+/// foreign keys resolved to names — overlaid with the OL `content` row
+/// joined by file path, when the export carries one, so what `addTrack`
+/// writes is what a view shows. Fields only the OL side carries are
+/// empty/null under `pdb_only`; an OL-only export builds the view from
+/// the `content` row outright (`id` is the content id — Rekordbox keeps
+/// content ids in the pdb track id space; see the type doc for the
+/// field convention).
 ///
 /// A view's strings are borrowed: from an iterator, until its next
 /// `next` call (dupe what must survive); from `trackByPath`, until the
 /// record's `deinit`.
 pub const TrackView = struct {
-    /// The pdb track id — the export's stable identity for the track.
-    id: u32,
+    /// The track id — the pdb Track row's id, or the content id on an
+    /// OL-only export; the export's stable identity for the track.
+    id: TrackId,
     title: []const u8,
     artist: []const u8,
     album: []const u8,
@@ -722,7 +812,10 @@ pub const TrackView = struct {
 /// it is, a value replaces it. An empty string is a value — patching
 /// `artist = ""` clears the foreign key, like `addTrack` with no artist.
 /// A non-null `file_path` renames the track — `updateTrack` carries the
-/// analysis relocation the move implies (see its doc).
+/// analysis relocation the move implies (see its doc). On an OL-only
+/// export (no `export.pdb`) the pdb-only fields (`message`, `mix_name`,
+/// `analyze_date`, `publish_track_information`) are ignored — there is
+/// no pdb row to patch — while everything else lands on the content row.
 pub const TrackPatch = struct {
     title: ?[]const u8 = null,
     artist: ?[]const u8 = null,
@@ -780,7 +873,8 @@ pub const TrackPatch = struct {
 /// Error of `updateTrack`: the writer state, the row replace, the
 /// dimension resolution, the OL mirror, or — when the patch renames —
 /// the path checks and the collision probe; `UnknownTrack` names an id
-/// no Track row carries.
+/// no Track row carries, `DatabaseNotFound` a root with no database at
+/// all.
 pub const UpdateTrackError =
     WriterStateError ||
     OlMirrorError ||
@@ -797,6 +891,7 @@ pub const UpdateTrackError =
         DuplicatePath,
         InvalidPath,
         AnalysisPathCollision,
+        DatabaseNotFound,
     };
 
 /// Options of `removeTrack`.
@@ -809,14 +904,15 @@ pub const RemoveTrackOptions = struct {
 };
 
 /// Error of `removeTrack`: the writer state, the row removals, or the OL
-/// cascade; `UnknownTrack` names an id no Track row carries.
+/// cascade; `UnknownTrack` names an id no Track row carries,
+/// `DatabaseNotFound` a root with no database at all.
 pub const RemoveTrackError =
     WriterStateError ||
     OlMirrorError ||
     pdb.DatabaseModifyError ||
     pdb.Database.RemoveRowError ||
     PathError ||
-    error{UnknownTrack};
+    error{ UnknownTrack, DatabaseNotFound };
 
 /// Error of the ANLZ relocation pass of `save`.
 pub const RelocateError =
@@ -873,28 +969,41 @@ fn captureCwd(alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
 /// the pdb database, located through `Layout`. `open` points the handle
 /// at an existing export, `create` builds a fresh one in memory. `save`
 /// is the only call that writes; `deinit` discards whatever was never
-/// saved. Files the export
-/// carries but the handle does not model are ignored by design:
-/// `djprofile.nxs` (undocumented). The OneLibrary db
+/// saved. Files the export carries but the handle does not model are
+/// ignored by design: `djprofile.nxs` (undocumented). The OneLibrary db
 /// (`exportLibrary.db`, newer exports) is read through `openOneLibrary`
 /// and mirrored by the writer side of the handle.
+///
+/// Exports come in two shapes. A full export carries `export.pdb`, its
+/// rows mirrored into `exportLibrary.db` by the mutating methods when the
+/// export carries one (`create`d and newer opened exports). An OL-only
+/// export — no `export.pdb`, as written by Rekordbox `-Donelibrary`
+/// builds — goes through `exportLibrary.db` outright: track ids are
+/// content ids, and the fields only one side stores (`message`,
+/// `mix_name`, `analyze_date`, `publish_track_information` on the pdb
+/// side) are ignored in both directions — the ignore-vice-versa
+/// convention. Methods work on either shape, failing with
+/// `DatabaseNotFound` only when the root carries neither database.
 pub const DeviceExport = struct {
     layout: Layout,
     io: std.Io,
     alloc: std.mem.Allocator,
     /// Directory every path is resolved against — the process working
-    /// directory, opened as a real handle at the first I/O call (in
-    /// `create`, right away) so a later cwd change cannot reinterpret a
-    /// relative root between calls. Null until then: `open` is infallible
-    /// and opening the handle can fail. Closed by `deinit`.
-    dir: ?std.Io.Dir,
+    /// directory, opened as a real handle at construction (`open` and
+    /// `create` both pin it immediately) so a later cwd change cannot
+    /// reinterpret a relative root between calls. Closed by `deinit`.
+    dir: std.Io.Dir,
     /// The process cwd at the moment `dir` was pinned — the absolute
-    /// prefix SQLite paths are built on (they resolve against the process
-    /// cwd, not the pinned handle). Null in `-Donelibrary=off` builds (nothing
-    /// needs it), until the pin, or when the cwd was unreadable.
+    /// prefix SQLite paths are built on (they resolve against the
+    /// process cwd, not the pinned handle). Null in `-Donelibrary=off` builds
+    /// (nothing needs it) or when the cwd was unreadable.
     dir_path: ?[]u8 = null,
-    /// The export's pdb, loaded on the first pdb-touching call — `open`
-    /// stays cheap for settings-only sessions.
+    /// Set by `create`: this handle builds a fresh export, so its first
+    /// `save` also writes the default directory skeleton. An `open`ed
+    /// export never creates directories.
+    created: bool = false,
+    /// The export's pdb, loaded on the first pdb-touching call — a
+    /// settings-only session never parses it.
     pdb_state: PdbState = .unloaded,
     /// Serialized default `*SETTING.DAT` images waiting for the first
     /// `save` of a created export; always null for opened ones.
@@ -969,49 +1078,59 @@ pub const DeviceExport = struct {
         loaded: pdb.Database,
     };
 
-    /// Points the handle at a device export on disk (a directory
-    /// containing `PIONEER`). Cheap and infallible: nothing is opened or
-    /// read until the first I/O call. The root path is borrowed; keep it
-    /// alive until `deinit`.
-    pub fn open(root_path: []const u8, io: std.Io, alloc: std.mem.Allocator) DeviceExport {
+    /// Points the handle at a device export on disk — minimally a root
+    /// with a `PIONEER` directory, verified here and nowhere else on the
+    /// read side: `NotAnExport` names a root without one (or a
+    /// non-directory there) at the call, not at the first I/O that needs
+    /// a database. Everything past that stays lazy — the pdbs,
+    /// `exportLibrary.db`, and the `*SETTING.DAT` files are first
+    /// examined by whatever call needs them. An export whose `PIONEER`
+    /// carries `exportLibrary.db` but no `export.pdb` (OL-only) reads
+    /// through the OL db in `-Donelibrary` builds; one carrying neither database
+    /// fails the read-side fallbacks with `DatabaseNotFound`.
+    /// `loadSettings` and `openOneLibrary` stay quiet on exports lacking their
+    /// files. The root path is borrowed; keep it alive until `deinit`.
+    pub fn open(root_path: []const u8, io: std.Io, alloc: std.mem.Allocator) OpenError!DeviceExport {
+        const layout = Layout{ .root = root_path };
+        // Pin the working directory now, like `create`: open is the
+        // handle's first I/O.
+        const dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
+        errdefer dir.close(io);
+        const dir_path: ?[]u8 = if (onelibrary.mode != .off)
+            captureCwd(alloc) catch null
+        else
+            null;
+        errdefer if (dir_path) |p| alloc.free(p);
+
+        const pioneer = try layout.pioneerDir(alloc);
+        defer alloc.free(pioneer);
+        if (!try isDir(dir, io, pioneer)) return error.NotAnExport;
+
         return .{
-            .layout = .{ .root = root_path },
+            .layout = layout,
             .io = io,
             .alloc = alloc,
-            .dir = null,
+            .dir = dir,
+            .dir_path = dir_path,
         };
-    }
-
-    /// The pinned working directory, opening it on first use. `Dir.cwd()`
-    /// is only an `AT_FDCWD` sentinel — every call resolves against the
-    /// process cwd as it is *then* — so a real handle is opened once and
-    /// reused. `-Donelibrary` builds also snapshot the cwd string: SQLite, which
-    /// the OneLibrary store goes through, resolves paths against the
-    /// process cwd rather than a directory handle.
-    fn dirHandle(e: *DeviceExport) (std.Io.Dir.OpenError || std.mem.Allocator.Error)!std.Io.Dir {
-        if (e.dir == null) {
-            e.dir = try std.Io.Dir.cwd().openDir(e.io, ".", .{});
-            if (onelibrary.mode != .off) {
-                // A cwd that cannot be read leaves `dir_path` null; the
-                // OneLibrary paths then fail with `CwdUnavailable`.
-                e.dir_path = captureCwd(e.alloc) catch null;
-            }
-        }
-        return e.dir.?;
     }
 
     /// Builds a fresh export in memory: a created pdb carrying the fixed
     /// 20-table layout (the `Unknown` slots must stay in place or CDJ
     /// players crash) with the default color, column, and menu rows, plus
     /// the four default setting files. Nothing touches the disk until
-    /// `save`.
+    /// `save`. The only skeleton-writer, and pdb-canonical: an export
+    /// opened with `open` never gains structure it did not carry — no
+    /// pdb, OL db, setting file, or directory tree appears that `create`
+    /// did not build, a `writeSettings` patch did not name, and `save`
+    /// did not land.
     pub fn create(
         root_path: []const u8,
         io: std.Io,
         alloc: std.mem.Allocator,
     ) CreateError!DeviceExport {
         const layout = Layout{ .root = root_path };
-        // Pin the working directory now: create is the export's first I/O.
+        // Pin the working directory now, like `open`.
         const dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
         errdefer dir.close(io);
         const dir_path: ?[]u8 = if (onelibrary.mode != .off)
@@ -1050,6 +1169,7 @@ pub const DeviceExport = struct {
             .alloc = alloc,
             .dir = dir,
             .dir_path = dir_path,
+            .created = true,
             .pdb_state = .{ .loaded = db },
             .pending_settings = pending,
             // Fresh counters and empty maps: the default color/column/menu
@@ -1098,7 +1218,7 @@ pub const DeviceExport = struct {
         for (e.pending_dir_deletes.items) |dir| e.alloc.free(dir);
         e.pending_dir_deletes.deinit(e.alloc);
         if (e.dir_path) |path| e.alloc.free(path);
-        if (e.dir) |dir| dir.close(e.io);
+        e.dir.close(e.io);
     }
 
     pub fn root(e: *const DeviceExport) []const u8 {
@@ -1109,7 +1229,7 @@ pub const DeviceExport = struct {
     /// missing or invalid file leaves its field null; a file that
     /// cannot be examined is an error.
     pub fn loadSettings(e: *DeviceExport) LoadSettingsError!Settings {
-        const dir = try e.dirHandle();
+        const dir = e.dir;
         var settings = Settings{};
         inline for (dat_files) |dat| {
             const payload = try loadSettingFile(
@@ -1132,14 +1252,31 @@ pub const DeviceExport = struct {
     /// writer's id counters and dedup maps (silently colliding ids on the
     /// next mutating call). Fields the typed methods don't expose belong
     /// on the manual path: parse, edit, `writeFileAtomic`.
+    ///
+    /// A missing pdb is `FileNotFound` — `open` verified `PIONEER` at
+    /// construction, so the caller decides what an export whose only
+    /// database is the OneLibrary db means. The `NotAnExport` branch
+    /// below only fires when the root lost or replaced its `PIONEER`
+    /// between `open` and this call.
     fn openPdb(e: *DeviceExport) OpenPdbError!*pdb.Database {
         switch (e.pdb_state) {
             .loaded => |*db| return db,
             .unloaded => {
                 const path = try e.layout.exportPdb(e.alloc);
                 defer e.alloc.free(path);
-                const dir = try e.dirHandle();
-                const buf = try dir.readFileAlloc(e.io, path, e.alloc, pdb_limit);
+                const dir = e.dir;
+                const buf = dir.readFileAlloc(e.io, path, e.alloc, pdb_limit) catch |err| switch (err) {
+                    // `NotDir` too: a non-directory somewhere along the
+                    // path (a `PIONEER` regular file, say) means the pdb
+                    // cannot exist — the stat below settles which.
+                    error.FileNotFound, error.NotDir => {
+                        const pioneer = try e.layout.pioneerDir(e.alloc);
+                        defer e.alloc.free(pioneer);
+                        if (!try isDir(dir, e.io, pioneer)) return error.NotAnExport;
+                        return error.FileNotFound;
+                    },
+                    else => return err,
+                };
                 defer e.alloc.free(buf);
                 // Load before tagging the union: a `.loaded = try ...`
                 // initializer can set the tag before the payload exists,
@@ -1151,89 +1288,242 @@ pub const DeviceExport = struct {
         }
     }
 
+    /// The database a mutating call targets.
+    const MutationStore = union(enum) {
+        pdb: *pdb.Database,
+        ol: *OlStore,
+    };
+
+    /// The database a read goes through.
+    const ReadStore = union(enum) {
+        pdb: *pdb.Database,
+        ol: *const onelibrary.Library,
+    };
+
+    /// Resolves the database a mutating call targets — the one place the
+    /// pdb/OL-only duality is decided: the export's pdb when it carries
+    /// one, else (in `-Donelibrary` builds) the OneLibrary store an
+    /// OL-only export mutates through. `DatabaseNotFound` names a root
+    /// with no database at all. (`save` resolves by hand: its two
+    /// branches land different files, not two bodies of one vocabulary.)
+    fn mutationStore(e: *DeviceExport) (WriterStateError || OlMirrorError || error{DatabaseNotFound})!MutationStore {
+        const db = e.openPdb() catch |err| switch (err) {
+            error.FileNotFound => {
+                if (onelibrary.mode == .off) return err;
+                const store = (try e.olStore()) orelse return error.DatabaseNotFound;
+                return .{ .ol = store };
+            },
+            else => return err,
+        };
+        return .{ .pdb = db };
+    }
+
+    /// The read-side counterpart of `mutationStore`: the export's pdb, or
+    /// the OneLibrary library an OL-only export reads through (the disk
+    /// snapshot `openOneLibrary` caches, not the writer store).
+    fn readStore(e: *DeviceExport) (OpenPdbError || OpenOLError || error{DatabaseNotFound})!ReadStore {
+        const db = e.openPdb() catch |err| switch (err) {
+            error.FileNotFound => {
+                if (onelibrary.mode == .off) return err;
+                const lib = (try e.openOneLibrary()) orelse return error.DatabaseNotFound;
+                return .{ .ol = lib };
+            },
+            else => return err,
+        };
+        return .{ .pdb = db };
+    }
+
     /// The export's playlist tree (see `getPlaylistsDb` for the shape and
-    /// ownership rules).
+    /// ownership rules); on an OL-only export, built from the OL
+    /// `playlist` rows (see the type doc).
     pub fn getPlaylists(
         e: *DeviceExport,
-    ) (OpenPdbError || PlaylistTreeError)!PlaylistTree {
-        return getPlaylistsDb(e.alloc, try e.openPdb());
+    ) (OpenPdbError || PlaylistTreeError || OpenOLError || error{DatabaseNotFound})!PlaylistTree {
+        return switch (try e.readStore()) {
+            .pdb => |db| try getPlaylistsDb(e.alloc, db),
+            .ol => |lib| try getPlaylistsOl(e.alloc, lib),
+        };
     }
 
     /// Iterates the export's tracks as `TrackView`s — one per pdb Track
     /// row, foreign keys resolved to names, the OL counterpart joined by
-    /// file path when the export carries one. A view's strings live
+    /// file path when the export carries one; an OL-only export iterates
+    /// its `content` rows (see the type doc). A view's strings live
     /// until the iterator's next `next` call; dupe what must outlive it.
     /// Mutating the export invalidates the iterator — finish iterating
     /// first.
     pub fn tracks(e: *DeviceExport) TrackViewError!TrackIter {
-        const db = try e.openPdb();
-        var dim_arena = std.heap.ArenaAllocator.init(e.alloc);
-        errdefer dim_arena.deinit();
-        const dims = try TrackDimensions.build(e, dim_arena.allocator());
-        return .{
-            .e = e,
-            .dim_arena = dim_arena,
-            .view_arena = std.heap.ArenaAllocator.init(e.alloc),
-            .dims = dims,
-            .it = try db.rows(.tracks),
-        };
+        switch (try e.readStore()) {
+            .pdb => |db| {
+                var dim_arena = std.heap.ArenaAllocator.init(e.alloc);
+                errdefer dim_arena.deinit();
+                const dims = try TrackDimensions.build(e, dim_arena.allocator());
+                return .{
+                    .e = e,
+                    .dim_arena = dim_arena,
+                    .view_arena = std.heap.ArenaAllocator.init(e.alloc),
+                    .dims = dims,
+                    .rows = .{ .pdb = try db.rowsOf(pdb.Track) },
+                };
+            },
+            .ol => |lib| {
+                return .{
+                    .e = e,
+                    .dim_arena = std.heap.ArenaAllocator.init(e.alloc),
+                    .view_arena = std.heap.ArenaAllocator.init(e.alloc),
+                    .dims = .{},
+                    .rows = .{ .ol = .{
+                        .lib = lib,
+                        .deletes = if (e.ol_state == .store)
+                            e.ol_state.store.content_deletes.items
+                        else
+                            &.{},
+                    } },
+                };
+            },
+        }
     }
 
     /// The track ids of `playlist_id`'s entries, ordered by `entry_index`
     /// — the order the player shows them in. A folder, or an id the
-    /// export does not carry, yields an empty slice. The caller owns the
-    /// slice.
+    /// export does not carry, yields an empty slice; the caller owns the
+    /// slice. An OL-only export reads its `playlist_content` rows instead,
+    /// ordered by their own dense 1-based `sequenceNo` (see the type
+    /// doc).
     pub fn getPlaylistTrackIds(
         e: *DeviceExport,
         alloc: std.mem.Allocator,
-        playlist_id: u32,
-    ) WriterStateError![]u32 {
-        const db = try e.openPdb();
-        const Entry = struct { index: u32, track_id: u32 };
-        var entries = std.ArrayList(Entry).empty;
-        defer entries.deinit(alloc);
-        var it = (try rowsOrEmpty(db, .playlist_entries)) orelse return &.{};
-        while (try it.next()) |row| switch (row.*) {
-            .playlist_entry => |entry| {
-                if (entry.playlist_id == playlist_id)
-                    try entries.append(alloc, .{
-                        .index = entry.entry_index,
-                        .track_id = entry.track_id,
-                    });
+        playlist: PlaylistNodeId,
+    ) (WriterStateError || OpenOLError || error{DatabaseNotFound})![]TrackId {
+        const playlist_id = playlist.int();
+        switch (try e.readStore()) {
+            .pdb => |db| {
+                const Entry = struct { index: u32, track_id: u32 };
+                var entries = std.ArrayList(Entry).empty;
+                defer entries.deinit(alloc);
+                var it = (try rowsOfOrEmpty(db, pdb.PlaylistEntry)) orelse return &.{};
+                while (try it.next()) |entry| {
+                    if (entry.playlist_id == playlist_id)
+                        try entries.append(alloc, .{
+                            .index = entry.entry_index,
+                            .track_id = entry.track_id,
+                        });
+                }
+                std.mem.sort(Entry, entries.items, {}, struct {
+                    fn before(_: void, a: Entry, b: Entry) bool {
+                        return a.index < b.index;
+                    }
+                }.before);
+                const ids = try alloc.alloc(TrackId, entries.items.len);
+                for (entries.items, ids) |entry, *id| id.* = @enumFromInt(entry.track_id);
+                return ids;
             },
-            else => {},
-        };
-        std.mem.sort(Entry, entries.items, {}, struct {
-            fn before(_: void, a: Entry, b: Entry) bool {
-                return a.index < b.index;
-            }
-        }.before);
-        const ids = try alloc.alloc(u32, entries.items.len);
-        for (entries.items, ids) |entry, *id| id.* = entry.track_id;
-        return ids;
+            .ol => |lib| {
+                // The cached disk snapshot, minus the cascade-delete
+                // tombstones (the session's view of a removal before its
+                // save).
+                const deletes: []const i64 = if (e.ol_state == .store)
+                    e.ol_state.store.content_deletes.items
+                else
+                    &.{};
+                const indices =
+                    lib.playlist_contents_by_playlist.get(playlist_id) orelse return &.{};
+                var ids = std.ArrayList(TrackId).empty;
+                defer ids.deinit(alloc);
+                for (indices) |i| {
+                    const row = &lib.playlist_contents[i];
+                    const content_id = row.content_id orelse continue;
+                    if (olIdQueued(deletes, content_id)) continue;
+                    // A diverged id outside the u32 track-id space has no
+                    // representation in the returned vocabulary.
+                    try ids.append(alloc, @enumFromInt(std.math.cast(u32, content_id) orelse continue));
+                }
+                return ids.toOwnedSlice(alloc);
+            },
+        }
     }
 
     /// The track view for `path` (device-root-absolute, e.g.
     /// `/Contents/Artist - Title.mp3`), or null when no track carries
-    /// it. Unlike an iterator's view, the record owns its strings — call
-    /// `deinit` when done.
+    /// it; an OL-only export resolves through its `content` rows (see
+    /// the type doc). Unlike an iterator's view, the record owns its
+    /// strings — call `deinit` when done.
     pub fn trackByPath(e: *DeviceExport, path: []const u8) TrackViewError!?TrackRecord {
-        const db = try e.openPdb();
-        const arena = try e.alloc.create(std.heap.ArenaAllocator);
-        errdefer e.alloc.destroy(arena);
-        arena.* = std.heap.ArenaAllocator.init(e.alloc);
-        errdefer arena.deinit();
-        const a = arena.allocator();
-        const dims = try TrackDimensions.build(e, a);
-        var it = try db.rows(.tracks);
-        while (try it.next()) |row| {
-            const file_path = try decodeOrEmpty(row.track.offsets.inner.file_path, a);
-            if (std.mem.eql(u8, file_path, path))
-                return .{ .arena = arena, .view = try fillTrackView(e, &dims, a, row.track) };
+        switch (try e.readStore()) {
+            .pdb => |db| {
+                const arena = try e.alloc.create(std.heap.ArenaAllocator);
+                errdefer e.alloc.destroy(arena);
+                arena.* = std.heap.ArenaAllocator.init(e.alloc);
+                errdefer arena.deinit();
+                const a = arena.allocator();
+                const dims = try TrackDimensions.build(e, a);
+                var it = try db.rowsOf(pdb.Track);
+                while (try it.next()) |track| {
+                    const file_path = try decodeOrEmpty(track.offsets.inner.file_path, a);
+                    if (std.mem.eql(u8, file_path, path))
+                        return .{ .arena = arena, .view = try fillTrackView(e, &dims, a, track) };
+                }
+                arena.deinit();
+                e.alloc.destroy(arena);
+                return null;
+            },
+            .ol => |lib| {
+                const c = lib.contentByPath(path) orelse return null;
+                // A queued cascade delete already carried the row off.
+                if (e.ol_state == .store and
+                    e.ol_state.store.contentDeleteQueued(c.content_id))
+                    return null;
+                const arena = try e.alloc.create(std.heap.ArenaAllocator);
+                errdefer e.alloc.destroy(arena);
+                arena.* = std.heap.ArenaAllocator.init(e.alloc);
+                errdefer arena.deinit();
+                return .{ .arena = arena, .view = try fillTrackViewOl(lib, arena.allocator(), c) };
+            },
         }
-        arena.deinit();
-        e.alloc.destroy(arena);
-        return null;
+    }
+
+    /// The track view of the first track titled `title` in row order —
+    /// the order `tracks` yields — or null when none carries it. Titles
+    /// are not unique (`file_path` is the dedup key; `trackByPath`
+    /// resolves it); when several rows may share one, iterate `tracks`
+    /// to see them all. Like `trackByPath`'s, the record owns its
+    /// strings — call `deinit` when done.
+    pub fn trackByTitle(e: *DeviceExport, title: []const u8) TrackViewError!?TrackRecord {
+        switch (try e.readStore()) {
+            .pdb => |db| {
+                const arena = try e.alloc.create(std.heap.ArenaAllocator);
+                errdefer e.alloc.destroy(arena);
+                arena.* = std.heap.ArenaAllocator.init(e.alloc);
+                errdefer arena.deinit();
+                const a = arena.allocator();
+                const dims = try TrackDimensions.build(e, a);
+                var it = try db.rowsOf(pdb.Track);
+                while (try it.next()) |track| {
+                    const row_title = try decodeOrEmpty(track.offsets.inner.title, a);
+                    if (std.mem.eql(u8, row_title, title))
+                        return .{ .arena = arena, .view = try fillTrackView(e, &dims, a, track) };
+                }
+                arena.deinit();
+                e.alloc.destroy(arena);
+                return null;
+            },
+            .ol => |lib| {
+                for (lib.contents) |*content| {
+                    const row_title = content.title orelse "";
+                    if (!std.mem.eql(u8, row_title, title)) continue;
+                    // A queued cascade delete already carried the row off.
+                    if (e.ol_state == .store and
+                        e.ol_state.store.contentDeleteQueued(content.content_id))
+                        continue;
+                    const arena = try e.alloc.create(std.heap.ArenaAllocator);
+                    errdefer e.alloc.destroy(arena);
+                    arena.* = std.heap.ArenaAllocator.init(e.alloc);
+                    errdefer arena.deinit();
+                    return .{ .arena = arena, .view = try fillTrackViewOl(lib, arena.allocator(), content) };
+                }
+                return null;
+            },
+        }
     }
 
     /// The export's OneLibrary db (`exportLibrary.db`, carried by newer
@@ -1255,7 +1545,7 @@ pub const DeviceExport = struct {
             .loaded => |*lib| return lib,
             .absent => return null,
             .unloaded => {
-                const dir = try e.dirHandle();
+                const dir = e.dir;
                 const rel = try e.layout.exportLibraryDb(e.alloc);
                 defer e.alloc.free(rel);
                 const stat = dir.statFile(e.io, rel, .{}) catch |err| switch (err) {
@@ -1314,7 +1604,7 @@ pub const DeviceExport = struct {
             .store => |*store| return store,
             .absent => return null,
             .unloaded => {
-                const dir = try e.dirHandle();
+                const dir = e.dir;
                 const rel = try e.layout.exportLibraryDb(e.alloc);
                 defer e.alloc.free(rel);
                 if (dir.access(e.io, rel, .{})) |_| {} else |err| switch (err) {
@@ -1433,7 +1723,7 @@ pub const DeviceExport = struct {
         else
             null;
 
-        try store.contents.append(a, .{
+        try pushContent(store, .{
             .content_id = row.id,
             .title = try a.dupe(u8, track.title),
             .titleForSearch = if (track.title_for_search) |s| try a.dupe(u8, s) else null,
@@ -1520,23 +1810,39 @@ pub const DeviceExport = struct {
     /// Idempotent on a non-empty `file_path`: if a track with that path
     /// was already added (this session, or read back by the writer-state
     /// scan of an opened export), the existing id is returned and nothing
-    /// is inserted; `AddTrackOutcome.is_new` tells the cases apart.
+    /// is inserted; `AddTrackOutcome.is_new` tells the cases apart. An
+    /// OL-only export adds through the OL db outright, dimensions
+    /// resolving through its own rows (see the type doc).
     ///
-    /// Everything that can fail on the caller's data — string encoding,
-    /// ANLZ serialization, the OL store's view of the export — happens
-    /// before any id is taken or row inserted, so a bad string leaves the
-    /// export untouched. A failure between the dimension-row inserts and
-    /// the Track row (allocation failure, or a database counters
-    /// inconsistency) can still leave orphaned dimension rows —
-    /// unreachable from any track, ignored by players, not recovered
-    /// automatically — and a failure in the OL mirroring after the Track
-    /// insert leaves the pdb side complete with the OL side partially
-    /// pending (same risk class; the next `save` lands what pends).
-    pub fn addTrack(e: *DeviceExport, track: TrackInput) AddTrackError!AddTrackOutcome {
+    /// Caller data that can fail — string encoding, ANLZ serialization,
+    /// the OL store's view of the export — fails before any id is taken
+    /// or row inserted. A failure between the dimension inserts and the
+    /// Track row can leave orphaned dimension rows — unreachable from
+    /// any track, ignored by players — and a failure in the OL mirroring
+    /// after the Track insert leaves the pdb side complete with the OL
+    /// side pending until the next `save`.
+    pub fn addTrack(e: *DeviceExport, track_in: TrackInput) AddTrackError!AddTrackOutcome {
+        var track = track_in;
+        // `filename` defaults to `file_path`'s basename — the rule
+        // `updateTrack`'s rename applies.
+        if (track.filename.len == 0 and track.file_path.len > 0)
+            track.filename = std.fs.path.basename(track.file_path);
+        return switch (try e.mutationStore()) {
+            .pdb => |db| try e.addTrackPdb(db, track),
+            .ol => |store| try e.addTrackOl(store, track),
+        };
+    }
+
+    /// The pdb-backed `addTrack` body; see `addTrack`.
+    fn addTrackPdb(
+        e: *DeviceExport,
+        db: *pdb.Database,
+        track: TrackInput,
+    ) AddTrackError!AddTrackOutcome {
         const state = try e.writerStateMut();
         if (track.file_path.len > 0) {
             if (state.tracks_by_path.get(track.file_path)) |id|
-                return .{ .id = id, .is_new = false };
+                return .{ .id = @enumFromInt(id), .is_new = false };
         }
         try e.primeOlStore();
 
@@ -1546,10 +1852,9 @@ pub const DeviceExport = struct {
         errdefer for (&anlz_files) |*slot| {
             if (slot.*) |*file| file.deinit(e.alloc);
         };
-        const row = try e.buildTrackRow(track, track.analysis != null);
+        const row = try buildTrackRow(db.arena.allocator(), track, track.analysis != null);
         const track_id = try state.next_track_id.mint();
 
-        const db = try e.openPdb();
         const artist_id = try getOrCreateArtist(state, db, track.artist);
         const album_id = try getOrCreateAlbum(state, db, track.album, artist_id);
         const genre_id = try getOrCreateGenre(state, db, track.genre);
@@ -1592,22 +1897,130 @@ pub const DeviceExport = struct {
 
         state.track_ids.putAssumeCapacity(track_id, {});
         if (owned_path) |path| state.tracks_by_path.putAssumeCapacity(path, track_id);
+
+        // Mirrored before the images move to the queue: the errdefer
+        // above still owns them, so a mirror failure must not come after
+        // the hand-off (it would free what the queue keeps). The OL-only
+        // body below keeps the same order for the same reason.
+        try e.mirrorAddedTrack(track, row);
+
         for (anlz_files) |slot| if (slot) |file|
             e.pending_anlz.appendAssumeCapacity(file);
 
+        return .{ .id = @enumFromInt(track_id), .is_new = true };
+    }
+
+    /// The OL-only `addTrack` body; see `addTrack`. The mapping machinery
+    /// is reused by synthesis: dimensions pre-resolve through the store's
+    /// name-keyed maps — each new row minting its id — and the content
+    /// row lands through `mirrorAddedTrack`, fed a transient `pdb.Track`
+    /// built as a value bag. Pre-resolving makes every bridge the mirror
+    /// looks up a map hit, so the bag's own dimension ids (unable to
+    /// carry the minted artist ids at and above 2^32) are dead by
+    /// construction — only `id` (the minted content id) and `artwork_id`
+    /// (the minted image id) are read.
+    fn addTrackOl(
+        e: *DeviceExport,
+        store: *OlStore,
+        track: TrackInput,
+    ) AddTrackError!AddTrackOutcome {
+        // The dedup key resolves against the OL rows: pending inserts,
+        // queued updates, then the db's own.
+        if (track.file_path.len > 0) {
+            if (try e.olContentIdByPath(store, track.file_path)) |id| {
+                const existing = std.math.cast(u32, id) orelse
+                    return error.IdSpaceExhausted;
+                return .{ .id = @enumFromInt(existing), .is_new = false };
+            }
+        }
+
+        // The caller's data fails here or never: nothing below this point
+        // is rolled back.
+        var anlz_files = try e.buildAnlzFiles(track);
+        errdefer for (&anlz_files) |*slot| {
+            if (slot.*) |*file| file.deinit(e.alloc);
+        };
+        var row_arena = std.heap.ArenaAllocator.init(e.alloc);
+        defer row_arena.deinit();
+        const row = try buildTrackRow(row_arena.allocator(), track, track.analysis != null);
+        const content_id = try store.next_content_id.mint();
+
+        // Dimensions first, so the mirror's bridges all hit. The album
+        // keys on the artist's own OL id, like the pdb side's per-artist
+        // key.
+        const artist_id = try olMintedRow(
+            store,
+            &store.artists_by_name,
+            &store.artists,
+            olArtistRow,
+            &store.next_minted_artist_id,
+            track.artist,
+        );
+        _ = try olMintedRow(
+            store,
+            &store.artists_by_name,
+            &store.artists,
+            olArtistRow,
+            &store.next_minted_artist_id,
+            track.remixer,
+        );
+        _ = try olMintedRow(
+            store,
+            &store.artists_by_name,
+            &store.artists,
+            olArtistRow,
+            &store.next_minted_artist_id,
+            track.orig_artist,
+        );
+        _ = try olMintedRow(
+            store,
+            &store.artists_by_name,
+            &store.artists,
+            olArtistRow,
+            &store.next_minted_artist_id,
+            track.composer,
+        );
+        _ = try olLyricistId(store, track.lyricist);
+        _ = try olMintedRow(
+            store,
+            &store.genres_by_name,
+            &store.genres,
+            olGenreRow,
+            &store.next_genre_id,
+            track.genre,
+        );
+        _ = try olMintedRow(
+            store,
+            &store.labels_by_name,
+            &store.labels,
+            olLabelRow,
+            &store.next_label_id,
+            track.label,
+        );
+        _ = try olMintedKeyId(store, track.key);
+        _ = try olMintedAlbumId(store, track.album, artist_id);
+        row.artwork_id = if (track.artwork_device_path.len > 0)
+            try olMintedImageId(store)
+        else
+            0;
+
+        row.id = content_id;
         try e.mirrorAddedTrack(track, row);
 
-        return .{ .id = track_id, .is_new = true };
+        try e.pending_anlz.ensureUnusedCapacity(e.alloc, anlz_files.len);
+        for (anlz_files) |slot| if (slot) |file|
+            e.pending_anlz.appendAssumeCapacity(file);
+
+        return .{ .id = @enumFromInt(content_id), .is_new = true };
     }
 
     /// Updates track `id` with the non-null fields of `patch`; null
     /// fields are left exactly as they are — including the row's unknown
     /// constants (`bitmask`, `unknown5`, …), which a patch never touches,
     /// unlike a fresh `addTrack` row. Dimension fields resolve like
-    /// `addTrack`'s: a new artist/album/genre/key/label/artwork name
-    /// creates its row under a fresh id, and the old dimension row stays
-    /// behind (unreferenced, ignored by players). An empty string is a
-    /// value — `artist = ""` clears the foreign key.
+    /// `addTrack`'s — a new name creates its row under a fresh id, the
+    /// old row staying behind (unreferenced, ignored by players). An
+    /// empty string is a value — `artist = ""` clears the foreign key.
     ///
     /// A non-null `file_path` renames the track to it — the
     /// device-absolute `/Contents/...` form; a path the row already
@@ -1621,31 +2034,25 @@ pub const DeviceExport = struct {
     /// players recompute the location from the path hash and ignore
     /// `analyze_path`, so relocation is not optional. Placing the audio
     /// file at the new location is the caller's; the library never
-    /// touches `Contents`. The old analysis directory outlives the
-    /// relocation until the new `export.pdb` has landed, then goes away
-    /// best-effort: a crash mid-save leaves the old index naming a
-    /// directory still populated. Renaming onto another track's path is
-    /// a `DuplicatePath`, a path without the leading device-root slash
-    /// an `InvalidPath`, and a target directory another track's analysis
-    /// already occupies an `AnalysisPathCollision` — two paths sharing
-    /// one directory is real, per the modulo in `pathHash`, and the
-    /// caller must pick another path: clobbering would destroy the
-    /// other track's analysis.
+    /// touches `Contents`. The old analysis directory goes away
+    /// best-effort once the new index has landed. Renaming onto another
+    /// track's path is a `DuplicatePath`, a path without the leading
+    /// device-root slash an `InvalidPath`, and a target directory
+    /// another track's analysis already occupies an
+    /// `AnalysisPathCollision` — two paths can share one directory, per
+    /// the modulo in `pathHash`, and clobbering would destroy the other
+    /// track's analysis.
     ///
     /// When the export carries a OneLibrary db and the track joined a
     /// `content` row, the mirrored columns move with the patch and the
     /// OL-only fields (`subtitle`, the KUVO pair, the update counts)
-    /// patch the OL row directly. A track with no OL row is patched on
-    /// the pdb side only.
-    ///
-    /// Ordering follows `addTrack`'s discipline: caller data that can
-    /// fail (string encoding) fails before anything is mutated. The
-    /// dimension inserts come before the track row lands, so a failure
-    /// between them can orphan dimension rows — the same residual risk,
-    /// unrecovered and harmless to players. The replace itself inserts
-    /// the new row before removing the old, so a failure cannot lose
-    /// the track.
-    pub fn updateTrack(e: *DeviceExport, id: u32, patch: TrackPatch) UpdateTrackError!void {
+    /// patch the OL row directly; a track with no OL row is patched on
+    /// the pdb side only. An OL-only export patches its content row
+    /// outright, the checks mirroring the pdb path's (see the type
+    /// doc). Failure ordering follows `addTrack`'s; the row replace
+    /// inserts the new row before removing the old, so a failure cannot
+    /// lose the track.
+    pub fn updateTrack(e: *DeviceExport, id: TrackId, patch: TrackPatch) UpdateTrackError!void {
         // The path coordinate is device-absolute.
         if (patch.file_path) |p| {
             if (p.len == 0 or p[0] != '/')
@@ -1653,6 +2060,15 @@ pub const DeviceExport = struct {
             _ = std.unicode.Utf8View.init(p) catch return error.InvalidPath;
         }
 
+        const raw_id = id.int();
+        return switch (try e.mutationStore()) {
+            .pdb => try e.updateTrackPdb(raw_id, patch),
+            .ol => |store| try e.updateTrackOl(store, raw_id, patch),
+        };
+    }
+
+    /// The pdb-backed `updateTrack` body; see `updateTrack`.
+    fn updateTrackPdb(e: *DeviceExport, id: u32, patch: TrackPatch) UpdateTrackError!void {
         const state = try e.writerStateMut();
         try e.primeOlStore();
         const old = (try e.findTrackRow(id)) orelse return error.UnknownTrack;
@@ -1689,7 +2105,7 @@ pub const DeviceExport = struct {
             const dirs_change = old_hash.?.p_value != new_hash.p_value or
                 old_hash.?.hash != new_hash.hash;
             if (dirs_change) {
-                const dir = try e.dirHandle();
+                const dir = e.dir;
                 const target = try e.layout.anlzDatFile(e.alloc, rename.?);
                 defer e.alloc.free(target);
                 if (dir.access(e.io, target, .{})) |_| {
@@ -1833,19 +2249,162 @@ pub const DeviceExport = struct {
             try e.mirrorTrackUpdate(id, p, boxed, patch, ids, rename);
     }
 
+    /// The OL-only `updateTrack` body; see `updateTrack`. The row
+    /// resolves by content id (the lockstep identity), the checks mirror
+    /// the pdb path's — the path index they run against is the OL rows
+    /// themselves — and the patch applies through
+    /// `applyTrackPatchToContentOl`, the sibling without a pdb row
+    /// behind it.
+    fn updateTrackOl(
+        e: *DeviceExport,
+        store: *OlStore,
+        id: u32,
+        patch: TrackPatch,
+    ) UpdateTrackError!void {
+        const ref = (try contentRefById(e, store, id)) orelse return error.UnknownTrack;
+        const old_path: ?[]const u8 = switch (ref) {
+            .pending => |i| store.contents.items[i].path,
+            .queued_update => |i| store.content_updates.items[i].path,
+            .disk => |c| c.path,
+        };
+
+        // A rename: a new path that differs from the one the row
+        // carries. Its check runs while the old path still names the
+        // row, before anything is mutated.
+        const rename: ?[]const u8 = blk: {
+            const np = patch.file_path orelse break :blk null;
+            if (old_path) |p| {
+                if (std.mem.eql(u8, p, np)) break :blk null;
+            }
+            break :blk np;
+        };
+        if (rename) |np| {
+            if (try e.olContentIdByPath(store, np)) |other| {
+                if (other != id) return error.DuplicatePath;
+            }
+        }
+
+        // Where the analysis lives now and where the new path puts it.
+        // The row's path is the coordinate; an undecodable one cannot
+        // occur (the OL side stores plain UTF-8), but a row with no path
+        // has no locatable analysis: it still renames, the files are
+        // left where they are.
+        const old_hash: ?PathHash = if (old_path) |p|
+            pathHash(p) catch null
+        else
+            null;
+        if (rename != null and old_hash != null) {
+            const new_hash = try pathHash(rename.?);
+            const dirs_change = old_hash.?.p_value != new_hash.p_value or
+                old_hash.?.hash != new_hash.hash;
+            if (dirs_change) {
+                const dir = e.dir;
+                const target = try e.layout.anlzDatFile(e.alloc, rename.?);
+                defer e.alloc.free(target);
+                if (dir.access(e.io, target, .{})) |_| {
+                    return error.AnalysisPathCollision;
+                } else |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                }
+            }
+        }
+
+        const sa = store.arena.allocator();
+        switch (ref) {
+            .pending => |i| {
+                const row = &store.contents.items[i];
+                if (rename) |np| try renameListedContent(
+                    store,
+                    row,
+                    sa,
+                    np,
+                    row.analysisDataFilePath != null,
+                );
+                try applyTrackPatchToContentOl(store, row, patch);
+            },
+            .queued_update => |i| {
+                const row = &store.content_updates.items[i];
+                if (rename) |np| try renameListedContent(
+                    store,
+                    row,
+                    sa,
+                    np,
+                    row.analysisDataFilePath != null,
+                );
+                try applyTrackPatchToContentOl(store, row, patch);
+            },
+            .disk => |c| {
+                var copy = try dupeContent(sa, c);
+                if (rename) |np| try moveContentRow(
+                    &copy,
+                    sa,
+                    np,
+                    copy.analysisDataFilePath != null,
+                );
+                try applyTrackPatchToContentOl(store, &copy, patch);
+                try queueContentUpdate(store, copy);
+            },
+        }
+
+        if (rename) |np| {
+            // The analysis: queued images retarget in memory, files on
+            // disk get a relocation the next `save` lands. Same hash
+            // directory means a relocation onto itself — the PPTH
+            // rewrite only. `old_path` borrows store or snapshot memory
+            // that outlives the mutations above.
+            if (old_path != null and old_hash != null) {
+                try e.retargetPendingAnlz(old_path.?, np);
+                const from_dir = try e.layout.anlzDir(e.alloc, old_path.?);
+                errdefer e.alloc.free(from_dir);
+                const to_dir = try e.layout.anlzDir(e.alloc, np);
+                errdefer e.alloc.free(to_dir);
+                const device_path = try e.alloc.dupe(u8, np);
+                errdefer e.alloc.free(device_path);
+                if (e.relocations.getPtr(id)) |rel| {
+                    e.alloc.free(rel.to_dir);
+                    e.alloc.free(rel.device_path);
+                    rel.to_dir = to_dir;
+                    rel.device_path = device_path;
+                    e.alloc.free(from_dir);
+                } else {
+                    try e.relocations.put(e.alloc, id, .{
+                        .from_dir = from_dir,
+                        .to_dir = to_dir,
+                        .device_path = device_path,
+                    });
+                }
+            }
+        }
+    }
+
     /// Removes track `id` from the export: the Track row, its playlist
     /// entries, and its tag junctions go; the OneLibrary side follows —
     /// a pending mirror row is dropped, a disk `content` row is
     /// cascade-deleted (with its junction rows) at the next `save`.
     /// Every reference goes with the cascade, so the id is free again
     /// after a reopen (the writer's scan is max-based, like the format's
-    /// own writers); within the session the counters stay past it.
-    /// With `delete_analysis_files`, the analysis directory goes too at
-    /// the next save — unless another track's path hashes onto it.
-    /// Orphaned dimension rows (an artist no remaining track names) stay
-    /// behind, like `addTrack`'s failure residue: unreferenced, ignored
-    /// by players.
+    /// own writers); within the session the counters stay past it. With
+    /// `delete_analysis_files`, the analysis directory goes too at the
+    /// next save — unless another track's path hashes onto it. Orphaned
+    /// dimension rows stay behind, like `addTrack`'s failure residue. An
+    /// OL-only export removes through its content rows, the
+    /// analysis-directory option keying on the content row's path (see
+    /// the type doc).
     pub fn removeTrack(
+        e: *DeviceExport,
+        id: TrackId,
+        options: RemoveTrackOptions,
+    ) RemoveTrackError!void {
+        const raw_id = id.int();
+        return switch (try e.mutationStore()) {
+            .pdb => try e.removeTrackPdb(raw_id, options),
+            .ol => |store| try e.removeTrackOl(store, raw_id, options),
+        };
+    }
+
+    /// The pdb-backed `removeTrack` body; see `removeTrack`.
+    fn removeTrackPdb(
         e: *DeviceExport,
         id: u32,
         options: RemoveTrackOptions,
@@ -1899,17 +2458,52 @@ pub const DeviceExport = struct {
         }
     }
 
-    /// Builds the Track row for `track` in the database's arena — every
-    /// string encoded, the device-derived constants set, and `comment`
-    /// grown past the 221-byte CDJ minimum — allocating no ids and
-    /// inserting nothing. `has_analysis` selects whether `analyze_path`
-    /// is populated.
-    fn buildTrackRow(
+    /// The OL-only `removeTrack` body; see `removeTrack`. The row
+    /// resolves by content id and drops through the same cascade
+    /// (`dropOlContentRef`); `old_path` borrows store-arena or snapshot
+    /// memory that outlives the list removal, for the analysis-side
+    /// cleanup below.
+    fn removeTrackOl(
         e: *DeviceExport,
+        store: *OlStore,
+        id: u32,
+        options: RemoveTrackOptions,
+    ) RemoveTrackError!void {
+        const ref = (try contentRefById(e, store, id)) orelse return error.UnknownTrack;
+        const old_path: ?[]const u8 = switch (ref) {
+            .pending => |i| store.contents.items[i].path,
+            .queued_update => |i| store.content_updates.items[i].path,
+            .disk => |c| c.path,
+        };
+
+        try dropOlContentRef(store, id, ref);
+
+        if (old_path) |p| try e.dropPendingAnlzFor(p);
+
+        // A rename that never saved leaves a queued relocation behind;
+        // its source directory may hold files an earlier save landed.
+        if (e.relocations.fetchRemove(id)) |kv| {
+            var rel = kv.value;
+            if (options.delete_analysis_files)
+                try e.queueDirDeleteIfUnusedOl(store, id, rel.from_dir);
+            rel.deinit(e.alloc);
+        }
+        if (options.delete_analysis_files) {
+            if (old_path) |p| try e.queueAnlzDirDeleteOl(store, id, p);
+        }
+    }
+
+    /// Builds the Track row for `track` in `a` — every string encoded,
+    /// the device-derived constants set, and `comment` grown past the
+    /// 221-byte CDJ minimum — allocating no ids and inserting nothing.
+    /// `has_analysis` selects whether `analyze_path` is populated. The
+    /// database's arena for a row about to be inserted; a throwaway arena
+    /// when the OL-only path builds one as a value bag.
+    fn buildTrackRow(
+        a: std.mem.Allocator,
         track: TrackInput,
         has_analysis: bool,
     ) AddTrackError!*pdb.Track {
-        const a = (try e.openPdb()).arena.allocator();
 
         // The device path of the track's ANLZ `.DAT`, derived from
         // `file_path` the way players recompute it.
@@ -2133,10 +2727,9 @@ pub const DeviceExport = struct {
 
     /// Locates the OL `content` row joined to pdb track `track_id` whose
     /// pdb file path is `path`: the recorded bridge first (a rename has
-    /// already moved the path on), then pending inserts and queued
-    /// updates by path, then the loaded library by path. Every hit
-    /// records the bridge, so the next resolution survives a later path
-    /// change. An export without an OL db resolves nothing.
+    /// already moved the path on), then by path (see `olContentRefByPath`).
+    /// Every path hit records the bridge, so the next resolution survives
+    /// a later path change. An export without an OL db resolves nothing.
     fn olContentRefForTrack(
         e: *DeviceExport,
         track_id: u32,
@@ -2148,44 +2741,61 @@ pub const DeviceExport = struct {
             if (try contentRefById(e, store, content_id)) |ref| return ref;
         }
         if (path.len == 0) return null;
-        for (store.contents.items, 0..) |*c, i| {
-            if (std.mem.eql(u8, c.path orelse "", path)) {
-                try recordBridge(store, track_id, c.content_id);
-                return .{ .pending = i };
-            }
-        }
-        for (store.content_updates.items, 0..) |*c, i| {
-            if (std.mem.eql(u8, c.path orelse "", path)) {
-                try recordBridge(store, track_id, c.content_id);
-                return .{ .queued_update = i };
-            }
-        }
-        if (onelibrary.mode != .off) {
-            const lib = (try e.openOneLibrary()) orelse return null;
-            if (lib.contentByPath(path)) |c| {
-                try recordBridge(store, track_id, c.content_id);
-                return .{ .disk = c };
-            }
+        if (try e.olContentRefByPath(store, path)) |ref| {
+            try recordBridge(store, track_id, olContentRefId(store, ref));
+            return ref;
         }
         return null;
     }
 
-    /// The OL content row of `content_id` wherever it lives — pending,
-    /// queued for update, or on disk in the cached library.
+    /// Any content row carrying `path` — pending inserts and queued
+    /// updates first (a rename already carries its new path there), then
+    /// the loaded library's snapshot of the disk, minus the rows queued
+    /// for the cascade delete.
+    fn olContentRefByPath(
+        e: *DeviceExport,
+        store: *OlStore,
+        path: []const u8,
+    ) OlMirrorError!?OlContentRef {
+        if (storeContentRefByPath(store, path)) |ref| return ref;
+        if (onelibrary.mode == .off) return null;
+        const lib = (try e.openOneLibrary()) orelse return null;
+        if (lib.contentByPath(path)) |c| {
+            if (store.contentDeleteQueued(c.content_id)) return null;
+            return .{ .disk = c };
+        }
+        return null;
+    }
+
+    /// The content id of the OL row carrying `path`, wherever it lives —
+    /// the add-side dedup and the rename collision probe on an OL-only
+    /// export.
+    fn olContentIdByPath(
+        e: *DeviceExport,
+        store: *OlStore,
+        path: []const u8,
+    ) OlMirrorError!?i64 {
+        if (try e.olContentRefByPath(store, path)) |ref|
+            return olContentRefId(store, ref);
+        return null;
+    }
+
+    /// The OL content row of `content_id` wherever it lives — the store's
+    /// id index over the pending inserts and queued updates, then the
+    /// cached library's snapshot of the disk — minus the rows queued for
+    /// the cascade delete, which the session already counts gone.
     fn contentRefById(
         e: *DeviceExport,
         store: *OlStore,
         content_id: i64,
     ) OlMirrorError!?OlContentRef {
-        for (store.contents.items, 0..) |*c, i| {
-            if (c.content_id == content_id) return .{ .pending = i };
-        }
-        for (store.content_updates.items, 0..) |*c, i| {
-            if (c.content_id == content_id) return .{ .queued_update = i };
-        }
+        if (store.content_ref_by_id.get(content_id)) |ref| return ref;
         if (onelibrary.mode != .off) {
             const lib = (try e.openOneLibrary()) orelse return null;
-            if (lib.byId(onelibrary.Content, content_id)) |c| return .{ .disk = c };
+            if (lib.byId(onelibrary.Content, content_id)) |c| {
+                if (store.contentDeleteQueued(c.content_id)) return null;
+                return .{ .disk = c };
+            }
         }
         return null;
     }
@@ -2210,27 +2820,37 @@ pub const DeviceExport = struct {
         const ref = (try e.olContentRefForTrack(track_id, old_path)) orelse return;
         const sa = store.arena.allocator();
 
-        const moveRow = struct {
-            fn move(c: *onelibrary.Content, a: std.mem.Allocator, new_path: []const u8, row: *const pdb.Track) OlMirrorError!void {
-                c.path = try a.dupe(u8, new_path);
-                c.fileName = try a.dupe(u8, std.fs.path.basename(new_path));
-                if (!strEmpty(row.offsets.inner.analyze_path))
-                    c.analysisDataFilePath = try anlzDevicePath(a, new_path);
-            }
-        }.move;
-
         switch (ref) {
             .pending => |i| {
-                if (rename) |np| try moveRow(&store.contents.items[i], sa, np, new_row);
-                try applyTrackPatchToContent(store, &store.contents.items[i], new_row, patch, ids);
+                const row = &store.contents.items[i];
+                if (rename) |np| try renameListedContent(
+                    store,
+                    row,
+                    sa,
+                    np,
+                    !strEmpty(new_row.offsets.inner.analyze_path),
+                );
+                try applyTrackPatchToContent(store, row, new_row, patch, ids);
             },
             .queued_update => |i| {
-                if (rename) |np| try moveRow(&store.content_updates.items[i], sa, np, new_row);
-                try applyTrackPatchToContent(store, &store.content_updates.items[i], new_row, patch, ids);
+                const row = &store.content_updates.items[i];
+                if (rename) |np| try renameListedContent(
+                    store,
+                    row,
+                    sa,
+                    np,
+                    !strEmpty(new_row.offsets.inner.analyze_path),
+                );
+                try applyTrackPatchToContent(store, row, new_row, patch, ids);
             },
             .disk => |c| {
                 var copy = try dupeContent(sa, c);
-                if (rename) |np| try moveRow(&copy, sa, np, new_row);
+                if (rename) |np| try moveContentRow(
+                    &copy,
+                    sa,
+                    np,
+                    !strEmpty(new_row.offsets.inner.analyze_path),
+                );
                 try applyTrackPatchToContent(store, &copy, new_row, patch, ids);
                 try queueContentUpdate(store, copy);
             },
@@ -2249,27 +2869,10 @@ pub const DeviceExport = struct {
         const store = (try e.olStore()) orelse return;
         const path = old_path orelse return;
         const ref = (try e.olContentRefForTrack(track_id, path)) orelse return;
-        const content_id = switch (ref) {
-            .pending => |i| store.contents.items[i].content_id,
-            .queued_update => |i| store.content_updates.items[i].content_id,
-            .disk => |c| c.content_id,
-        };
-        _ = store.content_bridge.remove(track_id);
-
-        dropJunctionsForContent(&store.playlist_pairs, content_id);
-        dropJunctionsForContent(&store.my_tag_pairs, content_id);
-
-        switch (ref) {
-            .pending => |i| _ = store.contents.orderedRemove(i),
-            .queued_update => |i| {
-                _ = store.content_updates.orderedRemove(i);
-                try queueContentDelete(store, content_id);
-            },
-            .disk => try queueContentDelete(store, content_id),
-        }
+        try dropOlContentRef(store, track_id, ref);
     }
 
-    /// Removes every row of `page_type`'s table that `matches` selects,
+    /// Removes every row of type `T`'s table that `matches` selects,
     /// collecting the payload pointers first — removal shifts the row
     /// list, but the boxed payloads are arena-stable (see
     /// `pdb.Database.removeRow`). A table the database does not carry
@@ -2371,9 +2974,8 @@ pub const DeviceExport = struct {
     ) PathError![]u8 {
         const names = anlzFolderNames(try pathHash(audio_path));
         return std.fs.path.join(e.alloc, &.{
-            e.layout.root, "PIONEER", "USBANLZ",
-            &names.p_folder, &names.leaf_folder,
-            filename,
+            e.layout.root,   "PIONEER",          "USBANLZ",
+            &names.p_folder, &names.leaf_folder, filename,
         });
     }
 
@@ -2410,6 +3012,18 @@ pub const DeviceExport = struct {
         try e.queueDirDeleteIfUnused(state, except_id, dir);
     }
 
+    /// `queueAnlzDirDelete` over an OL-only export's rows.
+    fn queueAnlzDirDeleteOl(
+        e: *DeviceExport,
+        store: *OlStore,
+        except_id: u32,
+        path: []const u8,
+    ) OlMirrorError!void {
+        const dir = try e.layout.anlzDir(e.alloc, path);
+        defer e.alloc.free(dir);
+        try e.queueDirDeleteIfUnusedOl(store, except_id, dir);
+    }
+
     /// Queues `dir` for deletion — unless a surviving track's analysis
     /// lives there too: another track's path may hash onto it, or a
     /// queued write may target it. Sharing means keeping.
@@ -2426,6 +3040,41 @@ pub const DeviceExport = struct {
             defer e.alloc.free(other);
             if (std.mem.eql(u8, other, dir)) return; // shared: keep it
         }
+        try e.queueDirDeleteIfNoPendingWrite(dir);
+    }
+
+    /// `queueDirDeleteIfUnused` over an OL-only export's rows: the
+    /// surviving tracks are the store's pending and queued rows plus the
+    /// disk snapshot's, each skipping the id being removed.
+    fn queueDirDeleteIfUnusedOl(
+        e: *DeviceExport,
+        store: *OlStore,
+        except_id: u32,
+        dir: []const u8,
+    ) OlMirrorError!void {
+        for (store.contents.items) |c| {
+            if (c.content_id == except_id) continue;
+            if (try e.olPathSharesAnlzDir(c.path, dir)) return;
+        }
+        for (store.content_updates.items) |c| {
+            if (c.content_id == except_id) continue;
+            if (try e.olPathSharesAnlzDir(c.path, dir)) return;
+        }
+        if (onelibrary.mode != .off) {
+            if (try e.openOneLibrary()) |lib| {
+                for (lib.contents) |c| {
+                    if (store.contentDeleteQueued(c.content_id)) continue;
+                    if (c.content_id == except_id) continue;
+                    if (try e.olPathSharesAnlzDir(c.path, dir)) return;
+                }
+            }
+        }
+        try e.queueDirDeleteIfNoPendingWrite(dir);
+    }
+
+    /// The tail shared by both unused checks: a queued ANLZ write or a
+    /// relocation targeting `dir` keeps it, else it queues.
+    fn queueDirDeleteIfNoPendingWrite(e: *DeviceExport, dir: []const u8) PathError!void {
         for (e.pending_anlz.items) |file| {
             if (isUnderDir(file.path, dir)) return;
         }
@@ -2434,6 +3083,23 @@ pub const DeviceExport = struct {
             if (std.mem.eql(u8, entry.value_ptr.to_dir, dir)) return;
         }
         try e.pending_dir_deletes.append(e.alloc, try e.alloc.dupe(u8, dir));
+    }
+
+    /// Whether `path`'s analysis directory is `dir`; no path, an empty
+    /// one, or one that cannot name a directory shares nothing.
+    fn olPathSharesAnlzDir(
+        e: *DeviceExport,
+        path: ?[]const u8,
+        dir: []const u8,
+    ) PathError!bool {
+        const p = path orelse return false;
+        if (p.len == 0) return false;
+        const other = e.layout.anlzDir(e.alloc, p) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidUtf8 => return false,
+        };
+        defer e.alloc.free(other);
+        return std.mem.eql(u8, other, dir);
     }
 
     /// `getOrCreateStringRow` for Artist rows.
@@ -2562,37 +3228,61 @@ pub const DeviceExport = struct {
     }
 
     /// Creates a playlist folder — a node that groups other folders and
-    /// playlists — and returns its id. `parent_id` is 0 (the tree root)
-    /// or the id of an existing folder (one this method or a scanned
-    /// export created); anything else, including a playlist's id, is
+    /// playlists — and returns its id. `parent` is `.root` or the id of
+    /// an existing folder (one this method or a scanned export created);
+    /// anything else, including a playlist's id, is
     /// `UnknownForeignKey`. When the export carries a OneLibrary db the
-    /// node mirrors into it (`attribute` 1).
+    /// node mirrors into it (`attribute` 1). An OL-only export (no
+    /// `export.pdb`, `-Donelibrary` builds) creates the node through the OL db
+    /// outright — the returned id is the minted playlist id, in the
+    /// lockstep u32 space past the db's own — and neither database is
+    /// `DatabaseNotFound`.
     pub fn createPlaylistFolder(
         e: *DeviceExport,
         name: []const u8,
-        parent_id: u32,
-    ) PlaylistError!u32 {
-        return e.createPlaylistNode(name, parent_id, true);
+        parent: PlaylistNodeId,
+    ) PlaylistError!PlaylistNodeId {
+        return @enumFromInt(try e.createPlaylistNode(name, parent.int(), true));
     }
 
     /// Creates a playlist — a leaf node holding tracks through
-    /// `addTrackToPlaylist` — under `parent_id` (same rule as
+    /// `addTrackToPlaylist` — under `parent` (same rule as
     /// `createPlaylistFolder`) and returns its id. When the export
     /// carries a OneLibrary db the node mirrors into it (`attribute` 0).
+    /// An OL-only export (no `export.pdb`, `-Donelibrary` builds) creates the
+    /// node through the OL db outright (see `createPlaylistFolder`).
     pub fn createPlaylist(
         e: *DeviceExport,
         name: []const u8,
-        parent_id: u32,
-    ) PlaylistError!u32 {
-        return e.createPlaylistNode(name, parent_id, false);
+        parent: PlaylistNodeId,
+    ) PlaylistError!PlaylistNodeId {
+        return @enumFromInt(try e.createPlaylistNode(name, parent.int(), false));
     }
 
     /// Inserts the node row and records it in the writer state. The name
     /// encodes and the id mints before anything is inserted, so a failed
     /// call leaves the export untouched — a failure past the mint may
-    /// burn an id, never mint a duplicate.
+    /// burn an id, never mint a duplicate. An OL-only export (no
+    /// `export.pdb`, `-Donelibrary` builds) creates the node through the OL db
+    /// outright: the id mints in the lockstep u32 space past the db's
+    /// own, the parent validates against the OL rows, and neither
+    /// database is `DatabaseNotFound`.
     fn createPlaylistNode(
         e: *DeviceExport,
+        name: []const u8,
+        parent_id: u32,
+        is_folder: bool,
+    ) PlaylistError!u32 {
+        return switch (try e.mutationStore()) {
+            .pdb => |db| try e.createPlaylistNodePdb(db, name, parent_id, is_folder),
+            .ol => |store| try createPlaylistNodeOl(store, name, parent_id, is_folder),
+        };
+    }
+
+    /// The pdb-backed node insert; see `createPlaylistNode`.
+    fn createPlaylistNodePdb(
+        e: *DeviceExport,
+        db: *pdb.Database,
         name: []const u8,
         parent_id: u32,
         is_folder: bool,
@@ -2606,7 +3296,6 @@ pub const DeviceExport = struct {
             if (!parent_is_folder) return error.UnknownForeignKey;
         }
 
-        const db = try e.openPdb();
         const a = db.arena.allocator();
         const name_str = try pdb.DeviceSQLString.fromUtf8(a, name);
         const id = try state.next_playlist_node_id.mint();
@@ -2630,14 +3319,32 @@ pub const DeviceExport = struct {
 
     /// Appends a track to the end of a playlist; the entry position is
     /// assigned automatically, dense from 0 and continuing across save
-    /// and reopen. `playlist_id` must name an existing *playlist* (a
+    /// and reopen. `playlist` must name an existing *playlist* (a
     /// folder id is rejected — tracks go into playlists only) and
-    /// `track_id` an existing track, else `UnknownForeignKey`. When the
+    /// `track` an existing track, else `UnknownForeignKey`. When the
     /// export carries a OneLibrary db the membership mirrors into it —
     /// with the OL side's own dense 1-based `sequenceNo`, continuing
-    /// past the rows already there.
+    /// past the rows already there. An OL-only export (no `export.pdb`,
+    /// `-Donelibrary` builds) appends through the OL db outright — both key
+    /// checks resolve against the OL rows, the content id is the track
+    /// id — and neither database is `DatabaseNotFound`.
     pub fn addTrackToPlaylist(
         e: *DeviceExport,
+        playlist: PlaylistNodeId,
+        track: TrackId,
+    ) PlaylistError!void {
+        const playlist_id = playlist.int();
+        const track_id = track.int();
+        return switch (try e.mutationStore()) {
+            .pdb => |db| try e.addTrackToPlaylistPdb(db, playlist_id, track_id),
+            .ol => |store| try e.addTrackToPlaylistOl(store, playlist_id, track_id),
+        };
+    }
+
+    /// The pdb-backed `addTrackToPlaylist` body; see `addTrackToPlaylist`.
+    fn addTrackToPlaylistPdb(
+        e: *DeviceExport,
+        db: *pdb.Database,
         playlist_id: u32,
         track_id: u32,
     ) PlaylistError!void {
@@ -2652,7 +3359,6 @@ pub const DeviceExport = struct {
             state.playlist_entry_counts.get(playlist_id) orelse .{ .next = 0 };
         const entry_index = try entry_mint.mint();
 
-        const db = try e.openPdb();
         const a = db.arena.allocator();
         const boxed = try a.create(pdb.PlaylistEntry);
         boxed.* = .{
@@ -2675,13 +3381,35 @@ pub const DeviceExport = struct {
         }
     }
 
+    /// The OL-only `addTrackToPlaylist` body; see `addTrackToPlaylist`.
+    /// The key checks resolve against the store's own view (a queued
+    /// cascade delete counts gone, the session tombstone) and the pair
+    /// pends like a mirrored one.
+    fn addTrackToPlaylistOl(
+        e: *DeviceExport,
+        store: *OlStore,
+        playlist_id: u32,
+        track_id: u32,
+    ) PlaylistError!void {
+        const node_is_folder = store.playlist_is_folder.get(playlist_id) orelse
+            return error.UnknownForeignKey;
+        if (node_is_folder) return error.UnknownForeignKey;
+        if ((try contentRefById(e, store, track_id)) == null)
+            return error.UnknownForeignKey;
+
+        try store.playlist_pairs.append(store.arena.allocator(), .{
+            .playlist_id = playlist_id,
+            .content_id = track_id,
+        });
+    }
+
     /// Creates a top-level tag category (e.g. "My Tags") in the tag
     /// database and returns its id. Leaf tags attach under a category
     /// through `addTagsToTrack`. The tag database (`exportExt.pdb`) loads
     /// lazily on first use; nothing lands on disk before `save`. When
     /// the export carries a OneLibrary db the category mirrors into its
     /// `myTag` tree under the same id.
-    pub fn createTagCategory(e: *DeviceExport, name: []const u8) TagError!u32 {
+    pub fn createTagCategory(e: *DeviceExport, name: []const u8) TagError!TagId {
         const state = try e.writerStateMut();
         try e.primeOlStore();
         const db = try e.extDb();
@@ -2704,10 +3432,10 @@ pub const DeviceExport = struct {
 
         if (try e.olStore()) |store|
             try mirrorMyTagRow(store, name, id, position, true, 0);
-        return id;
+        return @enumFromInt(id);
     }
 
-    /// Associates `labels` with `track_id` under `category_id` in the tag
+    /// Associates `labels` with `track` under `category` in the tag
     /// database. Empty labels are dropped and duplicates — within this
     /// call or already existing under the category — collapse to one leaf
     /// row. The junction rows themselves are not deduplicated: each call
@@ -2725,10 +3453,12 @@ pub const DeviceExport = struct {
     /// `myTag_content` row.
     pub fn addTagsToTrack(
         e: *DeviceExport,
-        track_id: u32,
-        category_id: u32,
+        track: TrackId,
+        category: TagId,
         labels: []const []const u8,
     ) TagError!void {
+        const track_id = track.int();
+        const category_id = category.int();
         const state = try e.writerStateMut();
         try e.primeOlStore();
         // The category check needs the tag state an opened export's
@@ -2846,7 +3576,7 @@ pub const DeviceExport = struct {
 
         const path = try e.layout.exportExtPdb(e.alloc);
         defer e.alloc.free(path);
-        const dir = try e.dirHandle();
+        const dir = e.dir;
         const buf = dir.readFileAlloc(e.io, path, e.alloc, pdb_limit) catch |err| switch (err) {
             error.FileNotFound => {
                 e.ext_pdb_state = .absent;
@@ -2865,19 +3595,57 @@ pub const DeviceExport = struct {
     /// Writes the buffered export to disk — the handle's only
     /// disk-writing call. Everything that can fail on the in-memory
     /// model — parsing, track-row validation, serialization — happens
-    /// before the first write, so a failed `save` leaves the disk
-    /// untouched. Crash-safe write order: the default directory tree,
-    /// the four setting files, the queued ANLZ files, the relocated
-    /// ANLZ files `updateTrack`'s rename queued (their old directories deleted
-    /// only after the new index lands), `exportExt.pdb`
-    /// when the tag methods loaded or created one, `exportLibrary.db`
-    /// when the OneLibrary side was created or carries pending rows,
-    /// then `export.pdb` — the index everything else is reached
-    /// through — last, so a crash leaves orphan files players ignore,
-    /// not rows naming missing data. Every file lands through
+    /// before the first write, so a failure there leaves the disk
+    /// untouched. A failure partway through the landing behaves like a
+    /// crash: the write order below keeps the index files naming the
+    /// previous consistent state, the handle keeps everything pending,
+    /// and a retried `save` re-lands it. Crash-safe write order: the
+    /// default directory tree, the four setting files, the queued ANLZ
+    /// files, the relocated ANLZ files `updateTrack`'s rename queued
+    /// (their old directories deleted only after the new index lands),
+    /// `exportExt.pdb` when the tag methods loaded or created one,
+    /// `exportLibrary.db` when the OneLibrary side was created or carries
+    /// pending rows, then `export.pdb` — the index everything else is
+    /// reached through — last, so a crash leaves orphan files players
+    /// ignore, not rows naming missing data. Every file lands through
     /// `writeFileAtomic`, so readers never see a torn one.
+    ///
+    /// An OL-only export saves through the same order minus the pdbs —
+    /// queued ANLZ, relocations, then `exportLibrary.db` as the terminal
+    /// index, drained into the existing db. `save` never creates
+    /// structure the export did not carry: an opened export without a
+    /// pdb, an OL db, or a setting file never gains one — `create` is
+    /// the only skeleton-writer.
     pub fn save(e: *DeviceExport) SaveError!void {
-        const db = try e.openPdb();
+        if (e.openPdb()) |db| {
+            return try e.savePdb(db);
+        } else |err| switch (err) {
+            error.FileNotFound => {
+                // No pdb to validate, serialize, or write. Settings are
+                // pdb-independent, so they land first regardless. The
+                // rest of this branch is database-side, and none of it
+                // can be pending on a root carrying no database at all —
+                // every mutating call resolves a database before
+                // queueing anything — so such a save is settings-only
+                // or a no-op and succeeds here. An OL-only export (no
+                // `export.pdb`, `-Donelibrary` builds) continues into its
+                // files, the OL db the terminal index (the same
+                // crash-order rationale); the mutating calls already
+                // resolved the store `writeOl` reads, and `writeOl`
+                // itself stays quiet with nothing mirrored.
+                const dir = e.dir;
+                if (e.pending_settings) |pending| try e.writePendingSettings(dir, pending);
+                if (e.pending_anlz.items.len > 0) try e.writePendingAnlz(dir);
+                try e.writeRelocatedAnlz(dir);
+                try e.writeOl();
+                e.cleanupAfterSave(dir);
+            },
+            else => return err,
+        }
+    }
+
+    /// The pdb-backed `save` body; see `save`.
+    fn savePdb(e: *DeviceExport, db: *pdb.Database) SaveError!void {
         try db.validateAllTrackRows();
         const image = try db.serialize(e.alloc);
         defer e.alloc.free(image);
@@ -2887,7 +3655,7 @@ pub const DeviceExport = struct {
             ext_image = try e.ext_pdb_state.loaded.serialize(e.alloc);
         }
 
-        const dir = try e.dirHandle();
+        const dir = e.dir;
         if (e.pending_settings) |pending| try e.writePendingSettings(dir, pending);
         if (e.pending_anlz.items.len > 0) try e.writePendingAnlz(dir);
         try e.writeRelocatedAnlz(dir);
@@ -2935,7 +3703,7 @@ pub const DeviceExport = struct {
         if (store.fresh) {
             // A created export starts from an empty db even over a
             // leftover file — the same overwrite stance as the ext pdb.
-            const dir = try e.dirHandle();
+            const dir = e.dir;
             dir.deleteFile(e.io, rel) catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => return err,
@@ -2955,15 +3723,16 @@ pub const DeviceExport = struct {
         try olDrain(w, &store.keys);
         try olDrain(w, &store.images);
         try olDrain(w, &store.playlists);
-        try olDrain(w, &store.contents);
+        try olDrainContents(w, store);
         try olDrainPlaylistPairs(w, &store.playlist_pairs);
         try olDrain(w, &store.my_tags);
         try olDrain(w, &store.my_tag_pairs);
         // Updates and deletes name rows already on disk — ids the
         // monotonic counters never re-emit — so their order against the
-        // inserts cannot collide.
-        try olDrainUpdates(w, &store.content_updates);
-        try olDrainContentDeletes(w, &store.content_deletes);
+        // inserts cannot collide. The content drains also carry the
+        // store's indexes (see `olDrainContents`).
+        try olDrainUpdates(w, store);
+        try olDrainContentDeletes(w, store);
 
         try w.close();
         store.fresh = false;
@@ -2984,10 +3753,6 @@ pub const DeviceExport = struct {
         for (e.pending_anlz.items) |*file| file.deinit(e.alloc);
         e.pending_anlz.clearRetainingCapacity();
     }
-
-    /// Size cap when reading one ANLZ sibling for relocation; the
-    /// largest analysis files run a few megabytes.
-    const anlz_limit = std.Io.Limit.limited(1 << 26);
 
     /// Lands every queued relocation: each sibling found under its
     /// `from_dir` is re-serialized — its path section naming the track's
@@ -3097,13 +3862,13 @@ pub const DeviceExport = struct {
 
 /// A playlist (leaf of the playlist tree).
 pub const Playlist = struct {
-    id: u32,
+    id: PlaylistNodeId,
     name: []u8,
 };
 
 /// A playlist folder, grouping other nodes.
 pub const PlaylistFolder = struct {
-    id: u32,
+    id: PlaylistNodeId,
     name: []u8,
     /// Child nodes, in row order.
     children: std.ArrayList(PlaylistNode),
@@ -3172,7 +3937,7 @@ fn buildTree(
             if (done.folder) |folder| {
                 const parent = &levels.items[levels.items.len - 1];
                 try parent.nodes.append(a, .{ .folder = .{
-                    .id = folder.id,
+                    .id = @enumFromInt(folder.id),
                     .name = folder.name,
                     .children = done.nodes,
                 } });
@@ -3194,7 +3959,7 @@ fn buildTree(
             });
         } else {
             const name = try node.name.utf8(a);
-            try top.nodes.append(a, .{ .playlist = .{ .id = node.id, .name = name } });
+            try top.nodes.append(a, .{ .playlist = .{ .id = @enumFromInt(node.id), .name = name } });
         }
     }
     return roots;
@@ -3212,7 +3977,7 @@ fn buildTree(
 /// The caller owns the tree; `deinit` frees everything:
 ///
 ///     const device = @import("rekordlib").device;
-///     var tree = try device.getPlaylistsDb(alloc, &db);
+///     var tree = try export.getPlaylistsDb(alloc, &db);
 ///     defer tree.deinit();
 pub fn getPlaylistsDb(
     alloc: std.mem.Allocator,
@@ -3227,20 +3992,122 @@ pub fn getPlaylistsDb(
     // The grouping map, visited set, level stack, and node storage all
     // come from the arena: a failed build is reclaimed wholesale.
     var groups = PlaylistGroups.init(a);
-    var it = try db.rows(.playlist_tree);
-    while (try it.next()) |row| switch (row.*) {
-        .playlist_tree_node => |node| {
-            const gop = try groups.getOrPut(node.parent_id);
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(a, node);
-        },
-        else => {},
-    };
+    var it = try db.rowsOf(pdb.PlaylistTreeNode);
+    while (try it.next()) |node| {
+        const gop = try groups.getOrPut(node.parent_id);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(a, node);
+    }
 
     var visited = std.AutoHashMap(u32, void).init(a);
     var roots = try buildTree(a, &groups, &visited);
 
     return .{ .arena = arena, .roots = try roots.toOwnedSlice(a) };
+}
+
+/// The OL-only `getPlaylists` body (see `getPlaylistsDb` for the shape
+/// and ownership rules): the same tree over the OL `playlist` rows —
+/// `playlist_id_parent` 0 parents the top level, `attribute` 1 marks a
+/// folder, and siblings order by `sequenceNo` with NULLs last. Like the
+/// OL-only track reads, the rows are the cached disk snapshot: nodes
+/// created this session appear after the `save` that lands them.
+pub fn getPlaylistsOl(
+    alloc: std.mem.Allocator,
+    lib: *const onelibrary.Library,
+) std.mem.Allocator.Error!PlaylistTree {
+    const arena = try alloc.create(std.heap.ArenaAllocator);
+    errdefer alloc.destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var groups = OlPlaylistGroups.init(a);
+    for (lib.playlists) |*row| {
+        const gop = try groups.getOrPut(row.playlist_id_parent orelse 0);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(a, row);
+    }
+    var git = groups.valueIterator();
+    while (git.next()) |list|
+        std.mem.sort(*const onelibrary.Playlist, list.items, {}, olSiblingBefore);
+
+    var visited = std.AutoHashMap(i64, void).init(a);
+    var roots = try buildTreeOl(a, &groups, &visited);
+
+    return .{ .arena = arena, .roots = try roots.toOwnedSlice(a) };
+}
+
+/// Whether `a` sorts before `b` in a parent's child order: `sequenceNo`
+/// ascending, NULLs last.
+fn olSiblingBefore(_: void, a: *const onelibrary.Playlist, b: *const onelibrary.Playlist) bool {
+    if (a.sequenceNo == null) return false;
+    if (b.sequenceNo == null) return true;
+    return a.sequenceNo.? < b.sequenceNo.?;
+}
+
+/// OL playlist rows grouped by their parent id.
+const OlPlaylistGroups = std.AutoHashMap(i64, std.ArrayList(*const onelibrary.Playlist));
+
+/// One level of the iterative OL tree build; see `PlaylistLevel`.
+const OlPlaylistLevel = struct {
+    rows: []const *const onelibrary.Playlist,
+    next: usize = 0,
+    nodes: std.ArrayList(PlaylistNode) = .empty,
+    /// The folder whose children this level collects; null at the root.
+    folder: ?struct { id: u32, name: []u8 } = null,
+};
+
+/// `buildTree` over the OL rows: the same visitation order (rows in
+/// order, a folder expanded at first encounter, the visited skip) so
+/// nesting of any depth costs heap, never call-stack frames. A row
+/// whose id sits outside the u32 node-id space is skipped — it has no
+/// representation in the tree's vocabulary, and its children group
+/// under the i64 id the skipped row never expands, unreachable like a
+/// node parented to a missing id.
+fn buildTreeOl(
+    a: std.mem.Allocator,
+    groups: *const OlPlaylistGroups,
+    visited: *std.AutoHashMap(i64, void),
+) std.mem.Allocator.Error!std.ArrayList(PlaylistNode) {
+    const root_rows = if (groups.get(0)) |group| group.items else &.{};
+    var levels: std.ArrayList(OlPlaylistLevel) = .empty;
+    try levels.append(a, .{ .rows = root_rows });
+
+    var roots = std.ArrayList(PlaylistNode).empty;
+    while (levels.items.len > 0) {
+        const top = &levels.items[levels.items.len - 1];
+        if (top.next >= top.rows.len) {
+            const done = levels.pop().?;
+            if (done.folder) |folder| {
+                const parent = &levels.items[levels.items.len - 1];
+                try parent.nodes.append(a, .{ .folder = .{
+                    .id = @enumFromInt(folder.id),
+                    .name = folder.name,
+                    .children = done.nodes,
+                } });
+            } else {
+                roots = done.nodes;
+            }
+            continue;
+        }
+        const node = top.rows[top.next];
+        top.next += 1;
+        const id = std.math.cast(u32, node.playlist_id) orelse continue;
+        if ((node.attribute orelse 0) == 1) {
+            if ((try visited.getOrPut(node.playlist_id)).found_existing) continue;
+            const name = try a.dupe(u8, node.name orelse "");
+            const child_rows = if (groups.get(node.playlist_id)) |group| group.items else &.{};
+            // `top` dangles past this append; the loop re-derives it.
+            try levels.append(a, .{
+                .rows = child_rows,
+                .folder = .{ .id = id, .name = name },
+            });
+        } else {
+            const name = try a.dupe(u8, node.name orelse "");
+            try top.nodes.append(a, .{ .playlist = .{ .id = @enumFromInt(id), .name = name } });
+        }
+    }
+    return roots;
 }
 
 // --- unified track model (read views, patches, OL join) -------------------------
@@ -3251,12 +4118,30 @@ pub fn getPlaylistsDb(
 /// view borrows from it until the next call.
 pub const TrackIter = struct {
     e: *DeviceExport,
-    /// Holds the dimension maps; freed by `deinit`.
+    /// Holds the dimension maps; freed by `deinit`. Unused (and empty) on
+    /// the OL-only path, whose names resolve through the borrowed library.
     dim_arena: std.heap.ArenaAllocator,
     /// Holds the current view's decoded strings; reset by every `next`.
     view_arena: std.heap.ArenaAllocator,
+    /// Only the pdb path fills these.
     dims: TrackDimensions,
-    it: pdb.RowIterator,
+    rows: Rows,
+
+    /// The row source: the pdb's Track table, or — on an OL-only export —
+    /// the `openOneLibrary` cache's `contents` in load order.
+    const Rows = union(enum) {
+        pdb: pdb.RowIter(pdb.Track),
+        /// The library is borrowed from the handle's `openOneLibrary` cache; only
+        /// `save` and `deinit` drop it, and both invalidate the iterator
+        /// outright (like every mutation). `deletes` borrows the store's
+        /// cascade-delete queue the same way — rows queued there are
+        /// skipped, the session's view of a removal before its save.
+        ol: struct {
+            lib: *const onelibrary.Library,
+            deletes: []const i64 = &.{},
+            index: usize = 0,
+        },
+    };
 
     pub fn deinit(it: *TrackIter) void {
         it.dim_arena.deinit();
@@ -3266,11 +4151,36 @@ pub const TrackIter = struct {
     /// The next track view, or null once the table is exhausted. The
     /// previous view's strings die here.
     pub fn next(it: *TrackIter) TrackViewError!?TrackView {
-        const row = (try it.it.next()) orelse return null;
         _ = it.view_arena.reset(.retain_capacity);
-        return try fillTrackView(it.e, &it.dims, it.view_arena.allocator(), row.track);
+        switch (it.rows) {
+            .pdb => |*rows| {
+                const track = (try rows.next()) orelse return null;
+                return try fillTrackView(it.e, &it.dims, it.view_arena.allocator(), track);
+            },
+            .ol => |*rows| {
+                const contents = rows.lib.contents;
+                while (rows.index < contents.len) : (rows.index += 1) {
+                    const c = &contents[rows.index];
+                    if (rows.deletes.len > 0 and olIdQueued(rows.deletes, c.content_id))
+                        continue;
+                    defer rows.index += 1;
+                    return try fillTrackViewOl(rows.lib, it.view_arena.allocator(), c);
+                }
+                return null;
+            },
+        }
     }
 };
+
+/// Whether `id` appears in a borrowed cascade-delete queue (the store's
+/// `contentDeleteQueued` over a slice, for the read side that holds no
+/// store pointer).
+fn olIdQueued(deletes: []const i64, id: i64) bool {
+    for (deletes) |queued| {
+        if (queued == id) return true;
+    }
+    return false;
+}
 
 /// A `TrackView` that owns its strings, from `DeviceExport.trackByPath`.
 /// `deinit` frees the view's every slice.
@@ -3294,6 +4204,23 @@ const OlContentRef = union(enum) {
     /// A row already on disk, borrowed from the cached library.
     disk: *const onelibrary.Content,
 };
+
+/// The content row of `path` among the store's pending inserts and
+/// queued updates — the half of the by-path resolution that touches no
+/// disk, answered from the store's indexes.
+fn storeContentRefByPath(store: *OlStore, path: []const u8) ?OlContentRef {
+    const id = store.content_id_by_path.get(path) orelse return null;
+    return store.content_ref_by_id.get(id);
+}
+
+/// The content id a resolved ref names.
+fn olContentRefId(store: *OlStore, ref: OlContentRef) i64 {
+    return switch (ref) {
+        .pending => |i| store.contents.items[i].content_id,
+        .queued_update => |i| store.content_updates.items[i].content_id,
+        .disk => |c| c.content_id,
+    };
+}
 
 /// One id-keyed dimension table of a read view: row id -> decoded name.
 const DimensionMap = std.AutoHashMapUnmanaged(u32, []const u8);
@@ -3377,7 +4304,7 @@ fn fillTrackView(
 ) TrackViewError!TrackView {
     const s = row.offsets.inner;
     var v: TrackView = .{
-        .id = row.id,
+        .id = @enumFromInt(row.id),
         .title = try decodeOrEmpty(s.title, a),
         .artist = dimName(&dims.artists, row.artist_id),
         .album = dimName(&dims.albums, row.album_id),
@@ -3433,21 +4360,127 @@ fn fillTrackView(
     return v;
 }
 
+/// Builds one track's view out of an OL `content` row alone — the
+/// OL-only export path, where the content row is the whole track. Names
+/// resolve through the library's id-keyed rows; the pdb-side vocabulary
+/// (`message`, `mix_name`, `analyze_date`, `publish_track_information`)
+/// stays empty — the ignore-vice-versa convention. Strings are duped into
+/// `a` (the iterator's view arena, or a record's), so the lifetime
+/// contract matches the pdb path's.
+fn fillTrackViewOl(
+    lib: *const onelibrary.Library,
+    a: std.mem.Allocator,
+    c: *const onelibrary.Content,
+) std.mem.Allocator.Error!TrackView {
+    var v: TrackView = .{
+        .id = @enumFromInt(olScalar(u32, c.content_id)),
+        .title = try olDupeOrEmpty(a, c.title),
+        .artist = try olDimName(lib, a, onelibrary.Artist, c.artist_id_artist),
+        .album = try olDimName(lib, a, onelibrary.Album, c.album_id),
+        .genre = try olDimName(lib, a, onelibrary.Genre, c.genre_id),
+        .key = try olDimName(lib, a, onelibrary.Key, c.key_id),
+        .label = try olDimName(lib, a, onelibrary.Label, c.label_id),
+        .composer = try olDimName(lib, a, onelibrary.Artist, c.artist_id_composer),
+        .remixer = try olDimName(lib, a, onelibrary.Artist, c.artist_id_remixer),
+        .orig_artist = try olDimName(lib, a, onelibrary.Artist, c.artist_id_originalArtist),
+        .lyricist = try olDimName(lib, a, onelibrary.Artist, c.artist_id_lyricist),
+        .comment = try olDupeOrEmpty(a, c.djComment),
+        .isrc = try olDupeOrEmpty(a, c.isrc),
+        .mix_name = "",
+        .release_date = try olDupeOrEmpty(a, c.releaseDate),
+        .date_added = try olDupeOrEmpty(a, c.dateAdded),
+        .message = "",
+        .file_path = try olDupeOrEmpty(a, c.path),
+        .filename = try olDupeOrEmpty(a, c.fileName),
+        .artwork_device_path = "",
+        .tempo = if (c.bpmx100) |bpm| @as(f32, @floatFromInt(bpm)) / 100.0 else 0,
+        .bitrate = olScalar(u32, c.bitrate),
+        .sample_rate = olScalar(u32, c.samplingRate),
+        .sample_depth = olScalar(u16, c.bitDepth),
+        .duration_secs = olScalar(u16, c.length),
+        .file_size = olScalar(u32, c.fileSize),
+        .track_number = olScalar(u32, c.trackNo),
+        .disc_number = olScalar(u16, c.discNo),
+        .year = olScalar(u16, c.releaseYear),
+        .play_count = olScalar(u16, c.djPlayCount),
+        .rating = olScalar(u8, c.rating),
+        .color = olEnumValue(util.ColorIndex, .none, c.color_id),
+        .file_type = olEnumValue(pdb.FileType, .unknown, c.fileType),
+        .autoload_hotcues = (c.isHotCueAutoLoadOn orelse 0) != 0,
+        .publish_track_information = false,
+        .analyze_date = "",
+        .has_analysis = c.analysisDataFilePath != null,
+        .source = .pdb_and_ol,
+        .subtitle = try olDupeOrEmpty(a, c.subtitle),
+        .title_for_search = if (c.titleForSearch) |s| try a.dupe(u8, s) else null,
+        .kuvo_delivery_on = (c.isKuvoDeliverStatusOn orelse 0) != 0,
+        .kuvo_delivery_comment = try olDupeOrEmpty(a, c.kuvoDeliveryComment),
+        .date_created = if (c.dateCreated) |s| try a.dupe(u8, s) else null,
+        .cue_update_count = c.cueUpdateCount,
+        .analysis_data_update_count = c.analysisDataUpdateCount,
+        .information_update_count = c.informationUpdateCount,
+    };
+
+    // The artwork path the pdb Artwork row would carry, derived from the
+    // image id (the `artworkSpec` a-variant); no image, no path — and a
+    // diverged id outside the u32 space derives nothing.
+    if (c.image_id) |id| {
+        if (std.math.cast(u32, id)) |artwork_id|
+            v.artwork_device_path = try artworkFilePath(a, artwork_id, 'a', "");
+    }
+    return v;
+}
+
+/// An OL text column as an owned slice, NULL included, for the view's
+/// empty-string vocabulary.
+fn olDupeOrEmpty(a: std.mem.Allocator, s: ?[]const u8) std.mem.Allocator.Error![]const u8 {
+    return a.dupe(u8, s orelse "");
+}
+
+/// An OL integer column as `T`, degrading NULL (or a value `T` cannot
+/// hold) to 0 — the `TrackInput` default for scalars.
+fn olScalar(comptime T: type, v: ?i64) T {
+    return std.math.cast(T, v orelse 0) orelse 0;
+}
+
+/// An OL enum column — the mirror's `@intFromEnum` inverted, degrading
+/// NULL or an out-of-range value to `default`. The open (`_`) enums make
+/// every in-range value representable; degradation only covers what the
+/// backing integer cannot hold.
+fn olEnumValue(comptime E: type, default: E, v: ?i64) E {
+    const I = @typeInfo(E).@"enum".tag_type;
+    const raw = std.math.cast(I, v orelse @intFromEnum(default)) orelse
+        @intFromEnum(default);
+    return @enumFromInt(raw);
+}
+
+/// A dimension name resolved through the library's id-keyed rows; a NULL
+/// foreign key (or one naming no row) is the empty name, and the result
+/// is owned by the view's arena.
+fn olDimName(
+    lib: *const onelibrary.Library,
+    a: std.mem.Allocator,
+    comptime T: type,
+    id: ?i64,
+) std.mem.Allocator.Error![]const u8 {
+    const row = (lib.byId(T, id orelse 0)) orelse return "";
+    return a.dupe(u8, row.name orelse "");
+}
+
 /// The OL content row a view joins by `path`, when the export carries an
-/// OL db: rows this session queued first (a pending insert, or a queued
-/// update — a rename already carries its new path there), then the
-/// loaded library's snapshot of the disk. Read-side only — the store is
-/// consulted, never loaded, so a session that never mutates never pays
-/// for one.
+/// OL db: rows this session queued first (the store's path index over
+/// the pending inserts and queued updates — a rename already carries its
+/// new path there), then the loaded library's snapshot of the disk.
+/// Read-side only — the store is consulted, never loaded, so a session
+/// that never mutates never pays for one.
 fn olJoinForView(e: *DeviceExport, path: []const u8) TrackViewError!?*const onelibrary.Content {
     if (e.ol_state == .store) {
         const store = &e.ol_state.store;
-        for (store.contents.items) |*c| {
-            if (std.mem.eql(u8, c.path orelse "", path)) return c;
-        }
-        for (store.content_updates.items) |*c| {
-            if (std.mem.eql(u8, c.path orelse "", path)) return c;
-        }
+        if (storeContentRefByPath(store, path)) |ref| return switch (ref) {
+            .pending => |i| &store.contents.items[i],
+            .queued_update => |i| &store.content_updates.items[i],
+            .disk => null,
+        };
     }
     if (onelibrary.mode == .off) return null;
     const lib = (try e.openOneLibrary()) orelse return null;
@@ -3569,6 +4602,137 @@ fn applyTrackPatchToContent(
     if (patch.information_update_count) |v| c.informationUpdateCount = v;
 }
 
+/// Moves a content row's path columns to `new_path` — the rename half
+/// both update paths share — recomputing `analysisDataFilePath` when
+/// `has_analysis` says the row carries one (the pdb path reads that off
+/// the new pdb row's `analyze_path`; the OL-only path off the row
+/// itself, before the move).
+fn moveContentRow(
+    c: *onelibrary.Content,
+    a: std.mem.Allocator,
+    new_path: []const u8,
+    has_analysis: bool,
+) OlMirrorError!void {
+    c.path = try a.dupe(u8, new_path);
+    c.fileName = try a.dupe(u8, std.fs.path.basename(new_path));
+    if (has_analysis) c.analysisDataFilePath = try anlzDevicePath(a, new_path);
+}
+
+/// `moveContentRow` over a pending-or-queued row, keeping the store's
+/// path index in step with the rename (see `reindexContentPath`).
+fn renameListedContent(
+    store: *OlStore,
+    row: *onelibrary.Content,
+    a: std.mem.Allocator,
+    new_path: []const u8,
+    has_analysis: bool,
+) OlMirrorError!void {
+    const prev = row.path;
+    try moveContentRow(row, a, new_path, has_analysis);
+    try reindexContentPath(store, row.content_id, prev, row.path);
+}
+
+/// Applies a `TrackPatch` to one OL content row on an OL-only export —
+/// the sibling of `applyTrackPatchToContent` with no pdb row behind it:
+/// scalars come from the patch itself (the pdb variant reads them off
+/// the already-patched row), dimensions resolve through the store's
+/// minting get-or-creates, the lyricist keys the row the pdb side keeps
+/// as a plain string, and the pdb-only fields (`message`, `mix_name`,
+/// `analyze_date`, `publish_track_information`) are ignored — there is
+/// no pdb row to patch.
+fn applyTrackPatchToContentOl(
+    store: *OlStore,
+    c: *onelibrary.Content,
+    patch: TrackPatch,
+) OlMirrorError!void {
+    const a = store.arena.allocator();
+    if (patch.title) |v| c.title = try a.dupe(u8, v);
+    if (patch.comment) |v| c.djComment = try a.dupe(u8, v);
+    if (patch.tempo) |bpm| c.bpmx100 = std.math.lossyCast(i64, @round(bpm * 100.0));
+    if (patch.duration_secs) |v| c.length = v;
+    if (patch.track_number) |v| c.trackNo = v;
+    if (patch.disc_number) |v| c.discNo = v;
+    if (patch.year) |v| c.releaseYear = v;
+    if (patch.rating) |v| c.rating = v;
+    if (patch.play_count) |v| c.djPlayCount = v;
+    if (patch.release_date) |v| c.releaseDate = try a.dupe(u8, v);
+    if (patch.date_added) |v| c.dateAdded = try a.dupe(u8, v);
+    if (patch.isrc) |v| c.isrc = try a.dupe(u8, v);
+    if (patch.bitrate) |v| c.bitrate = v;
+    if (patch.sample_depth) |v| c.bitDepth = v;
+    if (patch.sample_rate) |v| c.samplingRate = v;
+    if (patch.file_size) |v| c.fileSize = v;
+    if (patch.file_type) |v| c.fileType = @intFromEnum(v);
+    if (patch.autoload_hotcues) |v| c.isHotCueAutoLoadOn = if (v) 1 else 0;
+
+    if (patch.artist) |v|
+        c.artist_id_artist = try olMintedRow(
+            store,
+            &store.artists_by_name,
+            &store.artists,
+            olArtistRow,
+            &store.next_minted_artist_id,
+            v,
+        );
+    if (patch.remixer) |v|
+        c.artist_id_remixer = try olMintedRow(
+            store,
+            &store.artists_by_name,
+            &store.artists,
+            olArtistRow,
+            &store.next_minted_artist_id,
+            v,
+        );
+    if (patch.orig_artist) |v|
+        c.artist_id_originalArtist = try olMintedRow(
+            store,
+            &store.artists_by_name,
+            &store.artists,
+            olArtistRow,
+            &store.next_minted_artist_id,
+            v,
+        );
+    if (patch.composer) |v|
+        c.artist_id_composer = try olMintedRow(
+            store,
+            &store.artists_by_name,
+            &store.artists,
+            olArtistRow,
+            &store.next_minted_artist_id,
+            v,
+        );
+    if (patch.lyricist) |v| c.artist_id_lyricist = (try olLyricistId(store, v)) orelse 0;
+    if (patch.genre) |v|
+        c.genre_id = try olMintedRow(
+            store,
+            &store.genres_by_name,
+            &store.genres,
+            olGenreRow,
+            &store.next_genre_id,
+            v,
+        );
+    if (patch.label) |v|
+        c.label_id = try olMintedRow(
+            store,
+            &store.labels_by_name,
+            &store.labels,
+            olLabelRow,
+            &store.next_label_id,
+            v,
+        );
+    if (patch.key) |v| c.key_id = try olMintedKeyId(store, v);
+    if (patch.album) |v| c.album_id = try olMintedAlbumId(store, v, c.artist_id_artist);
+
+    if (patch.subtitle) |v| c.subtitle = try a.dupe(u8, v);
+    if (patch.title_for_search) |v| c.titleForSearch = try a.dupe(u8, v);
+    if (patch.kuvo_delivery_on) |v| c.isKuvoDeliverStatusOn = if (v) 1 else 0;
+    if (patch.kuvo_delivery_comment) |v| c.kuvoDeliveryComment = try a.dupe(u8, v);
+    if (patch.date_created) |v| c.dateCreated = try a.dupe(u8, v);
+    if (patch.cue_update_count) |v| c.cueUpdateCount = v;
+    if (patch.analysis_data_update_count) |v| c.analysisDataUpdateCount = v;
+    if (patch.information_update_count) |v| c.informationUpdateCount = v;
+}
+
 /// Whether `path` is a file directly inside directory `dir`.
 fn isUnderDir(path: []const u8, dir: []const u8) bool {
     return std.mem.startsWith(u8, path, dir) and
@@ -3640,6 +4804,20 @@ const OlStore = struct {
     /// are first seen joined (by path), so a later resolution — after a
     /// rename has moved the path on — still finds the OL row.
     content_bridge: std.AutoHashMapUnmanaged(u32, i64) = .empty,
+    /// Pending-side lookup indexes, so a resolution costs a map hop
+    /// instead of a scan that goes quadratic over a bulk session:
+    /// content id -> its slot among the pending inserts and queued
+    /// updates; file path -> content id, first row wins on aliasing (the
+    /// library's `content_by_path` stance); and the cascade-delete queue
+    /// as a set, the list itself staying the drain order. Disk rows
+    /// resolve through the cached library, not these. Every mutation of
+    /// the three lists maintains them: `pushContent`,
+    /// `queueContentUpdate`, `queueContentDelete`,
+    /// `renameListedContent`, `removeListedContent`, and the content
+    /// drains in `writeOl`.
+    content_ref_by_id: std.AutoHashMapUnmanaged(i64, OlContentRef) = .empty,
+    content_id_by_path: std.StringHashMapUnmanaged(i64) = .empty,
+    content_delete_set: std.AutoHashMapUnmanaged(i64, void) = .empty,
 
     /// Dedup state over the existing db (filled by `scanOlStore`) and the
     /// pending rows; values are OL ids. Name lookups make a reopened db
@@ -3655,6 +4833,10 @@ const OlStore = struct {
     image_ids: std.AutoHashMapUnmanaged(i64, void) = .empty,
     /// Bridged pdb node ids whose `playlist` row exists or pends.
     playlist_ids: std.AutoHashMapUnmanaged(i64, void) = .empty,
+    /// Playlist id → is-folder (`attribute` 1), over the existing db and
+    /// the pending rows — the OL-only writer's parent and membership
+    /// validation, the `playlist_nodes` map's sibling.
+    playlist_is_folder: std.AutoHashMapUnmanaged(i64, bool) = .empty,
     /// Parent id → next per-child `sequenceNo` (dense from 0, max + 1
     /// over existing rows) — the sibling ordinal, like the ext tag
     /// positions.
@@ -3667,6 +4849,23 @@ const OlStore = struct {
     /// `first_minted_artist_id` and raised past every artist id an
     /// existing db carries.
     next_minted_artist_id: IdMint(i64) = .{ .next = first_minted_artist_id },
+
+    /// Id mints for the OL-only writer (an export with no `export.pdb`,
+    /// where there is no pdb id to bridge a new row through): content,
+    /// playlist, and image ids stay in the pdb's u32 space — Rekordbox
+    /// keeps them in lockstep with the pdb track, node, and artwork ids,
+    /// and the ids `addTrack` returns are u32 — so a db whose rows there
+    /// exhaust that space fails the scan. The free dimension tables mint
+    /// in the OL side's own i64 space, continuing past the db's own ids;
+    /// artists reuse `next_minted_artist_id`, whose 2^32 floor keeps a
+    /// minted id clear of every bridged one.
+    next_content_id: IdMint(u32) = .{},
+    next_playlist_id: IdMint(u32) = .{},
+    next_image_id: IdMint(u32) = .{},
+    next_genre_id: IdMint(i64) = .{},
+    next_label_id: IdMint(i64) = .{},
+    next_key_id: IdMint(i64) = .{},
+    next_album_id: IdMint(i64) = .{},
 
     fn hasPending(store: *const OlStore) bool {
         return store.artists.items.len > 0 or
@@ -3682,6 +4881,14 @@ const OlStore = struct {
             store.my_tag_pairs.items.len > 0 or
             store.content_updates.items.len > 0 or
             store.content_deletes.items.len > 0;
+    }
+
+    /// Whether `content_id` is queued for the cascade delete: the row is
+    /// gone from the session's point of view — the cached disk snapshot
+    /// still names it until `save` lands the delete, so every resolution
+    /// treats a queued id as absent (the pdb side's `track_ids` verdict).
+    fn contentDeleteQueued(store: *const OlStore, content_id: i64) bool {
+        return store.content_delete_set.contains(content_id);
     }
 
     fn deinit(store: *OlStore) void {
@@ -3710,42 +4917,187 @@ fn olDrainPlaylistPairs(w: onelibrary.Writer, list: anytype) onelibrary.SqlError
     list.clearRetainingCapacity();
 }
 
+/// Drains pending content inserts through one `Writer.insertAll` batch —
+/// the same clear-only-after-commit contract as `olDrain` — and re-points
+/// the content indexes at the queued updates alone: the lists and the
+/// indexes must stay in step, or a later lookup reads a slot that no
+/// longer exists. Runs before the updates drain (the insert-first order
+/// `writeOl` already keeps); an id is never both pending and queued
+/// (updates replace disk rows), so the rebuild covers every listed row.
+fn olDrainContents(w: onelibrary.Writer, store: *OlStore) onelibrary.SqlError!void {
+    try w.insertAll(store.contents.items);
+    store.contents.clearRetainingCapacity();
+    const a = store.arena.allocator();
+    // Reserve before clearing: the rebuild must not be able to fail
+    // halfway and leave the queued updates unindexed.
+    try store.content_ref_by_id.ensureTotalCapacity(a, @intCast(store.content_updates.items.len));
+    var paths: usize = 0;
+    for (store.content_updates.items) |*row| {
+        if (row.path != null) paths += 1;
+    }
+    try store.content_id_by_path.ensureTotalCapacity(a, @intCast(paths));
+    store.content_ref_by_id.clearRetainingCapacity();
+    store.content_id_by_path.clearRetainingCapacity();
+    for (store.content_updates.items, 0..) |*row, i|
+        store.content_ref_by_id.putAssumeCapacity(row.content_id, .{ .queued_update = i });
+    for (store.content_updates.items) |*row| indexContentPath(store, row.*);
+}
+
 /// Drains queued whole-row content updates through one
 /// `Writer.updateAllContents` batch — the same clear-only-after-commit
-/// contract as `olDrain`.
-fn olDrainUpdates(w: onelibrary.Writer, list: anytype) onelibrary.SqlError!void {
-    try w.updateAllContents(list.items);
-    list.clearRetainingCapacity();
+/// contract as `olDrain` — with their index entries (nothing pending
+/// remains: the contents drain runs first).
+fn olDrainUpdates(w: onelibrary.Writer, store: *OlStore) onelibrary.SqlError!void {
+    try w.updateAllContents(store.content_updates.items);
+    store.content_updates.clearRetainingCapacity();
+    store.content_ref_by_id.clearRetainingCapacity();
+    store.content_id_by_path.clearRetainingCapacity();
 }
 
 /// Drains queued content cascade-deletes through one
 /// `Writer.deleteContentCascadeAll` batch — the same
-/// clear-only-after-commit contract as `olDrain`.
-fn olDrainContentDeletes(w: onelibrary.Writer, list: anytype) onelibrary.SqlError!void {
-    try w.deleteContentCascadeAll(list.items);
-    list.clearRetainingCapacity();
+/// clear-only-after-commit contract as `olDrain` — with the delete set.
+fn olDrainContentDeletes(w: onelibrary.Writer, store: *OlStore) onelibrary.SqlError!void {
+    try w.deleteContentCascadeAll(store.content_deletes.items);
+    store.content_deletes.clearRetainingCapacity();
+    store.content_delete_set.clearRetainingCapacity();
+}
+
+/// Appends `row` as a pending content insert, indexing it by id and
+/// path. The reservations come first so an indexing step can never fail
+/// after the row lands — an unindexed row would be invisible to the
+/// dedup lookups and let a later add duplicate it.
+fn pushContent(store: *OlStore, row: onelibrary.Content) std.mem.Allocator.Error!void {
+    const a = store.arena.allocator();
+    try store.content_ref_by_id.ensureUnusedCapacity(a, 1);
+    if (row.path != null) try store.content_id_by_path.ensureUnusedCapacity(a, 1);
+    const i = store.contents.items.len;
+    try store.contents.append(a, row);
+    store.content_ref_by_id.putAssumeCapacity(row.content_id, .{ .pending = i });
+    indexContentPath(store, row);
+}
+
+/// Records `row`'s path in the path index, first row wins on aliasing —
+/// the library's `content_by_path` stance. Capacity for the key must
+/// already be reserved.
+fn indexContentPath(store: *OlStore, row: onelibrary.Content) void {
+    const p = row.path orelse return;
+    const gop = store.content_id_by_path.getOrPutAssumeCapacity(p);
+    if (!gop.found_existing) gop.value_ptr.* = row.content_id;
+}
+
+/// Moves the path index with a row whose path changed: the key it no
+/// longer owns is dropped (only when it still maps to `content_id` — an
+/// alias another row owns stays), the new one recorded first-wins.
+fn reindexContentPath(
+    store: *OlStore,
+    content_id: i64,
+    old_path: ?[]const u8,
+    new_path: ?[]const u8,
+) std.mem.Allocator.Error!void {
+    if (old_path) |old| {
+        if (store.content_id_by_path.get(old)) |mapped| {
+            if (mapped == content_id) _ = store.content_id_by_path.remove(old);
+        }
+    }
+    const new = new_path orelse return;
+    try store.content_id_by_path.ensureUnusedCapacity(store.arena.allocator(), 1);
+    const gop = store.content_id_by_path.getOrPutAssumeCapacity(new);
+    if (!gop.found_existing) gop.value_ptr.* = content_id;
+}
+
+/// Un-indexes and swap-removes the listed row at slot `i` (`is_update`:
+/// the queued updates, else the pending inserts), re-seating the one row
+/// the swap displaced. Swap-removal reorders pending rows; every row
+/// carries its identity (the content id) explicitly, so only the drain
+/// order changes, never what lands. The displaced row's re-seat is
+/// reserved before the swap so it cannot fail and leave the row
+/// unindexed.
+fn removeListedContent(
+    store: *OlStore,
+    comptime is_update: bool,
+    i: usize,
+) std.mem.Allocator.Error!void {
+    const list = if (is_update) &store.content_updates else &store.contents;
+    const row = list.items[i];
+    if (row.path) |p| {
+        if (store.content_id_by_path.get(p)) |mapped| {
+            if (mapped == row.content_id) _ = store.content_id_by_path.remove(p);
+        }
+    }
+    _ = store.content_ref_by_id.remove(row.content_id);
+    if (i + 1 < list.items.len)
+        try store.content_ref_by_id.ensureUnusedCapacity(store.arena.allocator(), 1);
+    _ = list.swapRemove(i);
+    if (i < list.items.len) {
+        const moved = list.items[i];
+        store.content_ref_by_id.putAssumeCapacity(
+            moved.content_id,
+            if (is_update) .{ .queued_update = i } else .{ .pending = i },
+        );
+    }
 }
 
 /// Queues `row` as the pending replacement of its content row — at most
 /// one update per content id, so consecutive patches of one track
-/// compose instead of stacking.
+/// compose instead of stacking. Only the disk arms call this: an id
+/// already pending or queued is patched in place by the callers, so a
+/// listed entry here is the id's own earlier queued row.
 fn queueContentUpdate(store: *OlStore, row: onelibrary.Content) std.mem.Allocator.Error!void {
-    for (store.content_updates.items) |*queued| {
-        if (queued.content_id == row.content_id) {
+    if (store.content_ref_by_id.get(row.content_id)) |ref| switch (ref) {
+        .queued_update => |i| {
+            const queued = &store.content_updates.items[i];
+            try reindexContentPath(store, row.content_id, queued.path, row.path);
             queued.* = row;
             return;
-        }
-    }
-    try store.content_updates.append(store.arena.allocator(), row);
+        },
+        .pending, .disk => {},
+    };
+    const a = store.arena.allocator();
+    try store.content_ref_by_id.ensureUnusedCapacity(a, 1);
+    if (row.path != null) try store.content_id_by_path.ensureUnusedCapacity(a, 1);
+    const i = store.content_updates.items.len;
+    try store.content_updates.append(a, row);
+    store.content_ref_by_id.putAssumeCapacity(row.content_id, .{ .queued_update = i });
+    indexContentPath(store, row);
 }
 
 /// Queues `content_id` for the cascade delete at the next `save`;
-/// double-queuing is a no-op.
+/// double-queuing is a no-op. The set entry is reserved before the list
+/// append so the two cannot disagree.
 fn queueContentDelete(store: *OlStore, content_id: i64) std.mem.Allocator.Error!void {
-    for (store.content_deletes.items) |queued| {
-        if (queued == content_id) return;
+    if (store.content_delete_set.contains(content_id)) return;
+    const a = store.arena.allocator();
+    try store.content_delete_set.ensureUnusedCapacity(a, 1);
+    try store.content_deletes.append(a, content_id);
+    store.content_delete_set.putAssumeCapacity(content_id, {});
+}
+
+/// Drops the resolved content row from the OL side, keyed by the track id
+/// its bridge carries: the junction rows naming it never land, the bridge
+/// goes, a pending insert is removed, a queued update is unqueued and
+/// cascade-deleted, a disk row queued for the cascade delete.
+fn dropOlContentRef(
+    store: *OlStore,
+    track_id: u32,
+    ref: OlContentRef,
+) std.mem.Allocator.Error!void {
+    const content_id = olContentRefId(store, ref);
+    _ = store.content_bridge.remove(track_id);
+
+    dropJunctionsForContent(&store.playlist_pairs, content_id);
+    dropJunctionsForContent(&store.my_tag_pairs, content_id);
+
+    switch (ref) {
+        .pending => |i| try removeListedContent(store, false, i),
+        // A queued update stands for a disk row, so unqueueing it also
+        // queues the cascade delete, like the disk arm.
+        .queued_update => |i| {
+            try removeListedContent(store, true, i);
+            try queueContentDelete(store, content_id);
+        },
+        .disk => try queueContentDelete(store, content_id),
     }
-    try store.content_deletes.append(store.arena.allocator(), content_id);
 }
 
 /// Records the pdb-track-id to OL-content-id bridge.
@@ -3837,14 +5189,17 @@ fn scanOlStore(
             OlAlbumKey{ .artist_id = row.artist_id orelse 0, .name = try a.dupe(u8, name) },
             row.album_id,
         );
+        try store.next_album_id.raisePast(row.album_id);
     }
     for (lib.genres) |row| {
         if (row.name) |name|
             try putIfAbsent(&store.genres_by_name, a, try a.dupe(u8, name), row.genre_id);
+        try store.next_genre_id.raisePast(row.genre_id);
     }
     for (lib.labels) |row| {
         if (row.name) |name|
             try putIfAbsent(&store.labels_by_name, a, try a.dupe(u8, name), row.label_id);
+        try store.next_label_id.raisePast(row.label_id);
     }
     for (lib.keys) |row| {
         if (row.name) |name| try putIfAbsent(
@@ -3853,10 +5208,26 @@ fn scanOlStore(
             try canonicalKeyName(a, name),
             row.key_id,
         );
+        try store.next_key_id.raisePast(row.key_id);
     }
-    for (lib.images) |row| try store.image_ids.put(a, row.image_id, {});
+    // Content, playlist, and image ids mint in the u32 space (see the
+    // OlStore fields); a row whose id sits beyond it can never collide
+    // with a u32 mint, so it only skips the raise — one exactly at
+    // `maxInt(u32)` still rejects the scan, per `IdMint`.
+    for (lib.contents) |row| {
+        if (std.math.cast(u32, row.content_id)) |id|
+            try store.next_content_id.raisePast(id);
+    }
+    for (lib.images) |row| {
+        try store.image_ids.put(a, row.image_id, {});
+        if (std.math.cast(u32, row.image_id)) |id|
+            try store.next_image_id.raisePast(id);
+    }
     for (lib.playlists) |row| {
         try store.playlist_ids.put(a, row.playlist_id, {});
+        try store.playlist_is_folder.put(a, row.playlist_id, (row.attribute orelse 0) == 1);
+        if (std.math.cast(u32, row.playlist_id)) |id|
+            try store.next_playlist_id.raisePast(id);
         const gop = try store.playlist_child_counts.getOrPut(a, row.playlist_id_parent orelse 0);
         if (!gop.found_existing) gop.value_ptr.* = .{ .next = 0 };
         // A NULL sequenceNo occupies nothing: the high water stays at 0.
@@ -3910,6 +5281,21 @@ fn olNamedRow(
     return pdb_id;
 }
 
+/// `olNamedRow` with the new row's id minted from `counter` instead of
+/// bridged from the pdb side — the OL-only writer's dimension resolution.
+fn olMintedRow(
+    store: *OlStore,
+    map: *std.StringHashMapUnmanaged(i64),
+    list: anytype,
+    comptime build_row: anytype,
+    counter: *IdMint(i64),
+    name: []const u8,
+) (std.mem.Allocator.Error || error{IdSpaceExhausted})!?i64 {
+    if (name.len == 0) return null;
+    if (map.get(name)) |id| return id;
+    return try olNamedRow(store, map, list, build_row, try counter.mint(), name);
+}
+
 /// Minted artist ids start above every possible bridged id: pdb ids are
 /// u32 and the bridge copies them verbatim, so ids from 2^32 upward can
 /// never collide with a bridged row — a lockstep db stays collision-free
@@ -3961,6 +5347,18 @@ fn olKeyId(
     return pdb_id;
 }
 
+/// `olKeyId` with the new row's id minted — the OL-only resolution (no
+/// pdb key id to bridge).
+fn olMintedKeyId(
+    store: *OlStore,
+    name: []const u8,
+) (std.mem.Allocator.Error || error{IdSpaceExhausted})!?i64 {
+    if (name.len == 0) return null;
+    const canonical = try canonicalKeyName(store.arena.allocator(), name);
+    if (store.keys_by_canonical.get(canonical)) |id| return id;
+    return try olKeyId(store, name, try store.next_key_id.mint());
+}
+
 /// Resolves `(owning artist, name)` to a mirrored `album` row. The pdb
 /// side keys albums per-artist; the OL side keys per-OL-artist, which for
 /// lockstep dbs is the same thing. A null artist (the pdb null fk 0)
@@ -3995,6 +5393,20 @@ fn olAlbumId(
     return pdb_id;
 }
 
+/// `olAlbumId` with the new row's id minted — the OL-only resolution.
+fn olMintedAlbumId(
+    store: *OlStore,
+    name: []const u8,
+    ol_artist_id: ?i64,
+) (std.mem.Allocator.Error || error{IdSpaceExhausted})!?i64 {
+    if (name.len == 0) return null;
+    if (store.albums_by_artist_and_name.get(.{
+        .artist_id = ol_artist_id orelse 0,
+        .name = name,
+    })) |id| return id;
+    return try olAlbumId(store, name, try store.next_album_id.mint(), ol_artist_id);
+}
+
 /// Resolves an artwork row to its mirrored `image` row: the bridge is the
 /// artwork id itself, and the stored path is the OneLibrary `b{id}.jpg`
 /// variant derived from it — not the caller's `a*` path, which the spec
@@ -4012,6 +5424,15 @@ fn olImageId(store: *OlStore, pdb_artwork_id: u32) std.mem.Allocator.Error!?i64 
         .path = try olArtworkPath(a, pdb_artwork_id),
     });
     store.image_ids.putAssumeCapacity(id, {});
+    return id;
+}
+
+/// The OL-only artwork resolution: no pdb Artwork row exists to bridge,
+/// so the image id mints and the row lands under it (the `b{id}.jpg`
+/// path the mirror convention stores).
+fn olMintedImageId(store: *OlStore) (std.mem.Allocator.Error || error{IdSpaceExhausted})!u32 {
+    const id = try store.next_image_id.mint();
+    _ = try olImageId(store, id);
     return id;
 }
 
@@ -4035,6 +5456,7 @@ fn mirrorPlaylistRow(
         store.playlist_child_counts.get(parent_id) orelse .{ .next = 0 };
     const sequence_no = try sequence_mint.mint();
     try store.playlist_ids.ensureUnusedCapacity(a, 1);
+    try store.playlist_is_folder.ensureUnusedCapacity(a, 1);
     try store.playlist_child_counts.ensureUnusedCapacity(a, 1);
     try store.playlists.append(a, .{
         .playlist_id = id,
@@ -4045,8 +5467,32 @@ fn mirrorPlaylistRow(
         .playlist_id_parent = parent_id,
     });
     store.playlist_ids.putAssumeCapacity(id, {});
+    store.playlist_is_folder.putAssumeCapacity(id, is_folder);
     const gop = store.playlist_child_counts.getOrPutAssumeCapacity(parent_id);
     gop.value_ptr.* = sequence_mint;
+}
+
+/// The OL-only node mint (`createPlaylist`'s fallback body): the id
+/// comes from `next_playlist_id` — the lockstep u32 space, so the
+/// returned id is the API's u32 — and the row lands through
+/// `mirrorPlaylistRow`, the same shape a bridged node writes. The
+/// parent check runs against the store's folder map before the mint, so
+/// a rejected call burns nothing.
+fn createPlaylistNodeOl(
+    store: *OlStore,
+    name: []const u8,
+    parent_id: u32,
+    is_folder: bool,
+) PlaylistError!u32 {
+    // The root (id 0) is always a valid parent; any other id must name
+    // an existing folder — a playlist cannot hold children.
+    if (parent_id != 0) {
+        const parent_is_folder = store.playlist_is_folder.get(parent_id) orelse false;
+        if (!parent_is_folder) return error.UnknownForeignKey;
+    }
+    const id = try store.next_playlist_id.mint();
+    try mirrorPlaylistRow(store, name, parent_id, id, is_folder);
+    return id;
 }
 
 /// Mirrors a my-tag row: the ext tag id bridges — the fixture's ext Tag
@@ -4319,16 +5765,6 @@ fn rowsOfOrEmpty(
     comptime T: type,
 ) ScanError!?pdb.RowIter(T) {
     return db.rowsOf(T) catch |err| switch (err) {
-        error.NoTable => null,
-        else => |e| return e,
-    };
-}
-
-/// `Database.rows`, treating a table the database doesn't carry as empty
-/// (standard exports carry all 20 tables; this keeps the scan total over
-/// hand-built databases).
-fn rowsOrEmpty(db: *const pdb.Database, page_type: pdb.PageType) ScanError!?pdb.RowIterator {
-    return db.rows(page_type) catch |err| switch (err) {
         error.NoTable => null,
         else => |e| return e,
     };
