@@ -14,7 +14,7 @@
 const std = @import("std");
 const bin = @import("bin.zig");
 const anlz = @import("anlz.zig");
-const ol = @import("ol.zig");
+const onelibrary = @import("onelibrary.zig");
 const pdb = @import("pdb.zig");
 const setting = @import("setting.zig");
 const util = @import("util.zig");
@@ -427,15 +427,15 @@ pub const SaveError =
     AtomicWriteError ||
     std.Io.Dir.DeleteFileError ||
     RelocateError ||
-    ol.Writer.CreateError ||
-    ol.SqlError ||
+    onelibrary.Writer.CreateError ||
+    onelibrary.SqlError ||
     error{CwdUnavailable};
 
 /// Error of `DeviceExport.writerState`: reading or parsing
 /// `export.pdb`, or scanning it.
 pub const WriterStateError = OpenPdbError || ScanError;
 
-/// Error of `DeviceExport.openOL`: pinning the working directory,
+/// Error of `DeviceExport.openOneLibrary`: pinning the working directory,
 /// examining or opening `exportLibrary.db` (a file over the read cap is
 /// `LibraryTooLarge`), loading its models (a drifted schema is
 /// `SchemaMismatch`, a disproportionate decode also `LibraryTooLarge`),
@@ -444,7 +444,7 @@ pub const WriterStateError = OpenPdbError || ScanError;
 pub const OpenOLError =
     std.Io.Dir.OpenError ||
     std.Io.Dir.StatFileError ||
-    ol.LoadError ||
+    onelibrary.LoadError ||
     error{ CwdUnavailable, OutOfMemory };
 
 /// Error of the OL mirroring helpers: pinning the working directory,
@@ -455,7 +455,7 @@ pub const OlMirrorError =
     std.Io.Dir.OpenError ||
     std.Io.Dir.AccessError ||
     OpenOLError ||
-    ol.LoadError ||
+    onelibrary.LoadError ||
     std.mem.Allocator.Error ||
     error{ CwdUnavailable, InvalidUtf8, IdSpaceExhausted };
 
@@ -563,7 +563,7 @@ pub const TrackInput = struct {
 
     // OneLibrary-only data: columns that exist in `exportLibrary.db`
     // and never reach the pdb. Ignored when the export carries no OL db
-    // (an opened pdb-only export never gains one), in `-Dol=off`
+    // (an opened pdb-only export never gains one), in `-Donelibrary=off`
     // builds, and on the dedup path — `addTrack` returning an existing
     // track never updates it (append-only). Every default equals the
     // fixture's convention, so a track authored without them writes the
@@ -859,7 +859,7 @@ const AnlzRelocation = struct {
 };
 
 /// Reads the process working directory through libc. Only called in
-/// `-Dol` builds (which link libc) to snapshot the cwd a SQLite path can
+/// `-Donelibrary` builds (which link libc) to snapshot the cwd a SQLite path can
 /// be made absolute against; a cwd longer than the path buffer, or one
 /// that cannot be read at all, reports `OutOfMemory` — callers treat that
 /// as "no snapshot" and fail later at path-build time.
@@ -876,7 +876,7 @@ fn captureCwd(alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
 /// saved. Files the export
 /// carries but the handle does not model are ignored by design:
 /// `djprofile.nxs` (undocumented). The OneLibrary db
-/// (`exportLibrary.db`, newer exports) is read through `openOL`
+/// (`exportLibrary.db`, newer exports) is read through `openOneLibrary`
 /// and mirrored by the writer side of the handle.
 pub const DeviceExport = struct {
     layout: Layout,
@@ -890,7 +890,7 @@ pub const DeviceExport = struct {
     dir: ?std.Io.Dir,
     /// The process cwd at the moment `dir` was pinned — the absolute
     /// prefix SQLite paths are built on (they resolve against the process
-    /// cwd, not the pinned handle). Null in `-Dol=off` builds (nothing
+    /// cwd, not the pinned handle). Null in `-Donelibrary=off` builds (nothing
     /// needs it), until the pin, or when the cwd was unreadable.
     dir_path: ?[]u8 = null,
     /// The export's pdb, loaded on the first pdb-touching call — `open`
@@ -909,7 +909,7 @@ pub const DeviceExport = struct {
     /// `save` — before `export.pdb`, so a crash leaves orphan analysis
     /// files players ignore, not rows naming missing ones.
     pending_anlz: std.ArrayList(PendingAnlz) = .empty,
-    /// The OneLibrary db read side (`openOL`), independent of the
+    /// The OneLibrary db read side (`openOneLibrary`), independent of the
     /// writer side.
     ol_library: OlLibraryState = .unloaded,
     /// The OneLibrary db write side: rows mirrored by the mutating
@@ -930,7 +930,7 @@ pub const DeviceExport = struct {
     };
 
     /// Lifecycle of the `exportLibrary.db` models, loaded on first
-    /// `openOL` call and cached until the next `save` — which drops it,
+    /// `openOneLibrary` call and cached until the next `save` — which drops it,
     /// the snapshot naming the pre-save disk — or `deinit`.
     const OlLibraryState = union(enum) {
         /// Not examined yet; the first call checks the disk.
@@ -938,7 +938,7 @@ pub const DeviceExport = struct {
         /// No `exportLibrary.db` under the root (older exports).
         absent,
         /// Loaded and cached; owned by the handle.
-        loaded: ol.Library,
+        loaded: onelibrary.Library,
     };
 
     /// Lifecycle of the OneLibrary write side. Mirroring is a no-op in
@@ -985,13 +985,13 @@ pub const DeviceExport = struct {
     /// The pinned working directory, opening it on first use. `Dir.cwd()`
     /// is only an `AT_FDCWD` sentinel — every call resolves against the
     /// process cwd as it is *then* — so a real handle is opened once and
-    /// reused. `-Dol` builds also snapshot the cwd string: SQLite, which
+    /// reused. `-Donelibrary` builds also snapshot the cwd string: SQLite, which
     /// the OneLibrary store goes through, resolves paths against the
     /// process cwd rather than a directory handle.
     fn dirHandle(e: *DeviceExport) (std.Io.Dir.OpenError || std.mem.Allocator.Error)!std.Io.Dir {
         if (e.dir == null) {
             e.dir = try std.Io.Dir.cwd().openDir(e.io, ".", .{});
-            if (ol.mode != .off) {
+            if (onelibrary.mode != .off) {
                 // A cwd that cannot be read leaves `dir_path` null; the
                 // OneLibrary paths then fail with `CwdUnavailable`.
                 e.dir_path = captureCwd(e.alloc) catch null;
@@ -1014,7 +1014,7 @@ pub const DeviceExport = struct {
         // Pin the working directory now: create is the export's first I/O.
         const dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
         errdefer dir.close(io);
-        const dir_path: ?[]u8 = if (ol.mode != .off)
+        const dir_path: ?[]u8 = if (onelibrary.mode != .off)
             captureCwd(alloc) catch null
         else
             null;
@@ -1247,10 +1247,10 @@ pub const DeviceExport = struct {
     /// the OL view of a track — including the fields the pdb lacks
     /// (remixer/composer/lyricist/original-artist ids, subtitle, bit
     /// depth, sampling rate, djPlayCount). Only compiled with
-    /// `-Dol=vendored-sqlcipher` (or `=system-sqlcipher`).
-    pub fn openOL(e: *DeviceExport) OpenOLError!?*const ol.Library {
-        if (ol.mode == .off)
-            @compileError("rekordlib was built with -Dol=off; rebuild with -Dol=vendored-sqlcipher (or =system-sqlcipher) to read the OneLibrary store");
+    /// `-Donelibrary=vendored-sqlcipher` (or `=system-sqlcipher`).
+    pub fn openOneLibrary(e: *DeviceExport) OpenOLError!?*const onelibrary.Library {
+        if (onelibrary.mode == .off)
+            @compileError("rekordlib was built with -Donelibrary=off; rebuild with -Donelibrary=vendored-sqlcipher (or =system-sqlcipher) to read the OneLibrary store");
         switch (e.ol_library) {
             .loaded => |*lib| return lib,
             .absent => return null,
@@ -1269,10 +1269,10 @@ pub const DeviceExport = struct {
 
                 const path = try e.olDbPath();
                 defer e.alloc.free(path);
-                var db = try ol.Db.open(e.io, path);
+                var db = try onelibrary.Db.open(e.io, path);
                 errdefer db.close();
                 // Same tag-then-payload hazard as `openPdb`: load first.
-                const lib = try ol.Library.load(e.alloc, db);
+                const lib = try onelibrary.Library.load(e.alloc, db);
                 db.close();
                 e.ol_library = .{ .loaded = lib };
                 return &e.ol_library.loaded;
@@ -1307,9 +1307,9 @@ pub const DeviceExport = struct {
     /// state (the db is loaded and closed again — pending rows are the
     /// only mutations until `save`); an export without one never gains
     /// one, so mirroring is a no-op there. Null in the absent case — and
-    /// always, in `-Dol=off` builds, where mirroring is compiled out.
+    /// always, in `-Donelibrary=off` builds, where mirroring is compiled out.
     fn olStore(e: *DeviceExport) OlMirrorError!?*OlStore {
-        if (ol.mode == .off) return null;
+        if (onelibrary.mode == .off) return null;
         switch (e.ol_state) {
             .store => |*store| return store,
             .absent => return null,
@@ -1327,9 +1327,9 @@ pub const DeviceExport = struct {
 
                 const path = try e.olDbPath();
                 defer e.alloc.free(path);
-                var db = try ol.Db.open(e.io, path);
+                var db = try onelibrary.Db.open(e.io, path);
                 errdefer db.close();
-                var lib = try ol.Library.load(e.alloc, db);
+                var lib = try onelibrary.Library.load(e.alloc, db);
                 defer lib.deinit();
                 db.close();
 
@@ -1345,7 +1345,7 @@ pub const DeviceExport = struct {
     /// Builds the OL store before a mutating method touches the pdb, so
     /// an unopenable or schema-drifted `exportLibrary.db` fails the call
     /// with the export untouched. A no-op on exports that carry no db
-    /// (and in `-Dol=off` builds).
+    /// (and in `-Donelibrary=off` builds).
     fn primeOlStore(e: *DeviceExport) OlMirrorError!void {
         _ = try e.olStore();
     }
@@ -2157,8 +2157,8 @@ pub const DeviceExport = struct {
                 return .{ .queued_update = i };
             }
         }
-        if (ol.mode != .off) {
-            const lib = (try e.openOL()) orelse return null;
+        if (onelibrary.mode != .off) {
+            const lib = (try e.openOneLibrary()) orelse return null;
             if (lib.contentByPath(path)) |c| {
                 try recordBridge(store, track_id, c.content_id);
                 return .{ .disk = c };
@@ -2180,9 +2180,9 @@ pub const DeviceExport = struct {
         for (store.content_updates.items, 0..) |*c, i| {
             if (c.content_id == content_id) return .{ .queued_update = i };
         }
-        if (ol.mode != .off) {
-            const lib = (try e.openOL()) orelse return null;
-            if (lib.byId(ol.Content, content_id)) |c| return .{ .disk = c };
+        if (onelibrary.mode != .off) {
+            const lib = (try e.openOneLibrary()) orelse return null;
+            if (lib.byId(onelibrary.Content, content_id)) |c| return .{ .disk = c };
         }
         return null;
     }
@@ -2208,7 +2208,7 @@ pub const DeviceExport = struct {
         const sa = store.arena.allocator();
 
         const moveRow = struct {
-            fn move(c: *ol.Content, a: std.mem.Allocator, new_path: []const u8, row: *const pdb.Track) OlMirrorError!void {
+            fn move(c: *onelibrary.Content, a: std.mem.Allocator, new_path: []const u8, row: *const pdb.Track) OlMirrorError!void {
                 c.path = try a.dupe(u8, new_path);
                 c.fileName = try a.dupe(u8, std.fs.path.basename(new_path));
                 if (!strEmpty(row.offsets.inner.analyze_path))
@@ -2913,9 +2913,9 @@ pub const DeviceExport = struct {
     /// and `create` takes no date). Later saves touch the file only when
     /// rows are pending. `close` checkpoints, so the landed file is
     /// complete with no `-wal`/`-shm` sidecars, exactly rb's shape.
-    /// Skipped entirely in `-Dol=off` builds.
+    /// Skipped entirely in `-Donelibrary=off` builds.
     fn writeOl(e: *DeviceExport) SaveError!void {
-        if (ol.mode == .off) return;
+        if (onelibrary.mode == .off) return;
         const store = switch (e.ol_state) {
             .store => |*store| store,
             // Nothing mirrored — no db, or an untouched one: never write.
@@ -2928,7 +2928,7 @@ pub const DeviceExport = struct {
         const path = try e.olDbPath();
         defer e.alloc.free(path);
 
-        var w: ol.Writer = undefined;
+        var w: onelibrary.Writer = undefined;
         if (store.fresh) {
             // A created export starts from an empty db even over a
             // leftover file — the same overwrite stance as the ext pdb.
@@ -2937,9 +2937,9 @@ pub const DeviceExport = struct {
                 error.FileNotFound => {},
                 else => return err,
             };
-            w = try ol.Writer.create(e.io, path, .{ .created_date = "" });
+            w = try onelibrary.Writer.create(e.io, path, .{ .created_date = "" });
         } else {
-            w = try ol.Writer.open(e.io, path);
+            w = try onelibrary.Writer.open(e.io, path);
         }
         errdefer w.db.close();
 
@@ -3289,7 +3289,7 @@ const OlContentRef = union(enum) {
     /// A queued whole-row update — an `OlStore.content_updates` index.
     queued_update: usize,
     /// A row already on disk, borrowed from the cached library.
-    disk: *const ol.Content,
+    disk: *const onelibrary.Content,
 };
 
 /// One id-keyed dimension table of a read view: row id -> decoded name.
@@ -3438,7 +3438,7 @@ fn fillTrackView(
 /// loaded library's snapshot of the disk. Read-side only — the store is
 /// consulted, never loaded, so a session that never mutates never pays
 /// for one.
-fn olJoinForView(e: *DeviceExport, path: []const u8) TrackViewError!?*const ol.Content {
+fn olJoinForView(e: *DeviceExport, path: []const u8) TrackViewError!?*const onelibrary.Content {
     if (e.ol_state == .store) {
         const store = &e.ol_state.store;
         for (store.contents.items) |*c| {
@@ -3448,8 +3448,8 @@ fn olJoinForView(e: *DeviceExport, path: []const u8) TrackViewError!?*const ol.C
             if (std.mem.eql(u8, c.path orelse "", path)) return c;
         }
     }
-    if (ol.mode == .off) return null;
-    const lib = (try e.openOL()) orelse return null;
+    if (onelibrary.mode == .off) return null;
+    const lib = (try e.openOneLibrary()) orelse return null;
     return lib.contentByPath(path);
 }
 
@@ -3517,7 +3517,7 @@ fn encodePatchedStrings(
 /// pdb ids `ids` carries.
 fn applyTrackPatchToContent(
     store: *OlStore,
-    c: *ol.Content,
+    c: *onelibrary.Content,
     row: *const pdb.Track,
     patch: TrackPatch,
     ids: PatchDimensionIds,
@@ -3630,24 +3630,24 @@ const OlStore = struct {
     fresh: bool = false,
 
     /// Rows pending their first insert, in mirroring order.
-    artists: std.ArrayListUnmanaged(ol.Artist) = .empty,
-    albums: std.ArrayListUnmanaged(ol.Album) = .empty,
-    genres: std.ArrayListUnmanaged(ol.Genre) = .empty,
-    labels: std.ArrayListUnmanaged(ol.Label) = .empty,
-    keys: std.ArrayListUnmanaged(ol.Key) = .empty,
-    images: std.ArrayListUnmanaged(ol.Image) = .empty,
-    contents: std.ArrayListUnmanaged(ol.Content) = .empty,
-    playlists: std.ArrayListUnmanaged(ol.Playlist) = .empty,
+    artists: std.ArrayListUnmanaged(onelibrary.Artist) = .empty,
+    albums: std.ArrayListUnmanaged(onelibrary.Album) = .empty,
+    genres: std.ArrayListUnmanaged(onelibrary.Genre) = .empty,
+    labels: std.ArrayListUnmanaged(onelibrary.Label) = .empty,
+    keys: std.ArrayListUnmanaged(onelibrary.Key) = .empty,
+    images: std.ArrayListUnmanaged(onelibrary.Image) = .empty,
+    contents: std.ArrayListUnmanaged(onelibrary.Content) = .empty,
+    playlists: std.ArrayListUnmanaged(onelibrary.Playlist) = .empty,
     playlist_pairs: std.ArrayListUnmanaged(OlPlaylistPair) = .empty,
-    my_tags: std.ArrayListUnmanaged(ol.MyTag) = .empty,
+    my_tags: std.ArrayListUnmanaged(onelibrary.MyTag) = .empty,
     /// Pending `myTag_content` rows — the row type itself, since the
     /// junction carries nothing the insert derives.
-    my_tag_pairs: std.ArrayListUnmanaged(ol.MyTagContent) = .empty,
+    my_tag_pairs: std.ArrayListUnmanaged(onelibrary.MyTagContent) = .empty,
     /// Complete replacement rows for `content` rows already on disk,
     /// patched by `updateTrack` and rewritten by the next
-    /// `save` (see `ol.Writer.updateAllContents`). At most one per
+    /// `save` (see `onelibrary.Writer.updateAllContents`). At most one per
     /// content id.
-    content_updates: std.ArrayListUnmanaged(ol.Content) = .empty,
+    content_updates: std.ArrayListUnmanaged(onelibrary.Content) = .empty,
     /// Content ids `removeTrack` cascade-deletes at the next `save`.
     content_deletes: std.ArrayListUnmanaged(i64) = .empty,
     /// pdb track id -> OL content id, recorded wherever the two sides
@@ -3710,7 +3710,7 @@ const OlStore = struct {
 /// row pending for the next `save`, so a retry never duplicates a landed
 /// one (nothing landed): the pending lists keep naming exactly the rows
 /// the db lacks, all-or-nothing per table rather than per row.
-fn olDrain(w: ol.Writer, list: anytype) ol.SqlError!void {
+fn olDrain(w: onelibrary.Writer, list: anytype) onelibrary.SqlError!void {
     try w.insertAll(list.items);
     list.clearRetainingCapacity();
 }
@@ -3719,7 +3719,7 @@ fn olDrain(w: ol.Writer, list: anytype) ol.SqlError!void {
 /// 1-based `sequenceNo`s are derived inside the transaction, continuing
 /// past rows already on disk. The same clear-only-after-commit contract
 /// as `olDrain`.
-fn olDrainPlaylistPairs(w: ol.Writer, list: anytype) ol.SqlError!void {
+fn olDrainPlaylistPairs(w: onelibrary.Writer, list: anytype) onelibrary.SqlError!void {
     try w.addAllToPlaylist(list.items);
     list.clearRetainingCapacity();
 }
@@ -3727,7 +3727,7 @@ fn olDrainPlaylistPairs(w: ol.Writer, list: anytype) ol.SqlError!void {
 /// Drains queued whole-row content updates through one
 /// `Writer.updateAllContents` batch — the same clear-only-after-commit
 /// contract as `olDrain`.
-fn olDrainUpdates(w: ol.Writer, list: anytype) ol.SqlError!void {
+fn olDrainUpdates(w: onelibrary.Writer, list: anytype) onelibrary.SqlError!void {
     try w.updateAllContents(list.items);
     list.clearRetainingCapacity();
 }
@@ -3735,7 +3735,7 @@ fn olDrainUpdates(w: ol.Writer, list: anytype) ol.SqlError!void {
 /// Drains queued content cascade-deletes through one
 /// `Writer.deleteContentCascadeAll` batch — the same
 /// clear-only-after-commit contract as `olDrain`.
-fn olDrainContentDeletes(w: ol.Writer, list: anytype) ol.SqlError!void {
+fn olDrainContentDeletes(w: onelibrary.Writer, list: anytype) onelibrary.SqlError!void {
     try w.deleteContentCascadeAll(list.items);
     list.clearRetainingCapacity();
 }
@@ -3743,7 +3743,7 @@ fn olDrainContentDeletes(w: ol.Writer, list: anytype) ol.SqlError!void {
 /// Queues `row` as the pending replacement of its content row — at most
 /// one update per content id, so consecutive patches of one track
 /// compose instead of stacking.
-fn queueContentUpdate(store: *OlStore, row: ol.Content) std.mem.Allocator.Error!void {
+fn queueContentUpdate(store: *OlStore, row: onelibrary.Content) std.mem.Allocator.Error!void {
     for (store.content_updates.items) |*queued| {
         if (queued.content_id == row.content_id) {
             queued.* = row;
@@ -3790,9 +3790,9 @@ fn dropJunctionsForContent(list: anytype, content_id: i64) void {
 
 /// Copies `src`, duping every text column, so the copy outlives the
 /// library snapshot it came from.
-fn dupeContent(a: std.mem.Allocator, src: *const ol.Content) std.mem.Allocator.Error!ol.Content {
+fn dupeContent(a: std.mem.Allocator, src: *const onelibrary.Content) std.mem.Allocator.Error!onelibrary.Content {
     var c = src.*;
-    inline for (@typeInfo(ol.Content).@"struct".fields) |f| {
+    inline for (@typeInfo(onelibrary.Content).@"struct".fields) |f| {
         if (f.type == ?[]const u8) {
             if (@field(c, f.name)) |v| @field(c, f.name) = try a.dupe(u8, v);
         }
@@ -3835,7 +3835,7 @@ pub const OlAlbumsByArtistAndName = std.HashMapUnmanaged(
 /// the pdb-side null convention. An id that exhausts its space fails the
 /// scan (see `IdMint`).
 fn scanOlStore(
-    lib: *const ol.Library,
+    lib: *const onelibrary.Library,
     store: *OlStore,
 ) (std.mem.Allocator.Error || error{IdSpaceExhausted})!void {
     const a = store.arena.allocator();
@@ -3880,19 +3880,19 @@ fn scanOlStore(
 }
 
 /// One mirrored `artist` row; see `olNamedRow`.
-fn olArtistRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!ol.Artist {
+fn olArtistRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!onelibrary.Artist {
     _ = a;
     return .{ .artist_id = id, .name = name, .nameForSearch = null };
 }
 
 /// One mirrored `genre` row; see `olNamedRow`.
-fn olGenreRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!ol.Genre {
+fn olGenreRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!onelibrary.Genre {
     _ = a;
     return .{ .genre_id = id, .name = name };
 }
 
 /// One mirrored `label` row; see `olNamedRow`.
-fn olLabelRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!ol.Label {
+fn olLabelRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!onelibrary.Label {
     _ = a;
     return .{ .label_id = id, .name = name };
 }

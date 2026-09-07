@@ -1,23 +1,23 @@
 const std = @import("std");
 const testing = std.testing;
 
-const ol = @import("rekordlib").ol;
+const onelibrary = @import("rekordlib").onelibrary;
 const testutil = @import("util.zig");
 
 test {
-    if (ol.mode != .@"vendored-sqlcipher") return; // fixture tests need the vendored-sqlcipher build
+    if (onelibrary.mode != .@"vendored-sqlcipher") return; // fixture tests need the vendored-sqlcipher build
 }
 
 /// Copies the with_anlz `exportLibrary.db` into a temp dir (the WAL-persisted
 /// fixture needs write access for recovery) and opens it keyed.
-fn openFixtureDb(io: std.Io, tmp: *testing.TmpDir, alloc: std.mem.Allocator) !ol.Db {
+fn openFixtureDb(io: std.Io, tmp: *testing.TmpDir, alloc: std.mem.Allocator) !onelibrary.Db {
     return openFixtureCopy(io, tmp, alloc, true);
 }
 
 /// Copies the decrypted `testdata/ol/with_anlz_plain.db` into a temp dir
 /// and opens it without the OL key — skipping key derivation, the fast
 /// fixture path.
-fn openPlaintextFixtureDb(io: std.Io, tmp: *testing.TmpDir, alloc: std.mem.Allocator) !ol.Db {
+fn openPlaintextFixtureDb(io: std.Io, tmp: *testing.TmpDir, alloc: std.mem.Allocator) !onelibrary.Db {
     return openFixtureCopy(io, tmp, alloc, false);
 }
 
@@ -26,7 +26,7 @@ fn openFixtureCopy(
     tmp: *testing.TmpDir,
     alloc: std.mem.Allocator,
     keyed: bool,
-) !ol.Db {
+) !onelibrary.Db {
     const rel = if (keyed)
         "complete_export/with_anlz/PIONEER/rekordbox/exportLibrary.db"
     else
@@ -39,11 +39,11 @@ fn openFixtureCopy(
     defer alloc.free(tmp_path);
     const db_path = try std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ tmp_path, name }, 0);
     defer alloc.free(db_path);
-    return if (keyed) ol.Db.open(io, db_path) else ol.Db.openPlaintext(io, db_path);
+    return if (keyed) onelibrary.Db.open(io, db_path) else onelibrary.Db.openPlaintext(io, db_path);
 }
 
 test "with_anlz fixture: integrity, provider wiring, table counts" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -76,7 +76,7 @@ test "with_anlz fixture: integrity, provider wiring, table counts" {
 }
 
 test "create, write, read back through the provider" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -84,11 +84,11 @@ test "create, write, read back through the provider" {
     defer tmp.cleanup();
     const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     defer alloc.free(tmp_path);
-    const db_path = try std.fmt.allocPrintSentinel(alloc, "{s}/ol.db", .{tmp_path}, 0);
+    const db_path = try std.fmt.allocPrintSentinel(alloc, "{s}/onelibrary.db", .{tmp_path}, 0);
     defer alloc.free(db_path);
 
     {
-        var db = try ol.Db.openReadWriteCreate(io, db_path);
+        var db = try onelibrary.Db.openReadWriteCreate(io, db_path);
         defer db.close();
         try db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL, data BLOB);");
         var stmt = try db.prepare("INSERT INTO t (name, score, data) VALUES (?1, ?2, ?3);");
@@ -102,11 +102,11 @@ test "create, write, read back through the provider" {
     }
 
     // reopen: the file on disk must be encrypted and decrypt correctly
-    const raw = try tmp.dir.readFileAlloc(io, "ol.db", alloc, .limited(1 << 20));
+    const raw = try tmp.dir.readFileAlloc(io, "onelibrary.db", alloc, .limited(1 << 20));
     defer alloc.free(raw);
     try testing.expect(raw.len >= 4096);
     try testing.expect(!std.mem.eql(u8, raw[0..16], "SQLite format 3\x00")); // salt, not magic
-    var db = try ol.Db.open(io, db_path);
+    var db = try onelibrary.Db.open(io, db_path);
     defer db.close();
     var stmt = try db.prepare("SELECT id, name, score, data FROM t;");
     defer stmt.finalize();
@@ -123,8 +123,8 @@ test "create, write, read back through the provider" {
 }
 
 test "sqliteVersion is reachable" {
-    if (ol.mode == .off) return;
-    try testing.expect(std.mem.startsWith(u8, ol.sqliteVersion(), "3."));
+    if (onelibrary.mode == .off) return;
+    try testing.expect(std.mem.startsWith(u8, onelibrary.sqliteVersion(), "3."));
 }
 
 test "cbc matches NIST SP 800-38A F.2.5 (AES-256-CBC)" {
@@ -145,14 +145,14 @@ test "cbc matches NIST SP 800-38A F.2.5 (AES-256-CBC)" {
     );
 
     var buf: [64]u8 = undefined;
-    try ol.cbc(true, key, iv, &buf, &pt);
+    try onelibrary.cbc(true, key, iv, &buf, &pt);
     try testing.expectEqualSlices(u8, &ct, buf[0..pt.len]);
-    try ol.cbc(false, key, iv, &buf, &ct);
+    try onelibrary.cbc(false, key, iv, &buf, &ct);
     try testing.expectEqualSlices(u8, &pt, buf[0..ct.len]);
 
     // the preconditions are real errors, not debug asserts
-    try testing.expectError(error.BufferTooSmall, ol.cbc(true, key, iv, buf[0..8], &pt));
-    try testing.expectError(error.NotBlockAligned, ol.cbc(true, key, iv, &buf, pt[0..20]));
+    try testing.expectError(error.BufferTooSmall, onelibrary.cbc(true, key, iv, buf[0..8], &pt));
+    try testing.expectError(error.NotBlockAligned, onelibrary.cbc(true, key, iv, &buf, pt[0..20]));
 }
 
 fn hex(comptime s: []const u8) [s.len / 2]u8 {
@@ -162,7 +162,7 @@ fn hex(comptime s: []const u8) [s.len / 2]u8 {
 }
 
 test "O2 load: every table with the fixture's row counts" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -171,7 +171,7 @@ test "O2 load: every table with the fixture's row counts" {
     var db = try openPlaintextFixtureDb(io, &tmp, alloc);
     defer db.close();
 
-    var lib = try ol.Library.load(alloc, db);
+    var lib = try onelibrary.Library.load(alloc, db);
     defer lib.deinit();
 
     try testing.expectEqual(@as(usize, 1), lib.albums.len);
@@ -199,7 +199,7 @@ test "O2 load: every table with the fixture's row counts" {
 }
 
 test "O2 load: fixture values, NULL versus empty string" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -208,7 +208,7 @@ test "O2 load: fixture values, NULL versus empty string" {
     var db = try openPlaintextFixtureDb(io, &tmp, alloc);
     defer db.close();
 
-    var lib = try ol.Library.load(alloc, db);
+    var lib = try onelibrary.Library.load(alloc, db);
     defer lib.deinit();
 
     const bako = lib.contents[1];
@@ -251,7 +251,7 @@ test "O2 load: fixture values, NULL versus empty string" {
 }
 
 test "O2 load: schema drift is rejected" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -263,26 +263,26 @@ test "O2 load: schema drift is rejected" {
         var db = try openPlaintextFixtureDb(io, &tmp, alloc);
         defer db.close();
         try db.exec("ALTER TABLE artist ADD COLUMN extra varchar;");
-        try testing.expectError(error.SchemaMismatch, ol.Library.load(alloc, db));
+        try testing.expectError(error.SchemaMismatch, onelibrary.Library.load(alloc, db));
     }
     // renamed column: name mismatch
     {
         var db = try openPlaintextFixtureDb(io, &tmp, alloc);
         defer db.close();
         try db.exec("ALTER TABLE menuItem RENAME COLUMN name TO nom;");
-        try testing.expectError(error.SchemaMismatch, ol.Library.load(alloc, db));
+        try testing.expectError(error.SchemaMismatch, onelibrary.Library.load(alloc, db));
     }
     // duplicated property row: the singleton rule
     {
         var db = try openPlaintextFixtureDb(io, &tmp, alloc);
         defer db.close();
         try db.exec("INSERT INTO property SELECT * FROM property;");
-        try testing.expectError(error.SchemaMismatch, ol.Library.load(alloc, db));
+        try testing.expectError(error.SchemaMismatch, onelibrary.Library.load(alloc, db));
     }
 }
 
 test "O2 load: plaintext and encrypted paths yield identical models" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -290,14 +290,14 @@ test "O2 load: plaintext and encrypted paths yield identical models" {
     defer plain_tmp.cleanup();
     var plain = try openPlaintextFixtureDb(io, &plain_tmp, alloc);
     defer plain.close();
-    var plain_lib = try ol.Library.load(alloc, plain);
+    var plain_lib = try onelibrary.Library.load(alloc, plain);
     defer plain_lib.deinit();
 
     var enc_tmp = testing.tmpDir(.{});
     defer enc_tmp.cleanup();
     var enc = try openFixtureDb(io, &enc_tmp, alloc);
     defer enc.close();
-    var enc_lib = try ol.Library.load(alloc, enc);
+    var enc_lib = try onelibrary.Library.load(alloc, enc);
     defer enc_lib.deinit();
 
     try testing.expect(plain_lib.eql(&enc_lib));
@@ -315,7 +315,7 @@ fn walChecksum(sum: *[2]u32, bytes: []const u8) void {
     }
 }
 
-/// Plants a forged `ol.db-wal` beside a closed WAL-mode db: a WAL header
+/// Plants a forged `onelibrary.db-wal` beside a closed WAL-mode db: a WAL header
 /// plus one commit frame carrying page 1 with the in-header page count
 /// patched, so both page-count sources — the page-1 header and the
 /// commit frame's dbsize — tell the same lie. Salts and the checksum
@@ -326,7 +326,7 @@ fn walChecksum(sum: *[2]u32, bytes: []const u8) void {
 /// main-file growth bounded while still inflating the pre-clamp budget
 /// to 128 MiB, far past what the amplifying view below decodes to.
 fn forgeWalSidecar(io: std.Io, tmp: *testing.TmpDir, alloc: std.mem.Allocator, forged_pages: u32) !void {
-    const main = try tmp.dir.readFileAlloc(io, "ol.db", alloc, .limited(1 << 20));
+    const main = try tmp.dir.readFileAlloc(io, "onelibrary.db", alloc, .limited(1 << 20));
     defer alloc.free(main);
 
     // page size from the db header (offset 16; the value 1 encodes 64 KiB)
@@ -371,24 +371,24 @@ fn forgeWalSidecar(io: std.Io, tmp: *testing.TmpDir, alloc: std.mem.Allocator, f
     std.mem.writeInt(u32, frame[20..24], sum[1], .big);
     @memcpy(frame[24..], page1);
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "ol.db-wal", .data = wal });
+    try tmp.dir.writeFile(io, .{ .sub_path = "onelibrary.db-wal", .data = wal });
 }
 
 test "O2 load: a forged WAL sidecar cannot inflate the decode budget" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    const db_path = try tmpDbPath(&tmp, alloc, "onelibrary.db");
     defer alloc.free(db_path);
 
     // An honest writer db whose genre table is swapped for a view that
     // mints rows from thin air — the amplifying source the budget exists
     // to catch. 200k rows decode to well past a MiB.
     {
-        var w = try ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-28" });
+        var w = try onelibrary.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-28" });
         try w.db.exec(
             \\DROP TABLE genre;
             \\CREATE VIEW genre AS WITH RECURSIVE cnt(n) AS (
@@ -400,9 +400,9 @@ test "O2 load: a forged WAL sidecar cannot inflate the decode budget" {
 
     // Control, no sidecar: the view alone trips LibraryTooLarge.
     {
-        var db = try ol.Db.openPlaintext(io, db_path);
+        var db = try onelibrary.Db.openPlaintext(io, db_path);
         defer db.close();
-        try testing.expectError(error.LibraryTooLarge, ol.Library.load(alloc, db));
+        try testing.expectError(error.LibraryTooLarge, onelibrary.Library.load(alloc, db));
     }
 
     // The forge: claim 16 MiB from a 4 KiB sidecar. Before the
@@ -410,18 +410,18 @@ test "O2 load: a forged WAL sidecar cannot inflate the decode budget" {
     // load below ran to completion.
     try forgeWalSidecar(io, &tmp, alloc, 4096);
 
-    var db = try ol.Db.openPlaintext(io, db_path);
+    var db = try onelibrary.Db.openPlaintext(io, db_path);
     defer db.close();
 
     // recovery adopted the forged size...
     try testing.expectEqual(@as(i64, 4096), try db.scalarInt("PRAGMA page_count;"));
     // ...but the budget anchor stays the physical pair, not the lie
     try testing.expect(try db.mainFileSize() < 1024 * 1024);
-    try testing.expectError(error.LibraryTooLarge, ol.Library.load(alloc, db));
+    try testing.expectError(error.LibraryTooLarge, onelibrary.Library.load(alloc, db));
 }
 
 test "O2 keyed: by-id maps and the path join" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -429,7 +429,7 @@ test "O2 keyed: by-id maps and the path join" {
     defer tmp.cleanup();
     var db = try openPlaintextFixtureDb(io, &tmp, alloc);
     defer db.close();
-    var lib = try ol.Library.load(alloc, db);
+    var lib = try onelibrary.Library.load(alloc, db);
     defer lib.deinit();
 
     // the pdb-side join
@@ -439,22 +439,22 @@ test "O2 keyed: by-id maps and the path join" {
     try testing.expectEqual(@as(i64, 2), bako.content_id);
     try testing.expect(lib.contentByPath("/Contents/nope") == null);
 
-    try testing.expectEqualStrings("Reboot", lib.byId(ol.Artist, 1).?.name.?);
-    try testing.expectEqualStrings("Tech House", lib.byId(ol.Genre, 2).?.name.?);
-    try testing.expectEqualStrings("Cecille", lib.byId(ol.Label, 1).?.name.?);
-    try testing.expectEqualStrings("Genre", lib.byId(ol.MyTag, 1).?.name.?);
+    try testing.expectEqualStrings("Reboot", lib.byId(onelibrary.Artist, 1).?.name.?);
+    try testing.expectEqualStrings("Tech House", lib.byId(onelibrary.Genre, 2).?.name.?);
+    try testing.expectEqualStrings("Cecille", lib.byId(onelibrary.Label, 1).?.name.?);
+    try testing.expectEqualStrings("Genre", lib.byId(onelibrary.MyTag, 1).?.name.?);
     try testing.expectEqualStrings(
         "/PIONEER/Artwork/00001/b2.jpg",
-        lib.byId(ol.Image, 2).?.path.?,
+        lib.byId(onelibrary.Image, 2).?.path.?,
     );
-    try testing.expectEqual(@as(i64, 12900), lib.byId(ol.Content, 2).?.bpmx100.?);
+    try testing.expectEqual(@as(i64, 12900), lib.byId(onelibrary.Content, 2).?.bpmx100.?);
     // empty tables and the 0 = "no foreign key" convention
-    try testing.expect(lib.byId(ol.Key, 1) == null);
-    try testing.expect(lib.byId(ol.Content, 0) == null);
+    try testing.expect(lib.byId(onelibrary.Key, 1) == null);
+    try testing.expect(lib.byId(onelibrary.Content, 0) == null);
 }
 
 test "O2 keyed: junction groupings order, skip, and first-win" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -465,7 +465,7 @@ test "O2 keyed: junction groupings order, skip, and first-win" {
 
     // fixture order: sequenceNo 1, 2 -> contents 1, 2
     {
-        var lib = try ol.Library.load(alloc, db);
+        var lib = try onelibrary.Library.load(alloc, db);
         defer lib.deinit();
         const entries = lib.playlist_contents_by_playlist.get(1).?;
         try testing.expectEqual(@as(usize, 2), entries.len);
@@ -486,7 +486,7 @@ test "O2 keyed: junction groupings order, skip, and first-win" {
         \\VALUES (99, '/Contents/Reboot/www.electronicfresh.com/01. Reboot - Bako (Original Mix).mp3');
         \\
     );
-    var lib = try ol.Library.load(alloc, db);
+    var lib = try onelibrary.Library.load(alloc, db);
     defer lib.deinit();
     try testing.expectEqual(@as(usize, 5), lib.playlist_contents.len);
     const entries = lib.playlist_contents_by_playlist.get(1).?;
@@ -521,7 +521,7 @@ fn tmpDbPath(tmp: *testing.TmpDir, alloc: std.mem.Allocator, name: []const u8) !
 
 /// Compares two schemas as name-ordered (type, name, sql) triples —
 /// "schema diff empty modulo data".
-fn expectSchemaEql(a: ol.Db, b: ol.Db) !void {
+fn expectSchemaEql(a: onelibrary.Db, b: onelibrary.Db) !void {
     const sql = "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name;";
     var sa = try a.prepare(sql);
     defer sa.finalize();
@@ -556,15 +556,15 @@ fn expectTableEql(comptime T: type, expected: []const T, actual: []const T) !voi
 }
 
 test "O3 create: schema diff vs the real fixture is empty" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    const db_path = try tmpDbPath(&tmp, alloc, "onelibrary.db");
     defer alloc.free(db_path);
-    var w = try ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    var w = try onelibrary.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
     defer w.db.close();
 
     var fix_tmp = testing.tmpDir(.{});
@@ -576,35 +576,35 @@ test "O3 create: schema diff vs the real fixture is empty" {
 }
 
 test "O3 create: seeded defaults and the property row" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    const db_path = try tmpDbPath(&tmp, alloc, "onelibrary.db");
     defer alloc.free(db_path);
-    var w = try ol.Writer.create(io, db_path, .{
+    var w = try onelibrary.Writer.create(io, db_path, .{
         .plaintext = true,
         .created_date = "2026-07-16",
         .my_tag_master_dbid = 3168300669,
     });
     defer w.db.close();
 
-    var lib = try ol.Library.load(alloc, w.db);
+    var lib = try onelibrary.Library.load(alloc, w.db);
     defer lib.deinit();
 
     var fix_tmp = testing.tmpDir(.{});
     defer fix_tmp.cleanup();
     var fixture = try openPlaintextFixtureDb(io, &fix_tmp, alloc);
     defer fixture.close();
-    var fix_lib = try ol.Library.load(alloc, fixture);
+    var fix_lib = try onelibrary.Library.load(alloc, fixture);
     defer fix_lib.deinit();
 
-    try expectTableEql(ol.Color, fix_lib.colors, lib.colors);
-    try expectTableEql(ol.MenuItem, fix_lib.menu_items, lib.menu_items);
-    try expectTableEql(ol.Category, fix_lib.categories, lib.categories);
-    try expectTableEql(ol.Sort, fix_lib.sorts, lib.sorts);
+    try expectTableEql(onelibrary.Color, fix_lib.colors, lib.colors);
+    try expectTableEql(onelibrary.MenuItem, fix_lib.menu_items, lib.menu_items);
+    try expectTableEql(onelibrary.Category, fix_lib.categories, lib.categories);
+    try expectTableEql(onelibrary.Sort, fix_lib.sorts, lib.sorts);
 
     // everything a fresh export leaves empty is empty
     try testing.expectEqual(@as(usize, 0), lib.contents.len);
@@ -626,56 +626,56 @@ test "O3 create: seeded defaults and the property row" {
 }
 
 test "O3 create: refuses to build over an existing db" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    const db_path = try tmpDbPath(&tmp, alloc, "onelibrary.db");
     defer alloc.free(db_path);
-    var w = try ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    var w = try onelibrary.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
     try w.close();
 
     try testing.expectError(
         error.LibraryAlreadyExists,
-        ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" }),
+        onelibrary.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" }),
     );
 }
 
 test "O3 close: WAL header flag like rb exports, no sidecars left" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    const db_path = try tmpDbPath(&tmp, alloc, "onelibrary.db");
     defer alloc.free(db_path);
-    var w = try ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    var w = try onelibrary.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
     // one written row, so the checkpoint has WAL frames to fold
     try w.db.exec("INSERT INTO content (content_id, path) VALUES (1, '/Contents/a.mp3');");
     try w.close();
 
     // the persisted WAL flag (header bytes 18/19: 2 = WAL, 1 = rollback)
-    const raw = try tmp.dir.readFileAlloc(io, "ol.db", alloc, .limited(1 << 20));
+    const raw = try tmp.dir.readFileAlloc(io, "onelibrary.db", alloc, .limited(1 << 20));
     defer alloc.free(raw);
     try testing.expect(raw.len >= 100);
     try testing.expectEqual(@as(u8, 2), raw[18]);
     try testing.expectEqual(@as(u8, 2), raw[19]);
 
     // rb's exports carry no sidecars
-    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "ol.db-wal", .{}));
-    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "ol.db-shm", .{}));
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "onelibrary.db-wal", .{}));
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "onelibrary.db-shm", .{}));
 
     // and the db reopens without a recovery dance
-    var db = try ol.Db.openPlaintext(io, db_path);
+    var db = try onelibrary.Db.openPlaintext(io, db_path);
     defer db.close();
     try testing.expectEqual(@as(i64, 1), try db.scalarInt("SELECT COUNT(*) FROM content;"));
     try testing.expectEqualStrings("ok", try integrityCheck(db));
 }
 
-fn integrityCheck(db: ol.Db) ![]const u8 {
+fn integrityCheck(db: onelibrary.Db) ![]const u8 {
     var stmt = try db.prepare("PRAGMA integrity_check;");
     defer stmt.finalize();
     try testing.expectEqual(.row, try stmt.step());
@@ -683,7 +683,7 @@ fn integrityCheck(db: ol.Db) ![]const u8 {
 }
 
 test "O3 round-trip: fixture models re-written into a fresh db are eql" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -691,14 +691,14 @@ test "O3 round-trip: fixture models re-written into a fresh db are eql" {
     defer fix_tmp.cleanup();
     var fixture = try openPlaintextFixtureDb(io, &fix_tmp, alloc);
     defer fixture.close();
-    var src = try ol.Library.load(alloc, fixture);
+    var src = try onelibrary.Library.load(alloc, fixture);
     defer src.deinit();
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    const db_path = try tmpDbPath(&tmp, alloc, "onelibrary.db");
     defer alloc.free(db_path);
-    var w = try ol.Writer.create(io, db_path, .{
+    var w = try onelibrary.Writer.create(io, db_path, .{
         .plaintext = true,
         .created_date = "2026-07-16",
         .my_tag_master_dbid = 3168300669,
@@ -715,33 +715,33 @@ test "O3 round-trip: fixture models re-written into a fresh db are eql" {
     for (src.contents) |row| try w.insertContent(row);
     try w.close();
 
-    var db = try ol.Db.openPlaintext(io, db_path);
+    var db = try onelibrary.Db.openPlaintext(io, db_path);
     defer db.close();
     try testing.expectEqualStrings("ok", try integrityCheck(db));
-    var dst = try ol.Library.load(alloc, db);
+    var dst = try onelibrary.Library.load(alloc, db);
     defer dst.deinit();
     try testing.expect(src.eql(&dst));
 }
 
 test "O3 mutate: numberOfContents maintenance on insert and delete" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    const db_path = try tmpDbPath(&tmp, alloc, "onelibrary.db");
     defer alloc.free(db_path);
-    var w = try ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    var w = try onelibrary.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
     defer w.db.close();
 
     try testing.expectEqual(@as(i64, 0), try w.numberOfContents());
-    try testing.expectEqual(@as(i64, 1), try w.nextId(ol.Content));
+    try testing.expectEqual(@as(i64, 1), try w.nextId(onelibrary.Content));
 
     try w.insertContent(.{ .content_id = 1, .path = "/Contents/a.mp3" });
     try w.insertContent(.{ .content_id = 2, .path = "/Contents/b.mp3", .rating = 3 });
     try testing.expectEqual(@as(i64, 2), try w.numberOfContents());
-    try testing.expectEqual(@as(i64, 3), try w.nextId(ol.Content));
+    try testing.expectEqual(@as(i64, 3), try w.nextId(onelibrary.Content));
 
     try w.deleteContent(1);
     try testing.expectEqual(@as(i64, 1), try w.numberOfContents());
@@ -749,33 +749,33 @@ test "O3 mutate: numberOfContents maintenance on insert and delete" {
     // count-derived: matches the table, and the property stays a singleton
     try testing.expectEqual(@as(i64, 1), try w.db.scalarInt("SELECT COUNT(*) FROM property;"));
     // MAX+1 reuses a deleted last id, like SQLite's own rowid assignment
-    try testing.expectEqual(@as(i64, 3), try w.nextId(ol.Content));
+    try testing.expectEqual(@as(i64, 3), try w.nextId(onelibrary.Content));
 }
 
 test "O3 mutate: playlist append is dense and 1-based" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    const db_path = try tmpDbPath(&tmp, alloc, "onelibrary.db");
     defer alloc.free(db_path);
-    var w = try ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    var w = try onelibrary.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
     defer w.db.close();
 
     try w.insertContent(.{ .content_id = 1, .path = "/Contents/a.mp3" });
     try w.insertContent(.{ .content_id = 2, .path = "/Contents/b.mp3" });
 
-    try w.insert(ol.Playlist{
-        .playlist_id = try w.nextId(ol.Playlist),
+    try w.insert(onelibrary.Playlist{
+        .playlist_id = try w.nextId(onelibrary.Playlist),
         .sequenceNo = 0,
         .name = "pl",
         .attribute = 0,
         .playlist_id_parent = 0,
     });
-    try w.insert(ol.Playlist{
-        .playlist_id = try w.nextId(ol.Playlist),
+    try w.insert(onelibrary.Playlist{
+        .playlist_id = try w.nextId(onelibrary.Playlist),
         .sequenceNo = 1,
         .name = "other",
         .attribute = 0,
@@ -787,7 +787,7 @@ test "O3 mutate: playlist append is dense and 1-based" {
     try testing.expectEqual(@as(i64, 2), try w.addContentToPlaylist(1, 2));
     try testing.expectEqual(@as(i64, 1), try w.addContentToPlaylist(2, 1));
 
-    var lib = try ol.Library.load(alloc, w.db);
+    var lib = try onelibrary.Library.load(alloc, w.db);
     defer lib.deinit();
     try testing.expectEqual(@as(usize, 3), lib.playlist_contents.len);
     const entries = lib.playlist_contents_by_playlist.get(1).?;
@@ -796,64 +796,64 @@ test "O3 mutate: playlist append is dense and 1-based" {
 }
 
 test "O3 mutate: insertAll batches rows atomically through one statement" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    const db_path = try tmpDbPath(&tmp, alloc, "onelibrary.db");
     defer alloc.free(db_path);
-    var w = try ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    var w = try onelibrary.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
     defer w.db.close();
 
     try w.insertAll(&.{
-        ol.Artist{ .artist_id = 1, .name = "A" },
-        ol.Artist{ .artist_id = 2, .name = "B" },
-        ol.Artist{ .artist_id = 3, .name = "C" },
+        onelibrary.Artist{ .artist_id = 1, .name = "A" },
+        onelibrary.Artist{ .artist_id = 2, .name = "B" },
+        onelibrary.Artist{ .artist_id = 3, .name = "C" },
     });
     // a Content batch maintains numberOfContents once, like insertContent
     try w.insertAll(&.{
-        ol.Content{ .content_id = 1, .path = "/Contents/a.mp3" },
-        ol.Content{ .content_id = 2, .path = "/Contents/b.mp3" },
+        onelibrary.Content{ .content_id = 1, .path = "/Contents/a.mp3" },
+        onelibrary.Content{ .content_id = 2, .path = "/Contents/b.mp3" },
     });
     try testing.expectEqual(@as(i64, 2), try w.numberOfContents());
-    try testing.expectEqual(@as(i64, 4), try w.nextId(ol.Artist));
+    try testing.expectEqual(@as(i64, 4), try w.nextId(onelibrary.Artist));
 
-    var lib = try ol.Library.load(alloc, w.db);
+    var lib = try onelibrary.Library.load(alloc, w.db);
     defer lib.deinit();
     try testing.expectEqual(@as(usize, 3), lib.artists.len);
-    try testing.expectEqualStrings("B", lib.byId(ol.Artist, 2).?.name.?);
+    try testing.expectEqualStrings("B", lib.byId(onelibrary.Artist, 2).?.name.?);
 
     // a duplicate key rolls the whole batch back
     try testing.expectError(error.Sqlite, w.insertAll(&.{
-        ol.Artist{ .artist_id = 4, .name = "D" },
-        ol.Artist{ .artist_id = 4, .name = "D again" },
+        onelibrary.Artist{ .artist_id = 4, .name = "D" },
+        onelibrary.Artist{ .artist_id = 4, .name = "D again" },
     }));
     try testing.expectEqual(@as(i64, 3), w.db.scalarInt("SELECT COUNT(*) FROM artist;"));
-    try testing.expectEqual(@as(i64, 4), try w.nextId(ol.Artist));
+    try testing.expectEqual(@as(i64, 4), try w.nextId(onelibrary.Artist));
 }
 
 test "O3 mutate: addAllToPlaylist batches dense appends through one statement" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    const db_path = try tmpDbPath(&tmp, alloc, "onelibrary.db");
     defer alloc.free(db_path);
-    var w = try ol.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
+    var w = try onelibrary.Writer.create(io, db_path, .{ .plaintext = true, .created_date = "2026-08-23" });
     defer w.db.close();
 
     try w.insertAll(&.{
-        ol.Content{ .content_id = 1, .path = "/Contents/a.mp3" },
-        ol.Content{ .content_id = 2, .path = "/Contents/b.mp3" },
-        ol.Content{ .content_id = 3, .path = "/Contents/c.mp3" },
+        onelibrary.Content{ .content_id = 1, .path = "/Contents/a.mp3" },
+        onelibrary.Content{ .content_id = 2, .path = "/Contents/b.mp3" },
+        onelibrary.Content{ .content_id = 3, .path = "/Contents/c.mp3" },
     });
     try w.insertAll(&.{
-        ol.Playlist{ .playlist_id = 1, .sequenceNo = 0, .name = "pl", .attribute = 0, .playlist_id_parent = 0 },
-        ol.Playlist{ .playlist_id = 2, .sequenceNo = 1, .name = "other", .attribute = 0, .playlist_id_parent = 0 },
+        onelibrary.Playlist{ .playlist_id = 1, .sequenceNo = 0, .name = "pl", .attribute = 0, .playlist_id_parent = 0 },
+        onelibrary.Playlist{ .playlist_id = 2, .sequenceNo = 1, .name = "other", .attribute = 0, .playlist_id_parent = 0 },
     });
 
     // The batch continues past a row already on disk, then stays dense
@@ -866,7 +866,7 @@ test "O3 mutate: addAllToPlaylist batches dense appends through one statement" {
         .{ .playlist_id = 2, .content_id = 1 },
     });
 
-    var lib = try ol.Library.load(alloc, w.db);
+    var lib = try onelibrary.Library.load(alloc, w.db);
     defer lib.deinit();
     try testing.expectEqual(@as(usize, 4), lib.playlist_contents.len);
     const pl1 = lib.playlist_contents_by_playlist.get(1).?;
@@ -878,27 +878,27 @@ test "O3 mutate: addAllToPlaylist batches dense appends through one statement" {
 }
 
 test "O3 create: keyed db is encrypted and reopens through the provider" {
-    if (ol.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode != .@"vendored-sqlcipher") return;
     const alloc = testing.allocator;
     const io = testing.io;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db_path = try tmpDbPath(&tmp, alloc, "ol.db");
+    const db_path = try tmpDbPath(&tmp, alloc, "onelibrary.db");
     defer alloc.free(db_path);
     {
-        var w = try ol.Writer.create(io, db_path, .{ .created_date = "2026-08-23" });
+        var w = try onelibrary.Writer.create(io, db_path, .{ .created_date = "2026-08-23" });
         try w.insertContent(.{ .content_id = 1, .path = "/Contents/a.mp3" });
         try w.close();
     }
 
     // page 1 starts with the plaintext salt, never the SQLite magic
-    const raw = try tmp.dir.readFileAlloc(io, "ol.db", alloc, .limited(1 << 20));
+    const raw = try tmp.dir.readFileAlloc(io, "onelibrary.db", alloc, .limited(1 << 20));
     defer alloc.free(raw);
     try testing.expect(raw.len >= 4096);
     try testing.expect(!std.mem.eql(u8, raw[0..16], "SQLite format 3\x00"));
 
-    var w = try ol.Writer.open(io, db_path);
+    var w = try onelibrary.Writer.open(io, db_path);
     defer w.db.close();
     try testing.expectEqual(@as(i64, 1), try w.numberOfContents());
     try testing.expectEqualStrings("ok", try integrityCheck(w.db));

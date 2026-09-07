@@ -4,24 +4,24 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const OlMode = enum { off, @"vendored-sqlcipher", @"system-sqlcipher" };
-    const ol_mode = b.option(
-        OlMode,
-        "ol",
+    const OneLibraryMode = enum { off, @"vendored-sqlcipher", @"system-sqlcipher" };
+    const onelibrary_mode = b.option(
+        OneLibraryMode,
+        "onelibrary",
         "OneLibrary store backend: vendored-sqlcipher (rl_-prefixed SQLCipher amalgamation, which embeds SQLite, via zig cc), system-sqlcipher (consumer-provided), or off",
     ) orelse .@"system-sqlcipher";
 
-    const ol_options = b.addOptions();
-    ol_options.addOption(OlMode, "ol", ol_mode);
+    const onelibrary_options = b.addOptions();
+    onelibrary_options.addOption(OneLibraryMode, "onelibrary", onelibrary_mode);
 
     // The vendored-sqlcipher build renames every sqlite3_/sqlcipher_ export to rl_*;
     // the system-sqlcipher build binds the consumer's own unprefixed SQLCipher.
-    const ol_c_header = switch (ol_mode) {
+    const onelibrary_c_header = switch (onelibrary_mode) {
         .@"system-sqlcipher" => "vendor/sqlcipher/sqlite3.h",
         .off, .@"vendored-sqlcipher" => "vendor/sqlcipher/rl_sqlite3.h",
     };
-    const ol_translate = b.addTranslateC(.{
-        .root_source_file = b.path(ol_c_header),
+    const onelibrary_translate = b.addTranslateC(.{
+        .root_source_file = b.path(onelibrary_c_header),
         .target = target,
         .optimize = optimize,
     });
@@ -34,11 +34,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "c", .module = ol_translate.createModule() },
-            .{ .name = "options", .module = ol_options.createModule() },
+            .{ .name = "c", .module = onelibrary_translate.createModule() },
+            .{ .name = "options", .module = onelibrary_options.createModule() },
         },
     });
-    switch (ol_mode) {
+    switch (onelibrary_mode) {
         .off => {},
         .@"vendored-sqlcipher" => {
             rekordlib.addCSourceFile(.{
@@ -88,11 +88,11 @@ pub fn build(b: *std.Build) void {
     // Symbol-prefix verification for the vendored amalgamation: every defined
     // global in the compiled object must be rl_-prefixed, so the vendored
     // SQLCipher cannot collide with a consumer-embedded one. Runs
-    // only via `zig build ol-symbols` (needs python3 + nm), so `zig build
+    // only via `zig build onelibrary-symbols` (needs python3 + nm), so `zig build
     // test` stays host-tool free; run it when regenerating the rename
     // artifacts from a new upstream.
-    const ol_symbols_step = b.step("ol-symbols", "Verify rl_ symbol prefixing of the vendored SQLCipher object");
-    if (ol_mode == .@"vendored-sqlcipher") {
+    const onelibrary_symbols_step = b.step("onelibrary-symbols", "Verify rl_ symbol prefixing of the vendored SQLCipher object");
+    if (onelibrary_mode == .@"vendored-sqlcipher") {
         const obj_mod = b.createModule(.{
             .target = b.graph.host,
             .root_source_file = b.path("vendor/sqlcipher/check_root.zig"),
@@ -108,7 +108,7 @@ pub fn build(b: *std.Build) void {
         });
         const verify = b.addSystemCommand(&.{ "python3", "tools/gen_prefix.py", "--verify" });
         verify.addFileArg(obj.getEmittedBin());
-        ol_symbols_step.dependOn(&verify.step);
+        onelibrary_symbols_step.dependOn(&verify.step);
     }
 
     const bench_mod = b.addModule("bench", .{

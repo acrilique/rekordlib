@@ -19,7 +19,7 @@
 //!   schema plus its seeded defaults), inserts rows over the read
 //!   models, and closes in the on-disk shape of rb's exports.
 //!
-//! Build modes (`-Dol=off|vendored-sqlcipher|system-sqlcipher`): `off` compiles this module's
+//! Build modes (`-Donelibrary=off|vendored-sqlcipher|system-sqlcipher`): `off` compiles this module's
 //! types away from the binary (every runtime entry point is guarded by a
 //! comptime `@compileError`); `vendored-sqlcipher` compiles the prefixed amalgamation
 //! with zig cc; `system-sqlcipher` binds the consumer's own unprefixed SQLCipher.
@@ -30,10 +30,10 @@ const util = @import("util.zig");
 const opts = @import("options");
 const c = @import("c");
 
-pub const mode = opts.ol;
+pub const mode = opts.onelibrary;
 
 fn olDisabled() noreturn {
-    @compileError("rekordlib was built with -Dol=off; rebuild with -Dol=vendored-sqlcipher (or =system-sqlcipher) to use the OneLibrary store");
+    @compileError("rekordlib was built with -Donelibrary=off; rebuild with -Donelibrary=vendored-sqlcipher (or =system-sqlcipher) to use the OneLibrary store");
 }
 
 /// off/vendored-sqlcipher bind `rl_`-renamed symbols (typedefs included; `off`
