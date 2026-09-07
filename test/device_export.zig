@@ -910,7 +910,7 @@ test "addTrack mirrors the analysis path when analysis pends" {
     defer alloc.free(tmp_path);
 
     var beats = [1]anlz.Beat{.{ .beat_number = 1, .tempo = 12_800, .time = 0 }};
-    const input = anlz.AnlzInput{ .beats = &beats };
+    const input = anlz.Analysis{ .beats = &beats };
 
     var ex = try device.DeviceExport.create(tmp_path, io, alloc);
     defer ex.deinit();
@@ -2151,16 +2151,16 @@ test "add track with analysis writes anlz files" {
 
     // Minimal analysis vector: one beat, one mono preview column, a
     // one-column color preview — enough for `.DAT` + `.EXT`, not `.2EX`.
-    // The `AnlzInput` slices are mutable, so the columns live in vars.
+    // The `Analysis` slices are mutable, so the columns live in vars.
     var beats = [1]anlz.Beat{.{ .beat_number = 1, .tempo = 12_800, .time = 0 }};
     var preview_mono = [1]anlz.WaveformPreviewColumn{.{ .height = 1, .whiteness = 0 }};
     var color_preview = [1]anlz.WaveformColorPreviewColumn{.{
-        .energy_bottom_half_freq = 10,
-        .energy_bottom_third_freq = 20,
-        .energy_mid_third_freq = 30,
-        .energy_top_third_freq = 40,
+        .energy_low_wide = 10,
+        .energy_low = 20,
+        .energy_mid = 30,
+        .energy_high = 40,
     }};
-    const input = anlz.AnlzInput{
+    const input = anlz.Analysis{
         .beats = &beats,
         .cue_list_type = .memory_cues,
         .preview_mono = &preview_mono,
@@ -2983,7 +2983,7 @@ test "track views join both databases by path" {
             try testing.expectEqualStrings("Cecille", track.label);
             try testing.expectEqual(@as(usize, 0), track.key.len);
             // Centi-BPM decoded; the fixture row carries 12_900.
-            try testing.expectEqual(@as(f32, 129.0), track.tempo_bpm);
+            try testing.expectEqual(@as(f32, 129.0), track.tempo);
             try testing.expectEqual(@as(u8, 4), track.rating);
             try testing.expect(track.has_analysis);
             // The OL half: fields the pdb lacks.
@@ -3083,7 +3083,7 @@ test "updateTrack patches both databases and preserves untouched fields" {
     try testing.expectEqual(@as(u32, 2), v.id);
     try testing.expectEqualStrings("Bako (Remaster)", v.title);
     try testing.expectEqualStrings("Someone Else", v.artist);
-    try testing.expectEqual(@as(f32, 130.0), v.tempo_bpm);
+    try testing.expectEqual(@as(f32, 130.0), v.tempo);
     try testing.expectEqual(@as(u8, 5), v.rating);
     try testing.expect(!v.publish_track_information);
     try testing.expectEqualStrings("2026-08-31", v.analyze_date);
@@ -3295,7 +3295,7 @@ test "a pending rename retargets queued analysis before the first save" {
     defer alloc.free(root);
 
     var beats = [1]anlz.Beat{.{ .beat_number = 1, .tempo = 12_800, .time = 0 }};
-    const input = anlz.AnlzInput{ .beats = &beats, .cue_list_type = .memory_cues };
+    const input = anlz.Analysis{ .beats = &beats, .cue_list_type = .memory_cues };
 
     const first_path = "/Contents/test.mp3";
     const renamed_path = "/Contents/renamed.mp3";

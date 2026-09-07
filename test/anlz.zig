@@ -475,11 +475,11 @@ test "waveform sections roundtrip with checks" {
     };
     var tiny = [_]anlz.TinyWaveformPreviewColumn{.{ .height = 9, .unused = 3 }};
     var color_preview = [_]anlz.WaveformColorPreviewColumn{
-        .{ .unknown1 = 1, .unknown2 = 2, .energy_bottom_half_freq = 3, .energy_bottom_third_freq = 4, .energy_mid_third_freq = 5, .energy_top_third_freq = 6 },
+        .{ .mono_max = 1, .mono_min = 2, .energy_low_wide = 3, .energy_low = 4, .energy_mid = 5, .energy_high = 6 },
     };
     var color_detail = [_]anlz.WaveformColorDetailColumn{.{ .red = 5, .green = 3, .blue = 7, .height = 31, .unknown = 1 }};
-    var band_preview = [_]anlz.Waveform3BandColumn{.{ .energy_mid_third_freq = 1, .energy_top_third_freq = 2, .energy_bottom_third_freq = 3 }};
-    var band_detail = [_]anlz.Waveform3BandColumn{.{ .energy_mid_third_freq = 4, .energy_top_third_freq = 5, .energy_bottom_third_freq = 6 }};
+    var band_preview = [_]anlz.Waveform3BandColumn{.{ .energy_mid = 1, .energy_high = 2, .energy_low = 3 }};
+    var band_detail = [_]anlz.Waveform3BandColumn{.{ .energy_mid = 4, .energy_high = 5, .energy_low = 6 }};
     const sections = [_]anlz.Content{
         .{ .waveform_preview = .{ .data = &preview } },
         .{ .tiny_waveform_preview = .{ .data = &tiny } },
@@ -1007,20 +1007,20 @@ test "column stats build drives the analyzer laws" {
     // values land in the quantizers' 0-128 domain (the input domain is
     // 0-255, a straight copy would overshoot 2×).
     try testing.expect(std.meta.eql(columns.band3_detail[0], columns.band3_detail[7]));
-    try testing.expect(columns.band3_detail[0].energy_mid_third_freq <= 128);
-    try testing.expect(columns.band3_detail[0].energy_top_third_freq <= 128);
-    try testing.expect(columns.band3_detail[0].energy_bottom_third_freq <= 128);
+    try testing.expect(columns.band3_detail[0].energy_mid <= 128);
+    try testing.expect(columns.band3_detail[0].energy_high <= 128);
+    try testing.expect(columns.band3_detail[0].energy_low <= 128);
 
     // PWV4: span maxima — mono 30 → 15 with the two's-complement min
     // mirror, the low band 10 → 5, and the shares 10²/60·128 → 0,
     // 20²/60·128 → 3, 30²/60·128 → 7.
     try testing.expectEqual(anlz.WaveformColorPreviewColumn{
-        .unknown1 = 15,
-        .unknown2 = 241,
-        .energy_bottom_half_freq = 5,
-        .energy_bottom_third_freq = 0,
-        .energy_mid_third_freq = 3,
-        .energy_top_third_freq = 7,
+        .mono_max = 15,
+        .mono_min = 241,
+        .energy_low_wide = 5,
+        .energy_low = 0,
+        .energy_mid = 3,
+        .energy_high = 7,
     }, columns.color_preview[0]);
 
     // PWAV: a constant track calibrates every span to the AGC ceiling 23;
@@ -1042,8 +1042,8 @@ test "column stats previews aggregate their spans" {
     defer columns.deinit(alloc);
 
     // 12000 columns → 10 per PWV4 span.
-    try testing.expectEqual(@as(u8, 100), columns.color_preview[0].unknown1); // 200·128/256
-    try testing.expectEqual(@as(u8, 5), columns.color_preview[1].unknown1); // 10·128/256
+    try testing.expectEqual(@as(u8, 100), columns.color_preview[0].mono_max); // 200·128/256
+    try testing.expectEqual(@as(u8, 5), columns.color_preview[1].mono_max); // 10·128/256
 
     // PWAV spans hold 30 columns: span 0's mean level is
     // (29·1280 + 25600)/30 ≈ 2091 against 1280 elsewhere — the loudest
@@ -1113,13 +1113,13 @@ test "column stats PWV7 envelope decays like the analyzer" {
     const columns = try anlz.buildColumnsFromBands(alloc, &bands);
     defer columns.deinit(alloc);
     // Instant attack, exponential decay: strictly decreasing after the
-    // impulse and silent by the tail. The high band rides the
-    // bottom-third field (wire order); the other bands stay silent.
-    try testing.expect(columns.band3_detail[0].energy_bottom_third_freq > columns.band3_detail[1].energy_bottom_third_freq);
-    try testing.expect(columns.band3_detail[1].energy_bottom_third_freq > columns.band3_detail[2].energy_bottom_third_freq);
-    try testing.expectEqual(@as(u8, 0), columns.band3_detail[500].energy_bottom_third_freq);
-    try testing.expectEqual(@as(u8, 0), columns.band3_detail[0].energy_mid_third_freq);
-    try testing.expectEqual(@as(u8, 0), columns.band3_detail[0].energy_top_third_freq);
+    // impulse and silent by the tail. The impulse rides the high band's
+    // cosine quantizer; the other bands stay silent.
+    try testing.expect(columns.band3_detail[0].energy_high > columns.band3_detail[1].energy_high);
+    try testing.expect(columns.band3_detail[1].energy_high > columns.band3_detail[2].energy_high);
+    try testing.expectEqual(@as(u8, 0), columns.band3_detail[500].energy_high);
+    try testing.expectEqual(@as(u8, 0), columns.band3_detail[0].energy_low);
+    try testing.expectEqual(@as(u8, 0), columns.band3_detail[0].energy_mid);
 }
 
 test "empty waveform input produces empty sections" {
@@ -1193,7 +1193,7 @@ test "cue building point and loop" {
 test "built anlz input assembles consistently" {
     // Port of rekordcrate's build_anlz_input_assembles_consistently: a
     // populated performance data plus a column set yields a non-empty
-    // AnlzInput whose waveform sections are internally consistent (detail
+    // Analysis whose waveform sections are internally consistent (detail
     // == band count, preview ~1/22) and whose main cue was prepended to the
     // cue list.
     const alloc = testing.allocator;
@@ -1204,11 +1204,11 @@ test "built anlz input assembles consistently" {
         .{ .index = 5, .sample_offset = 60.0 / 120.0 * @as(f64, @floatFromInt(sr)) * 4.0 },
     };
     var columns = try anlz.buildColumnsFromBands(alloc, &bands);
-    defer columns.deinit(alloc); // moved-from: no-op once buildAnlzInput runs
-    const input = try anlz.buildAnlzInput(alloc, .{
+    defer columns.deinit(alloc); // moved-from: no-op once buildAnalysis runs
+    const input = try anlz.buildAnalysis(alloc, .{
         .sample_rate = sr,
         .sample_count = sr,
-        .bpm = 120.0,
+        .tempo = 120.0,
         .beatgrid = &markers,
         .main_cue = 0.0,
         .cues = &.{.{ .hot_cue = 1, .sample_offset = @floatFromInt(sr), .label = "x" }},
@@ -1228,7 +1228,7 @@ test "built anlz input assembles consistently" {
 }
 
 test "built anlz input serializes and re-parses" {
-    // Ours (no rekordcrate counterpart): a built AnlzInput, assembled into the
+    // Ours (no rekordcrate counterpart): a built Analysis, assembled into the
     // section sets the device writer will emit (.DAT/.EXT/.2EX, each led
     // by a PPTH path section), serializes, re-parses with equal data, and
     // roundtrips byte-identical — constructed output is valid ANLZ end to
@@ -1241,11 +1241,11 @@ test "built anlz input serializes and re-parses" {
         .{ .index = 5, .sample_offset = 60.0 / 120.0 * @as(f64, @floatFromInt(sr)) * 4.0 },
     };
     var columns = try anlz.buildColumnsFromBands(alloc, &bands);
-    defer columns.deinit(alloc); // moved-from: no-op once buildAnlzInput runs
-    const input = try anlz.buildAnlzInput(alloc, .{
+    defer columns.deinit(alloc); // moved-from: no-op once buildAnalysis runs
+    const input = try anlz.buildAnalysis(alloc, .{
         .sample_rate = sr,
         .sample_count = sr,
-        .bpm = 120.0,
+        .tempo = 120.0,
         .beatgrid = &markers,
         .main_cue = 0.0,
         .cues = &.{.{ .hot_cue = 1, .sample_offset = @floatFromInt(sr), .label = "Brëak", .r = 0x4D, .b = 0xFF }},
@@ -1318,12 +1318,12 @@ test "built anlz input serializes and re-parses" {
     // shares 50²/300·128/256 = 4, 100²/300·128/256 = 16, 150²/300·128/256
     // = 37.
     try testing.expectEqual(anlz.WaveformColorPreviewColumn{
-        .unknown1 = 75,
-        .unknown2 = 181,
-        .energy_bottom_half_freq = 25,
-        .energy_bottom_third_freq = 4,
-        .energy_mid_third_freq = 16,
-        .energy_top_third_freq = 37,
+        .mono_max = 75,
+        .mono_min = 181,
+        .energy_low_wide = 25,
+        .energy_low = 4,
+        .energy_mid = 16,
+        .energy_high = 37,
     }, color_preview.data[0]);
     const color_detail = ext_parsed.findSection(.waveform_color_detail).?;
     try testing.expectEqual(@as(usize, 150), color_detail.data.len);
@@ -1353,14 +1353,14 @@ test "built anlz input serializes and re-parses" {
     // PWV7's envelope is the value itself — 128/32768·(6400, 12800) =
     // (25, 50) linear, (64 − cos(π·19200/32768)·64) = 81 quadratic.
     try testing.expectEqual(anlz.Waveform3BandColumn{
-        .energy_mid_third_freq = 12,
-        .energy_top_third_freq = 50,
-        .energy_bottom_third_freq = 75,
+        .energy_low = 12,
+        .energy_mid = 50,
+        .energy_high = 75,
     }, band3_preview.data[0]);
     try testing.expectEqual(anlz.Waveform3BandColumn{
-        .energy_mid_third_freq = 25,
-        .energy_top_third_freq = 50,
-        .energy_bottom_third_freq = 81,
+        .energy_low = 25,
+        .energy_mid = 50,
+        .energy_high = 81,
     }, band3_detail.data[0]);
 }
 
@@ -1443,12 +1443,10 @@ test "builders pin preview widths and analyzer-law ranges against fixtures" {
 
         const bands = try alloc.alloc(anlz.Band, pwv7.data.len);
         defer alloc.free(bands);
-        // The wire order puts the low band in the mid-third field (see
-        // buildColumnsFromPcm's assembly note).
         for (pwv7.data, 0..) |column, i| bands[i] = .{
-            .low = column.energy_mid_third_freq,
-            .mid = column.energy_top_third_freq,
-            .high = column.energy_bottom_third_freq,
+            .low = column.energy_low,
+            .mid = column.energy_mid,
+            .high = column.energy_high,
         };
         const columns = try anlz.buildColumnsFromBands(alloc, bands);
         defer columns.deinit(alloc);
@@ -1468,9 +1466,9 @@ test "builders pin preview widths and analyzer-law ranges against fixtures" {
         for (columns.detail_mono) |column| max_h = @max(max_h, column.height);
         try testing.expectEqual(@as(u5, 31), max_h);
         for (columns.band3_detail) |column| {
-            try testing.expect(column.energy_mid_third_freq <= 128);
-            try testing.expect(column.energy_top_third_freq <= 128);
-            try testing.expect(column.energy_bottom_third_freq <= 128);
+            try testing.expect(column.energy_mid <= 128);
+            try testing.expect(column.energy_high <= 128);
+            try testing.expect(column.energy_low <= 128);
         }
     }
 }
@@ -1752,9 +1750,9 @@ fn expectAnalysisMatches(analysis: *const anlz.WaveformColumns, f: *const Analys
     if (failed == null) for (0..1200) |i| {
         const col = analysis.color_preview[i];
         const b = f.pwv4[i * 6 ..][0..6];
-        if (col.unknown1 != b[0] or col.unknown2 != b[1] or
-            col.energy_bottom_half_freq != b[2] or col.energy_bottom_third_freq != b[3] or
-            col.energy_mid_third_freq != b[4] or col.energy_top_third_freq != b[5])
+        if (col.mono_max != b[0] or col.mono_min != b[1] or
+            col.energy_low_wide != b[2] or col.energy_low != b[3] or
+            col.energy_mid != b[4] or col.energy_high != b[5])
         {
             failed = "PWV4";
             bad_index = i;
@@ -1771,8 +1769,8 @@ fn expectAnalysisMatches(analysis: *const anlz.WaveformColumns, f: *const Analys
     if (failed == null) for (0..1200) |i| {
         const col = analysis.band3_preview[i];
         const b = f.pwv6[i * 3 ..][0..3];
-        if (col.energy_mid_third_freq != b[0] or col.energy_top_third_freq != b[1] or
-            col.energy_bottom_third_freq != b[2])
+        if (col.energy_low != b[0] or col.energy_mid != b[1] or
+            col.energy_high != b[2])
         {
             failed = "PWV6";
             bad_index = i;
@@ -1782,8 +1780,8 @@ fn expectAnalysisMatches(analysis: *const anlz.WaveformColumns, f: *const Analys
     if (failed == null) for (0..analysis.band3_detail.len) |i| {
         const col = analysis.band3_detail[i];
         const b = f.pwv7[i * 3 ..][0..3];
-        if (col.energy_mid_third_freq != b[0] or col.energy_top_third_freq != b[1] or
-            col.energy_bottom_third_freq != b[2])
+        if (col.energy_low != b[0] or col.energy_mid != b[1] or
+            col.energy_high != b[2])
         {
             failed = "PWV7";
             bad_index = i;
@@ -1820,10 +1818,10 @@ test "buildColumnsFromPcm reproduces the fixtures byte-for-byte" {
         defer alloc.free(fixture_path);
         var fixture = try AnalysisFixture.read(alloc, fixture_path);
         defer fixture.deinit(alloc);
-        var analysis = try anlz.buildColumnsFromPcm(alloc, .{
+        var analysis = try anlz.buildColumnsFromPcm(alloc, .{ .planar = .{
             .left = fixture.left,
             .right = fixture.right,
-        });
+        } });
         defer analysis.deinit(alloc);
         errdefer std.debug.print("failing fixture: {s}\n", .{entry.path});
         try expectAnalysisMatches(&analysis, &fixture);
@@ -1837,10 +1835,10 @@ test "buildColumnsFromPcm encodes digital silence exactly like the analyzer" {
     // A short all-zero track reproduces every section's silence encoding.
     const alloc = testing.allocator;
     const zeros = [_]f32{0} ** 11025; // 0.25 s
-    var analysis = try anlz.buildColumnsFromPcm(alloc, .{
+    var analysis = try anlz.buildColumnsFromPcm(alloc, .{ .planar = .{
         .left = &zeros,
         .right = &zeros,
-    });
+    } });
     defer analysis.deinit(alloc);
 
     try testing.expectEqual(@as(usize, 400), analysis.preview_mono.len);
@@ -1859,18 +1857,18 @@ test "buildColumnsFromPcm encodes digital silence exactly like the analyzer" {
         try testing.expectEqual(anlz.Silence.color_detail_column, @as(u16, @bitCast(col)));
     }
     for (analysis.color_preview) |col| {
-        try testing.expectEqual(@as(u8, 0), col.unknown1);
-        try testing.expectEqual(@as(u8, 0), col.unknown2);
-        try testing.expectEqual(@as(u8, 0), col.energy_bottom_half_freq);
-        try testing.expectEqual(@as(u8, 0), col.energy_mid_third_freq);
+        try testing.expectEqual(@as(u8, 0), col.mono_max);
+        try testing.expectEqual(@as(u8, 0), col.mono_min);
+        try testing.expectEqual(@as(u8, 0), col.energy_low_wide);
+        try testing.expectEqual(@as(u8, 0), col.energy_mid);
     }
     for (analysis.band3_preview) |col| {
-        try testing.expectEqual(@as(u8, 0), col.energy_mid_third_freq);
-        try testing.expectEqual(@as(u8, 0), col.energy_top_third_freq);
-        try testing.expectEqual(@as(u8, 0), col.energy_bottom_third_freq);
+        try testing.expectEqual(@as(u8, 0), col.energy_mid);
+        try testing.expectEqual(@as(u8, 0), col.energy_high);
+        try testing.expectEqual(@as(u8, 0), col.energy_low);
     }
     for (analysis.band3_detail) |col| {
-        try testing.expectEqual(@as(u8, 0), col.energy_mid_third_freq);
+        try testing.expectEqual(@as(u8, 0), col.energy_low);
     }
     // Silence keeps the engine's initial auto-gain scales (1.0 ×100).
     try testing.expectEqual([3]u16{ 100, 100, 100 }, analysis.band3_scales);
@@ -1879,10 +1877,51 @@ test "buildColumnsFromPcm encodes digital silence exactly like the analyzer" {
 test "buildColumnsFromPcm requires stereo" {
     const alloc = testing.allocator;
     const zeros = [_]f32{0} ** 128;
-    try testing.expectError(error.ChannelMismatch, anlz.buildColumnsFromPcm(alloc, .{
+    try testing.expectError(error.ChannelMismatch, anlz.buildColumnsFromPcm(alloc, .{ .planar = .{
         .left = &zeros,
         .right = zeros[0..64],
-    }));
+    } }));
+}
+
+test "PcmInput accepts interleaved and mono input" {
+    // Interleaved and mono feed the engines the same planar samples as
+    // their planar equivalents, so the columns come out identical.
+    const alloc = testing.allocator;
+    var fixture = try AnalysisFixture.read(alloc, "analysis/sine440_a05.pcm");
+    defer fixture.deinit(alloc);
+
+    const frames = try alloc.alloc(f32, fixture.left.len * 2);
+    defer alloc.free(frames);
+    for (fixture.left, fixture.right, 0..) |l, r, i| {
+        frames[i * 2] = l;
+        frames[i * 2 + 1] = r;
+    }
+
+    // The interleaved path still reproduces the fixture byte-for-byte.
+    var via_interleaved = try anlz.buildColumnsFromPcm(alloc, .{ .interleaved = frames });
+    defer via_interleaved.deinit(alloc);
+    try expectAnalysisMatches(&via_interleaved, &fixture);
+
+    // The mono path is exactly planar with the channel duplicated.
+    var via_mono = try anlz.buildColumnsFromPcm(alloc, .{ .mono = fixture.left });
+    defer via_mono.deinit(alloc);
+    var planar_duped = try anlz.buildColumnsFromPcm(alloc, .{ .planar = .{
+        .left = fixture.left,
+        .right = fixture.left,
+    } });
+    defer planar_duped.deinit(alloc);
+    try testing.expectEqualSlices(anlz.WaveformPreviewColumn, via_mono.preview_mono, planar_duped.preview_mono);
+    try testing.expectEqualSlices(anlz.TinyWaveformPreviewColumn, via_mono.tiny_preview, planar_duped.tiny_preview);
+    try testing.expectEqualSlices(anlz.WaveformPreviewColumn, via_mono.detail_mono, planar_duped.detail_mono);
+    try testing.expectEqualSlices(anlz.WaveformColorPreviewColumn, via_mono.color_preview, planar_duped.color_preview);
+    try testing.expectEqualSlices(anlz.WaveformColorDetailColumn, via_mono.color_detail, planar_duped.color_detail);
+    try testing.expectEqualSlices(anlz.Waveform3BandColumn, via_mono.band3_preview, planar_duped.band3_preview);
+    try testing.expectEqualSlices(anlz.Waveform3BandColumn, via_mono.band3_detail, planar_duped.band3_detail);
+    try testing.expectEqual(via_mono.band3_scales, planar_duped.band3_scales);
+
+    // An odd-length interleaved buffer is a channel mismatch.
+    const odd = [_]f32{ 0, 0, 0 };
+    try testing.expectError(error.ChannelMismatch, anlz.buildColumnsFromPcm(alloc, .{ .interleaved = &odd }));
 }
 
 test "findSection matches sections by variant, not stored kind" {
@@ -1912,10 +1951,10 @@ test "PWV2 zero-code rule: 1 when both accumulators are zero, 2 when only band 2
     const alloc = testing.allocator;
     var fixture = try AnalysisFixture.read(alloc, "analysis/clicks.pcm");
     defer fixture.deinit(alloc);
-    var analysis = try anlz.buildColumnsFromPcm(alloc, .{
+    var analysis = try anlz.buildColumnsFromPcm(alloc, .{ .planar = .{
         .left = fixture.left,
         .right = fixture.right,
-    });
+    } });
     defer analysis.deinit(alloc);
     try expectAnalysisMatches(&analysis, &fixture);
 
@@ -1931,19 +1970,19 @@ test "PWV2 zero-code rule: 1 when both accumulators are zero, 2 when only band 2
     try testing.expectEqual(@as(usize, 1), twos);
 }
 
-test "buildAnlzInput moves the analysis columns into an input" {
+test "buildAnalysis moves the analysis columns into an input" {
     const alloc = testing.allocator;
     var fixture = try AnalysisFixture.read(alloc, "analysis/sine440_a05.pcm");
     defer fixture.deinit(alloc);
-    var columns = try anlz.buildColumnsFromPcm(alloc, .{
+    var columns = try anlz.buildColumnsFromPcm(alloc, .{ .planar = .{
         .left = fixture.left,
         .right = fixture.right,
-    });
-    defer columns.deinit(alloc); // moved-from: no-op once buildAnlzInput runs
+    } });
+    defer columns.deinit(alloc); // moved-from: no-op once buildAnalysis runs
     const detail_len = columns.detail_mono.len;
     const preview_ptr = columns.preview_mono.ptr;
 
-    var input = try anlz.buildAnlzInput(alloc, .{ .sample_rate = 44_100, .sample_count = fixture.n }, &columns);
+    var input = try anlz.buildAnalysis(alloc, .{ .sample_rate = 44_100, .sample_count = fixture.n }, &columns);
     defer input.deinit(alloc);
 
     // The slices moved, not copied: the columns are empty and the input

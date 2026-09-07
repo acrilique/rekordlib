@@ -557,9 +557,9 @@ pub const TrackInput = struct {
     /// files for `save` (each sibling only when its section set carries
     /// data) and stores the device `.DAT` path in `analyze_path`. Beats
     /// and cues are always caller-provided — the library does not do
-    /// beat detection; see `anlz.buildAnlzInput` for assembling one from
+    /// beat detection; see `anlz.buildAnalysis` for assembling one from
     /// performance data and waveform columns.
-    analysis: ?*const anlz.AnlzInput = null,
+    analysis: ?*const anlz.Analysis = null,
 
     // OneLibrary-only data: columns that exist in `exportLibrary.db`
     // and never reach the pdb. Ignored when the export carries no OL db
@@ -680,7 +680,7 @@ pub const TrackView = struct {
     /// Device path the Artwork row names; empty = none.
     artwork_device_path: []const u8,
     /// Tempo in BPM, decoded from the pdb's centi-BPM.
-    tempo_bpm: f32,
+    tempo: f32,
     bitrate: u32,
     sample_rate: u32,
     sample_depth: u16,
@@ -829,7 +829,7 @@ pub const RelocateError =
 
 /// One serialized ANLZ file waiting for the next `save`: the host path it
 /// lands at, plus its image. `addTrack` serializes eagerly so the
-/// caller's `AnlzInput` can go away and `save` only moves bytes.
+/// caller's `Analysis` can go away and `save` only moves bytes.
 const PendingAnlz = struct {
     path: []u8,
     image: []u8,
@@ -3401,7 +3401,7 @@ fn fillTrackView(
         .file_path = try decodeOrEmpty(s.file_path, a),
         .filename = try decodeOrEmpty(s.filename, a),
         .artwork_device_path = dimName(&dims.artwork, row.artwork_id),
-        .tempo_bpm = @as(f32, @floatFromInt(row.tempo)) / 100.0,
+        .tempo = @as(f32, @floatFromInt(row.tempo)) / 100.0,
         .bitrate = row.bitrate,
         .sample_rate = row.sample_rate,
         .sample_depth = row.sample_depth,
