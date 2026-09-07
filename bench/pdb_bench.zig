@@ -2,8 +2,7 @@
 // v. 2.0. If a copy of the MPL was not distributed with this file, You can
 // obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Benchmarks for the hot paths of the pdb module, so optimizations can be
-//! compared objectively against the unoptimized code (see `docs/BENCH.md`).
+//! Benchmarks for the hot paths of the pdb module.
 //!
 //! Run from the package root:
 //!
@@ -17,8 +16,7 @@
 //!
 //! Every iteration is timed separately; the report shows min, median, and
 //! mean, plus a throughput figure derived from the per-iteration workload.
-//! Compare runs only within the same build mode and machine; the min is the
-//! most noise-resistant figure.
+//! Compare runs only within the same build mode and machine.
 
 const std = @import("std");
 const pdb = @import("rekordlib").pdb;

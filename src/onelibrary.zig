@@ -1022,8 +1022,9 @@ pub const Library = struct {
     /// Reads every table of an open db (keyed or plaintext — the models
     /// do not differ); more than one `property` row is a `SchemaMismatch`.
     ///
-    /// Every decoded byte draws through a `budget.Budget` capped at four
-    /// times the main file's size: a same-schema source that generates
+    /// Every decoded byte draws through a `budget.Budget` capped at
+    /// `budget.multiplier` (eight) times the main file's size: a
+    /// same-schema source that generates
     /// rows from thin air — a VIEW over a recursive CTE with matching
     /// column aliases — fails with `LibraryTooLarge` instead of
     /// exhausting memory, and so does any other amplifying source.

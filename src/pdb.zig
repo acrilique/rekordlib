@@ -2545,8 +2545,9 @@ pub const Database = struct {
     /// verbatim instead of failing the database, mirroring the pages the
     /// format does not model.
     ///
-    /// Every decoded byte draws through a `budget.Budget` capped at four
-    /// times the input: a hostile file whose declared structure amplifies
+    /// Every decoded byte draws through a `budget.Budget` capped at
+    /// `budget.multiplier` (eight) times the input: a hostile file whose
+    /// declared structure amplifies
     /// (offsets aliasing one string, one row decoded per presence slot)
     /// fails with `DatabaseTooLarge` instead of exhausting memory. On
     /// success the parsed rows are trusted content, so the ceiling rises
