@@ -332,6 +332,69 @@ pub const Settings = struct {
     my_setting2: ?setting.MySetting2 = null,
 };
 
+/// Field patches for one `*SETTING.DAT` payload — the write shape
+/// `writeSettings` applies field by field, like `TrackPatch` does for
+/// `updateTrack`: `null` leaves the field as it is, a value replaces it.
+/// Generated from `SettingPayload(kind)`; the verbatim `unknown*` bytes are
+/// not patchable — they survive load-modify-write whole-file writes
+/// (`wholeSetting`) and otherwise pass through from the file being patched.
+pub fn SettingPatch(comptime kind: SettingKind) type {
+    const Payload = SettingPayload(kind);
+    comptime var n: usize = 0;
+    for (@typeInfo(Payload).@"struct".fields) |field| {
+        if (!std.mem.startsWith(u8, field.name, "unknown")) n += 1;
+    }
+    var names: [n][]const u8 = undefined;
+    var types: [n]type = undefined;
+    var attrs: [n]std.builtin.Type.StructField.Attributes = undefined;
+    var i: usize = 0;
+    for (@typeInfo(Payload).@"struct".fields) |field| {
+        if (std.mem.startsWith(u8, field.name, "unknown")) continue;
+        names[i] = field.name;
+        types[i] = ?field.type;
+        attrs[i] = .{ .default_value_ptr = &@as(?field.type, null) };
+        i += 1;
+    }
+    return @Struct(.auto, null, &names, &types, &attrs);
+}
+
+/// Field patches for `writeSettings`: a `null` field leaves that
+/// `*SETTING.DAT` file untouched; a patch applies onto the file's current
+/// value — the payload a previous patch left pending, else the file on disk
+/// when it parses, else the Rekordbox default (the shape a `create`d export
+/// lands) — so successive patches to one file overlay and nothing a later
+/// patch leaves `null` resets. The merged payload replaces the whole file
+/// at the next `save`.
+pub const SettingsPatch = struct {
+    dev_setting: ?SettingPatch(.dev_setting) = null,
+    djm_my_setting: ?SettingPatch(.djm_my_setting) = null,
+    my_setting: ?SettingPatch(.my_setting) = null,
+    my_setting2: ?SettingPatch(.my_setting2) = null,
+};
+
+/// The whole-payload form of a settings patch — every field set — for
+/// handing a fully-built payload (say, `loadSettings` output, edited or
+/// not) to `writeSettings` in one piece. This is the load-modify-write
+/// route; it is also the only way to set the verbatim `unknown*` bytes to
+/// anything but their defaults.
+pub fn wholeSetting(payload: anytype) SettingPatch(settingKindOf(@TypeOf(payload))) {
+    const Patch = SettingPatch(settingKindOf(@TypeOf(payload)));
+    var patch: Patch = .{};
+    inline for (@typeInfo(Patch).@"struct".fields) |field| {
+        @field(patch, field.name) = @field(payload, field.name);
+    }
+    return patch;
+}
+
+/// The setting kind whose payload is `Payload`, for `wholeSetting`'s type
+/// math; any other type is a compile error.
+fn settingKindOf(comptime Payload: type) SettingKind {
+    inline for (dat_files) |dat| {
+        if (SettingPayload(dat.kind) == Payload) return dat.kind;
+    }
+    @compileError(@typeName(Payload) ++ " is not a setting payload");
+}
+
 /// Size cap when reading a `*SETTING.DAT` file; the largest known payload
 /// is a few hundred bytes.
 const dat_limit = std.Io.Limit.limited(1 << 16);
@@ -340,6 +403,11 @@ const dat_limit = std.Io.Limit.limited(1 << 16);
 /// directory, or a setting file that exists but could not be examined —
 /// unreadable, over the read cap, or memory ran out.
 pub const LoadSettingsError = std.Io.Dir.ReadFileAllocError || std.Io.Dir.OpenError;
+
+/// Error of `DeviceExport.writeSettings`: reading the `*SETTING.DAT` file
+/// a patch's first overlay loads as its base (unreadable, over the read
+/// cap, or memory ran out). Serialization is `save`'s to fail.
+pub const WriteSettingsError = std.Io.Dir.ReadFileAllocError;
 
 /// Reads and parses one `*SETTING.DAT` file. A missing or unparseable
 /// file yields null — old exports genuinely lack files — while errors
@@ -461,6 +529,7 @@ pub const SaveError =
     AtomicWriteError ||
     std.Io.Dir.DeleteFileError ||
     RelocateError ||
+    bin.WriteError ||
     onelibrary.Writer.CreateError ||
     onelibrary.SqlError ||
     OlMirrorError ||
@@ -1005,9 +1074,13 @@ pub const DeviceExport = struct {
     /// The export's pdb, loaded on the first pdb-touching call — a
     /// settings-only session never parses it.
     pdb_state: PdbState = .unloaded,
-    /// Serialized default `*SETTING.DAT` images waiting for the first
-    /// `save` of a created export; always null for opened ones.
-    pending_settings: ?[dat_files.len][]u8 = null,
+    /// Merged `*SETTING.DAT` payloads queued for the next `save`: the
+    /// four defaults on a `create`d export, or exactly the files a
+    /// `writeSettings` patch named on any export, each overlaid onto its
+    /// base (a previous patch, else the disk copy, else the default).
+    /// Null fields stay untouched on disk; the queue drops once fully
+    /// drained. Plain data — nothing to free.
+    pending_settings: ?Settings = null,
     /// The writer's cached scan of the export — id counters and dedup
     /// maps — null until `writerState` builds it on first use.
     writer_state: ?WriterState = null,
@@ -1155,12 +1228,9 @@ pub const DeviceExport = struct {
         try pdb.insertDefaultColumns(&db);
         try pdb.insertDefaultMenus(&db);
 
-        var pending: [dat_files.len][]u8 = undefined;
-        var pending_filled: usize = 0;
-        errdefer for (pending[0..pending_filled]) |bytes| alloc.free(bytes);
+        var pending: Settings = .{};
         inline for (dat_files) |dat| {
-            pending[pending_filled] = try setting.Setting(SettingPayload(dat.kind)).default().serialize(alloc);
-            pending_filled += 1;
+            @field(pending, @tagName(dat.kind)) = SettingPayload(dat.kind){};
         }
 
         return .{
@@ -1206,9 +1276,6 @@ pub const DeviceExport = struct {
             .store => |*store| store.deinit(),
             .unloaded, .absent => {},
         }
-        if (e.pending_settings) |pending| {
-            for (pending) |bytes| e.alloc.free(bytes);
-        }
         if (e.writer_state) |*state| state.deinit();
         for (e.pending_anlz.items) |*file| file.deinit(e.alloc);
         e.pending_anlz.deinit(e.alloc);
@@ -1245,6 +1312,51 @@ pub const DeviceExport = struct {
             }
         }
         return settings;
+    }
+
+    /// Queues `*SETTING.DAT` changes for the next `save` — the write side
+    /// of `loadSettings`, with `updateTrack`'s patch shape: a null field
+    /// leaves that file untouched, and a patch names only the values that
+    /// change, overlaid onto the file's current value (a previous patch's
+    /// merge, else the disk copy when it parses, else the Rekordbox
+    /// default) — so a missing or unparseable file needs no
+    /// `loadSettings` round-trip before it can be patched, and nothing a
+    /// patch leaves null resets. `wholeSetting` covers the
+    /// load-modify-write form. Only the data section is the caller's:
+    /// brand/software/version strings and the checksum are the library's
+    /// (a `create`d export's defaults), so writes through this API keep
+    /// the header Rekordbox expects. The write lands through
+    /// `writeFileAtomic`, and a patched file an opened export does not
+    /// carry yet is created at `save` — the one explicit exception to
+    /// `open` never gaining files it did not carry.
+    pub fn writeSettings(e: *DeviceExport, patch: SettingsPatch) WriteSettingsError!void {
+        if (e.pending_settings == null) e.pending_settings = .{};
+        const pending = &e.pending_settings.?;
+        inline for (dat_files) |dat| {
+            if (@field(patch, @tagName(dat.kind))) |p|
+                @field(pending, @tagName(dat.kind)) =
+                    try e.mergeSettingPatch(dat.kind, dat.name, @field(pending, @tagName(dat.kind)), p);
+        }
+    }
+
+    /// Applies one file's field patch onto its pending value — the value
+    /// a previous `writeSettings` left, else the file on disk when it
+    /// parses, else the payload default.
+    fn mergeSettingPatch(
+        e: *DeviceExport,
+        comptime kind: SettingKind,
+        filename: []const u8,
+        pending: ?SettingPayload(kind),
+        patch: SettingPatch(kind),
+    ) WriteSettingsError!SettingPayload(kind) {
+        const Payload = SettingPayload(kind);
+        var merged: Payload = pending orelse
+            (try loadSettingFile(Payload, e.io, e.dir, e.alloc, e.layout, filename)) orelse
+            Payload{};
+        inline for (@typeInfo(SettingPatch(kind)).@"struct".fields) |field| {
+            if (@field(patch, field.name)) |value| @field(merged, field.name) = value;
+        }
+        return merged;
     }
 
     /// The export's database, parsing it off disk on first call. Private:
@@ -3634,7 +3746,7 @@ pub const DeviceExport = struct {
                 // resolved the store `writeOl` reads, and `writeOl`
                 // itself stays quiet with nothing mirrored.
                 const dir = e.dir;
-                if (e.pending_settings) |pending| try e.writePendingSettings(dir, pending);
+                if (e.pending_settings) |*pending| try e.writePendingSettings(dir, pending);
                 if (e.pending_anlz.items.len > 0) try e.writePendingAnlz(dir);
                 try e.writeRelocatedAnlz(dir);
                 try e.writeOl();
@@ -3656,7 +3768,10 @@ pub const DeviceExport = struct {
         }
 
         const dir = e.dir;
-        if (e.pending_settings) |pending| try e.writePendingSettings(dir, pending);
+        if (e.pending_settings) |*pending| {
+            if (e.created) try e.writeSkeletonDirs(dir);
+            try e.writePendingSettings(dir, pending);
+        }
         if (e.pending_anlz.items.len > 0) try e.writePendingAnlz(dir);
         try e.writeRelocatedAnlz(dir);
 
@@ -3830,14 +3945,14 @@ pub const DeviceExport = struct {
         }
     }
 
-    /// Writes the default directory tree and the four pending setting
-    /// images, then releases them; a failure leaves them owned by
-    /// `pending_settings`, for `deinit` to reclaim.
-    fn writePendingSettings(
+    /// Writes the default directory tree of a fresh export:
+    /// `PIONEER/rekordbox`, `PIONEER/USBANLZ`, and `Contents`. Called by
+    /// every `save` of a `create`d export, before any file lands —
+    /// idempotent, so a re-save passes over existing directories.
+    fn writeSkeletonDirs(
         e: *DeviceExport,
         dir: std.Io.Dir,
-        pending: [dat_files.len][]u8,
-    ) (std.mem.Allocator.Error || std.Io.Dir.CreateDirPathError || AtomicWriteError)!void {
+    ) (std.mem.Allocator.Error || std.Io.Dir.CreateDirPathError)!void {
         // Each path is freed before the next is built, so a failure
         // between the creations leaks nothing.
         inline for (.{
@@ -3849,13 +3964,27 @@ pub const DeviceExport = struct {
             defer e.alloc.free(dir_path);
             try dir.createDirPath(e.io, dir_path);
         }
+    }
 
-        inline for (dat_files, 0..) |dat, i| {
-            const path = try e.layout.datPath(e.alloc, dat.name);
-            defer e.alloc.free(path);
-            try writeFileAtomic(e.io, dir, path, pending[i]);
+    /// Writes every queued setting payload, then releases the drained
+    /// queue; a failure leaves the unwritten payloads queued for a retry.
+    fn writePendingSettings(
+        e: *DeviceExport,
+        dir: std.Io.Dir,
+        pending: *Settings,
+    ) (std.mem.Allocator.Error || bin.WriteError || AtomicWriteError)!void {
+        inline for (dat_files) |dat| {
+            if (@field(pending.*, @tagName(dat.kind))) |payload| {
+                var image = setting.Setting(SettingPayload(dat.kind)).default();
+                image.data = payload;
+                const bytes = try image.serialize(e.alloc);
+                defer e.alloc.free(bytes);
+                const path = try e.layout.datPath(e.alloc, dat.name);
+                defer e.alloc.free(path);
+                try writeFileAtomic(e.io, dir, path, bytes);
+                @field(pending.*, @tagName(dat.kind)) = null;
+            }
         }
-        for (pending) |bytes| e.alloc.free(bytes);
         e.pending_settings = null;
     }
 };

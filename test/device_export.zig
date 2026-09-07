@@ -347,6 +347,157 @@ test "loadSettings propagates a file that is not absence-shaped" {
     try testing.expectError(error.StreamTooLong, ex.loadSettings());
 }
 
+test "writeSettings lands exactly the patched files at save" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpExportPath(&tmp, alloc);
+    defer alloc.free(root);
+
+    // A settings-only root: PIONEER, one intact settings file, no
+    // database at all — save must still land the patch.
+    const good = try testutil.readFixture(
+        alloc,
+        "complete_export/with_anlz/PIONEER/MYSETTING.DAT",
+        .limited(1 << 16),
+    );
+    defer alloc.free(good);
+    try tmp.dir.createDirPath(io, "PIONEER");
+    try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER/MYSETTING.DAT", .data = good });
+
+    var ex = try device_export.DeviceExport.open(root, io, alloc);
+    defer ex.deinit();
+    var my_setting = (try ex.loadSettings()).my_setting.?;
+    my_setting.quantize = .off;
+    try ex.writeSettings(.{ .my_setting = device_export.wholeSetting(my_setting) });
+    try ex.save();
+
+    // The patched file changed; the unpatched absences stayed absent.
+    var reopened = try device_export.DeviceExport.open(root, io, alloc);
+    defer reopened.deinit();
+    const reread = try reopened.loadSettings();
+    try testing.expect(reread.my_setting.?.quantize == .off);
+    try testing.expect(reread.dev_setting == null);
+    try testing.expect(reread.djm_my_setting == null);
+    try testing.expect(reread.my_setting2 == null);
+}
+
+test "writeSettings patches fields without resetting the file" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpExportPath(&tmp, alloc);
+    defer alloc.free(root);
+
+    // Same settings-only root shape: one intact MYSETTING.DAT, nothing
+    // else. The field patch must overlay onto what the file carries, not
+    // replace it with defaults.
+    const good = try testutil.readFixture(
+        alloc,
+        "complete_export/with_anlz/PIONEER/MYSETTING.DAT",
+        .limited(1 << 16),
+    );
+    defer alloc.free(good);
+    try tmp.dir.createDirPath(io, "PIONEER");
+    try tmp.dir.writeFile(io, .{ .sub_path = "PIONEER/MYSETTING.DAT", .data = good });
+
+    // What the disk carries, read through an independent handle.
+    var probe = try device_export.DeviceExport.open(root, io, alloc);
+    defer probe.deinit();
+    const orig = (try probe.loadSettings()).my_setting.?;
+
+    var ex = try device_export.DeviceExport.open(root, io, alloc);
+    defer ex.deinit();
+    try ex.writeSettings(.{ .my_setting = .{ .quantize = .off } });
+    try ex.save();
+
+    var reopened = try device_export.DeviceExport.open(root, io, alloc);
+    defer reopened.deinit();
+    const reread = try reopened.loadSettings();
+    try testing.expect(reread.my_setting.?.quantize == .off);
+    // Everything the patch left null kept the file's value, not the
+    // payload default.
+    try testing.expect(reread.my_setting.?.jog_mode == orig.jog_mode);
+    try testing.expect(reread.my_setting.?.language == orig.language);
+    try testing.expectEqualSlices(u8, &orig.unknown1, &reread.my_setting.?.unknown1);
+}
+
+test "successive writeSettings patches to one file overlay" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpExportPath(&tmp, alloc);
+    defer alloc.free(root);
+
+    var ex = try device_export.DeviceExport.create(root, io, alloc);
+    defer ex.deinit();
+    try ex.writeSettings(.{ .my_setting = .{ .quantize = .off } });
+    try ex.writeSettings(.{ .my_setting = .{ .jog_mode = .cdj } });
+    try ex.save();
+
+    var reopened = try device_export.DeviceExport.open(root, io, alloc);
+    defer reopened.deinit();
+    const settings = try reopened.loadSettings();
+    // The second patch applied on top of the first, not over it.
+    try testing.expect(settings.my_setting.?.quantize == .off);
+    try testing.expect(settings.my_setting.?.jog_mode == .cdj);
+}
+
+test "writeSettings patches a missing file onto its default" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpExportPath(&tmp, alloc);
+    defer alloc.free(root);
+    try tmp.dir.createDirPath(io, "PIONEER");
+
+    var ex = try device_export.DeviceExport.open(root, io, alloc);
+    defer ex.deinit();
+    // No loadSettings round-trip needed on a file the export does not
+    // carry — the patch seeds from the default.
+    try ex.writeSettings(.{ .my_setting = .{ .quantize = .off } });
+    try ex.save();
+
+    var reopened = try device_export.DeviceExport.open(root, io, alloc);
+    defer reopened.deinit();
+    const settings = try reopened.loadSettings();
+    try testing.expect(settings.my_setting.?.quantize == .off);
+    try testing.expect(settings.my_setting.?.jog_mode == .vinyl);
+    try testing.expect(settings.dev_setting == null);
+}
+
+test "writeSettings overrides a created export's default" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpExportPath(&tmp, alloc);
+    defer alloc.free(root);
+
+    var ex = try device_export.DeviceExport.create(root, io, alloc);
+    defer ex.deinit();
+    try ex.writeSettings(.{ .my_setting = .{ .quantize = .off } });
+    try ex.save();
+
+    var reopened = try device_export.DeviceExport.open(root, io, alloc);
+    defer reopened.deinit();
+    const settings = try reopened.loadSettings();
+    // All four defaults landed; the patch won where it named a file.
+    try testing.expect(settings.dev_setting != null);
+    try testing.expect(settings.djm_my_setting != null);
+    try testing.expect(settings.my_setting.?.quantize == .off);
+    try testing.expect(settings.my_setting2 != null);
+}
+
 test "reader opens each fixture pdb and counts its tracks" {
     const alloc = testing.allocator;
     const io = testing.io;
