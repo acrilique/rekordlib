@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same ref supersedes its in-progress run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Keep in sync with minimum_zig_version in build.zig.zon.
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  fmt:
+    name: zig fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig fmt --check .
+
+  build-and-test:
+    name: build + test (${{ matrix.onelibrary }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every consumer configuration of the OneLibrary backend.
+        onelibrary: [off, vendored-sqlcipher, system-sqlcipher]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install system SQLCipher
+        if: matrix.onelibrary == 'system-sqlcipher'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlcipher-dev
+      - uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-${{ runner.os }}-${{ matrix.onelibrary }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'vendor/**') }}
+          restore-keys: zig-${{ runner.os }}-${{ matrix.onelibrary }}-
+      - name: Build
+        run: zig build -Donelibrary=${{ matrix.onelibrary }}
+      - name: Test
+        run: zig build test -Donelibrary=${{ matrix.onelibrary }}
+
+  docs:
+    name: build API docs
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      # Vendored mode keeps this job self-contained (no system SQLCipher) and
+      # comptime-includes the OneLibrary backend, so it appears in the docs.
+      - uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-${{ runner.os }}-vendored-sqlcipher-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'vendor/**') }}
+          restore-keys: zig-${{ runner.os }}-vendored-sqlcipher-
+      - name: Build docs
+        run: zig build docs -Donelibrary=vendored-sqlcipher
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: zig-out/docs
+
+  publish-docs:
+    name: publish docs to Pages
+    # Only deploy from main; PR builds verify the docs but never publish.
+    if: github.ref == 'refs/heads/main'
+    needs: [fmt, build-and-test, docs]
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
