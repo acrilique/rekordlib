@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const anlz = @import("rekordlib").anlz;
-const device = @import("rekordlib").device;
+const device = @import("rekordlib").device_export;
 const onelibrary = @import("rekordlib").onelibrary;
 const pdb = @import("rekordlib").pdb;
 const setting = @import("rekordlib").setting;
