@@ -1459,6 +1459,72 @@ test "num_rows database row counts per table" {
     );
 }
 
+test "rowsOf yields the table's rows typed, matching the dynamic iterator" {
+    const alloc = testing.allocator;
+    var db = try parseNumRows(alloc);
+    defer db.deinit();
+
+    var typed = try db.rowsOf(pdb.Track);
+    var typed_count: usize = 0;
+    while (try typed.next()) |track| {
+        try testing.expect(track.id != 0);
+        typed_count += 1;
+    }
+    try testing.expectEqual(try countTableRows(&db, .tracks), typed_count);
+
+    // The yielded payload pointer is the row's identity: it names the
+    // row to `removeRow` and stays valid across row-list shifts.
+    var first = try db.rowsOf(pdb.Genre);
+    const genre = (try first.next()).?;
+    var dynamic = try db.rows(.genres);
+    try testing.expectEqual(genre, (try dynamic.next()).?.genre);
+}
+
+test "rowsOf rejects row types of the other database type" {
+    const alloc = testing.allocator;
+
+    // Wire values 3 and 4 are albums/labels in a plain database; the ext
+    // row types have no tables there, and vice versa for albums in an
+    // ext database — all NoTable, never a mis-typed iteration.
+    var db = try parseNumRows(alloc);
+    defer db.deinit();
+    try testing.expectError(error.NoTable, db.rowsOf(pdb.TagOrCategory));
+    try testing.expectError(error.NoTable, db.rowsOf(pdb.TrackTag));
+
+    const input = try testutil.readFixture(
+        alloc,
+        "complete_export/demo_tracks/PIONEER/rekordbox/exportExt.pdb",
+        .limited(1 << 22),
+    );
+    defer alloc.free(input);
+    var ext_db = try pdb.Database.parse(alloc, input, .ext);
+    defer ext_db.deinit();
+    try testing.expectError(error.NoTable, ext_db.rowsOf(pdb.Album));
+
+    var tags = try ext_db.rowsOf(pdb.TagOrCategory);
+    var count: usize = 0;
+    while (try tags.next()) |_| count += 1;
+    try testing.expect(count > 0);
+}
+
+test "row iterators reject chain pages of another table's type" {
+    const alloc = testing.allocator;
+    var db = try parseNumRows(alloc);
+    defer db.deinit();
+
+    // A corrupted chain linking a page whose header names another table
+    // would decode that page's rows as the other table's row type; the
+    // iterator must error instead of yielding mistyped rows.
+    const table = db.header.findTable(.tracks).?;
+    const page = &db.pages[table.first_page - 1].page;
+    try testing.expectEqual(pdb.PageType.tracks, page.header.page_type);
+    page.header.page_type = .genres;
+    try testing.expectError(error.UnexpectedValue, db.rows(.tracks));
+    try testing.expectError(error.UnexpectedValue, db.rowsOf(pdb.Track));
+    page.header.page_type = .tracks;
+    _ = try db.rows(.tracks); // restored: iterates again
+}
+
 test "deleted-row page fixture pins dead-space zeroing and idempotent writes" {
     const alloc = testing.allocator;
     const input = try testutil.readFixture(
@@ -2910,14 +2976,11 @@ test "created databases carry the default color, column, and menu rows" {
 /// Counts the track rows with `rating`, by walking the tracks table's
 /// page chain.
 fn countTracks(db: *const pdb.Database, rating: u8) !usize {
-    var it = try db.rows(.tracks);
+    var it = try db.rowsOf(pdb.Track);
     var count: usize = 0;
-    while (try it.next()) |row| switch (row.*) {
-        .track => |track| {
-            if (track.rating == rating) count += 1;
-        },
-        else => {},
-    };
+    while (try it.next()) |track| {
+        if (track.rating == rating) count += 1;
+    }
     return count;
 }
 

@@ -1557,8 +1557,9 @@ fn rowMatchesPageType(
 
 /// The page-type wire value rows of type `T` dispatch on: the `page_type`
 /// decl of plain row types, or the raw value of an ext row type's
-/// `ext_page_type`.
-fn rowPageType(comptime T: type) PageType {
+/// `ext_page_type`. Pair it with the database type before comparing
+/// against page headers (see `DatabaseType`).
+pub fn rowPageType(comptime T: type) PageType {
     if (@hasDecl(T, "page_type")) return T.page_type;
     return @enumFromInt(@intFromEnum(T.ext_page_type));
 }
@@ -2644,12 +2645,37 @@ pub const Database = struct {
         const table = db.header.findTable(page_type) orelse return error.NoTable;
         var it = RowIterator{
             .db = db,
+            .page_type = page_type,
             .last_page = table.last_page,
             .current = table.first_page,
             .next_page = page_chain_end,
         };
         try it.loadPage();
         return it;
+    }
+
+    /// Iterates the rows of the table holding rows of type `T`, in page
+    /// order, typed: the iterator yields `?*T` payloads directly (see
+    /// `RowIter`). `T` is one of `Row`'s payload types — `Track`,
+    /// `Genre`, ..., `TagOrCategory`, `TrackTag` — whose page-type decls
+    /// also disambiguate the database type: a row type of the other
+    /// database type has no table in this database (wire values 3 and 4
+    /// swap meanings, see `DatabaseType`), which fails with `NoTable`
+    /// like a page type no table holds. Prefer this over `rows` whenever
+    /// the table is known statically.
+    pub fn rowsOf(db: *const Database, comptime T: type) RowIterError!RowIter(T) {
+        const want_db_type: DatabaseType = if (@hasDecl(T, "page_type")) .plain else .ext;
+        if (db.db_type != want_db_type) return error.NoTable;
+        const table = db.header.findTable(rowPageType(T)) orelse return error.NoTable;
+        var it = RowIterator{
+            .db = db,
+            .page_type = rowPageType(T),
+            .last_page = table.last_page,
+            .current = table.first_page,
+            .next_page = page_chain_end,
+        };
+        try it.loadPage();
+        return .{ .inner = it };
     }
 
     /// Appends `row` to the table holding its page type, allocating a new
@@ -2980,17 +3006,22 @@ pub const Database = struct {
     }
 };
 
-/// Error of `Database.rows` and `RowIterator.next`: `NoTable` is a page
-/// type no table in the header holds, `PageNotPresent` a chained page
-/// index outside the file, `PageOrderViolation` a chain link that does not
-/// advance (rekordcrate's `PageIterator` assumes pages in a table are
-/// linked in increasing order by index), and `UnparsedPage` a chained page
-/// kept raw because its rows are not wired for the database type.
+/// Error of `Database.rows`, `Database.rowsOf`, and the row iterators'
+/// `next`: `NoTable` is a page type no table in the header holds (or a row
+/// type of the other database type, whose wire values swap meanings, see
+/// `Database.rowsOf`), `PageNotPresent` a chained page index outside the
+/// file, `PageOrderViolation` a chain link that does not advance
+/// (rekordcrate's `PageIterator` assumes pages in a table are linked in
+/// increasing order by index), `UnparsedPage` a chained page kept raw
+/// because its rows are not wired for the database type, and
+/// `UnexpectedValue` a chained page whose header names a different page
+/// type than the table being iterated.
 pub const RowIterError = error{
     NoTable,
     PageNotPresent,
     PageOrderViolation,
     UnparsedPage,
+    UnexpectedValue,
 };
 
 /// Iterates the rows of one table's page chain in page order — the order
@@ -3000,6 +3031,11 @@ pub const RowIterError = error{
 /// the database for the iterator's lifetime.
 pub const RowIterator = struct {
     db: *const Database,
+    /// The iterated table's page type, checked against every loaded
+    /// page's header: a chain that links a page of another table's type
+    /// would decode its rows as that table's row type, so the mismatch
+    /// errors instead of yielding mistyped rows.
+    page_type: PageType,
     /// 1-based index of the page whose rows are being yielded.
     current: u32,
     /// The chain's final page; walking stops after it.
@@ -3020,6 +3056,7 @@ pub const RowIterator = struct {
             .page => |*page| page,
             .raw => return error.UnparsedPage,
         };
+        if (page.header.page_type != it.page_type) return error.UnexpectedValue;
         switch (page.content) {
             .data => |*content| it.rows = content.rows,
             .index => it.rows = &.{},
@@ -3047,6 +3084,34 @@ pub const RowIterator = struct {
         return null;
     }
 };
+
+/// Iterator over the rows of one table, typed by its row type: wraps
+/// `RowIterator`, projecting each row to its boxed payload of `T` (see
+/// `Database.rowsOf`), so callers hold a `?*Track` instead of the
+/// 17-variant `Row` — the variant a page's rows decode as is fixed by
+/// the table at parse time, and `T` names it at compile time. `T` must
+/// be one of `Row`'s payload types. The yielded pointer is the row's
+/// arena box, like reading the matching `Row` variant's payload: stable
+/// for the database's lifetime, and the identity `Database.removeRow`
+/// wants. Errors are `RowIterator`'s.
+pub fn RowIter(comptime T: type) type {
+    const field_name = comptime name: {
+        for (std.meta.fields(Row)) |field| {
+            if (RowPayload(field.type) == T) break :name field.name;
+        }
+        @compileError("RowIter: " ++ @typeName(T) ++ " is not a Row payload type");
+    };
+    return struct {
+        inner: RowIterator,
+
+        /// The table's next row of type `T`, or null once the chain is
+        /// exhausted.
+        pub fn next(it: *@This()) RowIterError!?*T {
+            const row = (try it.inner.next()) orelse return null;
+            return @field(row.*, field_name);
+        }
+    };
+}
 
 /// Parses one page as a `PageSlot`, the eager per-page attempt of
 /// `Database.parse`. A page whose rows are not wired for the database

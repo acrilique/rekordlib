@@ -4321,6 +4321,7 @@ pub const ScanError = error{
     PageNotPresent,
     PageOrderViolation,
     UnparsedPage,
+    UnexpectedValue,
     IdSpaceExhausted,
 };
 
