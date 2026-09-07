@@ -1117,10 +1117,8 @@ comptime {
 /// Parses the content of one section from `c` (positioned right after the
 /// section's 12-byte header). The section's bytes are bounded to its
 /// declared `total_size` and must be consumed exactly; a mismatch is
-/// reported as `InvalidFormat`. Each content type parses the `kind` it
-/// declares; the entry kinds (`file`, `cue`, `extended_cue`) only appear
-/// nested inside cue lists, so a stray one matches no type and is kept
-/// verbatim, like any unknown tag.
+/// reported as `InvalidFormat`. A `kind` that names no payload type (see
+/// `ContentOf`) parses as `unknown`, verbatim.
 fn parseContent(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!Content {
     if (header.size < 12 or header.total_size < header.size) return error.InvalidFormat;
     const region = try c.takeBytes(header.total_size - 12);
@@ -1136,11 +1134,25 @@ fn parseContent(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseE
 
 /// The kind a section's content serializes as: every content type declares
 /// its `kind` (unknown content keeps the kind it was parsed with).
-fn sectionKind(content: *const Content) Kind {
+pub fn sectionKind(content: *const Content) Kind {
     return switch (content.*) {
         .unknown => |u| u.kind,
         inline else => |x| @TypeOf(x).kind,
     };
+}
+
+/// The content type a section of `kind` carries: every known section kind
+/// names exactly one `Content` variant (the uniqueness check above
+/// `parseContent` enforces it), so the map is a bijection over the section
+/// kinds. The entry kinds (`file`, `cue`, `extended_cue`) only ever appear
+/// as the file header or nested inside cue lists, and unknown values parse
+/// as the shared `unknown` variant — none of them name a payload type, so
+/// they fail to compile here.
+pub fn ContentOf(comptime kind: Kind) type {
+    inline for (std.meta.fields(Content)) |field| {
+        if (field.type != Unknown and field.type.kind == kind) return field.type;
+    }
+    @compileError("no section content carries this kind; the entry kinds (file, cue, extended_cue) and unknown values never appear as top-level sections");
 }
 
 /// Derives the wire header of `content`: every section type declares its
@@ -1263,11 +1275,20 @@ pub const Anlz = struct {
     }
 
     /// Returns the first section of the given kind, or null if the file
-    /// contains none. The pointer reaches into this instance, so mutations
-    /// through it are picked up by `serialize`.
-    pub fn findSection(m: *const Anlz, kind: Kind) ?*Content {
+    /// contains none. The kind selects the return type through `ContentOf`
+    /// — `.beat_grid` yields `?*BeatGrid`, `.path` yields `?*Path`.
+    /// Sections are matched by their active variant, not their stored
+    /// kind, so a hand-built `.unknown` section cannot be misread as a
+    /// typed payload. The pointer reaches into this instance, so
+    /// mutations through it are picked up by `serialize`.
+    pub fn findSection(m: *const Anlz, comptime kind: Kind) ?*ContentOf(kind) {
+        const T = ContentOf(kind);
         for (m.sections) |*section| {
-            if (sectionKind(section) == kind) return section;
+            switch (section.*) {
+                inline else => |*payload| {
+                    if (comptime @TypeOf(payload.*) == T) return payload;
+                },
+            }
         }
         return null;
     }

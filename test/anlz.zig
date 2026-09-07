@@ -622,7 +622,7 @@ test "mutating fixture beat grid tempo re-parses" {
     var parsed = try anlz.Anlz.parse(alloc, input);
     defer parsed.deinit();
 
-    const grid = &parsed.findSection(.beat_grid).?.beat_grid;
+    const grid = parsed.findSection(.beat_grid).?;
     try testing.expectEqual(@as(usize, 257), grid.beats.len);
     for (grid.beats) |*beat| beat.tempo += 1;
 
@@ -634,7 +634,7 @@ test "mutating fixture beat grid tempo re-parses" {
 
     var reparsed = try anlz.Anlz.parse(alloc, modified);
     defer reparsed.deinit();
-    const beats = reparsed.findSection(.beat_grid).?.beat_grid.beats;
+    const beats = reparsed.findSection(.beat_grid).?.beats;
     try testing.expectEqualSlices(anlz.Beat, grid.beats, beats);
     try testing.expectEqual(@as(u16, 12001), beats[0].tempo);
 }
@@ -649,7 +649,7 @@ test "mutating fixture cue list entries re-parses" {
 
     // The fixture's hot cue list is empty; `len_cues` is derived on write,
     // and `memory_count` keeps the hot-cue sentinel.
-    const list = &parsed.findSection(.cue_list).?.cue_list;
+    const list = parsed.findSection(.cue_list).?;
     try testing.expectEqual(anlz.CueListType.hot_cues, list.list_type);
     try testing.expectEqual(@as(usize, 0), list.cues.len);
 
@@ -666,7 +666,7 @@ test "mutating fixture cue list entries re-parses" {
 
     var reparsed = try anlz.Anlz.parse(alloc, grown);
     defer reparsed.deinit();
-    const grown_list = reparsed.findSection(.cue_list).?.cue_list;
+    const grown_list = reparsed.findSection(.cue_list).?;
     try testing.expectEqualSlices(anlz.Cue, cues, grown_list.cues);
     try testing.expectEqual(@as(u32, 0xFFFF_FFFF), grown_list.memory_count);
 
@@ -678,7 +678,7 @@ test "mutating fixture cue list entries re-parses" {
 
     var reparsed2 = try anlz.Anlz.parse(alloc, tweaked);
     defer reparsed2.deinit();
-    const tweaked_cues = reparsed2.findSection(.cue_list).?.cue_list.cues;
+    const tweaked_cues = reparsed2.findSection(.cue_list).?.cues;
     try testing.expectEqualSlices(anlz.Cue, cues, tweaked_cues);
     try testing.expectEqual(@as(u32, 0x0004_62F7 + 500), tweaked_cues[0].time);
 
@@ -691,7 +691,7 @@ test "mutating fixture cue list entries re-parses" {
 
     var reparsed3 = try anlz.Anlz.parse(alloc, shrunk);
     defer reparsed3.deinit();
-    try testing.expectEqualSlices(anlz.Cue, cues[0..1], reparsed3.findSection(.cue_list).?.cue_list.cues);
+    try testing.expectEqualSlices(anlz.Cue, cues[0..1], reparsed3.findSection(.cue_list).?.cues);
 
     list.cues = &.{};
     const restored = try parsed.serialize(alloc);
@@ -707,7 +707,7 @@ test "mutating fixture extended cue comment re-parses" {
     defer parsed.deinit();
     const arena = parsed.arena.allocator();
 
-    const list = &parsed.findSection(.extended_cue_list).?.extended_cue_list;
+    const list = parsed.findSection(.extended_cue_list).?;
     try testing.expectEqual(@as(usize, 0), list.cues.len);
 
     // Add a cue whose comment grows the entry beyond its 68 fixed bytes.
@@ -727,7 +727,7 @@ test "mutating fixture extended cue comment re-parses" {
 
     var reparsed = try anlz.Anlz.parse(alloc, grown);
     defer reparsed.deinit();
-    const grown_list = reparsed.findSection(.extended_cue_list).?.extended_cue_list;
+    const grown_list = reparsed.findSection(.extended_cue_list).?;
     try testing.expectEqual(@as(usize, 1), grown_list.cues.len);
     const text = try grown_list.cues[0].comment.utf8(alloc);
     defer alloc.free(text);
@@ -748,7 +748,7 @@ test "mutating fixture extended cue comment re-parses" {
 
     var reparsed2 = try anlz.Anlz.parse(alloc, cleared);
     defer reparsed2.deinit();
-    const cleared_cue = &reparsed2.findSection(.extended_cue_list).?.extended_cue_list.cues[0];
+    const cleared_cue = reparsed2.findSection(.extended_cue_list).?.cues[0];
     try testing.expectEqual(@as(usize, 0), cleared_cue.comment.raw.len);
     const empty_text = try cleared_cue.comment.utf8(alloc);
     defer alloc.free(empty_text);
@@ -763,13 +763,13 @@ test "mutating fixture path re-parses" {
     defer parsed.deinit();
 
     const section = parsed.findSection(.path).?;
-    const original = try section.path.path.utf8(alloc);
+    const original = try section.path.utf8(alloc);
     defer alloc.free(original);
     try testing.expectEqualStrings("/Contents/Loopmasters/UnknownAlbum/Demo Track 2.mp3", original);
-    const old_len = section.path.path.byte_len();
+    const old_len = section.path.byte_len();
 
-    section.path.path = try anlz.LenPrefixedWideString.fromUtf8(parsed.arena.allocator(), "/Contents/mutated.mp3");
-    const new_len = section.path.path.byte_len();
+    section.path = try anlz.LenPrefixedWideString.fromUtf8(parsed.arena.allocator(), "/Contents/mutated.mp3");
+    const new_len = section.path.byte_len();
     try testing.expect(new_len < old_len);
 
     const modified = try parsed.serialize(alloc);
@@ -779,7 +779,7 @@ test "mutating fixture path re-parses" {
 
     var reparsed = try anlz.Anlz.parse(alloc, modified);
     defer reparsed.deinit();
-    const text = try reparsed.findSection(.path).?.path.path.utf8(alloc);
+    const text = try reparsed.findSection(.path).?.path.utf8(alloc);
     defer alloc.free(text);
     try testing.expectEqualStrings("/Contents/mutated.mp3", text);
 }
@@ -792,7 +792,7 @@ test "mutating fixture song structure re-encrypts" {
     defer parsed.deinit();
     const arena = parsed.arena.allocator();
 
-    const ss = &parsed.findSection(.song_structure).?.song_structure;
+    const ss = parsed.findSection(.song_structure).?;
     try testing.expect(ss.is_encrypted);
     try testing.expectEqual(anlz.Mood.mid, ss.data.mood);
     try testing.expectEqual(@as(usize, 11), ss.data.phrases.len);
@@ -808,7 +808,7 @@ test "mutating fixture song structure re-encrypts" {
 
     var reparsed = try anlz.Anlz.parse(alloc, modified);
     defer reparsed.deinit();
-    const ss2 = &reparsed.findSection(.song_structure).?.song_structure;
+    const ss2 = reparsed.findSection(.song_structure).?;
     try testing.expect(ss2.is_encrypted);
     try testing.expectEqual(anlz.Mood.low, ss2.data.mood);
     try testing.expectEqualSlices(anlz.Phrase, ss.data.phrases, ss2.data.phrases);
@@ -827,7 +827,7 @@ test "mutating fixture song structure re-encrypts" {
 
     var reparsed2 = try anlz.Anlz.parse(alloc, grown);
     defer reparsed2.deinit();
-    const ss3 = &reparsed2.findSection(.song_structure).?.song_structure;
+    const ss3 = reparsed2.findSection(.song_structure).?;
     try testing.expect(ss3.is_encrypted);
     try testing.expectEqual(anlz.Mood.low, ss3.data.mood);
     try testing.expectEqualSlices(anlz.Phrase, phrases, ss3.data.phrases);
@@ -1271,19 +1271,19 @@ test "built anlz input serializes and re-parses" {
     var dat_parsed = try anlz.Anlz.parse(alloc, dat);
     defer dat_parsed.deinit();
     try testing.expectEqual(@as(usize, 5), dat_parsed.sections.len);
-    try testing.expectEqualSlices(u8, track_path.raw, dat_parsed.findSection(.path).?.path.path.raw);
-    try testing.expectEqualSlices(anlz.Beat, input.beats, dat_parsed.findSection(.beat_grid).?.beat_grid.beats);
-    const dat_list = &dat_parsed.findSection(.cue_list).?.cue_list;
+    try testing.expectEqualSlices(u8, track_path.raw, dat_parsed.findSection(.path).?.path.raw);
+    try testing.expectEqualSlices(anlz.Beat, input.beats, dat_parsed.findSection(.beat_grid).?.beats);
+    const dat_list = dat_parsed.findSection(.cue_list).?;
     try testing.expectEqual(anlz.CueListType.hot_cues, dat_list.list_type);
     try testing.expectEqual(@as(u32, 0xFFFF_FFFF), dat_list.memory_count);
     try testing.expectEqualSlices(anlz.Cue, input.cues, dat_list.cues);
-    const preview = &dat_parsed.findSection(.waveform_preview).?.waveform_preview;
+    const preview = dat_parsed.findSection(.waveform_preview).?;
     try testing.expectEqual(anlz.MONO_PREVIEW_COLUMNS, preview.data.len);
     // Constant bands: every span calibrates to the AGC ceiling 23, class
     // pwavClass(dbcode(3200), dbcode(3200), dbcode(19200)) = 5.
     try testing.expectEqual(@as(u5, 23), preview.data[0].height);
     try testing.expectEqual(@as(u3, 5), preview.data[0].whiteness);
-    try testing.expectEqual(anlz.TINY_PREVIEW_COLUMNS, dat_parsed.findSection(.tiny_waveform_preview).?.tiny_waveform_preview.data.len);
+    try testing.expectEqual(anlz.TINY_PREVIEW_COLUMNS, dat_parsed.findSection(.tiny_waveform_preview).?.data.len);
 
     // .EXT: extended cues, mono detail, color preview/detail.
     const ext_sections = [_]anlz.Content{
@@ -1300,7 +1300,7 @@ test "built anlz input serializes and re-parses" {
     var ext_parsed = try anlz.Anlz.parse(alloc, ext);
     defer ext_parsed.deinit();
     try testing.expectEqual(@as(usize, 5), ext_parsed.sections.len);
-    const ext_list = &ext_parsed.findSection(.extended_cue_list).?.extended_cue_list;
+    const ext_list = ext_parsed.findSection(.extended_cue_list).?;
     try testing.expectEqual(anlz.CueListType.hot_cues, ext_list.list_type);
     try testing.expectEqual(@as(usize, 2), ext_list.cues.len);
     try testing.expectEqual(@as(u32, 0), ext_list.cues[0].hot_cue);
@@ -1308,11 +1308,11 @@ test "built anlz input serializes and re-parses" {
     defer alloc.free(label);
     try testing.expectEqualStrings("Brëak", label);
     try testing.expectEqual([3]u8{ 0x4D, 0, 0xFF }, ext_list.cues[1].hot_cue_color_rgb);
-    const detail = &ext_parsed.findSection(.waveform_detail).?.waveform_detail;
+    const detail = ext_parsed.findSection(.waveform_detail).?;
     try testing.expectEqual(@as(usize, 150), detail.data.len);
     // Constant bands: every column is the track peak → 31.
     try testing.expectEqual(@as(u5, 31), detail.data[0].height);
-    const color_preview = &ext_parsed.findSection(.waveform_color_preview).?.waveform_color_preview;
+    const color_preview = ext_parsed.findSection(.waveform_color_preview).?;
     try testing.expectEqual(anlz.COLOR_PREVIEW_COLUMNS, color_preview.data.len);
     // Span maxima: mono 150·128/256 = 75 (mirror 181), low 50·128/256 = 25,
     // shares 50²/300·128/256 = 4, 100²/300·128/256 = 16, 150²/300·128/256
@@ -1325,7 +1325,7 @@ test "built anlz input serializes and re-parses" {
         .energy_mid_third_freq = 16,
         .energy_top_third_freq = 37,
     }, color_preview.data[0]);
-    const color_detail = &ext_parsed.findSection(.waveform_color_detail).?.waveform_color_detail;
+    const color_detail = ext_parsed.findSection(.waveform_color_detail).?;
     try testing.expectEqual(@as(usize, 150), color_detail.data.len);
     try testing.expectEqual(@as(u3, 7), color_detail.data[0].blue);
     try testing.expectEqual(@as(u5, 31), color_detail.data[0].height);
@@ -1343,9 +1343,9 @@ test "built anlz input serializes and re-parses" {
     var ex2_parsed = try anlz.Anlz.parse(alloc, ex2);
     defer ex2_parsed.deinit();
     try testing.expectEqual(@as(usize, 3), ex2_parsed.sections.len);
-    const band3_preview = &ex2_parsed.findSection(.waveform_3band_preview).?.waveform_3band_preview;
+    const band3_preview = ex2_parsed.findSection(.waveform_3band_preview).?;
     try testing.expectEqual(anlz.COLOR_PREVIEW_COLUMNS, band3_preview.data.len);
-    const band3_detail = &ex2_parsed.findSection(.waveform_3band_detail).?.waveform_3band_detail;
+    const band3_detail = ex2_parsed.findSection(.waveform_3band_detail).?;
     try testing.expectEqual(@as(usize, 150), band3_detail.data.len);
     // Constant input through the scale derivation (unit scales): PWV6's
     // span-0 averages of 6400/2, 12800, 19200 over 256 = (12, 50, 75)
@@ -1434,12 +1434,12 @@ test "builders pin preview widths and analyzer-law ranges against fixtures" {
         var ex2_parsed = try anlz.Anlz.parse(alloc, ex2);
         defer ex2_parsed.deinit();
 
-        const pwav = &dat_parsed.findSection(.waveform_preview).?.waveform_preview;
-        const pwv2 = &dat_parsed.findSection(.tiny_waveform_preview).?.tiny_waveform_preview;
-        const pwv3 = &ext_parsed.findSection(.waveform_detail).?.waveform_detail;
-        const pwv4 = &ext_parsed.findSection(.waveform_color_preview).?.waveform_color_preview;
-        const pwv6 = &ex2_parsed.findSection(.waveform_3band_preview).?.waveform_3band_preview;
-        const pwv7 = &ex2_parsed.findSection(.waveform_3band_detail).?.waveform_3band_detail;
+        const pwav = dat_parsed.findSection(.waveform_preview).?;
+        const pwv2 = dat_parsed.findSection(.tiny_waveform_preview).?;
+        const pwv3 = ext_parsed.findSection(.waveform_detail).?;
+        const pwv4 = ext_parsed.findSection(.waveform_color_preview).?;
+        const pwv6 = ex2_parsed.findSection(.waveform_3band_preview).?;
+        const pwv7 = ex2_parsed.findSection(.waveform_3band_detail).?;
 
         const bands = try alloc.alloc(anlz.Band, pwv7.data.len);
         defer alloc.free(bands);
@@ -1883,6 +1883,25 @@ test "buildColumnsFromPcm requires stereo" {
         .left = &zeros,
         .right = zeros[0..64],
     }));
+}
+
+test "findSection matches sections by variant, not stored kind" {
+    // A hand-built unknown section carrying a known kind must not be
+    // projected as that kind's payload: the typed lookup matches the
+    // active variant, which for unknown sections is none of them.
+    const alloc = testing.allocator;
+    const arena = try alloc.create(std.heap.ArenaAllocator);
+    defer {
+        arena.deinit();
+        alloc.destroy(arena);
+    }
+    arena.* = std.heap.ArenaAllocator.init(alloc);
+    var sections = [_]anlz.Content{
+        .{ .unknown = .{ .kind = .beat_grid, .header_data = &.{}, .content_data = &.{} } },
+    };
+    var m = anlz.Anlz{ .arena = arena, .header_data = &.{}, .sections = &sections };
+    try testing.expect(anlz.sectionKind(&m.sections[0]) == .beat_grid);
+    try testing.expect(m.findSection(.beat_grid) == null);
 }
 
 test "PWV2 zero-code rule: 1 when both accumulators are zero, 2 when only band 2 is live" {
