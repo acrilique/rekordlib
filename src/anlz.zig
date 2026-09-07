@@ -76,6 +76,8 @@ pub const Kind = enum(u32) {
     /// Variable-width large 3-band version of the track waveform, in `.2EX`
     /// files.
     waveform_3band_detail = fourcc("PWV7"),
+    /// Auto-gain scales of the 3-band waveform sections, in `.2EX` files.
+    waveform_3band_scales = fourcc("PWVC"),
     /// Describes the structure of a song (Intro, Chorus, Verse, ...), in
     /// `.EXT` files.
     song_structure = fourcc("PSSI"),
@@ -805,6 +807,42 @@ pub const Waveform3BandDetail = WaveformSection(.{
     .constant_unknown = true,
 });
 
+/// The per-track auto-gain scales of the 3-band waveforms, in `.2EX`
+/// files: one gain per band (low/mid/high), in hundredths — 100 is
+/// neutral. The 3-band columns are stored already scaled by these gains.
+pub const Waveform3BandScales = struct {
+    /// Unknown field; zero in every known file, and any other value is
+    /// rejected on parse.
+    unknown: u16 = 0,
+    /// The gains, in low/mid/high order.
+    scales: [3]u16 = .{ 100, 100, 100 },
+
+    const kind: Kind = .waveform_3band_scales;
+    const header_size: u32 = 14;
+
+    fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!Waveform3BandScales {
+        _ = alloc;
+        if (header.size != header_size) return error.UnexpectedValue;
+        const unknown = try c.takeInt(u16, .big);
+        if (unknown != 0) return error.UnexpectedValue;
+        return .{ .scales = .{
+            try c.takeInt(u16, .big),
+            try c.takeInt(u16, .big),
+            try c.takeInt(u16, .big),
+        } };
+    }
+
+    fn contentLen(s: *const Waveform3BandScales) usize {
+        _ = s;
+        return 6;
+    }
+
+    fn writeTo(s: *const Waveform3BandScales, e: *bin.Emitter) WriteError!void {
+        try e.putInt(u16, s.unknown, .big);
+        for (s.scales) |scale| try e.putInt(u16, scale, .big);
+    }
+};
+
 /// Music classification used for Lighting mode, based on rhythm, tempo,
 /// kick drum, and sound density.
 pub const Mood = enum(u16) {
@@ -1050,6 +1088,7 @@ pub const Content = union(enum) {
     waveform_3band_preview: Waveform3BandPreview,
     /// Variable-width large 3-band version of the track waveform.
     waveform_3band_detail: Waveform3BandDetail,
+    waveform_3band_scales: Waveform3BandScales,
     /// Describes the structure of a song (Intro, Chorus, Verse, ...).
     song_structure: SongStructure,
     /// Unknown content, kept verbatim.
@@ -1603,6 +1642,8 @@ pub const AnlzInput = struct {
     band3_preview: ?[]Waveform3BandColumn = null,
     /// Variable-width 3-band detail (`PWV7`, 150 Hz), in `.2EX`.
     band3_detail: ?[]Waveform3BandColumn = null,
+    /// 3-band auto-gain scales (`PWVC`), in `.2EX` files.
+    band3_scales: ?[3]u16 = null,
 
     /// Frees every slice reachable from this instance.
     pub fn deinit(input: *const AnlzInput, alloc: std.mem.Allocator) void {
@@ -1641,6 +1682,8 @@ pub const WaveformColumns = struct {
     band3_preview: []Waveform3BandColumn = &.{},
     /// Variable-width 3-band detail (`PWV7`, `ceil(samples/294)` columns).
     band3_detail: []Waveform3BandColumn = &.{},
+    /// 3-band auto-gain scales (`PWVC`), in hundredths.
+    band3_scales: [3]u16 = .{ 100, 100, 100 },
 
     pub fn deinit(columns: *const WaveformColumns, alloc: std.mem.Allocator) void {
         alloc.free(columns.preview_mono);
@@ -1813,7 +1856,7 @@ pub fn buildColumnsFromBands(alloc: std.mem.Allocator, bands: []const Band) Buil
 
     const scales = try bandScalesAndPreview(a, vals, 150);
 
-    var out: WaveformColumns = .{};
+    var out: WaveformColumns = .{ .band3_scales = scales.scale_u16 };
     errdefer out.deinit(alloc);
     out.color_preview = try alloc.alloc(WaveformColorPreviewColumn, COLOR_PREVIEW_COLUMNS);
     for (out.color_preview) |*col| col.* = .{}; // empty spans keep zeros
@@ -2066,6 +2109,7 @@ pub fn buildAnlzInput(
         .color_detail = waveforms.color_detail,
         .band3_preview = waveforms.band3_preview,
         .band3_detail = waveforms.band3_detail,
+        .band3_scales = waveforms.band3_scales,
     };
     waveforms.* = .{};
     return out;
@@ -2280,6 +2324,20 @@ fn startsGrid(alloc: std.mem.Allocator, d: usize, n: usize) ![]usize {
     return starts;
 }
 
+/// Flush-to-zero of denormals, mirroring the analyzer's SSE FTZ/DAZ mode.
+fn ftz(x: f64) f64 {
+    return if (@abs(x) < 2.2250738585072014e-308) 0.0 else x;
+}
+
+/// The PWV4 share-field store: a window peak at or above 1.0 stores
+/// 0x7fff regardless of the count; otherwise
+/// `trunc(cnt·peak/win·32768)` with no product clamp (cnt ≤ win and
+/// peak < 1 keep the value under 32768).
+fn shareSat(cnt: i64, peak: f64, win: f64) i16 {
+    if (peak >= 1.0) return 32767;
+    return @intFromFloat(@trunc(@as(f64, @floatFromInt(cnt)) * peak / win * 32768.0));
+}
+
 /// The float-path WaveCreator: `push` streams one sample through the
 /// 18-biquad filterbank and folds it into the open record window;
 /// `closeRecord` seals a window at each boundary; the finalizers below
@@ -2353,9 +2411,6 @@ const WaveCreator = struct {
         const green = w.f_greenb.proc(w.f_greena.proc(mono));
         const blue = w.f_blue.proc(mono);
         const w400 = w.f_w400.proc(mono);
-        const lo = w.f_lowb.proc(w.f_lowa.proc(mono));
-        const mi = w.f_midd.proc(w.f_midc.proc(w.f_midb.proc(w.f_mida.proc(mono))));
-        const hi = w.f_highb.proc(w.f_higha.proc(mono));
         a.w7b0 = @max(a.w7b0, @abs(v7b0));
         a.w7b1 = @max(a.w7b1, @abs(v7b1));
         a.w7b2 = @max(a.w7b2, @abs(v7b2));
@@ -2363,6 +2418,12 @@ const WaveCreator = struct {
         a.wgreen = @max(a.wgreen, @abs(green));
         a.wblue = @max(a.wblue, @abs(blue));
         a.ww400 = @max(a.ww400, @abs(w400));
+        // The analyzer's SSE runs FTZ/DAZ: denormal band samples flush to
+        // zero, so decaying RBJ tails in digital silence tie at ±0 and the
+        // tie order hands the count to LOW.
+        const lo = ftz(w.f_lowb.proc(w.f_lowa.proc(mono)));
+        const mi = ftz(w.f_midd.proc(w.f_midc.proc(w.f_midb.proc(w.f_mida.proc(mono)))));
+        const hi = ftz(w.f_highb.proc(w.f_higha.proc(mono)));
         a.raw_lo = @max(a.raw_lo, @abs(lo));
         a.raw_mi = @max(a.raw_mi, @abs(mi));
         a.raw_hi = @max(a.raw_hi, @abs(hi));
@@ -2400,9 +2461,9 @@ const WaveCreator = struct {
             .green = sat16u(a.wgreen),
             .blue = sat16u(a.wblue),
             .w400 = sat16u(a.ww400),
-            .s3 = sat16(@as(f64, @floatFromInt(a.cnt_l)) * a.raw_lo / win),
-            .s4 = sat16(@as(f64, @floatFromInt(a.cnt_m)) * a.raw_mi / win),
-            .s5 = sat16(@as(f64, @floatFromInt(a.cnt_h)) * a.raw_hi / win),
+            .s3 = shareSat(a.cnt_l, a.raw_lo, win),
+            .s4 = shareSat(a.cnt_m, a.raw_mi, win),
+            .s5 = shareSat(a.cnt_h, a.raw_hi, win),
         };
         w.acc = .{};
         w.open = r + 1;
@@ -2835,7 +2896,8 @@ const det_rec_len = det_cap + 4;
 /// against the 0.01f marker itself; the run counter is stored as float
 /// and truncated on read; the ride path does not reset the 512-sample
 /// idle counter; the level decays ×0.993830323 after ≥ fs·1.714 samples
-/// idle.
+/// idle. The idle counter resets at every 588-sample call entry and
+/// never persists across chunks.
 const DetA = struct {
     tag: i32, // 0 band1, 1 band2, 2 band3
     total: usize,
@@ -2873,6 +2935,7 @@ const DetA = struct {
     fn chunk(st: *DetA, s: []const f32, c: usize) void {
         const drp: f32 = if (st.tag == 2) droop3 else droop;
         var shadow = st.shadow;
+        st.idle = 0; // register local: reset at every call entry
         for (s) |x| {
             st.runf = @floatFromInt(@as(i32, @intFromFloat(st.runf)) + 1);
             const run: i32 = @intFromFloat(st.runf);
@@ -2964,6 +3027,7 @@ const DetB = struct {
     fn chunk(st: *DetB, s: []const f32, c: usize) void {
         var shadow = st.shadow;
         st.wmax = 0.0;
+        st.idle = 0; // register local: reset at every call entry
         for (s, 0..) |x, i| {
             st.phase += 1;
             if (st.wmax < x) st.wmax = x;
@@ -3171,6 +3235,9 @@ const PwavPwv2Engine = struct {
     n: usize,
     nceil: usize,
     nchunks: usize,
+    /// 1-based index of the last processed chunk (real pieces, plus the
+    /// rare f32 phantom past them); `islast` fires here.
+    last_chunk: usize,
     cps: usize,
     f38: f32,
     span_credit: f32,
@@ -3193,7 +3260,7 @@ const PwavPwv2Engine = struct {
     // Writer choreography state.
     arr1b8: [400]f32 = [_]f32{0} ** 400,
     grp_cnt: i64 = 0,
-    grp_sum: f64 = 0.0,
+    grp_sum: f32 = 0.0,
     lvl_span: i64 = 0,
     lvl_carry: f32 = 0.0,
     armed: u8 = 0,
@@ -3213,16 +3280,23 @@ const PwavPwv2Engine = struct {
     pwv2_cursor: i64 = 0,
 
     fn init(alloc: std.mem.Allocator, n: usize) !PwavPwv2Engine {
+        // The analyzer's engine total is the last sample index n-1, not
+        // the sample count, and the PWV2 chunks-per-span is
+        // ((n-1)/588)/100 — one less than n/588/100 whenever n is an
+        // exact multiple of 58800. nceil (the float32 ceil of the same
+        // field) is unchanged for every n % 588 != 1.
+        const tot = if (n > 0) n - 1 else 0;
         // nceil comes from a float32 ceil of the chunk division; on
         // rounding it can exceed the integer nchunks by one.
-        const nceil: usize = @intFromFloat(@ceil(@as(f32, @floatFromInt(n)) / @as(f32, chunk_samples)));
+        const nceil: usize = @intFromFloat(@ceil(@as(f32, @floatFromInt(tot)) / @as(f32, chunk_samples)));
         const nchunks = ceilDiv(n, chunk_samples);
         const n_slots = @max(nceil, nchunks) + 2;
         return .{
             .n = n,
             .nceil = nceil,
             .nchunks = nchunks,
-            .cps = @max(1, n / chunk_samples / 100),
+            .last_chunk = @max(nceil, nchunks),
+            .cps = @max(1, tot / chunk_samples / 100),
             .f38 = divF32(400.0, nceil),
             .span_credit = @as(f32, @floatFromInt(nceil)) * @as(f32, 0.005),
             .lvl_rescale = divF32(15000.0, nceil),
@@ -3289,17 +3363,20 @@ const PwavPwv2Engine = struct {
     /// The writer body for chunk `c`. Also called with an empty buffer for
     /// float32-rounding phantom chunks past the last real one.
     fn runChunk(e: *PwavPwv2Engine, c: usize) void {
-        const islast = c == e.nceil;
+        const islast = c == e.last_chunk;
         const flag1ec = e.det_a[0].raised[c - 1] != 0;
         const nch = e.nceil;
 
         // 9-chunk group of |mono|·32768, cut short by band-1 record closes.
+        // The sum is a sequential f32 accumulation in sample order (carry
+        // = ((a0+carry)+a1)+a2+…), not a wider or pairwise sum — the f32
+        // rounding is part of the format's behavior.
         e.grp_cnt += 1;
-        e.grp_sum += npSum(e.mono_abs[0..e.buf_len]);
+        for (e.mono_abs[0..e.buf_len]) |x| e.grp_sum += @as(f32, @floatCast(x));
         var completed = false;
         var bufd8: f32 = 0.0;
         if (e.grp_cnt > 8 or flag1ec) {
-            bufd8 = @floatCast(e.grp_sum / @as(f64, @as(f32, @floatFromInt(chunk_samples * @as(usize, @intCast(e.grp_cnt))))));
+            bufd8 = e.grp_sum / @as(f32, @floatFromInt(chunk_samples * @as(usize, @intCast(e.grp_cnt))));
             if (e.armed == 1) {
                 e.pending = 1;
                 e.armed = 0;
@@ -3466,10 +3543,10 @@ const PwavPwv2Engine = struct {
 /// [−1, 1) (see `PcmInput`); Hand the result to `buildAnlzInput` with the
 /// track's performance data.
 ///
-/// Known divergences from Rekordbox on real program material: the PWAV
-/// 3-bit class code (dense material), and fast transients whose first
-/// band-1 record close shifts the level accumulator's span phase. The
-/// fixtures under `testdata/analysis` pin everything else byte-for-byte.
+/// Known divergences from Rekordbox on real program material: everything
+/// matches byte-for-byte and is pinned by the fixtures under
+/// `testdata/analysis`, except the PWAV 3-bit class code on noise-like
+/// high-band content (the height bits stay byte-exact).
 pub fn buildColumnsFromPcm(alloc: std.mem.Allocator, pcm: PcmInput) AnalyzeError!WaveformColumns {
     if (pcm.left.len != pcm.right.len) return error.ChannelMismatch;
     const n = pcm.left.len;
@@ -3491,8 +3568,15 @@ pub fn buildColumnsFromPcm(alloc: std.mem.Allocator, pcm: PcmInput) AnalyzeError
         const x: f64 = left[i];
         const y: f64 = right[i];
 
-        // WaveCreator float path.
-        wc.push(waveMonoMix(x, y));
+        // WaveCreator float path: the channels arrive s16-quantized
+        // (×32768, truncated toward zero, clamped to [-32768, 32767],
+        // widened back to f64) and the WaveCreator rescales by 1/32767,
+        // not 2⁻¹⁵. The half-code truncation shifts the PWV4 band signals
+        // enough to flip razor-thin share comparisons, so it must be
+        // kept exact.
+        const wl: f64 = @as(f64, @floatFromInt(std.math.clamp(@as(i32, @intFromFloat(@trunc(x * 32768.0))), -32768, 32767))) * (1.0 / 32767.0);
+        const wr: f64 = @as(f64, @floatFromInt(std.math.clamp(@as(i32, @intFromFloat(@trunc(y * 32768.0))), -32768, 32767))) * (1.0 / 32767.0);
+        wc.push(waveMonoMix(wl, wr));
         while (wc.open < wc.d and wc.starts[wc.open + 1] <= i + 1) {
             wc.closeRecord(wc.open);
         }
@@ -3516,7 +3600,7 @@ pub fn buildColumnsFromPcm(alloc: std.mem.Allocator, pcm: PcmInput) AnalyzeError
     }
     // float32-rounding phantom chunks past the last real one (rare, long
     // tracks): empty groups, zero counts.
-    while (chunk <= pp.nceil) : (chunk += 1) {
+    while (chunk <= pp.last_chunk) : (chunk += 1) {
         pp.runChunk(chunk);
     }
 
@@ -3528,7 +3612,7 @@ pub fn buildColumnsFromPcm(alloc: std.mem.Allocator, pcm: PcmInput) AnalyzeError
     const pwv4_bytes = try wc.pwv4(a);
     const preview_bytes = pp.bytes();
 
-    var out: WaveformColumns = .{};
+    var out: WaveformColumns = .{ .band3_scales = scales.scale_u16 };
     errdefer out.deinit(alloc);
     out.preview_mono = try alloc.alloc(WaveformPreviewColumn, 400);
     for (out.preview_mono, 0..) |*col, i| col.* = @bitCast(preview_bytes.pwav[i]);

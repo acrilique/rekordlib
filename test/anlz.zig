@@ -1648,6 +1648,7 @@ const AnalysisFixture = struct {
     pwv5: []u16, // big-endian words on disk, native here
     pwv6: []u8, // 1200 x 3
     pwv7: []u8, // N x 3
+    pwvc: [3]u16, // big-endian words on disk, native here
 
     fn read(alloc: std.mem.Allocator, sub_path: []const u8) !AnalysisFixture {
         const pcm = try readFixture(alloc, sub_path);
@@ -1673,7 +1674,7 @@ const AnalysisFixture = struct {
         const exp = try readFixture(alloc, stem);
         defer alloc.free(exp);
         const n_columns = (f.n + 293) / 294;
-        const want_len = 4 + 400 + 100 + n_columns + 7200 + 2 * n_columns + 3600 + 3 * n_columns;
+        const want_len = 4 + 400 + 100 + n_columns + 7200 + 2 * n_columns + 3600 + 3 * n_columns + 6;
         if (exp.len != want_len) return error.InvalidFormat;
         if (std.mem.readInt(u32, exp[0..4], .little) != f.n) return error.InvalidFormat;
         var off: usize = 4;
@@ -1699,6 +1700,12 @@ const AnalysisFixture = struct {
         off += 3600;
         f.pwv7 = try alloc.dupe(u8, exp[off .. off + 3 * n_columns]);
         errdefer alloc.free(f.pwv7);
+        off += 3 * n_columns;
+        f.pwvc = .{
+            std.mem.readInt(u16, exp[off..][0..2], .big),
+            std.mem.readInt(u16, exp[off + 2 ..][0..2], .big),
+            std.mem.readInt(u16, exp[off + 4 ..][0..2], .big),
+        };
         return f;
     }
 
@@ -1783,6 +1790,9 @@ fn expectAnalysisMatches(analysis: *const anlz.WaveformColumns, f: *const Analys
             break;
         }
     };
+    if (failed == null and !std.meta.eql(analysis.band3_scales, f.pwvc)) {
+        failed = "PWVC";
+    }
     if (failed) |section| {
         std.debug.print("analysis mismatch: {s} column {d}\n", .{ section, bad_index });
         return error.TestExpectedEqual;
@@ -1862,6 +1872,8 @@ test "buildColumnsFromPcm encodes digital silence exactly like the analyzer" {
     for (analysis.band3_detail) |col| {
         try testing.expectEqual(@as(u8, 0), col.energy_mid_third_freq);
     }
+    // Silence keeps the engine's initial auto-gain scales (1.0 ×100).
+    try testing.expectEqual([3]u16{ 100, 100, 100 }, analysis.band3_scales);
 }
 
 test "buildColumnsFromPcm requires stereo" {
@@ -1925,6 +1937,7 @@ test "buildAnlzInput moves the analysis columns into an input" {
     try testing.expectEqual(@as(usize, 100), input.tiny_preview.len);
     try testing.expectEqual(@as(usize, 1200), input.color_preview.?.len);
     try testing.expectEqual(@as(usize, 1200), input.band3_preview.?.len);
+    try testing.expectEqual(fixture.pwvc, input.band3_scales.?);
 
     // The input serializes into a well-formed ANLZ set.
     const dat = try anlz.serializeFile(alloc, &test_file_header_data, &.{

@@ -1978,8 +1978,8 @@ pub const DeviceExport = struct {
     /// `.EXT` when the
     /// extended-cue list is non-empty or any of its optional column
     /// groups is present (present-but-empty writes the file; null skips
-    /// it), `.2EX` when either 3-band group is present. Tracks without
-    /// analysis queue nothing.
+    /// it), `.2EX` when any 3-band group or the scales section is
+    /// present. Tracks without analysis queue nothing.
     fn buildAnlzFiles(e: *DeviceExport, track: TrackInput) AddTrackError![3]?PendingAnlz {
         const input = track.analysis orelse return .{ null, null, null };
         const a = e.alloc;
@@ -2043,15 +2043,20 @@ pub const DeviceExport = struct {
                 null,
         });
 
-        // `.2EX`: the 3-band groups.
+        // `.2EX`: the 3-band groups. The writer emits the detail stream
+        // before the fixed preview and closes with the scales section.
         files[2] = try e.serializeAnlzGroup(track.file_path, .two_ex, &.{
             path_section,
+            if (input.band3_detail) |cols|
+                anlz.Content{ .waveform_3band_detail = .{ .data = cols } }
+            else
+                null,
             if (input.band3_preview) |cols|
                 anlz.Content{ .waveform_3band_preview = .{ .data = cols } }
             else
                 null,
-            if (input.band3_detail) |cols|
-                anlz.Content{ .waveform_3band_detail = .{ .data = cols } }
+            if (input.band3_scales) |scales|
+                anlz.Content{ .waveform_3band_scales = .{ .scales = scales } }
             else
                 null,
         });
