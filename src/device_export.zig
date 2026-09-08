@@ -1646,9 +1646,10 @@ pub const DeviceExport = struct {
     /// path:
     /// `content.path` values are the device-root-absolute file paths the
     /// pdb Track rows store, so `lib.contentByPath(file_path)` hands back
-    /// the OL view of a track — including the fields the pdb lacks
-    /// (remixer/composer/lyricist/original-artist ids, subtitle, bit
-    /// depth, sampling rate, djPlayCount). Only compiled with
+    /// the OL view of a track — everything the joined `TrackView` already
+    /// decodes (subtitle, kuvo flags, update counts) plus the raw columns
+    /// no view carries (per-role artist ids, the stored `djPlayCount`,
+    /// `masterDbId`/`masterContentId`). Only compiled with
     /// `-Donelibrary=vendored-sqlcipher` (or `=system-sqlcipher`).
     pub fn openOneLibrary(e: *DeviceExport) OpenOLError!?*const onelibrary.Library {
         if (onelibrary.mode == .off)

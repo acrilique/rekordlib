@@ -132,9 +132,9 @@ const content = lib.contentByPath("/Contents/Some artist/01 Some track.mp3") ore
 std.debug.print("played {d} times\n", .{content.djPlayCount orelse 0});
 ```
 
-The `tracks()` iterator already joins these content rows into its views; `openOneLibrary` is for the rest of the store — playlists, play histories, hot cue banks, tag trees — and for the columns the pdb lacks (`djPlayCount`, `subtitle`, per-role artist ids, bit depth, ...), with dimension rows reachable through `lib.byId(rekordlib.onelibrary.Artist, id)`.
+There's also a `tracks()` iterator which already joins these content rows into its views, so the OL-only columns (`subtitle`, kuvo flags, update counts) come with them whenever the path join hits. `openOneLibrary` is for what no view carries — the store's other tables (play histories, hot cue banks, tag trees) and raw columns (per-role artist ids, the stored `djPlayCount`, master fields) — with dimension rows reachable through `lib.byId(rekordlib.onelibrary.Artist, id)`.
 
-An export with no `export.pdb` at all (an OL-only export) works too: every handle method resolves the database it goes through — the pdb when present, else the OL store (in `-Donelibrary` builds) — so `tracks()` iterates `content` rows and the mutating calls land on them. A root carrying neither database fails with `DatabaseNotFound`. Views say which side they joined through their `source` field (`pdb_only` or `pdb_and_ol`).
+An export with no `export.pdb` at all (an OL-only export) works too: every track or playlist method resolves the database it goes through — the pdb when present, else the OL store (in `-Donelibrary` builds) — so `tracks()` iterates `content` rows and the mutating calls land on them. A root carrying neither database fails with `DatabaseNotFound`. Views say which side they joined through their `source` field (`pdb_only` or `pdb_and_ol`).
 
 ## Settings
 
