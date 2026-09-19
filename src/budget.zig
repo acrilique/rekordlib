@@ -2,29 +2,33 @@
 // v. 2.0. If a copy of the MPL was not distributed with this file, You can
 // obtain one at https://mozilla.org/MPL/2.0/.
 
-//! An allocator wrapper that caps the bytes an untrusted decode may draw,
-//! proportional to the input that declared it.
+//! Caps the bytes an untrusted decode may allocate, in proportion to its
+//! input.
 //!
-//! The eager-parse design materializes a whole file into an arena, so a
-//! hostile format can amplify: format-declared counts and offsets can name
-//! the same bytes many times, and every copy costs real memory. A budget
-//! wrapped around the arena's child allocator bounds every such decode at
-//! one choke point — including decoder bugs not yet found — instead of
-//! per-site accounting: when the arena's cumulative demand passes `limit`,
-//! allocations fail and `exceeded` records that the refusal was policy,
-//! not host memory. The caller maps that flag to a typed error.
+//! The parsers materialize a whole file into memory. A hostile file's
+//! declared structure can expand: format-declared counts and offsets can
+//! name the same bytes many times, and every copy costs real memory. Such a
+//! file could exhaust host memory.
+//!
+//! A [Budget](#rekordlib.budget.Budget) wraps the arena's child allocator,
+//! so every allocation of a decode passes one choke point — including
+//! decoder bugs not yet found — instead of per-site accounting. If the
+//! running total passes `limit`, allocations fail. `exceeded` then records
+//! that the refusal was policy, not host memory, and the caller maps that
+//! flag to a typed error.
 
 const std = @import("std");
 
-/// Default proportional-limit policy shared by the format loaders: a
-/// decode may allocate up to `multiplier` bytes per input byte, and never
-/// less than `min_limit` (a minimal honest database still materializes a
-/// few hundred kilobytes of pages and rows). Sparse honest files decode
-/// to about their encoded size, but row-dense ones — many tiny rows,
-/// each carrying structs and a duped string against ~30 wire bytes —
-/// measure close to 4x, so eight times leaves margin over the worst
-/// honest shape while catching the hundreds-fold amplification aliased
-/// offsets, presence slots, and generated rows produce.
+/// Default proportional-limit policy shared by the format loaders. A decode may allocate up to
+/// [multiplier](#rekordlib.budget.multiplier) bytes per input byte, and never less than
+/// [min_limit](#rekordlib.budget.min_limit): even a minimal real database still materializes a
+/// few hundred kilobytes of pages and rows.
+///
+/// Sparse real files decode to about their encoded size. Real files with many tiny rows need
+/// more: each row carries structs and a duplicated string against ~30 wire bytes, which
+/// measures close to 4x the encoded size. So 8x leaves margin over the worst real shape, while
+/// catching the hundreds-fold expansion hostile files produce through aliased offsets,
+/// presence slots, and generated rows.
 pub const multiplier: usize = 8;
 pub const min_limit: usize = 1 << 20;
 
@@ -41,13 +45,13 @@ pub const Budget = struct {
     /// The allocator every byte is actually drawn from.
     child: std.mem.Allocator,
     /// The cumulative allocation ceiling. Raising it after a successful
-    /// parse is how a trusted-for-mutation database gains writer headroom
+    /// parse gives a trusted-for-mutation database writer headroom,
     /// without reopening the parse-time ceiling.
     limit: usize,
     /// Bytes currently allocated through the wrapper.
     used: usize = 0,
-    /// Set when an allocation was refused because it would pass `limit`;
-    /// distinguishes the policy refusal from a genuine `OutOfMemory`.
+    /// Set when an allocation was refused because it would pass `limit`.
+    /// This distinguishes the policy refusal from a genuine `OutOfMemory`.
     exceeded: bool = false,
 
     /// Bytes still available under the ceiling.
@@ -72,8 +76,9 @@ pub const Budget = struct {
         return @ptrCast(@alignCast(ctx));
     }
 
-    /// Refuses (and records) a growth of `delta` over the limit; shrink
-    /// and no-op sizes always pass the policy check.
+    /// If a growth of `delta` does not fit under the limit, refuse it and
+    /// record the refusal in `exceeded`. Shrinks and no-op sizes always
+    /// pass the policy check.
     fn allowsGrowth(b: *Budget, delta: usize) bool {
         if (delta > b.remaining()) {
             b.exceeded = true;

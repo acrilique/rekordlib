@@ -12,16 +12,18 @@ pub const WriteError = error{OutOfMemory};
 pub const Cursor = struct {
     buf: []const u8,
     pos: usize = 0,
-    /// Allocator available to custom codecs invoked by `takeStruct`. `null`
-    /// unless the cursor was created with `initAlloc`.
+    /// Allocator available to custom codecs invoked by
+    /// [takeStruct](#rekordlib.bin.takeStruct). `null` unless the cursor was
+    /// created with [initAlloc](#rekordlib.bin.Cursor.initAlloc).
     alloc: ?std.mem.Allocator = null,
 
     pub fn init(buf: []const u8) Cursor {
         return .{ .buf = buf };
     }
 
-    /// Like `init`, but with an allocator that custom codec fields may use to
-    /// copy variable-length data out of the buffer.
+    /// Like [init](#rekordlib.bin.Cursor.init), but with an allocator that
+    /// custom codec fields may use to copy variable-length data out of the
+    /// buffer.
     pub fn initAlloc(alloc: std.mem.Allocator, buf: []const u8) Cursor {
         return .{ .buf = buf, .alloc = alloc };
     }
@@ -149,7 +151,8 @@ pub const Emitter = struct {
 };
 
 /// Returns `true` if `T` declares both `decode` and `encode`, the custom
-/// codec contract of `takeStruct`/`putStruct` (see `takeStruct`).
+/// codec contract of [takeStruct](#rekordlib.bin.takeStruct) and
+/// [putStruct](#rekordlib.bin.putStruct).
 fn hasCodec(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(T, "decode") and @hasDecl(T, "encode"),
@@ -175,7 +178,7 @@ fn isPackedStruct(comptime T: type) bool {
     return ti == .@"struct" and ti.@"struct".layout == .@"packed";
 }
 
-/// Serialized byte count of an integer, its bit size in whole bytes — for
+/// Serialized byte count of an integer: its bit size in whole bytes. For
 /// non-power-of-two ints like `u24` this is smaller than the ABI
 /// `@sizeOf`, which includes padding.
 pub fn intBytes(comptime T: type) usize {
@@ -189,16 +192,17 @@ pub fn intBytes(comptime T: type) usize {
 /// * non-exhaustive enums, so that unknown enum values roundtrip verbatim
 ///   instead of tripping a safety check
 /// * `[N]u8` arrays
-/// * packed structs backed by u8/u16/u32/u64, bitcast through their backing
-///   integer (Zig packs the first declared field into the least significant
-///   bits)
+/// * packed structs backed by u8/u16/u24/u32/u64, bitcast through their
+///   backing integer (Zig packs the first declared field into the least
+///   significant bits)
 /// * plain nested structs, walked recursively
 /// * custom codecs: a type declaring both `decode` and `encode` handles its
 ///   own serialization via `T.decode(c: *Cursor) ReadError!T` and
 ///   `T.encode(self: T, e: *Emitter) WriteError!void`. Codecs pick their own
 ///   endianness and may copy memory through `Cursor.alloc` (set up with
-///   `Cursor.initAlloc`); a codec that needs an allocator while `alloc` is
-///   `null` fails with `error.OutOfMemory`.
+///   [Cursor.initAlloc](#rekordlib.bin.Cursor.initAlloc)); a codec that
+///   needs an allocator while `alloc` is `null` fails with
+///   `error.OutOfMemory`.
 /// * slices, which are skipped and left at their default value:
 ///   variable-length data is owned by the containing type's parse and write
 ///   logic. For that reason `T` and any nested struct types must have field
@@ -242,10 +246,10 @@ pub fn takeStruct(c: *Cursor, comptime T: type, comptime endian: std.builtin.End
     return out;
 }
 
-/// Writes the fields of `value` in declaration order at `endian`, the mirror
-/// image of `takeStruct` (whose documentation lists the supported field
-/// types, including the custom codec contract). `value` may be passed by
-/// value or as a pointer.
+/// Writes the fields of `value` in declaration order at `endian`. This is
+/// the mirror image of [takeStruct](#rekordlib.bin.takeStruct), whose
+/// documentation lists the supported field types, including the custom
+/// codec contract. `value` may be passed by value or as a pointer.
 pub fn putStruct(e: *Emitter, value: anytype, comptime endian: std.builtin.Endian) WriteError!void {
     const T = switch (@typeInfo(@TypeOf(value))) {
         .pointer => |p| p.child,
@@ -286,11 +290,12 @@ pub fn putStruct(e: *Emitter, value: anytype, comptime endian: std.builtin.Endia
 }
 
 /// Reads `n` elements of `T` in declaration order at `endian` (see
-/// `takeStruct` for the supported field types), allocating the returned
-/// slice with `alloc`; the caller owns it. The partial slice is freed if any
-/// element fails to read. Runs whose `n` elements cannot fit the remaining
-/// input fail with `UnexpectedEof` before anything is allocated, so
-/// attacker-controlled counts cannot amplify into oversized allocations.
+/// [takeStruct](#rekordlib.bin.takeStruct) for the supported field types),
+/// allocating the returned slice with `alloc`; the caller owns it. The
+/// partial slice is freed if any element fails to read. If the `n` elements
+/// cannot fit in the remaining input, the read fails with `UnexpectedEof`
+/// before anything is allocated, so attacker-controlled counts cannot
+/// amplify into oversized allocations.
 pub fn takeStructSlice(alloc: std.mem.Allocator, c: *Cursor, comptime T: type, comptime endian: std.builtin.Endian, n: usize) ReadError![]T {
     const elem_len = comptime serializedLen(T);
     const run_len: u64 = @as(u64, n) * elem_len;
@@ -301,9 +306,10 @@ pub fn takeStructSlice(alloc: std.mem.Allocator, c: *Cursor, comptime T: type, c
     return out;
 }
 
-/// Number of bytes `takeStruct`/`putStruct` read/write for `T`. Structs with
-/// slice fields (variable length) or codec fields (data-dependent length)
-/// have no fixed size and fail to compile.
+/// Number of bytes [takeStruct](#rekordlib.bin.takeStruct) and
+/// [putStruct](#rekordlib.bin.putStruct) read/write for `T`. If a struct has
+/// slice fields (variable length) or codec fields (data-dependent length),
+/// it has no fixed size and fails to compile.
 pub fn serializedLen(comptime T: type) usize {
     return comptime blk: {
         if (isPackedStruct(T)) break :blk intBytes(PackedBacking(T));
@@ -340,10 +346,10 @@ pub fn serializedLen(comptime T: type) usize {
 
 /// Checks the fields listed in `T.constant_fields` (an anonymous struct
 /// listing field names, e.g. `.{ .magic, .checksum }`) against their default
-/// values, which they must hold in all known files; other values are
-/// rejected with `error.UnexpectedValue`. Fields not listed are accepted and
-/// written verbatim. A `T` without a `constant_fields` declaration passes
-/// as-is.
+/// values, which they must hold in all known files. If a listed field holds
+/// any other value, it is rejected with `error.UnexpectedValue`. Fields not
+/// listed are accepted and written verbatim. A `T` without a
+/// `constant_fields` declaration passes as-is.
 pub fn validateConstantFields(comptime T: type, value: T) error{UnexpectedValue}!void {
     if (!@hasDecl(T, "constant_fields")) return;
     const defaults = T{};

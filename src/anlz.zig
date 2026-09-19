@@ -6,8 +6,8 @@
 //! nested subdirectories of the `PIONEER/USBANLZ` directory of a device
 //! export and can have the extensions `.DAT`, `.EXT`, or `.2EX`. They are
 //! also used for local Rekordbox databases. The files contain track data
-//! that is not part of the PDB file, such as beatgrids, cue points,
-//! waveforms, and song structure information.
+//! that is not part of the [pdb](#rekordlib.pdb) file, such as beatgrids,
+//! cue points, waveforms, and song structure information.
 //!
 //! The file starts with a `PMAI` header followed by a sequence of sections,
 //! each prefixed with a fourcc tag and size fields. With each hardware
@@ -39,7 +39,8 @@ pub fn fourcc(comptime tag: *const [4]u8) u32 {
 }
 
 /// The kind of a section, identified by its fourcc tag. Unknown tags are
-/// kept and roundtrip verbatim through the `Unknown` content.
+/// kept and roundtrip verbatim through the [Unknown](#rekordlib.anlz.Unknown)
+/// content.
 pub const Kind = enum(u32) {
     /// File header that contains all other sections.
     file = fourcc("PMAI"),
@@ -115,8 +116,9 @@ pub const Beat = struct {
     /// Current tempo in centi-BPM (= 1/100 BPM).
     tempo: u16 = 0,
     /// Time in milliseconds after which this beat would occur (at normal
-    /// playback speed). The write side works in samples —
-    /// `BeatMarker.sample_offset`, converted by `samplesToMs`.
+    /// playback speed). The write side works in samples:
+    /// [BeatMarker](#rekordlib.anlz.BeatMarker).`sample_offset`, converted
+    /// by [samplesToMs](#rekordlib.anlz.samplesToMs).
     time: u32 = 0,
 };
 
@@ -175,7 +177,7 @@ pub const CueType = enum(u8) {
 
 /// A memory or hot cue (or loop), a single entry of a cue list. Preceded on
 /// the wire by a nested 12-byte entry header (tag `PCPT`, total entry
-/// length `wire_len`).
+/// length [wire_len](#rekordlib.anlz.Cue.wire_len)).
 pub const Cue = struct {
     /// Hot cue number (0 = not a hot cue, 1 = A, 2 = B, ...).
     hot_cue: u32 = 0,
@@ -228,9 +230,9 @@ pub const Cue = struct {
     }
 };
 
-/// Entry count that a `CueList.memory_count` field must hold: the number of
-/// cues in a non-empty memory cue list, the `0xFFFFFFFF` sentinel in hot cue
-/// lists and empty lists.
+/// Entry count that a [CueList](#rekordlib.anlz.CueList)'s `memory_count`
+/// field must hold: the number of cues in a non-empty memory cue list, the
+/// `0xFFFFFFFF` sentinel in hot cue lists and empty lists.
 fn derivedMemoryCount(list_type: CueListType, len_cues: usize) usize {
     return if (list_type == .memory_cues and len_cues > 0) len_cues else 0xFFFF_FFFF;
 }
@@ -298,7 +300,8 @@ pub const CueList = struct {
 ///
 /// Diverging from rekordcrate, the payload is stored as raw bytes (NUL
 /// included) so roundtrips are byte-identical even for unusual data; use
-/// `utf8` and `fromUtf8` to convert.
+/// [utf8](#rekordlib.anlz.LenPrefixedWideString.utf8) and
+/// [fromUtf8](#rekordlib.anlz.LenPrefixedWideString.fromUtf8) to convert.
 pub const LenPrefixedWideString = struct {
     /// Raw payload bytes, exactly as found on disk.
     raw: []const u8 = &.{},
@@ -323,7 +326,7 @@ pub const LenPrefixedWideString = struct {
     }
 
     /// Encodes `text` as UTF-16BE with a trailing NUL, the inverse of
-    /// `utf8`.
+    /// [utf8](#rekordlib.anlz.LenPrefixedWideString.utf8).
     pub fn fromUtf8(alloc: std.mem.Allocator, text: []const u8) !LenPrefixedWideString {
         const units = try std.unicode.utf8ToUtf16LeAlloc(alloc, text);
         defer alloc.free(units);
@@ -337,7 +340,8 @@ pub const LenPrefixedWideString = struct {
         return .{ .raw = raw };
     }
 
-    /// Custom codec hook for `bin.takeStruct`/`bin.putStruct`.
+    /// Custom codec hook for [takeStruct](#rekordlib.bin.takeStruct)/
+    /// [putStruct](#rekordlib.bin.putStruct).
     pub fn decode(c: *bin.Cursor) bin.ReadError!LenPrefixedWideString {
         const len = try c.takeInt(u32, .big);
         if (len == 0) return .{};
@@ -345,7 +349,8 @@ pub const LenPrefixedWideString = struct {
         return .{ .raw = try alloc.dupe(u8, try c.takeBytes(len)) };
     }
 
-    /// Custom codec hook for `bin.takeStruct`/`bin.putStruct`.
+    /// Custom codec hook for [takeStruct](#rekordlib.bin.takeStruct)/
+    /// [putStruct](#rekordlib.bin.putStruct).
     pub fn encode(s: LenPrefixedWideString, e: *bin.Emitter) bin.WriteError!void {
         try e.putInt(u32, s.byte_len(), .big);
         try e.putBytes(s.raw);
@@ -516,7 +521,8 @@ pub const ExtendedCueList = struct {
     const header_size: u32 = 20;
 
     /// Fields that must hold their default value in all known files;
-    /// other values are rejected on parse (see `bin.validateConstantFields`).
+    /// other values are rejected on parse (see
+    /// [validateConstantFields](#rekordlib.bin.validateConstantFields)).
     pub const constant_fields = .{.unknown};
 
     fn parse(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!ExtendedCueList {
@@ -550,7 +556,7 @@ pub const ExtendedCueList = struct {
 /// Path of the audio file that this analysis belongs to.
 pub const Path = struct {
     /// Path of the audio file. The length prefix in the section preamble
-    /// must equal the section's `content_size`.
+    /// must equal the section's [content_size](#rekordlib.anlz.Header.content_size).
     path: LenPrefixedWideString = .{},
 
     const kind: Kind = .path;
@@ -606,20 +612,23 @@ pub const Vbr = struct {
 /// struct fields starting at the least significant bit, the fields are
 /// declared in wire bit order.
 pub const WaveformPreviewColumn = packed struct(u8) {
-    /// Height of the column; the scale is section-specific (see the
-    /// section docs).
+    /// Height of the column; the scale is section-specific (see
+    /// [WaveformPreview](#rekordlib.anlz.WaveformPreview) and
+    /// [WaveformDetail](#rekordlib.anlz.WaveformDetail)).
     height: u5 = 0,
-    /// Section-specific: display brightness in `WaveformDetail`, spectral
-    /// class in `WaveformPreview`.
+    /// Section-specific: display brightness in
+    /// [WaveformDetail](#rekordlib.anlz.WaveformDetail), spectral class in
+    /// [WaveformPreview](#rekordlib.anlz.WaveformPreview).
     whiteness: u3 = 0,
 };
 
 /// Single column of a `tiny_waveform_preview` section. The wire byte packs
 /// the height into the four least significant bits (see
-/// `WaveformPreviewColumn` for the field order); the upper four bits are
-/// unused.
+/// [WaveformPreviewColumn](#rekordlib.anlz.WaveformPreviewColumn) for the
+/// field order); the upper four bits are unused.
 pub const TinyWaveformPreviewColumn = packed struct(u8) {
-    /// Bass-band loudness of the column (see `TinyWaveformPreview`).
+    /// Bass-band loudness of the column (see
+    /// [TinyWaveformPreview](#rekordlib.anlz.TinyWaveformPreview)).
     height: u4 = 0,
     unused: u4 = 0,
 };
@@ -643,12 +652,15 @@ pub const WaveformColorPreviewColumn = struct {
 
 /// Single column of a `waveform_color_detail` section. The wire bytes pack
 /// the fields big-endian, starting with `red` in the three most significant
-/// bits (see `WaveformPreviewColumn` for the field order). Each channel is
+/// bits (see [WaveformPreviewColumn](#rekordlib.anlz.WaveformPreviewColumn)
+/// for the field order). Each channel is
 /// its band's share of the column's loudest band, so the channels carry
 /// color balance rather than absolute level.
 pub const WaveformColorDetailColumn = packed struct(u16) {
     unknown: u2 = 0,
-    /// Height of the column, on `WaveformDetail`'s track-relative scale.
+    /// Height of the column, on
+    /// [WaveformDetail](#rekordlib.anlz.WaveformDetail)'s track-relative
+    /// scale.
     height: u5 = 0,
     /// Highs (≥1500 Hz).
     blue: u3 = 0,
@@ -699,7 +711,8 @@ const WaveformSpec = struct {
 /// overview heights quantize loudness against fixed thresholds, the detail
 /// heights are relative to the track's loudest column, and the 3-band
 /// sections apply a per-track auto-gain that equalizes the three bands
-/// (recorded once per track by `Waveform3BandScales`).
+/// (recorded once per track by
+/// [Waveform3BandScales](#rekordlib.anlz.Waveform3BandScales)).
 fn WaveformSection(comptime spec: WaveformSpec) type {
     const Column = spec.column;
     if (spec.entry_bytes) |entry_bytes| {
@@ -714,9 +727,11 @@ fn WaveformSection(comptime spec: WaveformSpec) type {
         const kind: Kind = spec.kind;
         const header_size: u32 = 12 + 4 + (if (spec.entry_bytes != null) 4 else 0) + (if (spec.unknown != null) 4 else 0);
 
-        /// Unknown preamble field, stored verbatim (see the section alias
-        /// for the value found in known files). Virtual when the spec has no
-        /// such field: it stays at its default and is never serialized.
+        /// Unknown preamble field, stored verbatim (for the value found in
+        /// known files, see the section alias's initializer, for example
+        /// [WaveformDetail](#rekordlib.anlz.WaveformDetail)). Virtual when
+        /// the spec has no such field: it stays at its default and is never
+        /// serialized.
         unknown: u32 = spec.unknown orelse 0,
         /// Waveform column data; the entry count is recomputed from this
         /// slice on write.
@@ -755,10 +770,10 @@ fn WaveformSection(comptime spec: WaveformSpec) type {
 }
 
 /// Fixed-width monochrome preview of the track waveform: the whole-track
-/// loudness strip. `height` is an absolute loudness code (the span's mean
-/// level, quantized against fixed thresholds, so quiet tracks render low;
-/// never below 2), and `whiteness` holds a 6-way spectral class — which
-/// of bass/mid/high leads the span (values 6–7 are never written).
+/// loudness strip. `height` is an absolute loudness code: the span's mean
+/// level, quantized against fixed thresholds, so quiet tracks render low
+/// (never below 2). `whiteness` holds a 6-way spectral class — which of
+/// bass/mid/high leads the span (values 6–7 are never written).
 pub const WaveformPreview = WaveformSection(.{
     .kind = .waveform_preview,
     .column = WaveformPreviewColumn,
@@ -768,7 +783,7 @@ pub const WaveformPreview = WaveformSection(.{
 /// Smaller version of the fixed-width monochrome preview of the track
 /// waveform (for the CDJ-900): 100 columns of the smoothed bass-band
 /// envelope, quantized against its own fixed thresholds; heights floor at
-/// 2, and digital silence at 1 (see `Silence`).
+/// 2, and digital silence at 1 (see [Silence](#rekordlib.anlz.Silence)).
 pub const TinyWaveformPreview = WaveformSection(.{
     .kind = .tiny_waveform_preview,
     .column = TinyWaveformPreviewColumn,
@@ -776,11 +791,11 @@ pub const TinyWaveformPreview = WaveformSection(.{
 });
 
 /// Variable-width large monochrome version of the track waveform (the
-/// classic blue scrolling display), in `.EXT` files, at `DETAIL_HZ`
-/// columns per second. `height` is the column's peak power relative to
-/// the track's loudest column; `whiteness` is brightness — how much of
-/// that peak survives a 150 Hz low-pass, 0 for all-bass columns to 7 for
-/// no lows (or silence).
+/// classic blue scrolling display), in `.EXT` files, at
+/// [DETAIL_HZ](#rekordlib.anlz.DETAIL_HZ) columns per second. `height` is
+/// the column's peak power relative to the track's loudest column;
+/// `whiteness` is brightness — how much of that peak survives a 150 Hz
+/// low-pass, 0 for all-bass columns to 7 for no lows (or silence).
 pub const WaveformDetail = WaveformSection(.{
     .kind = .waveform_detail,
     .column = WaveformPreviewColumn,
@@ -800,10 +815,12 @@ pub const WaveformColorPreview = WaveformSection(.{
 });
 
 /// Variable-width large colored version of the track waveform (the
-/// scrolling RGB display), in `.EXT` files, at `DETAIL_HZ` columns per
-/// second. Red/green/blue carry the bass/mid/high balance (silence
-/// renders white), while `height` matches `WaveformDetail`'s
-/// track-relative scale.
+/// scrolling RGB display), in `.EXT` files, at
+/// [DETAIL_HZ](#rekordlib.anlz.DETAIL_HZ) columns per second.
+/// Red/green/blue carry the bass/mid/high balance (silence renders
+/// white), while `height` matches
+/// [WaveformDetail](#rekordlib.anlz.WaveformDetail)'s track-relative
+/// scale.
 pub const WaveformColorDetail = WaveformSection(.{
     .kind = .waveform_color_detail,
     .column = WaveformColorDetailColumn,
@@ -814,7 +831,7 @@ pub const WaveformColorDetail = WaveformSection(.{
 /// Fixed-width 3-band preview of the track waveform (whole-track strip of
 /// the 3-band view), in `.2EX` files. Per column, smoothed low/mid/high
 /// intensities after a per-track auto-gain that equalizes the three bands
-/// (see `Waveform3BandScales`).
+/// (see [Waveform3BandScales](#rekordlib.anlz.Waveform3BandScales)).
 pub const Waveform3BandPreview = WaveformSection(.{
     .kind = .waveform_3band_preview,
     .column = Waveform3BandColumn,
@@ -822,10 +839,11 @@ pub const Waveform3BandPreview = WaveformSection(.{
 });
 
 /// Variable-width large 3-band version of the track waveform (the scrolling
-/// 3-band display), in `.2EX` files, at `DETAIL_HZ` columns per second.
-/// Each band is an attack-decay envelope with its own release time
-/// (perceptual curve on the high band), on the auto-gain scales stored
-/// ×100 in the `Waveform3BandScales` section.
+/// 3-band display), in `.2EX` files, at
+/// [DETAIL_HZ](#rekordlib.anlz.DETAIL_HZ) columns per second. Each band is
+/// an attack-decay envelope with its own release time (perceptual curve on
+/// the high band), on the auto-gain scales stored ×100 in the
+/// [Waveform3BandScales](#rekordlib.anlz.Waveform3BandScales) section.
 pub const Waveform3BandDetail = WaveformSection(.{
     .kind = .waveform_3band_detail,
     .column = Waveform3BandColumn,
@@ -1090,7 +1108,8 @@ pub const Unknown = struct {
 };
 
 /// Section content, one variant per known section type; the variants carry
-/// their payload types' docs, and `Kind` documents the wire tags.
+/// their payload types' docs, and [Kind](#rekordlib.anlz.Kind) documents
+/// the wire tags.
 pub const Content = union(enum) {
     beat_grid: BeatGrid,
     cue_list: CueList,
@@ -1132,7 +1151,7 @@ comptime {
 /// section's 12-byte header). The section's bytes are bounded to its
 /// declared `total_size` and must be consumed exactly; a mismatch is
 /// reported as `InvalidFormat`. A `kind` that names no payload type (see
-/// `ContentOf`) parses as `unknown`, verbatim.
+/// [ContentOf](#rekordlib.anlz.ContentOf)) parses as `unknown`, verbatim.
 fn parseContent(c: *bin.Cursor, alloc: std.mem.Allocator, header: Header) ParseError!Content {
     if (header.size < 12 or header.total_size < header.size) return error.InvalidFormat;
     const region = try c.takeBytes(header.total_size - 12);
@@ -1156,9 +1175,10 @@ pub fn sectionKind(content: *const Content) Kind {
 }
 
 /// The content type a section of `kind` carries: every known section kind
-/// names exactly one `Content` variant (the uniqueness check above
-/// `parseContent` enforces it), so the map is a bijection over the section
-/// kinds. The entry kinds (`file`, `cue`, `extended_cue`) only ever appear
+/// names exactly one [Content](#rekordlib.anlz.Content) variant (the
+/// uniqueness check above `parseContent` enforces it), so the map is a
+/// bijection over the section kinds. The entry kinds (`file`, `cue`,
+/// `extended_cue`) only ever appear
 /// as the file header or nested inside cue lists, and unknown values parse
 /// as the shared `unknown` variant — none of them name a payload type, so
 /// they fail to compile here.
@@ -1233,7 +1253,7 @@ pub fn serializeFile(alloc: std.mem.Allocator, header_data: []const u8, sections
 /// Represents a whole `ANLZ0000.{DAT,EXT,2EX}` file.
 pub const Anlz = struct {
     /// Arena that owns every variable-size value reachable from this
-    /// instance; freed by `deinit`.
+    /// instance; freed by [deinit](#rekordlib.anlz.Anlz.deinit).
     arena: *std.heap.ArenaAllocator,
     /// Unknown preamble bytes following the file header (16 bytes in all
     /// known files). The `PMAI` header itself is fully derived on write.
@@ -1244,7 +1264,8 @@ pub const Anlz = struct {
     /// Parses an ANLZ image. All data is copied into an arena owned by the
     /// returned instance, so `buf` may be freed afterwards. Headers are
     /// validated against the values derived on write, so any file that
-    /// parses re-serializes byte-identical. Call `deinit` when done.
+    /// parses re-serializes byte-identical. Call
+    /// [deinit](#rekordlib.anlz.Anlz.deinit) when done.
     pub fn parse(alloc: std.mem.Allocator, buf: []const u8) ParseError!Anlz {
         const arena = try alloc.create(std.heap.ArenaAllocator);
         errdefer alloc.destroy(arena);
@@ -1289,12 +1310,15 @@ pub const Anlz = struct {
     }
 
     /// Returns the first section of the given kind, or null if the file
-    /// contains none. The kind selects the return type through `ContentOf`
-    /// — `.beat_grid` yields `?*BeatGrid`, `.path` yields `?*Path`.
+    /// contains none. The kind selects the return type through
+    /// [ContentOf](#rekordlib.anlz.ContentOf) — `.beat_grid` yields
+    /// `?*[BeatGrid](#rekordlib.anlz.BeatGrid)`, `.path` yields
+    /// `?*[Path](#rekordlib.anlz.Path)`.
     /// Sections are matched by their active variant, not their stored
     /// kind, so a hand-built `.unknown` section cannot be misread as a
     /// typed payload. The pointer reaches into this instance, so
-    /// mutations through it are picked up by `serialize`.
+    /// mutations through it are picked up by
+    /// [serialize](#rekordlib.anlz.Anlz.serialize).
     pub fn findSection(m: *const Anlz, comptime kind: Kind) ?*ContentOf(kind) {
         const T = ContentOf(kind);
         for (m.sections) |*section| {
@@ -1323,11 +1347,12 @@ pub const DETAIL_HZ: f64 = 150.0;
 pub const MONO_PREVIEW_COLUMNS: usize = 400;
 
 /// Columns of the tiny mono preview (`PWV2`). Fixed by the format, like
-/// `MONO_PREVIEW_COLUMNS`.
+/// [MONO_PREVIEW_COLUMNS](#rekordlib.anlz.MONO_PREVIEW_COLUMNS).
 pub const TINY_PREVIEW_COLUMNS: usize = 100;
 
 /// Columns of the color (`PWV4`) and 3-band (`PWV6`) previews, which share
-/// one width. Fixed by the format, like `MONO_PREVIEW_COLUMNS`.
+/// one width. Fixed by the format, like
+/// [MONO_PREVIEW_COLUMNS](#rekordlib.anlz.MONO_PREVIEW_COLUMNS).
 pub const COLOR_PREVIEW_COLUMNS: usize = 1200;
 
 /// The size of a waveform in libdjinterop's terms: how many columns it has,
@@ -1339,9 +1364,11 @@ pub const WaveformExtents = struct {
     samples_per_entry: f64,
 };
 
-/// The extents of the 150 Hz band vector `buildColumnsFromBands` wants for
-/// a track: `size = ceil(sample_count / (sample_rate / DETAIL_HZ))` columns
-/// of `sample_rate / DETAIL_HZ` samples each. Null when `sample_rate` is 0.
+/// The extents of the 150 Hz band vector
+/// [buildColumnsFromBands](#rekordlib.anlz.buildColumnsFromBands) wants for
+/// a track, at [DETAIL_HZ](#rekordlib.anlz.DETAIL_HZ) columns per second:
+/// `size = ceil(sample_count / (sample_rate / DETAIL_HZ))` columns of
+/// `sample_rate / DETAIL_HZ` samples each. Null when `sample_rate` is 0.
 pub fn detailExtents(sample_count: u64, sample_rate: u32) ?WaveformExtents {
     if (sample_rate == 0) return null;
     const samples_per_entry = @as(f64, @floatFromInt(sample_rate)) / DETAIL_HZ;
@@ -1352,12 +1379,14 @@ pub fn detailExtents(sample_count: u64, sample_rate: u32) ?WaveformExtents {
     };
 }
 
-/// The preview companion of `detailExtents`: previews are fixed-width, so
-/// the size is `COLOR_PREVIEW_COLUMNS` whatever the track, and each column
-/// spans `sample_count / COLOR_PREVIEW_COLUMNS` samples. The color tier is
-/// the one reported because libdjinterop's rekordbox adapter maps its own
-/// fixed-size 3-band overview onto `PWV6`. Null when `sample_rate` is 0,
-/// mirroring `detailExtents`.
+/// The preview companion of [detailExtents](#rekordlib.anlz.detailExtents):
+/// previews are fixed-width, so the size is
+/// [COLOR_PREVIEW_COLUMNS](#rekordlib.anlz.COLOR_PREVIEW_COLUMNS) whatever
+/// the track, and each column spans `sample_count / COLOR_PREVIEW_COLUMNS`
+/// samples. The color tier is the one reported because libdjinterop's
+/// rekordbox adapter maps its own fixed-size 3-band overview onto `PWV6`.
+/// Null when `sample_rate` is 0, mirroring
+/// [detailExtents](#rekordlib.anlz.detailExtents).
 pub fn previewExtents(sample_count: u64, sample_rate: u32) ?WaveformExtents {
     if (sample_rate == 0) return null;
     return .{
@@ -1369,7 +1398,8 @@ pub fn previewExtents(sample_count: u64, sample_rate: u32) ?WaveformExtents {
 
 /// Rekordbox's quantization of a waveform detail column height from the
 /// peak sample magnitude of its 150 Hz window: `min(31, floor(31.5·p²))`,
-/// with full scale (≥ 0.992) reaching 31. `detailHeightCode` is the exact
+/// with full scale (≥ 0.992) reaching 31.
+/// [detailHeightCode](#rekordlib.anlz.detailHeightCode) is the exact
 /// integer-domain form Rekordbox itself computes.
 pub fn detailHeight(peak: f64) u5 {
     const level = 31.5 * peak * peak;
@@ -1379,7 +1409,8 @@ pub fn detailHeight(peak: f64) u5 {
 
 /// Rekordbox's mono downmix for the s16 paths (PWV3/PWAV/PWV2): the
 /// arithmetic mean `(L + R) / 2`, not a max-channel pick — anti-phase
-/// input cancels. See `waveMonoMix` for the different float-path mix.
+/// input cancels. See [waveMonoMix](#rekordlib.anlz.waveMonoMix) for the
+/// different float-path mix.
 pub fn monoMix(left: f64, right: f64) f64 {
     return (left + right) / 2.0;
 }
@@ -1398,8 +1429,9 @@ pub fn bandValue(envelope: f64) u7 {
 /// given frequency (the top bits of `PWV3`/`PWAV` columns; DC encodes 0,
 /// digital silence 7): a monotone step function thresholding at 111.1,
 /// 139.7, 168.7, 197.5, 238.6, 297.4 and 420.5 Hz. On program material
-/// the code tracks an internal filterbank; `whitenessRatio` is the coded
-/// column law.
+/// the code tracks an internal filterbank;
+/// [whitenessRatio](#rekordlib.anlz.whitenessRatio) is the coded column
+/// law.
 pub fn whitenessTone(freq_hz: f64) u3 {
     if (freq_hz < 0.0 or freq_hz != freq_hz) return 7;
     const thresholds = [7]f64{ 111.06, 139.69, 168.74, 197.51, 238.59, 297.42, 420.54 };
@@ -1419,7 +1451,7 @@ pub fn whitenessTone(freq_hz: f64) u3 {
 /// exactly 7. The reference is a maximum over Rekordbox's internal color
 /// filterbank, which has more channels than the three visible ones.
 /// Scale-free: unlike the 3-band path there is no adaptive gain.
-/// `pwv5Colors` is the complete coded law.
+/// [pwv5Colors](#rekordlib.anlz.pwv5Colors) is the complete coded law.
 pub fn colorShare(ratio: f64) u3 {
     const level = 7.0 * ratio;
     if (!(level < 7.0)) return 7; // saturates; also maps NaN to 7
@@ -1495,7 +1527,8 @@ pub fn pwv7BandQuadratic(envelope: u16, scale_hundredths: u16) u8 {
 /// (u16 record peaks of the red/green/blue bands) are scaled by 255/max,
 /// then the two suppression corrections and the 1.3 blue boost are
 /// applied in float32, and the codes are `byte >> 5` — not
-/// `min(7, floor(7·A/A_ref))` (see `colorShare`): the >>5 quantizer lets
+/// `min(7, floor(7·A/A_ref))` (see
+/// [colorShare](#rekordlib.anlz.colorShare)): the >>5 quantizer lets
 /// non-dominant channels pin at 7 already at A/A_ref ≥ 0.878. All-zero
 /// input is digital silence and encodes (7,7,7).
 pub const ColorCodes = struct { red: u3, green: u3, blue: u3 };
@@ -1537,8 +1570,9 @@ pub fn pwv5Colors(red: u16, green: u16, blue: u16) ColorCodes {
 }
 
 /// The WaveCreator's mono downmix — the mix behind
-/// `PWV4`/`PWV5`/`PWV7`, distinct from `monoMix` (the s16 paths, a plain
-/// mean). The branch operands are bit-masked absolutes, so the law is:
+/// `PWV4`/`PWV5`/`PWV7`, distinct from [monoMix](#rekordlib.anlz.monoMix)
+/// (the s16 paths, a plain mean). The branch operands are bit-masked
+/// absolutes, so the law is:
 /// if `||L|−|R|| ≥ 0.001` take the mean, else take the channel with the
 /// larger magnitude — anti-phase content survives here.
 pub fn waveMonoMix(left: f64, right: f64) f64 {
@@ -1581,17 +1615,20 @@ pub const BeatMarker = struct {
     /// downbeats correctly.
     index: i32,
     /// Sample offset within the track, in samples at
-    /// `PerformanceData.sample_rate`. The wire grid stores milliseconds
-    /// (`Beat.time`); `samplesToMs` is the bridge, and integer offsets
-    /// land here cleanly when exact.
+    /// [PerformanceData](#rekordlib.anlz.PerformanceData).`sample_rate`.
+    /// The wire grid stores milliseconds
+    /// ([Beat](#rekordlib.anlz.Beat).`time`);
+    /// [samplesToMs](#rekordlib.anlz.samplesToMs) is the bridge, and
+    /// integer offsets land here cleanly when exact.
     sample_offset: f64,
 };
 
 /// One 150 Hz waveform detail column: peak band energies. The input of
-/// `buildColumnsFromBands` and the shape foreign waveform data maps onto —
-/// libdjinterop's `waveform_entry` (low/mid/high values; its per-band
-/// opacity fields are render alphas, not levels, and do not qualify)
-/// resampled to `DETAIL_HZ`.
+/// [buildColumnsFromBands](#rekordlib.anlz.buildColumnsFromBands) and the
+/// shape foreign waveform data maps onto — libdjinterop's `waveform_entry`
+/// (low/mid/high values; its per-band opacity fields are render alphas,
+/// not levels, and do not qualify) resampled to
+/// [DETAIL_HZ](#rekordlib.anlz.DETAIL_HZ).
 pub const Band = struct {
     /// Sound energy of the low frequency band (0-255).
     low: u8 = 0,
@@ -1628,8 +1665,9 @@ pub const CueInput = struct {
 /// Format-agnostic performance data for one track: the metadata half of an
 /// ANLZ build — beats, cues, and the rates that place them in time. All
 /// positions are sample offsets interpreted at `sample_rate`. The waveform
-/// half travels separately in a `WaveformColumns`; `buildAnalysis` joins the
-/// two.
+/// half travels separately in a
+/// [WaveformColumns](#rekordlib.anlz.WaveformColumns);
+/// [buildAnalysis](#rekordlib.anlz.buildAnalysis) joins the two.
 pub const PerformanceData = struct {
     /// Audio sample rate in Hz, used for sample→ms conversion. Zero makes
     /// beat and cue times come out as zero.
@@ -1637,8 +1675,10 @@ pub const PerformanceData = struct {
     /// Total number of samples in the track; clips beats past the end.
     sample_count: u64,
     /// Track tempo in BPM — `tempo`, not `bpm`'s wire sense: the high-level
-    /// vocabulary says `tempo` in plain BPM (`TrackInput.tempo`), the raw
-    /// mirrors (`Beat.tempo`, `pdb.Track.tempo`) carry centi-BPM. When set,
+    /// vocabulary says `tempo` in plain BPM
+    /// ([TrackInput](#rekordlib.device_export.TrackInput).`tempo`), the raw
+    /// mirrors ([Beat](#rekordlib.anlz.Beat).`tempo`,
+    /// [Track](#rekordlib.pdb.Track).`tempo`) carry centi-BPM. When set,
     /// it is applied uniformly to every beat, even for a variable-tempo
     /// grid (a Rekordbox-era simplification kept from rekordcrate); `null`
     /// derives the tempo per grid segment.
@@ -1653,12 +1693,15 @@ pub const PerformanceData = struct {
 };
 
 /// Caller-provided analysis content for a track — the ANLZ sections a
-/// player reads — the output of `buildAnalysis` and the input of the
-/// device writer (`TrackInput.analysis`): beats/cues go to `.DAT`
-/// (extended cues mirror to `.EXT`); the optional column groups select
-/// which sibling files are written — null skips that file, empty means the
-/// file is written without that section. All slices come from one
-/// allocator and are freed by `deinit`.
+/// player reads — the output of
+/// [buildAnalysis](#rekordlib.anlz.buildAnalysis) and the input of the
+/// device writer
+/// ([TrackInput](#rekordlib.device_export.TrackInput).`analysis`):
+/// beats/cues go to `.DAT` (extended cues mirror to `.EXT`); the optional
+/// column groups select which sibling files are written — null skips that
+/// file, empty means the file is written without that section. All slices
+/// come from one allocator and are freed by
+/// [deinit](#rekordlib.anlz.Analysis.deinit).
 pub const Analysis = struct {
     /// Beat grid (caller-provided).
     beats: []Beat = &.{},
@@ -1702,12 +1745,16 @@ pub const Analysis = struct {
 };
 
 /// The seven waveform column groups of an ANLZ file plus the 3-band
-/// auto-gain scales: the waveform half of an `Analysis` build, with field
-/// names matching `Analysis` one-to-one. Produced by
-/// `buildColumnsFromPcm` (byte-exact, from decoded PCM) or
-/// `buildColumnsFromBands` (approximate, from foreign 3-band data), and
-/// moved into `buildAnalysis`. All slices are owned by the caller's
-/// allocator and freed by `deinit`.
+/// auto-gain scales: the waveform half of an
+/// [Analysis](#rekordlib.anlz.Analysis) build, with field names matching
+/// [Analysis](#rekordlib.anlz.Analysis) one-to-one. Produced by
+/// [buildColumnsFromPcm](#rekordlib.anlz.buildColumnsFromPcm) (byte-exact,
+/// from decoded PCM) or
+/// [buildColumnsFromBands](#rekordlib.anlz.buildColumnsFromBands)
+/// (approximate, from foreign 3-band data), and moved into
+/// [buildAnalysis](#rekordlib.anlz.buildAnalysis). All slices are owned by
+/// the caller's allocator and freed by
+/// [deinit](#rekordlib.anlz.WaveformColumns.deinit).
 pub const WaveformColumns = struct {
     /// Fixed-width mono preview (`PWAV`, 400 columns).
     preview_mono: []WaveformPreviewColumn = &.{},
@@ -1737,12 +1784,13 @@ pub const WaveformColumns = struct {
     }
 };
 
-/// Frees the comment payloads of the extended cues built by `buildCues`.
+/// Frees the comment payloads of the extended cues built by
+/// [buildCues](#rekordlib.anlz.buildCues).
 fn freeExtendedCues(alloc: std.mem.Allocator, cues: []const ExtendedCue) void {
     for (cues) |cue| alloc.free(cue.comment.raw);
 }
 
-/// The two cue lists of `buildCues`.
+/// The two cue lists of [buildCues](#rekordlib.anlz.buildCues).
 pub const CueLists = struct {
     cues: []Cue = &.{},
     extended: []ExtendedCue = &.{},
@@ -1784,7 +1832,8 @@ fn barPosition(global_beat: i64) u16 {
 /// **constant tempo between markers** (linear interpolation of sample
 /// offsets). Markers need not be sorted (they are sorted first; the wire
 /// grid requires ascending offsets) and markers sharing a sample offset
-/// are skipped. `tempo` seeds `Beat.tempo` (see `PerformanceData.tempo`).
+/// are skipped. `tempo` seeds [Beat](#rekordlib.anlz.Beat).`tempo` (see
+/// [PerformanceData](#rekordlib.anlz.PerformanceData).`tempo`).
 /// No beat is emitted before the track start or past `sample_count`, and
 /// none at or past the final marker — the tempo beyond it is unknown, so
 /// it only ends the last segment.
@@ -1855,16 +1904,21 @@ fn statsEnvelopeAt(vals: []const [3]u16, band: usize, col: usize, win: usize, al
 }
 
 /// Builds the seven waveform column groups from a single 150 Hz 3-band
-/// detail vector — the route for callers holding foreign waveform data
-/// (e.g. an Engine overview resampled to `DETAIL_HZ`), not decoded audio
-/// (`buildColumnsFromPcm` is that route, byte-exact). The input must be
-/// sampled at exactly `DETAIL_HZ`: the detail sections track the input
-/// columns one-to-one, so a different rate silently stretches or squashes
-/// every output waveform; `detailExtents`/`previewExtents` report the
-/// target shape. Band energies map onto the analyzer's s16 record peaks
-/// as `value · 128`; what band data cannot supply is proxied per group,
-/// as documented at each group's site in the body. Digital silence
-/// encodes as `Silence` documents; empty `bands` produce empty sections.
+/// detail vector. This is the route for callers holding foreign waveform
+/// data (e.g. an Engine overview resampled to
+/// [DETAIL_HZ](#rekordlib.anlz.DETAIL_HZ)), not decoded audio;
+/// [buildColumnsFromPcm](#rekordlib.anlz.buildColumnsFromPcm) is that
+/// route, byte-exact. The input must be sampled at exactly
+/// [DETAIL_HZ](#rekordlib.anlz.DETAIL_HZ): the detail sections track the
+/// input columns one-to-one, so if the rate differs, every output
+/// waveform silently stretches or squashes;
+/// [detailExtents](#rekordlib.anlz.detailExtents) and
+/// [previewExtents](#rekordlib.anlz.previewExtents) report the target
+/// shape. Band energies map onto the analyzer's s16 record peaks as
+/// `value · 128`. What band data cannot supply is proxied per group, as
+/// documented at each group's site in the body. Digital silence encodes
+/// as [Silence](#rekordlib.anlz.Silence) documents. Empty `bands` produce
+/// empty sections.
 pub fn buildColumnsFromBands(
     alloc: std.mem.Allocator,
     bands: []const Band,
@@ -2078,13 +2132,14 @@ pub fn buildColumnsFromBands(
 }
 
 /// Builds the `.DAT` plain-cue list and the `.EXT` extended-cue list from
-/// one set of cues. Both lists share `list_type`: memory cues
-/// (`hot_cue == 0`) are emitted as memory lists, hot cues as hot lists —
-/// since the writer applies a single shared type to both lists, hot cues
-/// win whenever any is present. Memory-cue colors default to
-/// `ColorIndex.none` and hot-cue palette indices to zero (the RGBA→palette
-/// mapping is a known gap). A loop without `loop_end` keeps the
-/// `0xFFFF_FFFF` sentinel.
+/// one set of cues. Both lists share `list_type`. If all cues are memory
+/// cues (`hot_cue == 0`), the lists are emitted as memory lists; if any
+/// cue is a hot cue, they are emitted as hot lists — the writer applies a
+/// single shared type to both lists, so hot cues win whenever any is
+/// present. Memory-cue colors default to
+/// [ColorIndex](#rekordlib.util.ColorIndex).none and hot-cue palette
+/// indices to zero (the RGBA→palette mapping is a known gap). A loop
+/// without `loop_end` keeps the `0xFFFF_FFFF` sentinel.
 pub fn buildCues(alloc: std.mem.Allocator, cues: []const CueInput, sample_rate: u32) BuildError!CueLists {
     const has_hot_cue = for (cues) |cue| {
         if (cue.hot_cue != 0) break true;
@@ -2125,16 +2180,18 @@ pub fn buildCues(alloc: std.mem.Allocator, cues: []const CueInput, sample_rate: 
     return .{ .cues = plain, .extended = extended, .list_type = if (has_hot_cue) .hot_cues else .memory_cues };
 }
 
-/// Assembles a complete `Analysis` from format-agnostic performance data
-/// and a waveform column set: the single composition entry point. The
-/// beatgrid is densified by `expandBeatgrid`, `pd.main_cue` is prepended
-/// to `pd.cues` as a colorless memory point cue before `buildCues` sees
-/// one list, and all seven waveform column groups are **moved** out of
-/// `waveforms` (which is left empty, so an unconditional
-/// `defer waveforms.deinit(alloc)` stays correct; see `WaveformColumns`
-/// for how to produce them). A default `WaveformColumns{}` leaves every
-/// waveform section empty. All output is owned by `alloc` and freed by
-/// `Analysis.deinit`.
+/// Assembles a complete [Analysis](#rekordlib.anlz.Analysis) from
+/// format-agnostic performance data and a waveform column set: the single
+/// composition entry point. The beatgrid is densified by
+/// [expandBeatgrid](#rekordlib.anlz.expandBeatgrid), `pd.main_cue` is
+/// prepended to `pd.cues` as a colorless memory point cue before
+/// [buildCues](#rekordlib.anlz.buildCues) sees one list, and all seven
+/// waveform column groups are **moved** out of `waveforms` (which is left
+/// empty, so an unconditional `defer waveforms.deinit(alloc)` stays
+/// correct; see [WaveformColumns](#rekordlib.anlz.WaveformColumns) for how
+/// to produce them). A default `WaveformColumns{}` leaves every waveform
+/// section empty. All output is owned by `alloc` and freed by
+/// [Analysis.deinit](#rekordlib.anlz.Analysis.deinit).
 pub fn buildAnalysis(
     alloc: std.mem.Allocator,
     pd: PerformanceData,
@@ -2176,7 +2233,7 @@ pub const AnalyzeError = error{ OutOfMemory, ChannelMismatch };
 
 /// Raw decoded PCM input: f32 samples in [−1, 1) (NaN/inf are a contract
 /// violation — the analyzer's saturating casts assume finite samples) at
-/// 44 100 Hz, the only rate Rekordbox's analysis supports; this library
+/// 44 100 Hz, the only rate Rekordbox's analysis supports. This library
 /// doesn't resample or decode. `planar` hands the two channels over,
 /// `interleaved` (frame order L R L R …, even length) deinterleaves on
 /// the fly, and `mono` is duplicated to both channels — Rekordbox's
@@ -2305,9 +2362,10 @@ fn ceilDiv(a: usize, b: usize) usize {
     return (a + b - 1) / b;
 }
 
-/// The PWV7 b0/b1 quantizer of `pwv7BandLinear`'s law, on the fractional
-/// f32 envelope: the engine's envelope decays between record values, so
-/// it needs the untruncated input.
+/// The PWV7 b0/b1 quantizer of
+/// [pwv7BandLinear](#rekordlib.anlz.pwv7BandLinear)'s law, on the
+/// fractional f32 envelope: the engine's envelope decays between record
+/// values, so it needs the untruncated input.
 fn pwv7QuantLinear(env: f32, scale_hundredths: u16) u8 {
     const scale: f32 = @as(f32, @floatFromInt(scale_hundredths)) * 0.01;
     const v = env * (1.0 / 32768.0) * scale * 128.0;
@@ -2315,8 +2373,9 @@ fn pwv7QuantLinear(env: f32, scale_hundredths: u16) u8 {
     return @truncate(i);
 }
 
-/// The PWV7 b2 transform of `pwv7BandQuadratic`'s law, on the fractional
-/// f32 envelope.
+/// The PWV7 b2 transform of
+/// [pwv7BandQuadratic](#rekordlib.anlz.pwv7BandQuadratic)'s law, on the
+/// fractional f32 envelope.
 fn pwv7QuantQuadratic(env: f32, scale_hundredths: u16) u8 {
     const scale: f32 = @as(f32, @floatFromInt(scale_hundredths)) * 0.01;
     const arg: f64 = @as(f64, env * (1.0 / 32768.0)) * std.math.pi;
@@ -2879,7 +2938,8 @@ fn clampToRecords(x: i64, d: usize) i64 {
 
 /// The s16 path: per 294-sample column, the peak of the truncated
 /// `(L+R)/2` mix and the peak of its 150 Hz tan-form lowpass, quantized by
-/// `anlz.detailHeightCode` and `anlz.whitenessRatio`.
+/// [detailHeightCode](#rekordlib.anlz.detailHeightCode) and
+/// [whitenessRatio](#rekordlib.anlz.whitenessRatio).
 const Pwv3Engine = struct {
     n: usize,
     n_columns: usize,
@@ -3589,15 +3649,18 @@ const PwavPwv2Engine = struct {
     }
 };
 
-/// Analyzes decoded PCM and produces the `WaveformColumns` of an ANLZ
-/// file, replicating Rekordbox's analysis. Requires 44 100 Hz stereo f32
-/// input in [−1, 1) (see `PcmInput`); hand the result to `buildAnalysis`
-/// with the track's performance data.
+/// Analyzes decoded PCM and produces the
+/// [WaveformColumns](#rekordlib.anlz.WaveformColumns) of an ANLZ file,
+/// replicating Rekordbox's analysis. Requires 44 100 Hz stereo f32 input
+/// in [−1, 1) (see [PcmInput](#rekordlib.anlz.PcmInput)). Hand the result
+/// to [buildAnalysis](#rekordlib.anlz.buildAnalysis) with the track's
+/// performance data.
 ///
 /// Everything matches Rekordbox byte-for-byte and is pinned by the
-/// fixtures under `testdata/analysis`, except one known divergence: on
-/// noise-like high-band content the PWAV class code is wrong on up to
-/// ~40 % of spans while the height bits stay byte-exact.
+/// fixtures (real export captures under `testdata/analysis`), except one
+/// known divergence: on noise-like high-band content the PWAV class code
+/// is wrong on up to ~40 % of spans while the height bits stay
+/// byte-exact.
 pub fn buildColumnsFromPcm(alloc: std.mem.Allocator, pcm: PcmInput) AnalyzeError!WaveformColumns {
     switch (pcm) {
         .planar => |p| {
@@ -3646,9 +3709,10 @@ const InterleavedSource = struct {
     }
 };
 
-/// The engine-feeding body of `buildColumnsFromPcm` (see its doc for
-/// the byte-exactness record), generic over the frame source so planar
-/// and interleaved input share one pass with no reformatting copy.
+/// The engine-feeding body of
+/// [buildColumnsFromPcm](#rekordlib.anlz.buildColumnsFromPcm), whose doc
+/// records the byte-exactness contract: generic over the frame source, so
+/// planar and interleaved input share one pass with no reformatting copy.
 fn analyzePcm(alloc: std.mem.Allocator, src: anytype) AnalyzeError!WaveformColumns {
     const n = src.frameCount();
 

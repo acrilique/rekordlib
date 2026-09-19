@@ -25,7 +25,8 @@ pub const DecodeError = bin.ReadError || error{InvalidFormat};
 /// `((len + 1) << 1) | 1` must fit a `u8`.
 const max_short_len: usize = (std.math.maxInt(u8) >> 1) - 1;
 
-/// Longest string `fromUtf8` accepts, in UTF-8 bytes, as in rekordcrate.
+/// Longest string [fromUtf8](#rekordlib.pdb.DeviceSQLString.fromUtf8)
+/// accepts, in UTF-8 bytes.
 const max_len: usize = std.math.maxInt(i16);
 
 /// Bytes a long-form header occupies: flags byte, `u16` length, padding.
@@ -50,11 +51,13 @@ const long_flags_isrc_or_ucs2: u8 = 0x90;
 ///   the flags:
 ///   * `0x40`: `length - 4` raw ASCII bytes.
 ///   * `0x90`: an ISRC — `0x03` magic byte, NUL-terminated ASCII, a Pioneer
-///     quirk, see `fromIsrc` — or UCS-2LE code units. The ISRC shape is
+///     quirk, see [fromIsrc](#rekordlib.pdb.DeviceSQLString.fromIsrc) — or
+///     UCS-2LE code units. The ISRC shape is
 ///     tried first, so a body of that shape is an ISRC even when its bytes
 ///     would also read as valid UCS-2LE.
 pub const DeviceSQLString = union(enum) {
-    /// Short-form content: raw ASCII bytes, at most `max_short_len`.
+    /// Short-form content: raw ASCII bytes, at most
+    /// [max_short_len](#rekordlib.pdb.max_short_len).
     short_ascii: []const u8,
     /// Long-form body.
     long: LongBody,
@@ -204,7 +207,8 @@ pub const DeviceSQLString = union(enum) {
     /// An empty `text` becomes the regular empty string; anything but 12
     /// ASCII characters without a NUL byte is rejected (basic validation
     /// from <https://isrc.ifpi.org/downloads/ISRC_Bulletin-2015-01.pdf>; a
-    /// NUL would make `decode` read the body back as UCS-2LE.
+    /// NUL would make [decode](#rekordlib.pdb.DeviceSQLString.decode) read
+    /// the body back as UCS-2LE.
     pub fn fromIsrc(
         alloc: std.mem.Allocator,
         text: []const u8,
@@ -288,9 +292,9 @@ pub const DeviceSQLString = union(enum) {
     }
 
     /// Reads a string from `c`, which must have an allocator set (see
-    /// `bin.Cursor.initAlloc`). Content bytes are not validated on parse,
-    /// only by `utf8`; structural constants (flag values, the padding
-    /// byte, the ISRC body shape) are.
+    /// [Cursor.initAlloc](#rekordlib.bin.Cursor.initAlloc)). Content bytes are not validated on
+    /// parse, only by [utf8](#rekordlib.pdb.DeviceSQLString.utf8); structural constants (flag
+    /// values, the padding byte, the ISRC body shape) are.
     pub fn decode(c: *bin.Cursor) DecodeError!DeviceSQLString {
         const alloc = c.alloc orelse return bin.ReadError.OutOfMemory;
         const first = try c.takeInt(u8, .little);
@@ -369,7 +373,7 @@ pub const OffsetArrayEncodeError = bin.WriteError || error{UnexpectedValue};
 
 /// Specifies whether the offsets of an offset array are stored as `u8` or
 /// `u16`; the surrounding row's subtype selects the width (see
-/// `fromSubtype`).
+/// [fromSubtype](#rekordlib.pdb.OffsetSize.fromSubtype)).
 pub const OffsetSize = enum {
     u8,
     u16,
@@ -409,10 +413,9 @@ pub const OffsetSize = enum {
     }
 };
 
-/// The offsets of an `OffsetArrayContainer`: either exactly as stored in
-/// the file or computed from the items during serialization. This is
-/// rekordcrate's `MaybeCalculated<OffsetArray<N>>` collapsed into one flag
-/// with the stored width.
+/// The offsets of an [OffsetArrayContainer](#rekordlib.pdb.OffsetArrayContainer):
+/// either exactly as stored in the file or computed from the items during
+/// serialization.
 pub fn Offsets(comptime n: usize) type {
     return union(enum) {
         const Self = @This();
@@ -427,7 +430,8 @@ pub fn Offsets(comptime n: usize) type {
         },
 
         /// Offsets computed during serialization, the mode for newly
-        /// built rows; see `OffsetArrayContainer.encode`.
+        /// built rows; see
+        /// [OffsetArrayContainer.encode](#rekordlib.pdb.OffsetArrayContainer.encode).
         calculated,
 
         pub fn eql(a: Self, b: Self) bool {
@@ -443,24 +447,27 @@ pub fn Offsets(comptime n: usize) type {
 
 /// An array of `n` offsets followed by the data at those offsets, the tail
 /// structure rows use to locate strings (and other heap objects) after
-/// their fixed fields: a magic sized by `OffsetSize`, the `n` offsets, and
-/// the items at positions computed from the offsets. Offsets are relative
-/// to the row start, not to the array, which is what the `array_offset`
-/// arguments of `decode` and `encode` compensate for.
+/// their fixed fields: a magic sized by [OffsetSize](#rekordlib.pdb.OffsetSize), the `n` offsets,
+/// and the items at positions computed from the offsets. Offsets are
+/// relative to the row start, not to the array, which is what the
+/// `array_offset` arguments of
+/// [decode](#rekordlib.pdb.OffsetArrayContainer.decode) and
+/// [encode](#rekordlib.pdb.OffsetArrayContainer.encode) compensate for.
 ///
 /// The inner type `T` combines the items into one value and must declare:
 ///
 /// * `offset_count`: how many items (and offsets) it comprises
 /// * `OffsetItem`: the item type, holding the `decode`/`encode`/`deinit`/
 ///   `heapBytesRequired`/`requiredAlignment`/`eql` protocol of
-///   `DeviceSQLString`; `requiredAlignment` returns the power-of-two
-///   alignment, at least 1, that a calculated offset must respect
+///   [DeviceSQLString](#rekordlib.pdb.DeviceSQLString); `requiredAlignment` returns the
+///   power-of-two alignment, at least 1, that a calculated offset must
+///   respect
 ///
 /// Plus the item glue — `offsetItems(T) [n]OffsetItem` (a borrowing view),
 /// `fromOffsetItems([n]OffsetItem) T` (which takes item ownership), and
 /// `eql(a: T, b: T) bool` — declared either wholesale by `T` itself or,
 /// when every field of `T` is an `OffsetItem`, generated from the field
-/// list via `OffsetItemsOf`.
+/// list via [OffsetItemsOf](#rekordlib.pdb.OffsetItemsOf).
 pub fn OffsetArrayContainer(comptime T: type) type {
     const n = T.offset_count;
     const Item = T.OffsetItem;
@@ -473,7 +480,7 @@ pub fn OffsetArrayContainer(comptime T: type) type {
         /// Number of offsets and items, re-exposed from `T`.
         pub const offset_count = n;
 
-        /// The offsets; see `Offsets`.
+        /// The offsets; see [Offsets](#rekordlib.pdb.Offsets).
         offsets: Offsets(n) = .calculated,
 
         /// The inner value the items combine into.
@@ -481,7 +488,7 @@ pub fn OffsetArrayContainer(comptime T: type) type {
 
         /// Reads the offsets from `c`, then each item from its own
         /// sub-cursor at `base + offset`, `base` being the row start
-        /// (the row walkers pass `fixedLen`). The cursor is left
+        /// (the row walkers pass [fixedLen](#rekordlib.pdb.fixedLen)). The cursor is left
         /// directly after the offsets; items may lie beyond that and
         /// need not fill the buffer they occupy. Items decoded before
         /// a failure are freed.
@@ -521,8 +528,9 @@ pub fn OffsetArrayContainer(comptime T: type) type {
         }
 
         /// Writes the magic and offsets, then each item — placed at
-        /// `base + offset` for provided offsets (the inverse of `decode`,
-        /// same `array_offset` convention; gaps the offsets skip over are
+        /// `base + offset` for provided offsets (the inverse of
+        /// [decode](#rekordlib.pdb.OffsetArrayContainer.decode), same
+        /// `array_offset` convention; gaps the offsets skip over are
         /// zero-filled), or appended in order for calculated ones, each
         /// start aligned per its `requiredAlignment`, with the computed
         /// offsets patched back into their reserved slots.
@@ -652,7 +660,8 @@ fn OffsetItemsOf(comptime T: type, comptime Item: type) type {
 /// page-type values in page headers and table entries: standard
 /// `export.pdb` files or extended `exportExt.pdb` files, whose tables
 /// reuse values 3 and 4 for tags and track tags instead of albums and
-/// labels. Row dispatch is gated on this (see `Row.decode`).
+/// labels. Row dispatch is gated on this (see
+/// [Row.decode](#rekordlib.pdb.Row.decode)).
 pub const DatabaseType = enum {
     /// Standard `export.pdb` files.
     plain,
@@ -661,9 +670,9 @@ pub const DatabaseType = enum {
 };
 
 /// The type of rows a page holds, as stored in page headers and table
-/// entries: the wire constants of `export.pdb` tables (see `DatabaseType`
-/// for the ext meanings of values 3 and 4). Unknown values roundtrip
-/// verbatim.
+/// entries: the wire constants of `export.pdb` tables (see
+/// [DatabaseType](#rekordlib.pdb.DatabaseType) for the ext meanings of
+/// values 3 and 4). Unknown values roundtrip verbatim.
 pub const PageType = enum(u32) {
     /// Track metadata: title, artist, genre, artwork ID, playing time, etc.
     tracks = 0,
@@ -701,8 +710,8 @@ pub const PageType = enum(u32) {
 };
 
 /// Page types of `exportExt.pdb` databases whose wire values collide
-/// with plain meanings (see `DatabaseType`). Unknown values fail row
-/// dispatch with `error.NotImplemented`.
+/// with plain meanings (see [DatabaseType](#rekordlib.pdb.DatabaseType)).
+/// Unknown values fail row dispatch with `error.NotImplemented`.
 pub const ExtPageType = enum(u32) {
     /// Rows that can be assigned to tracks for the purpose of
     /// categorization.
@@ -802,10 +811,11 @@ pub const IndexPageHeader = struct {
     magic: u16 = 0x03EC,
     /// Offset where the next index entry will be written, from the
     /// beginning of the entries array. Sometimes differs from
-    /// `num_entries` for unknown reasons; observed naming a slot past the
-    /// declared entries, and the slots it covers can hold live entries
-    /// that `num_entries` does not count — `decode` reads up to it so
-    /// those entries survive a write.
+    /// `num_entries` for unknown reasons. It has been observed naming a
+    /// slot past the declared entries, and the slots it covers can hold
+    /// live entries that `num_entries` does not count;
+    /// [decode](#rekordlib.pdb.IndexPageContent.decode) reads up to it,
+    /// so those entries survive a write.
     next_offset: u16 = 0,
     /// Redundant copy of the page index.
     page_index: u32 = 0,
@@ -855,8 +865,8 @@ pub const IndexPageContent = struct {
     }
 
     /// Writes the header with its verbatim `num_entries`, the entries,
-    /// `totalEntries(page_size) - entries.len` empty entries, and zero
-    /// padding to the end of the page.
+    /// [totalEntries](#rekordlib.pdb.totalEntries)(page_size) - entries.len
+    /// empty entries, and zero padding to the end of the page.
     pub fn encode(self: *const IndexPageContent, e: *bin.Emitter, page_size: usize) IndexPageEncodeError!void {
         if (self.entries.len > std.math.maxInt(u16) or
             self.entries.len < self.header.num_entries) return error.UnexpectedValue;
@@ -905,8 +915,7 @@ fn totalEntries(page_size: usize) error{UnexpectedValue}!usize {
 }
 
 /// Audio file formats tracks reference, stored as the Track row's
-/// `file_type` field. Ported from rekordcrate's `util::FileType`; unknown
-/// values roundtrip verbatim.
+/// `file_type` field. Unknown values roundtrip verbatim.
 pub const FileType = enum(u16) {
     /// Unknown file type.
     unknown = 0,
@@ -947,7 +956,8 @@ pub const RowDecodeError = bin.ReadError || error{ InvalidFormat, UnexpectedValu
 pub const DataPageDecodeError = RowDecodeError;
 
 /// Encoding error of a row: the trailing offset array's errors, the only
-/// fallible part of a row write (see `OffsetArrayEncodeError`).
+/// fallible part of a row write (see
+/// [OffsetArrayEncodeError](#rekordlib.pdb.OffsetArrayEncodeError)).
 pub const RowEncodeError = OffsetArrayEncodeError;
 
 /// Encoding error of a data page: row encoding errors; `UnexpectedValue`
@@ -959,8 +969,8 @@ pub const DataPageEncodeError = RowEncodeError;
 const history_date_magic: u32 = 0;
 const history_version_magic: u16 = 0x1E19;
 
-/// Whether `T` is an `OffsetArrayContainer` instantiation, recognized by
-/// its `offset_count` declaration.
+/// Whether `T` is an [OffsetArrayContainer](#rekordlib.pdb.OffsetArrayContainer)
+/// instantiation, recognized by its `offset_count` declaration.
 fn isOffsetContainer(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(T, "offset_count"),
@@ -969,20 +979,23 @@ fn isOffsetContainer(comptime T: type) bool {
 }
 
 /// The field kinds the row walkers understand, classified in one place
-/// (see `rowFieldKind`).
+/// (see [rowFieldKind](#rekordlib.pdb.rowFieldKind)).
 const RowFieldKind = enum {
     int,
     @"enum",
-    /// An inline `DeviceSQLString`.
+    /// An inline [DeviceSQLString](#rekordlib.pdb.DeviceSQLString).
     string,
-    /// An `OffsetArrayContainer`.
+    /// An [OffsetArrayContainer](#rekordlib.pdb.OffsetArrayContainer).
     offset_container,
 };
 
-/// Classifies a row field for the walkers (`fixedLen`, `decodeRow`,
-/// `encodeRow`, `rowHeapBytesRequired`, `rowEql`, `rowDeinit`): the single
-/// place a field type's kind is decided, so every walker handles every
-/// kind or fails to compile.
+/// Classifies a row field for the walkers
+/// ([fixedLen](#rekordlib.pdb.fixedLen), [decodeRow](#rekordlib.pdb.decodeRow),
+/// [encodeRow](#rekordlib.pdb.encodeRow),
+/// [rowHeapBytesRequired](#rekordlib.pdb.rowHeapBytesRequired),
+/// [rowEql](#rekordlib.pdb.rowEql), [rowDeinit](#rekordlib.pdb.rowDeinit)):
+/// the single place a field type's kind is decided, so every walker
+/// handles every kind or fails to compile.
 fn rowFieldKind(comptime T: type) RowFieldKind {
     return if (isOffsetContainer(T))
         .offset_container
@@ -1030,13 +1043,14 @@ fn fixedLen(comptime T: type) usize {
 }
 
 /// Reads the fields of row type `T` in declaration order at
-/// little-endian: the row-layer analogue of `bin.takeStruct`. Supported
-/// field types are integers, non-exhaustive enums (so unknown values
-/// roundtrip verbatim), inline `DeviceSQLString`s, and a trailing
-/// offset-array container whose offsets reach back past the row's
-/// fixed fields (`fixedLen`). Fields a failing decode leaves behind
-/// are freed, and a `constant_fields` declaration is validated after
-/// the walk, as for page headers.
+/// little-endian: the row-layer analogue of
+/// [takeStruct](#rekordlib.bin.takeStruct). Supported field types are
+/// integers, non-exhaustive enums (so unknown values roundtrip verbatim),
+/// inline [DeviceSQLString](#rekordlib.pdb.DeviceSQLString)s, and a trailing offset-array
+/// container whose offsets reach back past the row's fixed fields
+/// ([fixedLen](#rekordlib.pdb.fixedLen)). Fields a failing decode leaves behind are freed,
+/// and a `constant_fields` declaration is validated after the walk, as
+/// for page headers.
 pub fn decodeRow(comptime T: type, c: *bin.Cursor) RowDecodeError!T {
     comptime validateRowType(T);
     var row: T = .{};
@@ -1066,8 +1080,8 @@ pub fn decodeRow(comptime T: type, c: *bin.Cursor) RowDecodeError!T {
     return row;
 }
 
-/// Writes the fields of `row` in declaration order; see `decodeRow` for
-/// the supported field types.
+/// Writes the fields of `row` in declaration order; see
+/// [decodeRow](#rekordlib.pdb.decodeRow) for the supported field types.
 pub fn encodeRow(comptime T: type, row: *const T, e: *bin.Emitter) RowEncodeError!void {
     inline for (std.meta.fields(T)) |field| {
         switch (comptime rowFieldKind(field.type)) {
@@ -1234,7 +1248,8 @@ pub const History = struct {
     pub const page_type: PageType = .history;
 
     /// Fields that must hold their default value in all known files;
-    /// other values are rejected on parse (see `bin.validateConstantFields`).
+    /// other values are rejected on parse (see
+    /// [validateConstantFields](#rekordlib.bin.validateConstantFields)).
     pub const constant_fields = .{ .date_magic, .version_magic };
 };
 
@@ -1290,7 +1305,8 @@ pub const TrailingName = struct {
 /// Contains the artist name and ID.
 pub const Artist = struct {
     /// Selects the trailing offset array's width (see
-    /// `OffsetSize.fromSubtype`); observed values `0x60` and `0x64`.
+    /// [OffsetSize.fromSubtype](#rekordlib.pdb.OffsetSize.fromSubtype));
+    /// observed values `0x60` and `0x64`.
     subtype: u16 = 0x60,
     /// Unknown field, called `index_shift` by flesniak; appears to always
     /// be `0x20 * row index`.
@@ -1305,7 +1321,8 @@ pub const Artist = struct {
 /// Contains the album name, the ID of its artist, and its own ID.
 pub const Album = struct {
     /// Selects the trailing offset array's width (see
-    /// `OffsetSize.fromSubtype`); the usual value is `0x0080`.
+    /// [OffsetSize.fromSubtype](#rekordlib.pdb.OffsetSize.fromSubtype));
+    /// the usual value is `0x0080`.
     subtype: u16 = 0x0080,
     /// Unknown field; appears to always be `0x20 * row index`.
     index_shift: u16 = 0,
@@ -1324,7 +1341,7 @@ pub const Album = struct {
 /// playlist.
 pub const PlaylistTreeNode = struct {
     /// ID of the parent row (which must be a folder); nodes parented to
-    /// `PlaylistTreeNodeId.root` (0) sit at the top level.
+    /// ID 0 sit at the top level.
     parent_id: u32 = 0,
     unknown: u32 = 0,
     /// Sort order indicator.
@@ -1332,7 +1349,8 @@ pub const PlaylistTreeNode = struct {
     id: u32 = 0,
     /// Non-zero when the node is a folder, zero when it is a leaf
     /// playlist (rekordcrate's doc comment inverts the meaning; its
-    /// code and the fixtures agree on this one).
+    /// code and the fixtures (real export captures under `testdata/`)
+    /// agree on this one).
     node_is_folder: u32 = 0,
     /// Name of this node, as shown when navigating the menu.
     name: DeviceSQLString = DeviceSQLString.empty(),
@@ -1405,7 +1423,8 @@ const track_subtype: u16 = 0x24;
 /// and the 21 strings behind the row's trailing offset array.
 pub const Track = struct {
     /// Selects the trailing offset array's width (see
-    /// `OffsetSize.fromSubtype` and `track_subtype`).
+    /// [OffsetSize.fromSubtype](#rekordlib.pdb.OffsetSize.fromSubtype) and
+    /// [track_subtype](#rekordlib.pdb.track_subtype)).
     subtype: u16 = track_subtype,
     /// Unknown field; appears to always be `0x20 * row index`.
     index_shift: u16 = 0,
@@ -1492,7 +1511,8 @@ pub const TagOrCategoryStrings = struct {
 /// category through `parent_id`.
 pub const TagOrCategory = struct {
     /// Selects the trailing offset array's width (see
-    /// `OffsetSize.fromSubtype`); observed values `0x0680` and `0x0684`.
+    /// [OffsetSize.fromSubtype](#rekordlib.pdb.OffsetSize.fromSubtype));
+    /// observed values `0x0680` and `0x0684`.
     subtype: u16 = 0x0680,
     /// Unknown field; appears to always be `0x20 * row index`.
     index_shift: u16 = 0,
@@ -1500,9 +1520,7 @@ pub const TagOrCategory = struct {
     unknown1: u32 = 0,
     /// Unknown purpose; not always zero.
     unknown2: u32 = 0,
-    /// ID of the parent category row, or 0 when there is no parent
-    /// (rekordcrate's `Option<NonZero<u32>>` collapsed to the wire
-    /// value it serializes to).
+    /// ID of the parent category row, or 0 when there is no parent.
     parent_id: u32 = 0,
     /// Zero-based position at which this tag is displayed within its
     /// category; for a category row, the position of the category within
@@ -1535,13 +1553,13 @@ pub const TrackTag = struct {
 
     /// Fields that must hold their default value in all known files;
     /// other values are rejected on parse (see
-    /// `bin.validateConstantFields`).
+    /// [validateConstantFields](#rekordlib.bin.validateConstantFields)).
     pub const constant_fields = .{.magic};
 };
 
 /// Whether rows of type `T` live in pages of `page_type` in a database of
 /// `db_type`: plain row types declare `page_type`, ext row types declare
-/// `ext_page_type` (see `DatabaseType`).
+/// `ext_page_type` (see [DatabaseType](#rekordlib.pdb.DatabaseType)).
 fn rowMatchesPageType(
     comptime T: type,
     page_type: PageType,
@@ -1558,21 +1576,23 @@ fn rowMatchesPageType(
 /// The page-type wire value rows of type `T` dispatch on: the `page_type`
 /// decl of plain row types, or the raw value of an ext row type's
 /// `ext_page_type`. Pair it with the database type before comparing
-/// against page headers (see `DatabaseType`).
+/// against page headers (see [DatabaseType](#rekordlib.pdb.DatabaseType)).
 pub fn rowPageType(comptime T: type) PageType {
     if (@hasDecl(T, "page_type")) return T.page_type;
     return @enumFromInt(@intFromEnum(T.ext_page_type));
 }
 
-/// A table row: one of the row types below, boxed behind a pointer so the
-/// union costs a tag and a pointer instead of the size of its largest
-/// variant — pages full of twelve-byte entries must not pay `Track`'s
-/// 21 strings each. The payload is allocated by `decode` (with the
-/// cursor's allocator) or by the caller (with the database's arena, for
-/// rows moved into `addRow`), and freed by `deinit`. Each variant declares
-/// its `page_type` (plain rows) or `ext_page_type` (ext rows), which
-/// selects it in `decode`; page types of the other database type and
-/// unknown values fail with `error.NotImplemented`.
+/// A table row: one of the row types below, boxed behind a pointer, so
+/// the union costs a tag and a pointer instead of the size of its
+/// largest variant — pages full of twelve-byte entries must not pay
+/// [Track](#rekordlib.pdb.Track)'s 21 strings each. The payload is
+/// allocated by [decode](#rekordlib.pdb.Row.decode) (with the cursor's
+/// allocator) or by the caller (with the database's arena, for rows moved
+/// into [addRow](#rekordlib.pdb.Database.addRow)), and freed by
+/// [deinit](#rekordlib.pdb.Row.deinit). Each variant declares its
+/// `page_type` (plain rows) or `ext_page_type` (ext rows), which selects
+/// it in [decode](#rekordlib.pdb.Row.decode); page types of the other
+/// database type and unknown values fail with `error.NotImplemented`.
 pub const Row = union(enum) {
     genre: *Genre,
     label: *Label,
@@ -1593,9 +1613,10 @@ pub const Row = union(enum) {
     track_tag: *TrackTag,
 
     /// Reads the row for `page_type` from `c`, which starts at the row's
-    /// heap offset, dispatching per `rowMatchesPageType` and boxing the
-    /// decoded payload — so `c` must carry an allocator (see
-    /// `bin.Cursor.initAlloc`) even for rows whose fields allocate
+    /// heap offset, dispatching per
+    /// [rowMatchesPageType](#rekordlib.pdb.rowMatchesPageType) and boxing
+    /// the decoded payload — so `c` must carry an allocator (see
+    /// [Cursor.initAlloc](#rekordlib.bin.Cursor.initAlloc)) even for rows whose fields allocate
     /// nothing.
     pub fn decode(
         c: *bin.Cursor,
@@ -1628,7 +1649,7 @@ pub const Row = union(enum) {
 
     /// The page type rows of this variant belong to; pair it with the
     /// database type before comparing against page headers (see
-    /// `DatabaseType`).
+    /// [DatabaseType](#rekordlib.pdb.DatabaseType)).
     pub fn pageType(self: Row) PageType {
         return switch (self) {
             inline else => |row| comptime rowPageType(@TypeOf(row.*)),
@@ -1653,7 +1674,8 @@ pub const Row = union(enum) {
     }
 };
 
-/// The payload type behind a boxed `Row` variant field.
+/// The payload type behind a boxed [Row](#rekordlib.pdb.Row) variant
+/// field.
 fn RowPayload(comptime boxed: type) type {
     return switch (@typeInfo(boxed)) {
         .pointer => |p| p.child,
@@ -1778,8 +1800,9 @@ pub const RowAtOffset = struct {
 
 /// The data-containing part of a page: a header, the rows at their heap
 /// offsets, and the row groups at the end of the heap that locate them.
-/// Heap bytes covered by neither a row nor a row group are zero on write;
-/// the fixtures roundtrip under that model.
+/// If a heap byte is covered by neither a row nor a row group, it is
+/// zeroed on write. The fixtures (real export captures under `testdata/`)
+/// roundtrip under that model.
 pub const DataPageContent = struct {
     /// The header of the data page.
     header: DataPageHeader = .{},
@@ -1787,11 +1810,13 @@ pub const DataPageContent = struct {
     /// the heap: the group holding the page's first rows ends at the heap
     /// end, later groups sit below it.
     row_groups: []RowGroup = &.{},
-    /// Capacity of the `row_groups` allocation; see `appendElem`.
+    /// Capacity of the `row_groups` allocation; see
+    /// [appendElem](#rekordlib.pdb.appendElem).
     row_groups_cap: usize = 0,
     /// Rows in allocation order: row-group order, presence bits ascending.
     rows: []RowAtOffset = &.{},
-    /// Capacity of the `rows` allocation; see `appendElem`.
+    /// Capacity of the `rows` allocation; see
+    /// [appendElem](#rekordlib.pdb.appendElem).
     rows_cap: usize = 0,
 
     /// Reads the data page header, the row groups backwards from the end
@@ -1961,7 +1986,8 @@ fn dataPageHeapSize(page_size: usize) error{UnexpectedValue}!usize {
 }
 
 /// Byte range a serialized row occupies in the page heap, for
-/// `DataPageContent.encode`'s overlap check.
+/// [DataPageContent.encode](#rekordlib.pdb.DataPageContent.encode)'s
+/// overlap check.
 const RowExtent = struct {
     start: usize,
     end: usize,
@@ -1977,7 +2003,7 @@ fn rowExtentBefore(_: void, a: RowExtent, b: RowExtent) bool {
 pub const Table = struct {
     /// Identifies the type of rows that this table contains; the meaning
     /// of the stored value depends on the database type (see
-    /// `DatabaseType`).
+    /// [DatabaseType](#rekordlib.pdb.DatabaseType)).
     page_type: PageType = .tracks,
     /// Unknown field, maybe links to a chain of empty pages if the database
     /// is ever garbage collected (?). Often points past the end of the
@@ -2004,10 +2030,13 @@ fn headerFixedAndTablesLen(count: u64) u64 {
 pub const HeaderDecodeError = bin.ReadError || error{UnexpectedValue};
 
 /// Encoding error of the file header: `UnexpectedValue` is a table count
-/// that does not fit the page, or a page size below `header_fixed_len`.
+/// that does not fit the page, or a page size below
+/// [header_fixed_len](#rekordlib.pdb.header_fixed_len).
 pub const HeaderEncodeError = bin.WriteError || error{UnexpectedValue};
 
-/// The shared search behind `Header.findTable` and `Header.findTableMut`.
+/// The shared search behind
+/// [Header.findTable](#rekordlib.pdb.Header.findTable) and
+/// [Header.findTableMut](#rekordlib.pdb.Header.findTableMut).
 fn findTableIn(tables: []Table, page_type: PageType) ?*Table {
     for (tables) |*table| {
         if (table.page_type == page_type) return table;
@@ -2031,8 +2060,7 @@ pub const Header = struct {
     /// table's `empty_candidate`; sometimes points past the end of the
     /// file.
     next_unused_page: u32 = 0,
-    /// Unknown field; observed as 5 in real exports, and set to 5 by
-    /// rekordcrate's `create`.
+    /// Unknown field; observed as 5 in real exports.
     unknown: u32 = 5,
     /// Unknown field; always incremented by at least one, sometimes by two
     /// or three.
@@ -2040,19 +2068,21 @@ pub const Header = struct {
     /// Gap between the fixed fields and the tables; always zero.
     gap: u32 = 0,
     /// The table of contents, `num_tables` entries on the wire. The slice
-    /// is skipped by the struct walker; `decode` and `encode` own it.
+    /// is skipped by the struct walker; [decode](#rekordlib.pdb.Header.decode)
+    /// and [encode](#rekordlib.pdb.Header.encode) own it.
     tables: []Table = &.{},
 
     pub const constant_fields = .{ .magic, .gap };
 
     /// Reads the fixed fields (validating the magics and that the tables
-    /// fit within page 0), then the `num_tables` table entries. A page
-    /// size off the index-entry grid is refused: index pages quantize
-    /// their entries at 4-byte strides, so such a geometry truncates the
-    /// entry capacity and can never encode back to the full page — a file
-    /// declaring it could be parsed but not saved without shifting every
-    /// later page boundary. The returned `tables` slice is allocated
-    /// with `alloc`.
+    /// fit within page 0), then the `num_tables` table entries. The
+    /// returned `tables` slice is allocated with `alloc`.
+    ///
+    /// A page size off the index-entry grid is refused. Index pages
+    /// quantize their entries at 4-byte strides, so such a geometry
+    /// truncates the entry capacity and can never encode back to the full
+    /// page. If a file declared it, the file could be parsed but not
+    /// saved without shifting every later page boundary.
     pub fn decode(c: *bin.Cursor, alloc: std.mem.Allocator) HeaderDecodeError!Header {
         var header = try bin.takeStruct(c, Header, .little);
         try bin.validateConstantFields(Header, header);
@@ -2094,7 +2124,8 @@ pub const Header = struct {
         return findTableIn(header.tables, page_type);
     }
 
-    /// The mutable counterpart of `findTable`.
+    /// The mutable counterpart of
+    /// [findTable](#rekordlib.pdb.Header.findTable).
     pub fn findTableMut(header: *Header, page_type: PageType) ?*Table {
         return findTableIn(header.tables, page_type);
     }
@@ -2166,7 +2197,8 @@ pub const PageContent = union(enum) {
     }
 };
 
-/// Ticket from `Page.allocRow` for `Page.commitRow`: where a row will sit
+/// Ticket from [Page.allocRow](#rekordlib.pdb.Page.allocRow) for
+/// [Page.commitRow](#rekordlib.pdb.Page.commitRow): where a row will sit
 /// once committed.
 pub const RowAlloc = struct {
     /// Heap offset assigned to the row; also its identity in the page's
@@ -2210,7 +2242,7 @@ fn appendElem(
 
 /// The boxed payload pointer of `row` — a row's identity within its
 /// database, since every variant boxes its payload in the arena (see
-/// `Database.removeRow`).
+/// [Database.removeRow](#rekordlib.pdb.Database.removeRow)).
 fn rowPayloadPtr(row: *const Row) *const anyopaque {
     return switch (row.*) {
         inline else => |p| @ptrCast(p),
@@ -2297,18 +2329,20 @@ pub const Page = struct {
         };
     }
 
-    /// Allocates `bytes` of page heap for a new row — rounded up to
-    /// `row_alignment` — reserving a row-group offset slot and charging
-    /// the page's free/used accounting, and returns the ticket for
-    /// `commitRow`. Returns null when the page is an index page or has
-    /// insufficient free space, leaving the page unchanged.
+    /// Allocates `bytes` of page heap for a new row, rounded up to
+    /// `row_alignment`. Reserves a row-group offset slot and charges the
+    /// page's free/used accounting. Returns the ticket for
+    /// [commitRow](#rekordlib.pdb.Page.commitRow), or null when the page
+    /// is an index page or has insufficient free space; on null the page
+    /// is unchanged.
     ///
-    /// The allocate/commit pair replaces rekordcrate's insert closure, so
-    /// a row only moves once its space is known. Allocation without a
-    /// following `commitRow` is a legal state — the offset slot and
-    /// `num_rows` already account for the row while the presence bit and
-    /// `num_rows_valid` do not, exactly a deleted row's footprint — and a
-    /// later `allocRow` may follow an uncommitted one.
+    /// Allocation and commit are separate so a row only moves once its
+    /// space is known. Allocation without a following
+    /// [commitRow](#rekordlib.pdb.Page.commitRow) is a legal state: the
+    /// offset slot and `num_rows` already account for the row, while the
+    /// presence bit and `num_rows_valid` do not — exactly a deleted row's
+    /// footprint. A later [allocRow](#rekordlib.pdb.Page.allocRow) may
+    /// follow an uncommitted one.
     pub fn allocRow(
         page: *Page,
         alloc: std.mem.Allocator,
@@ -2360,7 +2394,8 @@ pub const Page = struct {
         };
     }
 
-    /// Commits the row of a completed `allocRow` ticket: places `row` at
+    /// Commits the row of a completed
+    /// [allocRow](#rekordlib.pdb.Page.allocRow) ticket: places `row` at
     /// the ticket's heap offset, marks the offset slot present, and counts
     /// the row valid. The ticket must be this page's most recent
     /// allocation and not yet committed. On error the page keeps the
@@ -2449,8 +2484,9 @@ fn parsedPageAt(slots: []PageSlot, page_index: u32) ?*Page {
 }
 
 /// Decoding error of a whole database; `DatabaseTooLarge` means the
-/// decoded size was disproportionate to the input (see the parse budget
-/// below) rather than the host running out of memory.
+/// decoded size was disproportionate to the input (see
+/// [Database.parse](#rekordlib.pdb.Database.parse)) rather than the host
+/// running out of memory.
 pub const DatabaseDecodeError =
     bin.ReadError || error{ UnexpectedValue, DatabaseTooLarge };
 
@@ -2460,16 +2496,18 @@ pub const DatabaseDecodeError =
 pub const DatabaseEncodeError = bin.WriteError || error{UnexpectedValue};
 
 /// Ceiling a parsed or freshly created database may grow to through its
-/// own writer — appended pages, rows, and strings, including the eager
-/// gap-page materialization `allocDataPage` performs for a `next_unused_page`
-/// counter beyond the pages present. The library appends a page at a
-/// time, so 64 MB bounds a session adding on the order of a hundred
-/// thousand rows (real fixtures grow by single pages) while refusing a
-/// hostile counter's multi-gigabyte demand.
+/// own writer — appended pages, rows, and strings, including the gap
+/// pages [allocDataPage](#rekordlib.pdb.Database.allocDataPage) eagerly
+/// materializes when `next_unused_page` names a page beyond the pages
+/// present. The library appends a page at a time, so 64 MB bounds a
+/// session adding on the order of a hundred thousand rows (the fixtures,
+/// real export captures under `testdata/`, grow by single pages) while
+/// refusing a hostile counter's multi-gigabyte demand.
 const writer_growth_allowance = 64 << 20;
 
-/// The decode half of `Database.parse`, extracted so the budget's
-/// error mapping wraps every fallible step in one place.
+/// The decode half of [Database.parse](#rekordlib.pdb.Database.parse),
+/// extracted so the [Budget](#rekordlib.budget.Budget) error mapping
+/// wraps every fallible step in one place.
 const ParsedImage = struct {
     header: Header,
     pages: []PageSlot,
@@ -2508,22 +2546,24 @@ fn parseImage(
 }
 
 /// A whole `export.pdb`/`exportExt.pdb` image, parsed into an arena: the
-/// file header and every page after page 0. A deliberate divergence:
-/// rekordcrate's editor demand-loads pages and rewrites only the touched
-/// ones in place, while this model re-serializes the whole image, with
-/// pages that fail to parse kept as raw byte slots written back
-/// verbatim. Byte-identical parse→serialize roundtrips on every fixture
-/// are the safety argument, and the perf-budget test on the largest
-/// fixture the tripwire for moving to lazy pages should large
-/// real-world databases ever need them.
+/// file header and every page after page 0. All pages are parsed eagerly,
+/// and saving re-serializes the whole image — a deliberate divergence
+/// from rekordcrate's editor, which demand-loads pages and rewrites only
+/// the touched ones in place. A page that fails to parse is kept as raw
+/// bytes and written back verbatim. Parse→serialize roundtrips are
+/// byte-identical on every fixture (real export captures under
+/// `testdata/`); those roundtrips are the safety argument, and the
+/// perf-budget test on the largest fixture is the tripwire for moving to
+/// lazy pages should large real-world databases ever need them.
 pub const Database = struct {
     /// Arena owning every value parsed into this instance. Rows and their
-    /// strings parse directly into it; `serialize` never allocates from
-    /// it.
+    /// strings parse directly into it; [serialize](#rekordlib.pdb.Database.serialize)
+    /// never allocates from it.
     arena: *std.heap.ArenaAllocator,
-    /// The budget the arena draws through: parse set a ceiling
-    /// proportional to the input and, on success, raised it to the
-    /// writer allowance, so mutations stay bounded too.
+    /// The [Budget](#rekordlib.budget.Budget) the arena draws through: parse
+    /// set a ceiling proportional to the input and, on success, raised it
+    /// to the [writer_growth_allowance](#rekordlib.pdb.writer_growth_allowance),
+    /// so mutations stay bounded too.
     budget: *budget.Budget,
     /// The type of database being parsed, which selects the meaning of
     /// the page-type values in tables and page headers.
@@ -2540,18 +2580,18 @@ pub const Database = struct {
     tail: []const u8 = &.{},
 
     /// Parses a whole database image of the given type. All pages are
-    /// parsed eagerly; a page that fails to parse — anything but
-    /// `error.OutOfMemory` — is kept as raw bytes and written back
+    /// parsed eagerly. If a page fails to parse with anything but
+    /// `error.OutOfMemory`, it is kept as raw bytes and written back
     /// verbatim instead of failing the database, mirroring the pages the
     /// format does not model.
     ///
-    /// Every decoded byte draws through a `budget.Budget` capped at
-    /// `budget.multiplier` (eight) times the input: a hostile file whose
-    /// declared structure amplifies
-    /// (offsets aliasing one string, one row decoded per presence slot)
-    /// fails with `DatabaseTooLarge` instead of exhausting memory. On
-    /// success the parsed rows are trusted content, so the ceiling rises
-    /// to the input plus the writer allowance for later mutations.
+    /// Allocations draw through a [Budget](#rekordlib.budget.Budget) whose
+    /// limit is [multiplier](#rekordlib.budget.multiplier) bytes per input
+    /// byte; a decode past the limit fails with `DatabaseTooLarge` instead
+    /// of exhausting memory. After a successful parse the limit rises to
+    /// the input size plus a fixed growth allowance
+    /// ([writer_growth_allowance](#rekordlib.pdb.writer_growth_allowance)),
+    /// so later mutations stay bounded.
     pub fn parse(
         alloc: std.mem.Allocator,
         buf: []const u8,
@@ -2641,7 +2681,7 @@ pub const Database = struct {
     }
 
     /// Iterates the rows of the table holding `page_type`, in page order
-    /// (see `RowIterator`).
+    /// (see [RowIterator](#rekordlib.pdb.RowIterator)).
     pub fn rows(db: *const Database, page_type: PageType) RowIterError!RowIterator {
         const table = db.header.findTable(page_type) orelse return error.NoTable;
         var it = RowIterator{
@@ -2657,13 +2697,17 @@ pub const Database = struct {
 
     /// Iterates the rows of the table holding rows of type `T`, in page
     /// order, typed: the iterator yields `?*T` payloads directly (see
-    /// `RowIter`). `T` is one of `Row`'s payload types — `Track`,
-    /// `Genre`, ..., `TagOrCategory`, `TrackTag` — whose page-type decls
-    /// also disambiguate the database type: a row type of the other
-    /// database type has no table in this database (wire values 3 and 4
-    /// swap meanings, see `DatabaseType`), which fails with `NoTable`
-    /// like a page type no table holds. Prefer this over `rows` whenever
-    /// the table is known statically.
+    /// [RowIter](#rekordlib.pdb.RowIter)). `T` is one of
+    /// [Row](#rekordlib.pdb.Row)'s payload types —
+    /// [Track](#rekordlib.pdb.Track), [Genre](#rekordlib.pdb.Genre), ...,
+    /// [TagOrCategory](#rekordlib.pdb.TagOrCategory),
+    /// [TrackTag](#rekordlib.pdb.TrackTag) — whose page-type decls also
+    /// disambiguate the database type. If `T` belongs to the other
+    /// database type, it has no table in this database (wire values 3 and
+    /// 4 swap meanings; see [DatabaseType](#rekordlib.pdb.DatabaseType)),
+    /// and the call fails with `NoTable` like a page type no table holds.
+    /// Prefer this over [rows](#rekordlib.pdb.Database.rows) whenever the
+    /// table is known statically.
     pub fn rowsOf(db: *const Database, comptime T: type) RowIterError!RowIter(T) {
         const want_db_type: DatabaseType = if (@hasDecl(T, "page_type")) .plain else .ext;
         if (db.db_type != want_db_type) return error.NoTable;
@@ -2758,11 +2802,13 @@ pub const Database = struct {
         return .{ .page_index = page_index, .row_offset = ticket.row_offset };
     }
 
-    /// Error of `Database.removeRow`: the structural walk errors of
-    /// `Database.rows`, plus `TableTypeNotFound` when no table holds the
-    /// page type, `RowNotFound` when no row of the table boxes `payload`,
-    /// and `UnexpectedValue` for a page whose row list does not line up
-    /// with its row groups.
+    /// Error of [Database.removeRow](#rekordlib.pdb.Database.removeRow):
+    /// the structural walk errors of
+    /// [Database.rows](#rekordlib.pdb.Database.rows), plus
+    /// `TableTypeNotFound` when no table holds the page type,
+    /// `RowNotFound` when no row of the table boxes `payload`, and
+    /// `UnexpectedValue` for a page whose row list does not line up with
+    /// its row groups.
     pub const RemoveRowError = RowIterError || error{
         TableTypeNotFound,
         RowNotFound,
@@ -2770,20 +2816,23 @@ pub const Database = struct {
     };
 
     /// Removes the row of `page_type`'s table whose boxed payload is
-    /// `payload` — every `Row` variant boxes its payload in the database's
-    /// arena, so the pointer names exactly one row. The row leaves the
-    /// format's deleted-row footprint behind, the same state an uncommitted
-    /// `allocRow` leaves: the presence bit clears and `num_rows_valid`
-    /// drops, while the heap slot, the row-group offset slot, and
-    /// `num_rows` keep accounting for it — readers walk presence bits, so
-    /// the remnants are invisible, exactly as on real exports. The `Row`
-    /// value is dropped without `deinit`; its payload stays in the arena
-    /// until the database's own `deinit`.
+    /// `payload`. Every [Row](#rekordlib.pdb.Row) variant boxes its
+    /// payload in the database's arena, so the pointer names exactly one
+    /// row. The row leaves the format's deleted-row footprint behind —
+    /// the same state an uncommitted
+    /// [allocRow](#rekordlib.pdb.Page.allocRow) leaves: the presence bit
+    /// clears and `num_rows_valid` drops, while the heap slot, the
+    /// row-group offset slot, and `num_rows` keep accounting for it.
+    /// Readers walk presence bits, so the remnants are invisible, exactly
+    /// as on real exports. The [Row](#rekordlib.pdb.Row) value is dropped
+    /// without [deinit](#rekordlib.pdb.Row.deinit); its payload stays in
+    /// the arena until the database's own
+    /// [deinit](#rekordlib.pdb.Database.deinit).
     ///
-    /// Rows must not be iterated while removing: the found page's row list
-    /// shifts. Collect the payload pointers first, then remove each — the
-    /// payload pointers are arena-stable across shifts, unlike `Row`
-    /// addresses.
+    /// Rows must not be iterated while removing: the found page's row
+    /// list shifts. Collect the payload pointers first, then remove each
+    /// — the payload pointers are arena-stable across shifts, unlike
+    /// [Row](#rekordlib.pdb.Row) addresses.
     pub fn removeRow(
         db: *Database,
         page_type: PageType,
@@ -2858,9 +2907,9 @@ pub const Database = struct {
     }
 
     /// Allocates a fresh empty data page and returns its index, bumping
-    /// `next_unused_page`. Page indexes the file lacked — the counter can
-    /// exceed the pages present — become zero-filled gap pages, written as
-    /// zeros exactly like rekordcrate's seek over unloaded pages.
+    /// `next_unused_page`. The counter can exceed the pages present; page
+    /// indexes the file lacked become zero-filled gap pages, written as
+    /// zeros.
     pub fn allocDataPage(db: *Database, page_type: PageType) DatabaseModifyError!u32 {
         // Pages are appended at the end of the image; a trailing partial
         // page would be displaced by the new page's bytes.
@@ -2908,12 +2957,14 @@ pub const Database = struct {
     }
 
     /// Creates a new empty database of `db_type` with one table per entry
-    /// of `table_page_types` (see `standard_table_page_types` for the
-    /// fixed 20-entry order a device export needs), each table initialized
-    /// with an index page followed by an empty data page: `first_page` and
-    /// `last_page` both point at the index page and `empty_candidate` at
-    /// the data page, so the first `addRow` relinks the chain onto the
-    /// data page. Everything the database owns lives in its arena.
+    /// of `table_page_types` (see
+    /// [standard_table_page_types](#rekordlib.pdb.standard_table_page_types)
+    /// for the fixed 20-entry order a device export needs), each table
+    /// initialized with an index page followed by an empty data page:
+    /// `first_page` and `last_page` both point at the index page and
+    /// `empty_candidate` at the data page, so the first
+    /// [addRow](#rekordlib.pdb.Database.addRow) relinks the chain onto
+    /// the data page. Everything the database owns lives in its arena.
     pub fn create(
         alloc: std.mem.Allocator,
         db_type: DatabaseType,
@@ -2979,11 +3030,13 @@ pub const Database = struct {
         };
     }
 
-    /// Validates every track row against `min_track_allocated_size` by
-    /// walking the tracks table's page chain; ext databases have no
-    /// tracks table and pass trivially. rekordcrate runs this on every
-    /// flush; the device writer calls it before serializing, the
-    /// whole-image model's equivalent moment.
+    /// Validates every track row against
+    /// [min_track_allocated_size](#rekordlib.pdb.min_track_allocated_size)
+    /// by walking the tracks table's page chain; ext databases have no
+    /// tracks table and pass trivially. The device writer
+    /// ([DeviceExport.save](#rekordlib.device_export.DeviceExport.save))
+    /// calls it before serializing, the whole-image model's equivalent
+    /// moment.
     pub fn validateAllTrackRows(db: *const Database) ValidateAllTrackRowsError!void {
         if (db.db_type != .plain) return;
         const table = db.header.findTable(.tracks) orelse
@@ -3007,16 +3060,21 @@ pub const Database = struct {
     }
 };
 
-/// Error of `Database.rows`, `Database.rowsOf`, and the row iterators'
-/// `next`: `NoTable` is a page type no table in the header holds (or a row
-/// type of the other database type, whose wire values swap meanings, see
-/// `Database.rowsOf`), `PageNotPresent` a chained page index outside the
-/// file, `PageOrderViolation` a chain link that does not advance
-/// (rekordcrate's `PageIterator` assumes pages in a table are linked in
-/// increasing order by index), `UnparsedPage` a chained page kept raw
-/// because its rows are not wired for the database type, and
-/// `UnexpectedValue` a chained page whose header names a different page
-/// type than the table being iterated.
+/// Error of [Database.rows](#rekordlib.pdb.Database.rows),
+/// [Database.rowsOf](#rekordlib.pdb.Database.rowsOf),
+/// [RowIterator.next](#rekordlib.pdb.RowIterator.next), and
+/// [RowIter.next](#rekordlib.pdb.RowIter.next):
+///
+/// * `NoTable`: a page type no table in the header holds, or a row type
+///   of the other database type, whose wire values swap meanings (see
+///   [Database.rowsOf](#rekordlib.pdb.Database.rowsOf)).
+/// * `PageNotPresent`: a chained page index outside the file.
+/// * `PageOrderViolation`: a chain link that does not advance; pages in a
+///   table are assumed to be linked in increasing order by index.
+/// * `UnparsedPage`: a chained page kept raw because its rows are not
+///   wired for the database type.
+/// * `UnexpectedValue`: a chained page whose header names a different
+///   page type than the table being iterated.
 pub const RowIterError = error{
     NoTable,
     PageNotPresent,
@@ -3026,7 +3084,7 @@ pub const RowIterError = error{
 };
 
 /// Iterates the rows of one table's page chain in page order — the order
-/// the writer appends them in; index pages carry no rows and are skipped.
+/// the writer appends them in. Index pages carry no rows and are skipped.
 /// Every hop validates that the chain advances and stays inside the file,
 /// so a corrupted chain errors instead of looping. Rows are borrowed from
 /// the database for the iterator's lifetime.
@@ -3087,14 +3145,18 @@ pub const RowIterator = struct {
 };
 
 /// Iterator over the rows of one table, typed by its row type: wraps
-/// `RowIterator`, projecting each row to its boxed payload of `T` (see
-/// `Database.rowsOf`), so callers hold a `?*Track` instead of the
-/// 17-variant `Row` — the variant a page's rows decode as is fixed by
-/// the table at parse time, and `T` names it at compile time. `T` must
-/// be one of `Row`'s payload types. The yielded pointer is the row's
-/// arena box, like reading the matching `Row` variant's payload: stable
-/// for the database's lifetime, and the identity `Database.removeRow`
-/// wants. Errors are `RowIterator`'s.
+/// [RowIterator](#rekordlib.pdb.RowIterator), projecting each row to its
+/// boxed payload of `T` (see
+/// [Database.rowsOf](#rekordlib.pdb.Database.rowsOf)), so callers hold a
+/// [Track](#rekordlib.pdb.Track) pointer instead of the 17-variant
+/// [Row](#rekordlib.pdb.Row). The variant a page's rows decode as is
+/// fixed by the table at parse time, and `T` names it at compile time.
+/// `T` must be one of [Row](#rekordlib.pdb.Row)'s payload types. The
+/// yielded pointer is the row's arena box, like reading the matching
+/// [Row](#rekordlib.pdb.Row) variant's payload: stable for the database's
+/// lifetime, and the identity
+/// [Database.removeRow](#rekordlib.pdb.Database.removeRow) wants. Errors
+/// are [RowIterError](#rekordlib.pdb.RowIterError).
 pub fn RowIter(comptime T: type) type {
     const field_name = comptime name: {
         for (std.meta.fields(Row)) |field| {
@@ -3114,9 +3176,11 @@ pub fn RowIter(comptime T: type) type {
     };
 }
 
-/// Parses one page as a `PageSlot`, the eager per-page attempt of
-/// `Database.parse`. A page whose rows are not wired for the database
-/// type (unknown page types) fails with `error.NotImplemented`.
+/// Parses one page as a [PageSlot](#rekordlib.pdb.PageSlot), the eager
+/// per-page attempt of
+/// [Database.parse](#rekordlib.pdb.Database.parse). A page whose rows are
+/// not wired for the database type (unknown page types) fails with
+/// `error.NotImplemented`.
 fn parsePage(
     page_buf: []const u8,
     page_size: usize,
@@ -3136,7 +3200,8 @@ fn parsePage(
 /// page indexes.
 pub const page_chain_end: u32 = 0x03FF_FFFF;
 
-/// Error of `Database.validateAllTrackRows`.
+/// Error of
+/// [Database.validateAllTrackRows](#rekordlib.pdb.Database.validateAllTrackRows).
 pub const ValidateAllTrackRowsError = error{
     TableTypeNotFound,
     TrackRowTooSmall,
@@ -3149,12 +3214,14 @@ const default_page_size: u32 = 4096;
 
 /// Error of the modification layer: `TableTypeNotFound` is a row whose
 /// page type no table in the header holds, `TrackRowTooSmall` a Track row
-/// below `min_track_allocated_size`, `TrackRowTooLarge` a Track row whose
-/// heap bytes exceed the `u16` page accounting, `UnexpectedValue` a database
-/// whose page chains or allocation counters are inconsistent with the
-/// operation or misuse of the allocate/commit pair, and `DatabaseTooLarge`
-/// a mutation whose demand (typically a `next_unused_page` gap) exceeds
-/// the database's growth budget.
+/// below [min_track_allocated_size](#rekordlib.pdb.min_track_allocated_size),
+/// `TrackRowTooLarge` a Track row whose heap bytes exceed the `u16` page
+/// accounting, `UnexpectedValue` a database whose page chains or
+/// allocation counters are inconsistent with the operation or misuse of
+/// the [Page.allocRow](#rekordlib.pdb.Page.allocRow)/
+/// [Page.commitRow](#rekordlib.pdb.Page.commitRow) pair, and
+/// `DatabaseTooLarge` a mutation whose demand (typically a
+/// `next_unused_page` gap) exceeds the database's growth budget.
 pub const DatabaseModifyError = error{
     OutOfMemory,
     TableTypeNotFound,
@@ -3184,9 +3251,10 @@ pub fn allocatedRowSize(row_size: u32) u32 {
 }
 
 /// Rejects Track rows whose allocated size is below
-/// `min_track_allocated_size`; `addRow` enforces it, and the device
+/// [min_track_allocated_size](#rekordlib.pdb.min_track_allocated_size);
+/// [addRow](#rekordlib.pdb.Database.addRow) enforces it, and the device
 /// writer enforces it on whole databases before serializing (see
-/// `Database.validateAllTrackRows`).
+/// [Database.validateAllTrackRows](#rekordlib.pdb.Database.validateAllTrackRows)).
 pub fn validateTrackRowSize(
     track: *const Track,
 ) error{ TrackRowTooSmall, TrackRowTooLarge }!void {
@@ -3198,12 +3266,11 @@ pub fn validateTrackRowSize(
 }
 
 /// Grows the row's `comment` with trailing spaces — semantically harmless
-/// free text — until `validateTrackRowSize` passes, the padding
-/// rekordcrate's high-level writer applies (only `comment` is re-encoded
-/// per pass). Strings are created with `alloc`, which
-/// must be the allocator the row's strings use; each replaced comment is
-/// freed, so nothing leaks under a general allocator (an arena reclaims
-/// everything at once).
+/// free text — until [validateTrackRowSize](#rekordlib.pdb.validateTrackRowSize)
+/// passes (only `comment` is re-encoded per pass). Strings are created
+/// with `alloc`, which must be the allocator the row's strings use; each
+/// replaced comment is freed, so nothing leaks under a general allocator
+/// (an arena reclaims everything at once).
 pub fn padTrackCommentToMinimum(
     track: *Track,
     alloc: std.mem.Allocator,
@@ -3233,9 +3300,9 @@ pub fn padTrackCommentToMinimum(
 }
 
 /// The fixed 20-entry table order rekordbox writes into new `export.pdb`
-/// files, for `Database.create`: table indexes 9, 10, 14, 15, and 18 hold
-/// currently-unknown page types that must stay in place or CDJ players
-/// crash.
+/// files, for [Database.create](#rekordlib.pdb.Database.create): table
+/// indexes 9, 10, 14, 15, and 18 hold currently-unknown page types that
+/// must stay in place or CDJ players crash.
 pub const standard_table_page_types = [20]PageType{
     .tracks,          .genres,          .artists,
     .albums,          .labels,          .keys,
@@ -3247,8 +3314,9 @@ pub const standard_table_page_types = [20]PageType{
 };
 
 /// The two-entry table order of a fresh `exportExt.pdb`, for
-/// `Database.create`: the ext meanings of the wire values that mean
-/// albums and labels in a plain database (see `ExtPageType`).
+/// [Database.create](#rekordlib.pdb.Database.create): the ext meanings of
+/// the wire values that mean albums and labels in a plain database (see
+/// [ExtPageType](#rekordlib.pdb.ExtPageType)).
 pub const ext_table_page_types = [2]PageType{
     @enumFromInt(@intFromEnum(ExtPageType.tag)),
     @enumFromInt(@intFromEnum(ExtPageType.track_tag)),
@@ -3287,7 +3355,7 @@ const default_menus = [_]struct {
     .{ .category_id = 22, .content_pointer = 27, .unknown = 99, .visibility = .visible, .sort_order = 10 },
 };
 
-/// The `Row` variant holding a `*T` payload.
+/// The [Row](#rekordlib.pdb.Row) variant holding a `*T` payload.
 fn rowOf(comptime T: type, payload: *T) Row {
     const tag = comptime blk: {
         for (std.meta.fields(Row)) |field| {
@@ -3308,8 +3376,8 @@ fn defaultString(a: std.mem.Allocator, text: []const u8) error{OutOfMemory}!Devi
     };
 }
 
-/// Creates `payload` in the database's arena, boxes it into its `Row`
-/// variant, and adds it as a row.
+/// Creates `payload` in the database's arena, boxes it into its
+/// [Row](#rekordlib.pdb.Row) variant, and adds it as a row.
 fn addDefaultRow(db: *Database, payload: anytype) DatabaseModifyError!void {
     const owned = try db.arena.allocator().create(@TypeOf(payload));
     owned.* = payload;
@@ -3317,8 +3385,8 @@ fn addDefaultRow(db: *Database, payload: anytype) DatabaseModifyError!void {
     _ = try db.addRow(&row);
 }
 
-/// Inserts the default color rows (`util.color_specs`) rekordbox writes
-/// into a new export.
+/// Inserts the default color rows ([color_specs](#rekordlib.util.color_specs))
+/// rekordbox writes into a new export.
 pub fn insertDefaultColors(db: *Database) DatabaseModifyError!void {
     const a = db.arena.allocator();
     for (util.color_specs) |entry| {
@@ -3330,8 +3398,9 @@ pub fn insertDefaultColors(db: *Database) DatabaseModifyError!void {
     }
 }
 
-/// Inserts the default metadata-category rows (`util.column_specs`)
-/// rekordbox writes into a new export.
+/// Inserts the default metadata-category rows
+/// ([column_specs](#rekordlib.util.column_specs)) rekordbox writes into a
+/// new export.
 pub fn insertDefaultColumns(db: *Database) DatabaseModifyError!void {
     const a = db.arena.allocator();
     for (util.column_specs) |entry| {

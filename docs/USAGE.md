@@ -23,11 +23,21 @@ try ex.updateTrack(rec.view.id, .{ .title = "New title" });
 try ex.save();
 ```
 
-The above code opens a Rekordbox export from `root`, finds a track by title, and updates its title. Finally, `save` writes the changes back to the export. `tracks()` iterates the same views when you need them all — a view's strings live until the iterator's next `next` call (dupe what must outlive it), and mutating the export invalidates the iterator.
+The above code opens a Rekordbox export from `root`, finds a track by title, and updates its title. `save` writes the changes back to the export. `tracks()` iterates the same views when you need them all. A view's strings live until the iterator's next `next` call, so dupe anything that must outlive it. Mutating the export invalidates the iterator.
 
-Renaming goes through the same patch: a non-null `file_path` in `updateTrack` renames the track, and `save` carries the analysis along — the ANLZ siblings are re-serialized into the USBANLZ folder the new path hashes to (players recompute the location from the path hash, not from the database) and the old folder is deleted.
+Renaming goes through the same patch: if `updateTrack` gets a non-null `file_path`, the track is renamed. `save` carries the analysis along: the ANLZ siblings are re-serialized into the USBANLZ folder the new path hashes to, and the old folder is deleted.
 
-`save` lands everything, in an order a crash cannot corrupt: setting files, the default directory tree (created exports), queued ANLZ files, relocated ANLZ, `exportExt.pdb`, the OneLibrary db, and `export.pdb` last — a crash leaves the old index naming a consistent export. A failed save keeps its queues for a retry.
+`save` lands everything, in an order a crash cannot corrupt:
+
+1. setting files
+2. the default directory tree (created exports)
+3. queued ANLZ files
+4. relocated ANLZ
+5. `exportExt.pdb`
+6. the OneLibrary (OL) db (`exportLibrary.db`)
+7. `export.pdb` (last)
+
+A crash leaves the old index naming a consistent export. A failed save keeps its queues for a retry.
 
 A track can also be removed:
 
@@ -89,11 +99,11 @@ try ex.addTrackToPlaylist(playlist, track.id);
 try ex.save();
 ```
 
-Here we created a new export, used `buildColumnsFromPcm` to obtain the anlz waveform data from PCM samples, and added a new track to the export. We also added the track to a playlist. The audio file itself is yours to place — `addTrack` only writes the database rows and the ANLZ files. Adding a `file_path` the export already carries does not duplicate it: the existing track comes back, with `is_new = false` in the outcome.
+Here we created a new export. `buildColumnsFromPcm` obtained the anlz waveform data from the PCM samples. We added a new track to the export, and added that track to a playlist. The audio file itself is yours to place — `addTrack` only writes the database rows and the ANLZ files. If you add a `file_path` the export already carries, the track is not duplicated: the existing track comes back, with `is_new = false` in the outcome.
 
-The `buildColumnsFromPcm` function does give you a very good approximation to what Rekordbox would compute; the DSP pipeline it invokes was implemented through black-box reverse engineering plus a few rounds of AI assisted static analysis of the rekordbox binary using ghidra. It has helped me get a better idea of what the different sections of the ANLZ files actually mean, and I intend to contribute this information to the Pioneer reverse engineering community.
+The `buildColumnsFromPcm` function does give you a very good approximation of what Rekordbox would compute. The DSP pipeline it invokes was implemented through black-box reverse engineering, plus a few rounds of AI-assisted static analysis of the Rekordbox binary using Ghidra. It has helped me get a better idea of what the different sections of the ANLZ files actually mean, and I intend to contribute this information to the Pioneer reverse engineering community.
 
-An alternative to using `buildColumnsFromPcm` is to use the `buildColumnsFromBands` function, which builds the anlz columns from your own 3-band data. This is useful if you have already analyzed the track with another tool and want to use that data instead of passing the PCM samples around. It's an approach closer to what `libdjinterop` does. The input is one `Band` per 150 Hz column of the track — low/mid/high band energies plus an optional overall peak, each 0-255:
+An alternative to `buildColumnsFromPcm` is `buildColumnsFromBands`, which builds the anlz columns from your own 3-band data. This is useful if you have already analyzed the track with another tool and want to use that data instead of passing the PCM samples around. It's an approach closer to what `libdjinterop` does. The input is one `Band` per 150 Hz column of the track — low/mid/high band energies plus an optional overall peak, each 0-255:
 
 ```zig
 const bands = [_]rekordlib.anlz.Band{
@@ -108,16 +118,18 @@ defer columns.deinit(alloc);
 
 The result feeds `buildAnalysis` exactly like `buildColumnsFromPcm`'s does. Rolling your own DSP pipeline means filling a `WaveformColumns` (or a whole `Analysis`) yourself.
 
-Tags live in the tag database (`exportExt.pdb`), which loads lazily on first use:
+Tags live in the tag database (`exportExt.pdb`), which loads lazily on first use. Both this db and the OneLibrary one organize them as the same tree — categories at the top, tags as the leaves under a category, each row pointing at its parent by id:
 
 ```zig
 const category = try ex.createTagCategory("Mood");
 try ex.addTagsToTrack(track.id, category, &.{ "Warm-up", "Vocal" });
 ```
 
+When the export carries a OneLibrary db (explained in the next section), tags that exist only in its `myTag` tree get the same recovery as tags recovered from `exportExt.pdb`. That covers an export with no `exportExt.pdb` at all, and one whose `exportExt.pdb` is missing tags the OneLibrary db already has. If a tag exists only in the `myTag` tree, its category is validated, its label is deduped, and it gets a new id minted clear of the tree (a minted id is allocated fresh, past every id the tree already uses). The next `save` also writes these tags into the tag database under their own ids, keeping both stores in the shape Rekordbox writes.
+
 ## OneLibrary
 
-Newer exports carry a second database next to the pdb — `exportLibrary.db`, the OneLibrary store — and every `create`d export builds one. `openOneLibrary` hands it back, or null when the export carries none. Only compiled in with an sqlcipher backend (`-Donelibrary=vendored-sqlcipher` or `=system-sqlcipher`; see the README).
+Newer exports carry a second database next to `export.pdb` — `exportLibrary.db`, the OneLibrary store — and every `create`d export builds one. `openOneLibrary` hands it back, or null when the export carries none. OneLibrary support is only compiled in with an sqlcipher backend (`-Donelibrary=vendored-sqlcipher` or `=system-sqlcipher`; see the README).
 
 ```zig
 var ex = try rekordlib.device_export.DeviceExport.open(root, io, alloc);
@@ -132,13 +144,15 @@ const content = lib.contentByPath("/Contents/Some artist/01 Some track.mp3") ore
 std.debug.print("played {d} times\n", .{content.djPlayCount orelse 0});
 ```
 
-There's also a `tracks()` iterator which already joins these content rows into its views, so the OL-only columns (`subtitle`, kuvo flags, update counts) come with them whenever the path join hits. `openOneLibrary` is for what no view carries — the store's other tables (play histories, hot cue banks, tag trees) and raw columns (per-role artist ids, the stored `djPlayCount`, master fields) — with dimension rows reachable through `lib.byId(rekordlib.onelibrary.Artist, id)`.
+There's also a `tracks()` iterator, which already joins these content rows into its views. Whenever the path join hits, the views carry the OL-only columns too: `subtitle`, kuvo flags, and update counts. `openOneLibrary` is for what no view carries: the store's other tables (play histories, cue and hot cue bank rows) and raw columns (per-role artist ids, the stored `djPlayCount`, master fields). Dimension rows are reachable through `lib.byId(rekordlib.onelibrary.Artist, id)`.
 
-An export with no `export.pdb` at all (an OL-only export) works too: every track or playlist method resolves the database it goes through — the pdb when present, else the OL store (in `-Donelibrary` builds) — so `tracks()` iterates `content` rows and the mutating calls land on them. A root carrying neither database fails with `DatabaseNotFound`. Views say which side they joined through their `source` field (`pdb_only` or `pdb_and_ol`).
+You don't need to know this in order to use the library's high-level API, but the OL db consolidates some data that the pdb side splits across files. There, tags live in a separate `exportExt.pdb`, and cues only in the ANLZ files; the OL db carries both in a single file, containing the tag tree in its `myTag` table, and cues (per-track points and loops, plus hot cue banks) in its `cue` tables. For tags, the calls in the previous section already keep the `myTag` tree in step, so the raw table is all `openOneLibrary` adds. For cues, this library currently writes ANLZ only and skips the OL cue tables. Whether a real player prefers the OL cue rows over the ANLZ ones when both exist is unverified.
+
+An export with no `export.pdb` at all (an OL-only export) works too. Every track or playlist method resolves the database it goes through: `export.pdb` when present, else the OL store (in `-Donelibrary` builds). So `tracks()` iterates `content` rows, and the mutating calls land on them. A root carrying neither database fails with `DatabaseNotFound`. Views say which side they joined through their `source` field (`pdb_only` or `pdb_and_ol`).
 
 ## Settings
 
-An export also carries the player's preference files — the four `*SETTING.DAT` under `PIONEER`. `loadSettings` parses them into typed payloads; a missing or unparseable file leaves its field null (old exports genuinely lack some of them):
+An export also carries the player's preference files — the four `*SETTING.DAT` under `PIONEER`. `loadSettings` parses them into typed payloads. A missing or unparseable file leaves its field null (old exports genuinely lack some of them):
 
 ```zig
 var ex = try rekordlib.device_export.DeviceExport.open(root, io, alloc);
@@ -154,7 +168,7 @@ if (settings.my_setting) |s| {
 }
 ```
 
-Every preference is a typed enum (`Quantize`, `JogMode`, `Language`, `LcdBrightness`, ...). Writes go through `writeSettings`, the write side of `loadSettings`, with `updateTrack`'s patch shape: a null field leaves that file untouched, and a patch names only the values that change, merged onto the file's current value (a previous patch, the disk copy, or the Rekordbox default). Brand/software/version strings and the checksum are the library's, and the write lands at `save`.
+Every preference is a typed enum (`Quantize`, `JogMode`, `Language`, `LcdBrightness`, ...). Writes go through `writeSettings`, the write side of `loadSettings`; it takes the same patch shape as `updateTrack`. A null field leaves that file untouched. A patch names only the values that change, and each one is merged onto the file's current value: a previous patch if there is one, else the disk copy, else the Rekordbox default. Brand/software/version strings and the checksum are the library's. The write lands at `save`.
 
 ```zig
 try ex.writeSettings(.{ .my_setting = .{ .jog_mode = .cdj } });
@@ -164,7 +178,7 @@ try ex.writeSettings(.{ .my_setting = .{ .jog_mode = .cdj } });
 
 ## Low level access to inner formats
 
-You're also able to access and manipulate the inner files of an export directly using lower level APIs. For instance, you can read the `export.pdb` file directly:
+You can also access and manipulate the inner files of an export directly, through lower level APIs. For instance, you can read the `export.pdb` file directly:
 
 ```zig
 // Layout derives the path of every file in an export from the root.
@@ -214,4 +228,4 @@ if (file.findSection(.beat_grid)) |section| {
 }
 ```
 
-The snippets above only read, but the same tools can be used to write: parse, edit the rows, serialize, then land the image with `rekordlib.device_export.writeFileAtomic`, so a crash can't leave a half-written database.
+The snippets above only read, but the same tools can be used to write: parse, edit the rows, serialize, then land the image with `rekordlib.device_export.writeFileAtomic`, so a crash cannot leave a half-written database.

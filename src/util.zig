@@ -5,8 +5,8 @@
 //! Wire types shared by more than one format module.
 
 /// Indexed color identifiers used for tracks and memory cues, stored as a
-/// single byte: the pdb color rows and track `color` fields and the ANLZ
-/// extended-cue entries reference them. Ported from rekordcrate's
+/// single byte: the pdb color rows and track `color` fields, and the ANLZ
+/// extended-cue entries, reference them. Ported from rekordcrate's
 /// `util::ColorIndex`.
 pub const ColorIndex = enum(u8) {
     none = 0,
@@ -45,10 +45,10 @@ pub const color_specs = [_]ColorSpec{
 /// One of the 27 metadata-category rows a fresh export carries in both the
 /// pdb `columns` table and the OneLibrary `menuItem` table: the category
 /// id shared by both, the kind constant both store for it (the pdb's
-/// `unknown0`, the OL `kind`), and the display name wrapped in the Unicode
-/// "interlinear annotation" anchors `\u{fffa}`/`\u{fffb}` — the anchors
-/// force the long UCS-2LE string form even though the names are otherwise
-/// ASCII.
+/// `unknown0`, the OneLibrary `kind`), and the display name wrapped in the
+/// Unicode "interlinear annotation" anchors `\u{fffa}`/`\u{fffb}` — the
+/// anchors force the long UCS-2LE string form even though the names are
+/// otherwise ASCII.
 pub const ColumnSpec = struct {
     id: u16,
     kind: u16,

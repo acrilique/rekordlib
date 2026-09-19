@@ -7,7 +7,8 @@
 //!
 //! Ported from rekordcrate's `src/xor.rs`.
 //!
-//! XOR is self-inverse, so the same `apply` covers both directions.
+//! XOR is self-inverse, so the same [apply](#rekordlib.xor.apply) covers
+//! both directions.
 
 const std = @import("std");
 
@@ -18,8 +19,9 @@ pub fn apply(buf: []u8, key: []const u8) void {
 }
 
 /// XOR `buf` in place with `key`, repeating it as if `keystream_offset` bytes
-/// of the key stream had already been consumed. Transforming consecutive
-/// chunks with their matching offsets equals transforming them in one go.
+/// of the key stream had already been consumed. If you transform consecutive
+/// chunks with their matching offsets, the result equals transforming them
+/// in one go.
 pub fn applyAt(buf: []u8, key: []const u8, keystream_offset: usize) void {
     if (key.len == 0) return;
     for (buf, 0..) |*byte, i| {

@@ -4,10 +4,6 @@ const testing = std.testing;
 const onelibrary = @import("rekordlib").onelibrary;
 const testutil = @import("util.zig");
 
-test {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return; // fixture tests need the vendored-sqlcipher build
-}
-
 /// Copies the with_anlz `exportLibrary.db` into a temp dir (the WAL-persisted
 /// fixture needs write access for recovery) and opens it keyed.
 fn openFixtureDb(io: std.Io, tmp: *testing.TmpDir, alloc: std.mem.Allocator) !onelibrary.Db {
@@ -43,7 +39,7 @@ fn openFixtureCopy(
 }
 
 test "with_anlz fixture: integrity, provider wiring, table counts" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -58,11 +54,15 @@ test "with_anlz fixture: integrity, provider wiring, table counts" {
     try testing.expectEqualStrings("ok", stmt.readText(0));
     try testing.expectEqual(.done, try stmt.step());
 
-    // the Zig std.crypto provider must be the one SQLCipher used
-    var prov = try db.prepare("PRAGMA cipher_provider;");
-    defer prov.finalize();
-    try testing.expectEqual(.row, try prov.step());
-    try testing.expectEqualStrings("zig-std-crypto", prov.readText(0));
+    // the Zig std.crypto provider must be the one SQLCipher used. Only
+    // the vendored build registers it; system-sqlcipher runs the
+    // consumer's own provider, whose name is theirs to know.
+    if (onelibrary.mode == .@"vendored-sqlcipher") {
+        var prov = try db.prepare("PRAGMA cipher_provider;");
+        defer prov.finalize();
+        try testing.expectEqual(.row, try prov.step());
+        try testing.expectEqualStrings("zig-std-crypto", prov.readText(0));
+    }
 
     // hand-pinned counts observed in the with_anlz fixture
     try testing.expectEqual(@as(i64, 2), try db.scalarInt("SELECT COUNT(*) FROM content;"));
@@ -76,7 +76,7 @@ test "with_anlz fixture: integrity, provider wiring, table counts" {
 }
 
 test "create, write, read back through the provider" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -162,7 +162,7 @@ fn hex(comptime s: []const u8) [s.len / 2]u8 {
 }
 
 test "O2 load: every table with the fixture's row counts" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -199,7 +199,7 @@ test "O2 load: every table with the fixture's row counts" {
 }
 
 test "O2 load: fixture values, NULL versus empty string" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -251,7 +251,7 @@ test "O2 load: fixture values, NULL versus empty string" {
 }
 
 test "O2 load: schema drift is rejected" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -282,7 +282,7 @@ test "O2 load: schema drift is rejected" {
 }
 
 test "O2 load: plaintext and encrypted paths yield identical models" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -375,7 +375,7 @@ fn forgeWalSidecar(io: std.Io, tmp: *testing.TmpDir, alloc: std.mem.Allocator, f
 }
 
 test "O2 load: a forged WAL sidecar cannot inflate the decode budget" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -421,7 +421,7 @@ test "O2 load: a forged WAL sidecar cannot inflate the decode budget" {
 }
 
 test "O2 keyed: by-id maps and the path join" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -454,7 +454,7 @@ test "O2 keyed: by-id maps and the path join" {
 }
 
 test "O2 keyed: junction groupings order, skip, and first-win" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -556,7 +556,7 @@ fn expectTableEql(comptime T: type, expected: []const T, actual: []const T) !voi
 }
 
 test "O3 create: schema diff vs the real fixture is empty" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -576,7 +576,7 @@ test "O3 create: schema diff vs the real fixture is empty" {
 }
 
 test "O3 create: seeded defaults and the property row" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -626,7 +626,7 @@ test "O3 create: seeded defaults and the property row" {
 }
 
 test "O3 create: refuses to build over an existing db" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -644,7 +644,7 @@ test "O3 create: refuses to build over an existing db" {
 }
 
 test "O3 close: WAL header flag like rb exports, no sidecars left" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -683,7 +683,7 @@ fn integrityCheck(db: onelibrary.Db) ![]const u8 {
 }
 
 test "O3 round-trip: fixture models re-written into a fresh db are eql" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -724,7 +724,7 @@ test "O3 round-trip: fixture models re-written into a fresh db are eql" {
 }
 
 test "O3 mutate: numberOfContents maintenance on insert and delete" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -753,7 +753,7 @@ test "O3 mutate: numberOfContents maintenance on insert and delete" {
 }
 
 test "O3 mutate: playlist append is dense and 1-based" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -796,7 +796,7 @@ test "O3 mutate: playlist append is dense and 1-based" {
 }
 
 test "O3 mutate: insertAll batches rows atomically through one statement" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -835,7 +835,7 @@ test "O3 mutate: insertAll batches rows atomically through one statement" {
 }
 
 test "O3 mutate: addAllToPlaylist batches dense appends through one statement" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -878,7 +878,7 @@ test "O3 mutate: addAllToPlaylist batches dense appends through one statement" {
 }
 
 test "O3 create: keyed db is encrypted and reopens through the provider" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 

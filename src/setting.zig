@@ -18,22 +18,26 @@ const string_field_len = 32;
 /// (`0x60` in all known files).
 const len_string_fields = 3 * string_field_len;
 
-/// Offset of the `data` section; the checksum starts at `data_offset + len_data`.
+/// Offset of the `data` section. The checksum field starts at
+/// [data_offset](#rekordlib.setting.data_offset) + `len_data`.
 pub const data_offset = 4 + len_string_fields + 4;
 
 pub const ParseError = error{ UnexpectedEof, InvalidFormat, UnexpectedValue, OutOfMemory, ChecksumMismatch };
 
 /// Represents a `*SETTING.DAT` file, generic over the payload type `Data`
-/// (`DevSetting` for `DEVSETTING.DAT`, `MySetting` for `MYSETTING.DAT`,
-/// `MySetting2` for `MYSETTING2.DAT`, `DJMMySetting` for `DJMMYSETTING.DAT`).
-/// The payload's fields are read and written in declaration order; its
-/// serialized size determines the expected `len_data`, so parsing with a
-/// payload type of a different size fails.
+/// ([DevSetting](#rekordlib.setting.DevSetting) for `DEVSETTING.DAT`,
+/// [MySetting](#rekordlib.setting.MySetting) for `MYSETTING.DAT`,
+/// [MySetting2](#rekordlib.setting.MySetting2) for `MYSETTING2.DAT`, and
+/// [DJMMySetting](#rekordlib.setting.DJMMySetting) for `DJMMYSETTING.DAT`).
+/// The payload's fields are read and written in declaration order. The
+/// payload's serialized size determines the expected `len_data`. If the
+/// payload type has a different size, parsing fails.
 pub fn Setting(comptime Data: type) type {
     return struct {
         const Self = @This();
 
-        /// Serialized size of the data section, derived from `Data`'s fields.
+        /// Serialized size of the data section, as computed by
+        /// [serializedLen](#rekordlib.bin.serializedLen) from `Data`'s fields.
         const data_len = bin.serializedLen(Data);
 
         /// Name of the brand, NUL-padded ("PIONEER DJ" for `DEVSETTING.DAT`,
@@ -45,20 +49,20 @@ pub fn Setting(comptime Data: type) type {
         version: [string_field_len]u8,
         /// The actual settings data.
         data: Data,
-        /// Trailing unknown field, zero in all known files; parsing rejects any
+        /// Trailing unknown field, zero in all known files. Parsing rejects any
         /// other value, so it is always zero in parsed instances.
         unknown: u16,
 
-        /// Offset where the checksummed range begins, relative to the start
-        /// of the setting: the data section, except in `DJMMYSETTING.DAT`
-        /// where it covers the whole file.
+        /// Offset where the checksummed range begins, relative to the start of
+        /// the setting: the data section, except in `DJMMYSETTING.DAT`, where
+        /// the checksummed range covers the whole file.
         fn checksumOffset() usize {
             return if (Data.checksum_covers_data_only) data_offset else 0;
         }
 
-        /// Parse a `*SETTING.DAT` image. The checksum is verified and a
-        /// mismatch is reported as `error.ChecksumMismatch`; it is
-        /// recalculated on write.
+        /// Parse a `*SETTING.DAT` image. The checksum is verified; a mismatch
+        /// is reported as `error.ChecksumMismatch`. The checksum is
+        /// recalculated on write by [writeTo](#rekordlib.setting.Setting.writeTo).
         pub fn parse(buf: []const u8) ParseError!Self {
             var c = bin.Cursor.init(buf);
             const len_stringdata = try c.takeInt(u32, .little);
@@ -138,7 +142,7 @@ pub fn Setting(comptime Data: type) type {
 }
 
 /// Payload of a `DEVSETTING.DAT` file. Fields are read and written in
-/// declaration order; the default values are those written by Rekordbox 6.6.1.
+/// declaration order. The default values are those written by Rekordbox 6.6.1.
 pub const DevSetting = struct {
     /// Unknown field, `78 56 34 12 01 00 00 00 01` in all known files.
     unknown1: [9]u8 = .{ 0x78, 0x56, 0x34, 0x12, 0x01, 0x00, 0x00, 0x00, 0x01 },
@@ -155,7 +159,8 @@ pub const DevSetting = struct {
     /// Unknown field, zero in all known files.
     unknown3: [18]u8 = @splat(0),
 
-    /// The checksum covers just the data section (see `Setting.writeTo`).
+    /// The checksum covers just the data section (see
+    /// [writeTo](#rekordlib.setting.Setting.writeTo)).
     pub const checksum_covers_data_only = true;
 
     /// Brand string found in `DEVSETTING.DAT` files written by Rekordbox.
@@ -164,13 +169,14 @@ pub const DevSetting = struct {
     /// Version string found in `DEVSETTING.DAT` files written by Rekordbox.
     pub const default_version = "6.6.1";
 
-    /// Fields that must hold their default value in all known files;
-    /// other values are rejected on parse (see `bin.validateConstantFields`).
+    /// Fields that must hold their default value in all known files. If one
+    /// of them holds any other value, parsing fails (see
+    /// [validateConstantFields](#rekordlib.bin.validateConstantFields)).
     pub const constant_fields = .{ .unknown1, .unknown2, .unknown3 };
 };
 
 /// Payload of a `MYSETTING.DAT` file. Fields are read and written in
-/// declaration order; the default values are those written by Rekordbox 6.6.1.
+/// declaration order. The default values are those written by Rekordbox 6.6.1.
 pub const MySetting = struct {
     /// Unknown field (fixtures carry `78 56 34 12 02 00 00 00`), kept verbatim.
     unknown1: [8]u8 = .{ 0x78, 0x56, 0x34, 0x12, 0x02, 0x00, 0x00, 0x00 },
@@ -229,7 +235,8 @@ pub const MySetting = struct {
     /// Unknown field, zero in all known files.
     unknown6: u16 = 0,
 
-    /// The checksum covers just the data section (see `Setting.writeTo`).
+    /// The checksum covers just the data section (see
+    /// [writeTo](#rekordlib.setting.Setting.writeTo)).
     pub const checksum_covers_data_only = true;
 
     /// Brand string found in `MYSETTING.DAT` files written by Rekordbox.
@@ -238,13 +245,14 @@ pub const MySetting = struct {
     /// Version string found in `MYSETTING.DAT` files written by Rekordbox 6.6.1.
     pub const default_version = "0.001";
 
-    /// Fields that must hold their default value in all known files;
-    /// other values are rejected on parse (see `bin.validateConstantFields`).
+    /// Fields that must hold their default value in all known files. If one
+    /// of them holds any other value, parsing fails (see
+    /// [validateConstantFields](#rekordlib.bin.validateConstantFields)).
     pub const constant_fields = .{ .unknown4, .unknown5, .unknown6 };
 };
 
 /// Payload of a `MYSETTING2.DAT` file. Fields are read and written in
-/// declaration order; the default values are those written by Rekordbox 6.6.1.
+/// declaration order. The default values are those written by Rekordbox 6.6.1.
 pub const MySetting2 = struct {
     /// "VINYL SPEED ADJUST" setting.
     vinyl_speed_adjust: VinylSpeedAdjust = .touch,
@@ -267,7 +275,8 @@ pub const MySetting2 = struct {
     /// Unknown field, zero in all known files.
     unknown3: [27]u8 = @splat(0),
 
-    /// The checksum covers just the data section (see `Setting.writeTo`).
+    /// The checksum covers just the data section (see
+    /// [writeTo](#rekordlib.setting.Setting.writeTo)).
     pub const checksum_covers_data_only = true;
 
     /// Brand string found in `MYSETTING2.DAT` files written by Rekordbox.
@@ -276,13 +285,14 @@ pub const MySetting2 = struct {
     /// Version string found in `MYSETTING2.DAT` files written by Rekordbox 6.6.1.
     pub const default_version = "0.001";
 
-    /// Fields that must hold their default value in all known files;
-    /// other values are rejected on parse (see `bin.validateConstantFields`).
+    /// Fields that must hold their default value in all known files. If one
+    /// of them holds any other value, parsing fails (see
+    /// [validateConstantFields](#rekordlib.bin.validateConstantFields)).
     pub const constant_fields = .{ .unknown1, .unknown3 };
 };
 
 /// Payload of a `DJMMYSETTING.DAT` file. Fields are read and written in
-/// declaration order; the default values are those written by Rekordbox 6.6.1.
+/// declaration order. The default values are those written by Rekordbox 6.6.1.
 pub const DJMMySetting = struct {
     /// Unknown field (fixtures carry `78 56 34 12 01 00 00 00 20 00 00 00`),
     /// kept verbatim.
@@ -313,13 +323,13 @@ pub const DJMMySetting = struct {
     indicator_brightness: MixerIndicatorBrightness = .three,
     /// "CH FADER CURVE (LONG FADER)" setting.
     channel_fader_curve_long_fader: ChannelFaderCurveLongFader = .exponential,
-    /// Unknown field, zero in older files; newer exports carry five
+    /// Unknown field, zero in older files. Newer exports carry five
     /// setting-like bytes (`0x80`-range values, not yet modeled) at its
     /// start. Kept verbatim.
     unknown2: [27]u8 = @splat(0),
 
     /// Unlike the other settings files, the checksum covers the whole file
-    /// (see `Setting.writeTo`).
+    /// (see [writeTo](#rekordlib.setting.Setting.writeTo)).
     pub const checksum_covers_data_only = false;
 
     /// Brand string found in `DJMMYSETTING.DAT` files written by Rekordbox.

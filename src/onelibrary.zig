@@ -12,17 +12,29 @@
 //!   through SQLCipher's documented `SQLCIPHER_CRYPTO_CUSTOM` hook, so no
 //!   third-party crypto C is vendored;
 //! * a thin SQLite wrapper over the symbol-renamed C API;
-//! * the read models (`Library`): every row of the 22 OneLibrary tables,
-//!   schema-pinned and arena-owned, with keyed access for the joins the
-//!   device reader needs;
-//! * the write layer (`Writer`): creates a fresh export's db (the real
-//!   schema plus its seeded defaults), inserts rows over the read
-//!   models, and closes in the on-disk shape of rb's exports.
+//! * the read models ([Library](#rekordlib.onelibrary.Library)): every row of the 22 OneLibrary
+//!   tables, schema-pinned and arena-owned, with keyed access for the
+//!   joins the device reader ([DeviceExport](#rekordlib.device_export.DeviceExport)) needs;
+//! * the write layer ([Writer](#rekordlib.onelibrary.Writer)): creates a fresh export's db (the
+//!   real schema plus its seeded defaults), inserts rows over the read
+//!   models, and closes in the on-disk shape of exports Rekordbox
+//!   writes.
 //!
-//! Build modes (`-Donelibrary=off|vendored-sqlcipher|system-sqlcipher`): `off` compiles this module's
-//! types away from the binary (every runtime entry point is guarded by a
-//! comptime `@compileError`); `vendored-sqlcipher` compiles the prefixed amalgamation
-//! with zig cc; `system-sqlcipher` binds the consumer's own unprefixed SQLCipher.
+//! Build modes (`-Donelibrary=off|vendored-sqlcipher|system-sqlcipher`): `off` compiles
+//! this module's types away from the binary (every runtime entry point
+//! is guarded by a comptime `@compileError`); `vendored-sqlcipher` compiles the
+//! prefixed amalgamation with zig cc; `system-sqlcipher` binds the
+//! consumer's own unprefixed SQLCipher.
+//!
+//! Glossary for terms used throughout the library's docs:
+//!
+//! * OneLibrary (OL) — the `exportLibrary.db` store newer exports carry
+//!   next to the pdb; "OL" is its shorthand used throughout the
+//!   library's docs.
+//! * rbox — a previous OneLibrary implementation this module was checked
+//!   against (https://github.com/mhgnd/rbox).
+//! * fixtures — the real-export captures under `testdata/`; the
+//!   with_anlz fixture is `testdata/ol/`.
 
 const std = @import("std");
 const budget = @import("budget.zig");
@@ -122,11 +134,13 @@ pub const Provider = extern struct {
 
 /// OS entropy source seed for salt/IV generation. SQLCipher passes the
 /// provider ctx to every callback but gives `ctx_init` no input, so
-/// `Db.open` parks its Io here and `providerCtxInit` copies it into each
-/// provider ctx — an open db pins its own Io instead of racing on
-/// whatever `Db.open` ran last. The seed itself is module-global, so
-/// `open_gate` serializes the open-to-key stretch that reads it: a
-/// concurrent open cannot swap another db's entropy source in.
+/// [Db.open](#rekordlib.onelibrary.Db.open) parks its Io here, and
+/// [providerCtxInit](#rekordlib.onelibrary.providerCtxInit) copies it into each provider ctx:
+/// an open db pins its own Io instead of racing on whatever
+/// [Db.open](#rekordlib.onelibrary.Db.open) ran last. The
+/// seed itself is module-global, so [open_gate](#rekordlib.onelibrary.open_gate) serializes the
+/// open-to-key stretch that reads it: a concurrent open cannot swap
+/// another db's entropy source in.
 var io_seed: ?std.Io = null;
 var open_gate: std.Io.Mutex = .init;
 
@@ -299,10 +313,10 @@ fn providerGetHmacSz(ctx: ?*anyopaque, algorithm: c_int) callconv(.c) c_int {
     };
 }
 
-/// Snapshots the seed Io into the provider ctx sqlcipher hands to every
-/// callback. Before the first open the seed is null (sqlcipher's library
-/// init also comes through here) and the ctx stays null; `providerRandom`
-/// refuses then.
+/// Snapshots the [io_seed](#rekordlib.onelibrary.io_seed) Io into the provider ctx sqlcipher
+/// hands to every callback. Before the first open the seed is null
+/// (sqlcipher's library init also comes through here) and the ctx stays
+/// null; [providerRandom](#rekordlib.onelibrary.providerRandom) refuses then.
 fn providerCtxInit(ctx: *?*anyopaque) callconv(.c) c_int {
     ctx.* = null;
     if (io_seed) |io| {
@@ -376,7 +390,7 @@ pub const SqlError = error{ Sqlite, OutOfMemory };
 
 pub const StepResult = enum { row, done };
 
-/// One prepared statement over an open `Db`.
+/// One prepared statement over an open [Db](#rekordlib.onelibrary.Db).
 pub const Stmt = struct {
     handle: *cStmt,
 
@@ -454,7 +468,7 @@ pub const Stmt = struct {
     /// `text` is read by SQLite when the statement is next stepped, not
     /// copied (SQLITE_STATIC), and must stay valid until then. The
     /// row-binding paths use it: caller rows outlive their step, so the
-    /// copy `bindText` pays is pure overhead there.
+    /// copy [bindText](#rekordlib.onelibrary.Stmt.bindText) pays is pure overhead there.
     fn bindTextStatic(self: Stmt, i: usize, text: []const u8) SqlError!void {
         const rc = api.bind_text(self.handle, @intCast(i), text.ptr, @intCast(text.len), null);
         if (rc != c.SQLITE_OK) return error.Sqlite;
@@ -473,22 +487,22 @@ fn sqlite_transient() ?*const fn (?*anyopaque) callconv(.c) void {
     return @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
 }
 
-/// An open OneLibrary database. `open` reads (recovering WAL state),
-/// `openReadWriteCreate` also creates - both apply the OL passphrase.
+/// An open OneLibrary database. [open](#rekordlib.onelibrary.Db.open) reads an existing db and
+/// recovers its WAL state; [openReadWriteCreate](#rekordlib.onelibrary.Db.openReadWriteCreate)
+/// also creates the file. Both apply the OL passphrase.
 pub const Db = struct {
     handle: *c.sqlite3,
     /// Bytes physically present under the db's path at open time: the
-    /// main file plus any `-wal`/`-shm` sidecars. `mainFileSize` clamps
-    /// SQLite's reported size to this — a forged WAL commit frame or a
-    /// patched page-1 header can make `PRAGMA page_count` claim any
-    /// size, but the bytes on disk cannot lie about how much input a
-    /// decode proportional budget may draw from.
+    /// main file plus any `-wal`/`-shm` sidecars.
+    /// [mainFileSize](#rekordlib.onelibrary.Db.mainFileSize) clamps SQLite's reported size to this
+    /// value; see it for why the clamp is needed.
     physical_bytes: u64 = 0,
 
     pub const OpenError = SqlError;
 
-    /// `io` seeds the crypto provider's entropy source (salt/IV generation
-    /// on write); read-only sessions never draw from it.
+    /// `io` seeds the crypto provider's entropy source
+    /// ([io_seed](#rekordlib.onelibrary.io_seed); salt/IV generation on write); read-only
+    /// sessions never draw from it.
     pub fn open(io: std.Io, path: [:0]const u8) OpenError!Db {
         return openFlags(io, path, c.SQLITE_OPEN_READWRITE, true);
     }
@@ -505,7 +519,8 @@ pub const Db = struct {
     }
 
     /// Creates or opens a plaintext db without applying the OL
-    /// passphrase (`Writer.create` with `plaintext` writes such files).
+    /// passphrase ([Writer.create](#rekordlib.onelibrary.Writer.create) with `plaintext` writes
+    /// such files).
     pub fn openPlaintextReadWriteCreate(io: std.Io, path: [:0]const u8) OpenError!Db {
         return openFlags(io, path, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE, false);
     }
@@ -537,7 +552,8 @@ pub const Db = struct {
 
     /// The on-disk byte sum of the db file and its journal sidecars,
     /// missing files counting zero. Failures also count zero: an
-    /// understated size only tightens the decode budget (fail-closed).
+    /// understated size only tightens the decode [Budget](#rekordlib.budget.Budget)
+    /// (fail-closed).
     fn physicalSize(io: std.Io, path: [:0]const u8) u64 {
         const cwd = std.Io.Dir.cwd();
         var total: u64 = sizeOf(cwd.statFile(io, path, .{}));
@@ -586,13 +602,14 @@ pub const Db = struct {
 
     /// The main database file's size in bytes as SQLite accounts it: page
     /// count times page size, clamped to the bytes physically on disk at
-    /// open time (main file plus `-wal`/`-shm` sidecars). SQLite's page
-    /// count is attacker-writable metadata — a forged WAL commit frame
-    /// raises it past any limit without moving a byte of real input — so
-    /// the decode budget draws from what the disk actually holds, never
-    /// from what the header claims. WAL sidecar bulk is otherwise
-    /// excluded from the account: the budget wants the bytes that
-    /// declare the rows, not uncheckpointed journal growth.
+    /// open time (`physical_bytes`: main file plus `-wal`/`-shm`
+    /// sidecars). SQLite's page count is attacker-writable metadata: a
+    /// forged WAL commit frame or a patched page-1 header can make
+    /// `PRAGMA page_count` claim any size without moving a byte of real
+    /// input, so the decode [Budget](#rekordlib.budget.Budget) draws from what the disk
+    /// actually holds, never from what the header claims. WAL sidecar
+    /// bulk is otherwise excluded from the account: the budget wants the
+    /// bytes that declare the rows, not uncheckpointed journal growth.
     pub fn mainFileSize(self: Db) SqlError!u64 {
         const page_size: u64 = @intCast(try self.scalarInt("PRAGMA page_size;"));
         const page_count: u64 = @intCast(try self.scalarInt("PRAGMA page_count;"));
@@ -617,10 +634,11 @@ pub fn sqliteVersion() [:0]const u8 {
 // OneLibrary read models
 // ---------------------------------------------------------------------------
 
-/// Loading error of `Library.load`: SQLite errors, `SchemaMismatch` (a
-/// table's columns differ from the pinned schema), and `LibraryTooLarge`
-/// — the decoded size was disproportionate to the database file (see the
-/// load budget) rather than the host running out of memory.
+/// Loading error of [Library.load](#rekordlib.onelibrary.Library.load): SQLite errors,
+/// `SchemaMismatch` (a table's columns differ from the pinned schema), and
+/// `LibraryTooLarge` — the decoded size was disproportionate to the
+/// database file, over the [Budget](#rekordlib.budget.Budget) limit, rather than the host
+/// running out of memory.
 pub const LoadError = SqlError || error{ SchemaMismatch, LibraryTooLarge };
 
 /// An `album` row. `isComplation` [sic] is Pioneer's typo, kept verbatim
@@ -657,13 +675,15 @@ pub const Color = struct {
 };
 
 /// A `content` row: one track. The central table of the db — every other
-/// track-related table references it by `content_id`. Facts pinned by
-/// the with_anlz fixture: `analysisDataFilePath` is root-absolute to the
-/// track's ANLZ `.DAT`,
-/// `contentLink` = 788 224 = the pdb Track bitmask `0x000C0700`,
-/// `analysedBits` = 41 = the pdb Track `unknown5`, and the artist foreign
-/// keys are named `artist_id_<role>` (`djPlayCount` and
-/// `artist_id_originalArtist` are missing from the rbox 0.1.5 model).
+/// track-related table references it by `content_id`. Facts verified
+/// against the with_anlz fixture:
+///
+/// * `analysisDataFilePath` is root-absolute to the track's ANLZ `.DAT`.
+/// * `contentLink` = 788 224 = the pdb [Track](#rekordlib.pdb.Track) bitmask `0x000C0700`.
+/// * `analysedBits` = 41 = the pdb [Track](#rekordlib.pdb.Track) `unknown5`.
+/// * The artist foreign keys are named `artist_id_<role>`.
+/// * `djPlayCount` and `artist_id_originalArtist` are missing from the
+///   rbox 0.1.5 model.
 pub const Content = struct {
     content_id: i64,
     title: ?[]const u8 = null,
@@ -744,7 +764,7 @@ pub const Cue = struct {
     outNumberOfSampleInBlock: ?i64 = null,
 };
 
-/// A `genre` row: the db's copy of the pdb genre table.
+/// A `genre` row: the db's copy of the pdb [Genre](#rekordlib.pdb.Genre) table.
 pub const Genre = struct {
     genre_id: i64,
     name: ?[]const u8 = null,
@@ -809,7 +829,7 @@ pub const Label = struct {
 
 /// A `menuItem` row: a browse column header (27 in the fixture), named
 /// with the same `\u{fffa}`/`\u{fffb}` interlinear-annotation wrapping as
-/// the pdb Menu rows.
+/// the pdb [Menu](#rekordlib.pdb.Menu) rows.
 pub const MenuItem = struct {
     menuItem_id: i64,
     kind: ?i64 = null,
@@ -817,9 +837,10 @@ pub const MenuItem = struct {
 };
 
 /// A `myTag` row: the db's copy of the my-tag tree mirrored in
-/// `exportExt.pdb`'s Tag rows. `attribute` 1 = column (container), 0 =
-/// leaf — the same bit the ext pdb stores as `raw_is_category << 24`;
-/// parent 0 = root; ids are random-looking u32s like ext tag ids.
+/// `exportExt.pdb`'s [TagOrCategory](#rekordlib.pdb.TagOrCategory) rows. `attribute` 1 = column
+/// (container), 0 = leaf — the same bit the ext pdb stores as
+/// `raw_is_category << 24`; parent 0 = root; ids are random-looking u32s
+/// like ext tag ids.
 pub const MyTag = struct {
     myTag_id: i64,
     sequenceNo: ?i64 = null,
@@ -886,10 +907,11 @@ pub const Sort = struct {
 };
 
 /// One table's wiring into the rest of the module: the row type, the
-/// SQL table name, and the `Library` field its rows load into — plus,
-/// where present, the keyed-access map (`map` and `id` are set exactly
-/// for the primary-key tables `load` indexes) and the `writable` mark
-/// of the families `Writer.insert` accepts.
+/// SQL table name, and the [Library](#rekordlib.onelibrary.Library) field its rows load into —
+/// plus, where present, the keyed-access map (`map` and `id` are set
+/// exactly for the primary-key tables
+/// [Library.load](#rekordlib.onelibrary.Library.load) indexes) and the `writable` mark of the
+/// families [Writer.insert](#rekordlib.onelibrary.Writer.insert) accepts.
 const Table = struct {
     row: type,
     table: []const u8,
@@ -900,8 +922,8 @@ const Table = struct {
 };
 
 /// Every table except `property` (a singleton loaded by hand), in
-/// schema order — the single registry the load, keyed-access, and write
-/// paths all derive from.
+/// schema order — the single registry the [Library.load](#rekordlib.onelibrary.Library.load),
+/// keyed-access, and write paths all derive from.
 const tables = [_]Table{
     .{ .row = Album, .table = "album", .rows = "albums", .map = "album_by_id", .id = "album_id", .writable = true },
     .{ .row = Artist, .table = "artist", .rows = "artists", .map = "artist_by_id", .id = "artist_id", .writable = true },
@@ -946,7 +968,8 @@ fn filterTables(comptime pred: fn (Table) bool) FilteredTables(pred) {
     return selected;
 }
 
-/// What `load` indexes and `byId` serves.
+/// What [Library.load](#rekordlib.onelibrary.Library.load) indexes and
+/// [byId](#rekordlib.onelibrary.Library.byId) serves.
 const id_tables = filterTables(struct {
     fn keyed(t: Table) bool {
         return t.map != null;
@@ -961,10 +984,10 @@ const id_tables = filterTables(struct {
 /// for unset foreign keys (`artist_id_remixer`) and empty strings
 /// elsewhere (`isrc`), and both survive verbatim. Integer columns are
 /// read through SQLite's numeric conversion; there are no enums — the
-/// reader layer interprets raw values.
+/// reader layer ([DeviceExport](#rekordlib.device_export.DeviceExport)) interprets raw values.
 pub const Library = struct {
     arena: *std.heap.ArenaAllocator,
-    /// The budget the arena draws through, proportional to the db file.
+    /// The [Budget](#rekordlib.budget.Budget) the arena draws through, proportional to the db file.
     budget: *budget.Budget,
     albums: []const Album = &.{},
     artists: []const Artist = &.{},
@@ -990,10 +1013,11 @@ pub const Library = struct {
     /// The singleton `property` row, or null when the table is empty.
     property: ?Property = null,
 
-    /// Keyed access built by `load`: one id → row-index map per
-    /// primary-key table (`byId`), the pdb-side join by `content.path`
-    /// (`contentByPath`), and the junction groupings mirroring the
-    /// schema's own four indexes — the only indexes real files carry.
+    /// Keyed access built by [Library.load](#rekordlib.onelibrary.Library.load): one id → row-index
+    /// map per primary-key table ([byId](#rekordlib.onelibrary.Library.byId)), the pdb-side join
+    /// by `content.path` ([contentByPath](#rekordlib.onelibrary.Library.contentByPath)), and the
+    /// junction groupings mirroring the schema's own four indexes — the
+    /// only indexes real files carry.
     album_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
     artist_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
     category_by_id: std.AutoHashMapUnmanaged(i64, u32) = .empty,
@@ -1022,12 +1046,12 @@ pub const Library = struct {
     /// Reads every table of an open db (keyed or plaintext — the models
     /// do not differ); more than one `property` row is a `SchemaMismatch`.
     ///
-    /// Every decoded byte draws through a `budget.Budget` capped at
-    /// `budget.multiplier` (eight) times the main file's size: a
-    /// same-schema source that generates
-    /// rows from thin air — a VIEW over a recursive CTE with matching
-    /// column aliases — fails with `LibraryTooLarge` instead of
-    /// exhausting memory, and so does any other amplifying source.
+    /// Allocations draw through a [Budget](#rekordlib.budget.Budget) whose limit is
+    /// [multiplier](#rekordlib.budget.multiplier) bytes per input byte; a decode past the limit
+    /// fails with `LibraryTooLarge` instead of exhausting memory. A
+    /// same-schema source generating rows from thin air — a VIEW over a
+    /// recursive CTE with matching column aliases — is exactly what the
+    /// cap catches.
     pub fn load(alloc: std.mem.Allocator, db: Db) LoadError!Library {
         if (mode == .off) olDisabled();
 
@@ -1071,7 +1095,8 @@ pub const Library = struct {
 
     /// The join to the pdb side: `content.path` values are
     /// device-root-absolute (`/Contents/...`), the value shape of the pdb
-    /// Track `file_path` — the two id spaces are otherwise independent.
+    /// [Track](#rekordlib.pdb.Track) `file_path` — the two id spaces are otherwise
+    /// independent.
     pub fn contentByPath(self: *const Library, path: []const u8) ?*const Content {
         const idx = self.content_by_path.get(path) orelse return null;
         return &self.contents[idx];
@@ -1102,9 +1127,9 @@ pub const Library = struct {
     }
 };
 
-/// The table-reading half of `Library.load`, extracted so the budget's
-/// error mapping wraps every fallible step in one place. Every field of
-/// `lib` except the arena and budget is set here.
+/// The table-reading half of [Library.load](#rekordlib.onelibrary.Library.load), extracted so the
+/// budget's error mapping wraps every fallible step in one place. Every
+/// field of `lib` except the arena and budget is set here.
 fn loadInto(a: std.mem.Allocator, db: Db, lib: *Library) LoadError!void {
     inline for (tables) |t|
         try loadTable(t.row, t.table, a, db, &@field(lib, t.rows));
@@ -1204,7 +1229,8 @@ fn decodeRow(comptime T: type, a: std.mem.Allocator, stmt: Stmt) LoadError!T {
     return row;
 }
 
-/// Field-wise equality of one row pair (`Library.eql`'s inner loop).
+/// Field-wise equality of one row pair
+/// ([Library.eql](#rekordlib.onelibrary.Library.eql)'s inner loop).
 fn rowEql(comptime T: type, a: *const T, b: *const T) bool {
     inline for (@typeInfo(T).@"struct".fields) |f| {
         if (!cellEql(f.type, @field(a, f.name), @field(b, f.name))) return false;
@@ -1223,8 +1249,8 @@ fn cellEql(comptime F: type, a: F, b: F) bool {
     };
 }
 
-/// Builds one id → row-index map (see `id_tables`); SQLite's PK
-/// constraint guarantees unique keys.
+/// Builds one id → row-index map (see [id_tables](#rekordlib.onelibrary.id_tables)); SQLite's
+/// PK constraint guarantees unique keys.
 fn indexById(
     a: std.mem.Allocator,
     rows: anytype,
@@ -1299,13 +1325,13 @@ fn SeqOrder(comptime Rows: type, comptime field: []const u8) type {
 // ---------------------------------------------------------------------------
 
 /// The corrected schema: every CREATE statement of the real with_anlz
-/// `exportLibrary.db`, verbatim and in creation order — no FOREIGN KEY and
-/// no NOT NULL anywhere, `content.djPlayCount` present,
-/// `recommendedLike.createdDate` INTEGER, the real column spellings
-/// (`artist_id_originalArtist`, `OutFileOffsetInBlock`, `isComplation`),
-/// and the four indexes real files carry. rbox 0.1.5's migration drifts on
-/// every one of these points; the stored `sqlite_master.sql` text of a db
-/// this creates is byte-identical to the fixture's.
+/// `exportLibrary.db`, verbatim and in creation order: no FOREIGN KEY
+/// and no NOT NULL anywhere; `content.djPlayCount` present;
+/// `recommendedLike.createdDate` INTEGER; the real column spellings
+/// (`artist_id_originalArtist`, `OutFileOffsetInBlock`, `isComplation`);
+/// and the four indexes real files carry. rbox 0.1.5's migration drifts
+/// on every one of these points. The stored `sqlite_master.sql` text of
+/// a db this creates is byte-identical to the fixture's.
 const schema_sql =
     \\CREATE TABLE content(content_id integer primary key, title varchar, titleForSearch varchar, subtitle varchar, bpmx100 integer, length integer, trackNo integer, discNo integer, artist_id_artist integer, artist_id_remixer integer, artist_id_originalArtist integer, artist_id_composer integer, artist_id_lyricist integer, album_id integer, genre_id integer, label_id integer, key_id integer, color_id integer, image_id integer, djComment varchar, rating integer, releaseYear integer, releaseDate varchar, dateCreated varchar, dateAdded varchar, path varchar, fileName varchar, fileSize integer, fileType integer, bitrate integer, bitDepth integer, samplingRate integer, isrc varchar, djPlayCount integer, isHotCueAutoLoadOn integer, isKuvoDeliverStatusOn integer, kuvoDeliveryComment varchar, masterDbId integer, masterContentId integer, analysisDataFilePath varchar, analysedBits integer, contentLink integer, hasModified integer, cueUpdateCount integer, analysisDataUpdateCount integer, informationUpdateCount integer);
     \\CREATE TABLE genre(genre_id integer primary key, name varchar);
@@ -1336,7 +1362,8 @@ const schema_sql =
 ;
 
 /// The eight fixed track colors a fresh export carries (rbox's migration
-/// inserts the same rows): `util.color_specs` projected onto `Color` rows.
+/// inserts the same rows): [color_specs](#rekordlib.util.color_specs) projected onto
+/// [Color](#rekordlib.onelibrary.Color) rows.
 const default_colors = proj: {
     var rows: [util.color_specs.len]Color = undefined;
     for (util.color_specs, 0..) |spec, i| rows[i] = .{ .color_id = spec.id, .name = spec.name };
@@ -1344,7 +1371,8 @@ const default_colors = proj: {
 };
 
 /// The 27 browse-column headers a fresh export carries:
-/// `util.column_specs` projected onto `MenuItem` rows.
+/// [column_specs](#rekordlib.util.column_specs) projected onto
+/// [MenuItem](#rekordlib.onelibrary.MenuItem) rows.
 const default_menu_items = proj: {
     var rows: [util.column_specs.len]MenuItem = undefined;
     for (util.column_specs, 0..) |spec, i| rows[i] = .{
@@ -1405,9 +1433,10 @@ const default_sorts = [_]Sort{
     .{ .sort_id = 17, .menuItem_id = 22, .sequenceNo = 0, .isVisible = 0, .isSelectedAsSubColumn = 0 },
 };
 
-/// One explicit transaction: `deinit` rolls back unless `commit` ran, so
-/// `var tx = try Tx.begin(db); errdefer tx.deinit();` is the whole
-/// failure protocol of a multi-statement mutation.
+/// One explicit transaction: [deinit](#rekordlib.onelibrary.Tx.deinit) rolls back unless
+/// [commit](#rekordlib.onelibrary.Tx.commit) ran, so
+/// `var tx = try Tx.begin(db); errdefer tx.deinit();`
+/// is the whole failure protocol of a multi-statement mutation.
 const Tx = struct {
     db: Db,
     spent: bool = false,
@@ -1423,28 +1452,30 @@ const Tx = struct {
     }
 
     /// A rollback failure is swallowed — there is nothing left to do
-    /// but leave the connection to `close`.
+    /// but leave the connection to [Db.close](#rekordlib.onelibrary.Db.close).
     fn deinit(tx: *Tx) void {
         if (!tx.spent) tx.db.exec("ROLLBACK;") catch {};
         tx.spent = true;
     }
 };
 
-/// The `writable` subset of `tables`: the entity families a device
-/// writer mirrors (dimensions, content through `insertContent`,
-/// playlists, my-tags). Cue, history, and hot-cue-bank authoring is
-/// absent on purpose — fresh exports carry no rows there and rbox
-/// offers no inserts for them either.
+/// The `writable` subset of [tables](#rekordlib.onelibrary.tables): the entity families the
+/// device writer ([DeviceExport](#rekordlib.device_export.DeviceExport)) mirrors (dimensions, content
+/// through [Writer.insertContent](#rekordlib.onelibrary.Writer.insertContent), playlists, my-tags). Cue,
+/// history, and hot-cue-bank authoring is absent on purpose — fresh
+/// exports carry no rows there and rbox offers no inserts for them
+/// either.
 const write_tables = filterTables(struct {
     fn isWritable(t: Table) bool {
         return t.writable;
     }
 }.isWritable);
 
-/// Options of `Writer.create`.
+/// Options of [Writer.create](#rekordlib.onelibrary.Writer.create).
 pub const CreateOptions = struct {
     /// Writes the db without the OL passphrase — the plaintext side of
-    /// `Db.openPlaintext` (fixtures and plain-SQLite consumers).
+    /// [Db.openPlaintext](#rekordlib.onelibrary.Db.openPlaintext) (fixtures and plain-SQLite
+    /// consumers).
     plaintext: bool = false,
     /// Written to `property.createdDate` (`'YYYY-MM-DD'` in real
     /// exports). The library reads no clock; the caller supplies the date.
@@ -1454,29 +1485,31 @@ pub const CreateOptions = struct {
     my_tag_master_dbid: i64 = 0,
 };
 
-/// A OneLibrary db opened for writing: `create` builds a fresh export's
-/// db (schema, seeded defaults, the property singleton), `open` attaches
-/// to an existing one, and both write through prepared SQL over the
-/// read-side row models — borrowed input is fine. Appends are
-/// first-class; `updateAllContents` rewrites whole `content` rows and
-/// `deleteContentCascadeAll` removes a track everywhere it appears. The
-/// schema carries no foreign keys, so no method validates ids — tree and
-/// junction semantics belong to the caller (the device writer).
+/// A OneLibrary db opened for writing: [create](#rekordlib.onelibrary.Writer.create) builds a fresh
+/// export's db (schema, seeded defaults, the property singleton),
+/// [open](#rekordlib.onelibrary.Writer.open) attaches to an existing one, and both write through
+/// prepared SQL over the read-side row models — borrowed input is fine.
+/// Appends are first-class: [updateAllContents](#rekordlib.onelibrary.Writer.updateAllContents)
+/// rewrites whole `content` rows, and
+/// [deleteContentCascadeAll](#rekordlib.onelibrary.Writer.deleteContentCascadeAll) removes a track
+/// everywhere it appears. The schema carries no foreign keys, so no
+/// method validates ids — tree and junction semantics belong to the
+/// caller (the device writer, [DeviceExport](#rekordlib.device_export.DeviceExport)).
 pub const Writer = struct {
     db: Db,
 
-    /// Error of `create`: `LibraryAlreadyExists` — the exclusive claim
-    /// refusing to build over an existing file.
+    /// Error of [create](#rekordlib.onelibrary.Writer.create): `LibraryAlreadyExists` — the exclusive
+    /// claim refusing to build over an existing file.
     pub const CreateError = SqlError ||
         std.Io.File.OpenError ||
         error{LibraryAlreadyExists};
 
     /// Creates a fresh OneLibrary db at `path`: the real schema (see
-    /// `schema_sql`), the four seeded tables' default rows, and the
+    /// [schema_sql](#rekordlib.onelibrary.schema_sql)), the four seeded tables' default rows, and the
     /// property singleton, all in one transaction — a failed create
-    /// leaves no file behind. The db is keyed with the OL passphrase
-    /// unless `plaintext` is set, and starts in WAL journal mode like
-    /// rb's exports.
+    /// leaves no file behind. The db is keyed with the OL
+    /// [passphrase](#rekordlib.onelibrary.passphrase) unless `plaintext` is set, and starts in WAL
+    /// journal mode like exports Rekordbox writes.
     pub fn create(io: std.Io, path: [:0]const u8, options: CreateOptions) CreateError!Writer {
         const cwd = std.Io.Dir.cwd();
         // Claim the target exclusively: no window between an access
@@ -1527,25 +1560,26 @@ pub const Writer = struct {
     }
 
     /// Folds the WAL back into the main file and truncates it, landing a
-    /// complete db without closing the handle (the device-export save
-    /// hook).
+    /// complete db without closing the handle (the
+    /// [DeviceExport.save](#rekordlib.device_export.DeviceExport.save) hook).
     pub fn checkpoint(self: Writer) SqlError!void {
         try self.db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
     }
 
     /// Checkpoints and closes. The file keeps its WAL-mode header flag —
-    /// exactly the shape of rb's exports — and closing the last
-    /// connection removes the sidecar files.
+    /// exactly the shape of exports Rekordbox writes — and closing the
+    /// last connection removes the sidecar files.
     pub fn close(self: Writer) SqlError!void {
         const folded = self.checkpoint();
         self.db.close();
         try folded;
     }
 
-    /// Inserts one row of any `write_tables` family, primary key
-    /// included: ids are the caller's to mint (`nextId`, or an ext tag's
-    /// id when mirroring my-tags). A duplicate key fails with
-    /// `error.Sqlite` and inserts nothing.
+    /// Inserts one row of any [write_tables](#rekordlib.onelibrary.write_tables) family, primary key
+    /// included: ids are the caller's to mint
+    /// ([nextId](#rekordlib.onelibrary.Writer.nextId), or an ext tag's id when mirroring
+    /// my-tags). A duplicate key fails with `error.Sqlite` and inserts
+    /// nothing.
     pub fn insert(self: Writer, row: anytype) SqlError!void {
         const T = @TypeOf(row);
         if (T == Content)
@@ -1553,13 +1587,14 @@ pub const Writer = struct {
         return insertRow(self.db, comptime tableOf(T), row);
     }
 
-    /// Inserts many rows of one `write_tables` family atomically — the
-    /// bulk path for mirroring a library-sized batch. `rows` is any
+    /// Inserts many rows of one [write_tables](#rekordlib.onelibrary.write_tables) family atomically —
+    /// the bulk path for mirroring a library-sized batch. `rows` is any
     /// slice, array, or tuple of like-typed rows (`&batch`,
-    /// `&.{ row, row }`). A `Content` batch maintains
-    /// `property.numberOfContents` once, like `insertContent`; ids are
-    /// the caller's to mint, and any failure — a duplicate key included —
-    /// rolls the whole batch back.
+    /// `&.{ row, row }`). A [Content](#rekordlib.onelibrary.Content) batch maintains
+    /// `property.numberOfContents` once, like
+    /// [insertContent](#rekordlib.onelibrary.Writer.insertContent); ids are the caller's to mint,
+    /// and any failure — a duplicate key included — rolls the whole
+    /// batch back.
     pub fn insertAll(self: Writer, rows: anytype) SqlError!void {
         if (rows.len == 0) return;
         const T = rowOf(@TypeOf(rows));
@@ -1627,8 +1662,9 @@ pub const Writer = struct {
     /// rows in `playlist_content` and `myTag_content` (the schema carries
     /// no FK, so the deletes are spelled out), and
     /// `property.numberOfContents` follows the table count. Unlike
-    /// `deleteContent`, which mirrors rbox's leave-the-junctions stance
-    /// for single rows, this is the device writer's cascade for a removed
+    /// [deleteContent](#rekordlib.onelibrary.Writer.deleteContent), which mirrors rbox's
+    /// leave-the-junctions stance for single rows, this is the device
+    /// writer's cascade ([DeviceExport](#rekordlib.device_export.DeviceExport)) for a removed
     /// track — its junctions name nothing once the content row is gone.
     pub fn deleteContentCascadeAll(self: Writer, content_ids: []const i64) SqlError!void {
         if (content_ids.len == 0) return;
@@ -1666,7 +1702,8 @@ pub const Writer = struct {
         return self.db.scalarInt("SELECT numberOfContents FROM property LIMIT 1;");
     }
 
-    /// The append both playlist APIs share.
+    /// The append [addContentToPlaylist](#rekordlib.onelibrary.Writer.addContentToPlaylist) and
+    /// [addAllToPlaylist](#rekordlib.onelibrary.Writer.addAllToPlaylist) share.
     const playlist_append_sql = "INSERT INTO playlist_content (playlist_id, content_id, sequenceNo) VALUES (?1, ?2, " ++
         "(SELECT COALESCE(MAX(sequenceNo), 0) + 1 FROM playlist_content WHERE playlist_id = ?1))";
 
@@ -1686,9 +1723,9 @@ pub const Writer = struct {
 
     /// Appends many tracks to playlists atomically. `pairs` is a slice
     /// or array of structs carrying `playlist_id` and `content_id`
-    /// fields (unlike `insertAll`, a plain `for` iterates `pairs`, so a
-    /// tuple literal is not an accepted shape); any failure rolls the
-    /// whole batch back.
+    /// fields (unlike [insertAll](#rekordlib.onelibrary.Writer.insertAll), a plain `for` iterates
+    /// `pairs`, so a tuple literal is not an accepted shape); any
+    /// failure rolls the whole batch back.
     pub fn addAllToPlaylist(self: Writer, pairs: anytype) SqlError!void {
         if (pairs.len == 0) return;
         var tx = try Tx.begin(self.db);
@@ -1730,7 +1767,7 @@ fn pkOf(comptime T: type) []const u8 {
 }
 
 /// One INSERT, built and bound from the row's comptime layout — the
-/// write-side mirror of `decodeRow`: null fields bind NULL, empty
+/// write-side mirror of [decodeRow](#rekordlib.onelibrary.decodeRow): null fields bind NULL, empty
 /// strings bind as themselves, and SQLite reads the text at the step
 /// without copying it.
 fn insertRow(db: Db, comptime table: []const u8, row: anytype) SqlError!void {
@@ -1740,8 +1777,9 @@ fn insertRow(db: Db, comptime table: []const u8, row: anytype) SqlError!void {
 }
 
 /// Many INSERTs of one table through one prepared statement — the path
-/// behind `Writer.insertAll` and `Writer.create`'s seeding: prepare once,
-/// then bind, step, and `resetAndClear` per row instead of paying a
+/// behind [Writer.insertAll](#rekordlib.onelibrary.Writer.insertAll) and
+/// [Writer.create](#rekordlib.onelibrary.Writer.create)'s seeding: prepare once, then bind, step, and
+/// [resetAndClear](#rekordlib.onelibrary.Stmt.resetAndClear) per row instead of paying a
 /// prepare/finalize pair per row.
 fn insertRows(db: Db, comptime table: []const u8, rows: anytype) SqlError!void {
     const T = rowOf(@TypeOf(rows));
@@ -1762,10 +1800,11 @@ fn stepRow(stmt: Stmt, row: anytype) SqlError!void {
     try stmt.resetAndClear();
 }
 
-/// The row type of an `insertAll`/`insertRows` batch argument: a slice,
-/// an array or tuple, or a pointer to either — the shapes a caller
-/// spells naturally (`&batch`, `&.{ row, row }`). `std.meta.Elem` alone
-/// rejects tuple pointers, the type of an anonymous literal argument.
+/// The row type of an [insertAll](#rekordlib.onelibrary.Writer.insertAll) or
+/// [insertRows](#rekordlib.onelibrary.insertRows) batch argument: a slice, an array or tuple, or a
+/// pointer to either — the shapes a caller spells naturally (`&batch`,
+/// `&.{ row, row }`). `std.meta.Elem` alone rejects tuple pointers, the
+/// type of an anonymous literal argument.
 fn rowOf(comptime rows: type) type {
     switch (@typeInfo(rows)) {
         .pointer => |p| switch (p.size) {
@@ -1827,7 +1866,7 @@ fn insertSql(comptime table: []const u8, comptime T: type) [:0]const u8 {
 
 /// An `UPDATE ... SET` over every column, keyed by the first field — the
 /// primary key, bound once more after the last column (see
-/// `Writer.updateAllContents`).
+/// [Writer.updateAllContents](#rekordlib.onelibrary.Writer.updateAllContents)).
 fn updateSql(comptime table: []const u8, comptime T: type) [:0]const u8 {
     comptime {
         @setEvalBranchQuota(100_000);

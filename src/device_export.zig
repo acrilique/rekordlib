@@ -5,8 +5,9 @@
 //! On-disk layout of a Rekordbox device export: where `export.pdb`,
 //! `exportExt.pdb`, the `*SETTING.DAT` files and the `PIONEER`/`USBANLZ`/
 //! `Contents` directories live relative to the device root, plus the
-//! handle that opens an export's settings and database through that
-//! layout, and builds fresh ones.
+//! handle ([DeviceExport](#rekordlib.device_export.DeviceExport)) that
+//! opens an export's settings and database through that layout, and
+//! builds fresh ones.
 //!
 //! Initially ported from rekordcrate's `src/device/layout.rs` and
 //! `src/device/reader.rs`/`writer.rs`.
@@ -19,7 +20,10 @@ const pdb = @import("pdb.zig");
 const setting = @import("setting.zig");
 const util = @import("util.zig");
 
-/// Error of the layout functions that hash or format an audio path.
+/// Error of the functions that hash or format an audio path:
+/// [pathHash](#rekordlib.device_export.pathHash),
+/// [anlzDevicePath](#rekordlib.device_export.anlzDevicePath), and the
+/// [Layout](#rekordlib.device_export.Layout) analysis-path methods.
 pub const PathError = error{ OutOfMemory, InvalidUtf8 };
 
 /// Which settings payload a `*SETTING.DAT` file carries.
@@ -48,8 +52,10 @@ pub const dat_files = [_]DatFile{
 /// On-disk layout of a device export rooted at `root`. Derives all paths
 /// from it on demand; every method returns a slice the caller owns.
 ///
-/// Exposed so expert callers can locate `exportPdb`/`exportExtPdb` and the
-/// surrounding `PIONEER`/`Contents` directories directly, for manual
+/// Exposed so expert callers can locate
+/// [exportPdb](#rekordlib.device_export.Layout.exportPdb) and
+/// [exportExtPdb](#rekordlib.device_export.Layout.exportExtPdb), and the
+/// surrounding `PIONEER`/`Contents` directories, directly for manual
 /// inspection or modification outside the high-level reader/writer.
 pub const Layout = struct {
     /// The device root directory, as a host path.
@@ -100,7 +106,8 @@ pub const Layout = struct {
     }
 
     /// Per-track analysis directory `PIONEER/USBANLZ/P{XXX}/{HHHHHHHH}`,
-    /// computed from `audio_path`; see `pathHash` for the format
+    /// computed from `audio_path`; see
+    /// [pathHash](#rekordlib.device_export.pathHash) for the format
     /// `audio_path` must have.
     pub fn anlzDir(l: Layout, alloc: std.mem.Allocator, audio_path: []const u8) PathError![]u8 {
         const names = anlzFolderNames(try pathHash(audio_path));
@@ -150,8 +157,8 @@ pub const Layout = struct {
     }
 };
 
-/// Result of `pathHash`: the two values that name a track's analysis
-/// directory under `PIONEER/USBANLZ`.
+/// Result of [pathHash](#rekordlib.device_export.pathHash): the two values
+/// that name a track's analysis directory under `PIONEER/USBANLZ`.
 pub const PathHash = struct {
     /// 7-bit value assembled from scattered bits of `hash`; names the
     /// `P` folder in hexadecimal, three digits.
@@ -168,13 +175,13 @@ pub const PathHash = struct {
 /// Pioneer CDJ/XDJ hardware ignores the pdb `analyze_path` and recomputes
 /// the analysis directory from this hash, so the on-disk layout must match
 /// it for waveforms to display. Algorithm reverse-engineered from
-/// rekordbox's `CreateAnlzFileFolderPath`: the path is hashed as UTF-16
+/// Rekordbox's `CreateAnlzFileFolderPath`: the path is hashed as UTF-16
 /// code units with a custom rolling hash, reduced modulo 200 003 (prime),
 /// and a 7-bit P value is then extracted from scattered bits of the result.
 ///
 /// Characters outside the BMP contribute only their low 16 bits instead of
 /// a proper surrogate pair; non-BMP paths therefore collide with unrelated
-/// BMP ones, matching observed rekordbox behavior for the sanitized paths
+/// BMP ones, matching observed Rekordbox behavior for the sanitized paths
 /// it produces.
 pub fn pathHash(audio_path: []const u8) error{InvalidUtf8}!PathHash {
     var hash: u32 = 0;
@@ -208,8 +215,10 @@ const AnlzFolderNames = struct {
     leaf_folder: [8]u8,
 };
 
-/// Formats a path hash's two folder names. The arrays exactly fit every
-/// value `pathHash` produces, so the prints cannot fail.
+/// Formats a [PathHash](#rekordlib.device_export.PathHash)'s two folder
+/// names. The arrays exactly fit every value
+/// [pathHash](#rekordlib.device_export.pathHash) produces, so the prints
+/// cannot fail.
 fn anlzFolderNames(h: PathHash) AnlzFolderNames {
     var names: AnlzFolderNames = undefined;
     _ = std.fmt.bufPrint(&names.p_folder, "P{X:0>3}", .{h.p_value}) catch unreachable;
@@ -220,7 +229,7 @@ fn anlzFolderNames(h: PathHash) AnlzFolderNames {
 /// Device-relative path stored in the pdb `analyze_path` column: the `.DAT`
 /// the player loads first; sibling `.EXT`/`.2EX` are found by extension
 /// substitution on the same stem. Computed from `audio_path` via
-/// `pathHash`.
+/// [pathHash](#rekordlib.device_export.pathHash).
 pub fn anlzDevicePath(alloc: std.mem.Allocator, audio_path: []const u8) PathError![]u8 {
     const names = anlzFolderNames(try pathHash(audio_path));
     return std.fmt.allocPrint(
@@ -245,11 +254,12 @@ pub const Resolution = struct {
 /// JPEG files under the `PIONEER/Artwork` shard folder — the `a*` set the
 /// pdb names and the `b*` set the OneLibrary db names. Rekordbox writes
 /// both sets (same shard rule, `b` where the pdb set says `a`); the caller
-/// writes the files, stores `thumbnail_path` in the pdb Artwork row, and
-/// the OneLibrary mirror stores `ol_thumbnail_path`.
+/// writes the files, stores `thumbnail_path` in the pdb
+/// [Artwork](#rekordlib.pdb.Artwork) row, and the OneLibrary mirror
+/// stores `ol_thumbnail_path`.
 pub const ArtworkSpec = struct {
     /// Device-root-absolute path of the 80x80 thumbnail `a{id}.jpg` — the
-    /// path stored in the pdb Artwork row.
+    /// path stored in the pdb [Artwork](#rekordlib.pdb.Artwork) row.
     thumbnail_path: []u8,
     /// Device-root-absolute path of the 240x240 image `a{id}_m.jpg`.
     medium_path: []u8,
@@ -271,7 +281,8 @@ pub const ArtworkSpec = struct {
     }
 };
 
-/// Builds the `ArtworkSpec` for artwork row `id`.
+/// Builds the [ArtworkSpec](#rekordlib.device_export.ArtworkSpec) for
+/// artwork row `id`.
 pub fn artworkSpec(alloc: std.mem.Allocator, id: u32) std.mem.Allocator.Error!ArtworkSpec {
     const thumbnail_path = try artworkFilePath(alloc, id, 'a', "");
     errdefer alloc.free(thumbnail_path);
@@ -333,11 +344,15 @@ pub const Settings = struct {
 };
 
 /// Field patches for one `*SETTING.DAT` payload — the write shape
-/// `writeSettings` applies field by field, like `TrackPatch` does for
-/// `updateTrack`: `null` leaves the field as it is, a value replaces it.
-/// Generated from `SettingPayload(kind)`; the verbatim `unknown*` bytes are
-/// not patchable — they survive load-modify-write whole-file writes
-/// (`wholeSetting`) and otherwise pass through from the file being patched.
+/// [DeviceExport.writeSettings](#rekordlib.device_export.DeviceExport.writeSettings)
+/// applies field by field, like [TrackPatch](#rekordlib.device_export.TrackPatch)
+/// does for [DeviceExport.updateTrack](#rekordlib.device_export.DeviceExport.updateTrack):
+/// `null` leaves the field as it is, a value replaces it. Generated from
+/// [SettingPayload](#rekordlib.device_export.SettingPayload)(kind); the
+/// verbatim `unknown*` bytes are not patchable — they survive
+/// load-modify-write whole-file writes
+/// ([wholeSetting](#rekordlib.device_export.wholeSetting)) and otherwise
+/// pass through from the file being patched.
 pub fn SettingPatch(comptime kind: SettingKind) type {
     const Payload = SettingPayload(kind);
     comptime var n: usize = 0;
@@ -358,13 +373,17 @@ pub fn SettingPatch(comptime kind: SettingKind) type {
     return @Struct(.auto, null, &names, &types, &attrs);
 }
 
-/// Field patches for `writeSettings`: a `null` field leaves that
-/// `*SETTING.DAT` file untouched; a patch applies onto the file's current
-/// value — the payload a previous patch left pending, else the file on disk
-/// when it parses, else the Rekordbox default (the shape a `create`d export
-/// lands) — so successive patches to one file overlay and nothing a later
-/// patch leaves `null` resets. The merged payload replaces the whole file
-/// at the next `save`.
+/// Field patches for
+/// [DeviceExport.writeSettings](#rekordlib.device_export.DeviceExport.writeSettings).
+/// If a field is `null`, that `*SETTING.DAT` file stays untouched. If a
+/// field is a patch, it applies onto the file's current value — the
+/// payload a previous patch left pending, else the file on disk when it
+/// parses, else the Rekordbox default (the shape a
+/// [DeviceExport.create](#rekordlib.device_export.DeviceExport.create)d
+/// export lands) — so successive patches to one file overlay and nothing
+/// a later patch leaves `null` resets. The merged payload replaces the
+/// whole file at the next
+/// [DeviceExport.save](#rekordlib.device_export.DeviceExport.save).
 pub const SettingsPatch = struct {
     dev_setting: ?SettingPatch(.dev_setting) = null,
     djm_my_setting: ?SettingPatch(.djm_my_setting) = null,
@@ -373,10 +392,13 @@ pub const SettingsPatch = struct {
 };
 
 /// The whole-payload form of a settings patch — every field set — for
-/// handing a fully-built payload (say, `loadSettings` output, edited or
-/// not) to `writeSettings` in one piece. This is the load-modify-write
-/// route; it is also the only way to set the verbatim `unknown*` bytes to
-/// anything but their defaults.
+/// handing a fully-built payload (say,
+/// [DeviceExport.loadSettings](#rekordlib.device_export.DeviceExport.loadSettings)
+/// output, edited or not) to
+/// [DeviceExport.writeSettings](#rekordlib.device_export.DeviceExport.writeSettings)
+/// in one piece. This is the load-modify-write route; it is also the only
+/// way to set the verbatim `unknown*` bytes to anything but their
+/// defaults.
 pub fn wholeSetting(payload: anytype) SettingPatch(settingKindOf(@TypeOf(payload))) {
     const Patch = SettingPatch(settingKindOf(@TypeOf(payload)));
     var patch: Patch = .{};
@@ -386,8 +408,9 @@ pub fn wholeSetting(payload: anytype) SettingPatch(settingKindOf(@TypeOf(payload
     return patch;
 }
 
-/// The setting kind whose payload is `Payload`, for `wholeSetting`'s type
-/// math; any other type is a compile error.
+/// The setting kind whose payload is `Payload`, for
+/// [wholeSetting](#rekordlib.device_export.wholeSetting)'s type math; any
+/// other type is a compile error.
 fn settingKindOf(comptime Payload: type) SettingKind {
     inline for (dat_files) |dat| {
         if (SettingPayload(dat.kind) == Payload) return dat.kind;
@@ -399,14 +422,19 @@ fn settingKindOf(comptime Payload: type) SettingKind {
 /// is a few hundred bytes.
 const dat_limit = std.Io.Limit.limited(1 << 16);
 
-/// Error of `DeviceExport.loadSettings`: opening the pinned working
-/// directory, or a setting file that exists but could not be examined —
-/// unreadable, over the read cap, or memory ran out.
+/// Error of
+/// [DeviceExport.loadSettings](#rekordlib.device_export.DeviceExport.loadSettings):
+/// opening the pinned working directory, or a setting file that exists
+/// but could not be examined — unreadable, over the read cap, or memory
+/// ran out.
 pub const LoadSettingsError = std.Io.Dir.ReadFileAllocError || std.Io.Dir.OpenError;
 
-/// Error of `DeviceExport.writeSettings`: reading the `*SETTING.DAT` file
-/// a patch's first overlay loads as its base (unreadable, over the read
-/// cap, or memory ran out). Serialization is `save`'s to fail.
+/// Error of
+/// [DeviceExport.writeSettings](#rekordlib.device_export.DeviceExport.writeSettings):
+/// reading the `*SETTING.DAT` file a patch's first overlay loads as its
+/// base (unreadable, over the read cap, or memory ran out). Serialization
+/// is [DeviceExport.save](#rekordlib.device_export.DeviceExport.save)'s
+/// to fail.
 pub const WriteSettingsError = std.Io.Dir.ReadFileAllocError;
 
 /// Reads and parses one `*SETTING.DAT` file. A missing or unparseable
@@ -450,9 +478,10 @@ pub const OpenPdbError =
 /// the manual parse path; the largest fixture is 2.9 MB.
 pub const pdb_limit = std.Io.Limit.limited(1 << 26);
 
-/// Size cap when opening an `exportLibrary.db`, mirroring `pdb_limit`: a
-/// same-schema database larger than this is refused before SQLite reads
-/// it, regardless of how cheaply its rows would materialize.
+/// Size cap when opening an `exportLibrary.db`, mirroring
+/// [pdb_limit](#rekordlib.device_export.pdb_limit): a same-schema
+/// database larger than this is refused before SQLite reads it,
+/// regardless of how cheaply its rows would materialize.
 pub const ol_db_limit: u64 = 1 << 26;
 
 /// Size cap when reading one ANLZ sibling — the writer's own, published
@@ -460,21 +489,22 @@ pub const ol_db_limit: u64 = 1 << 26;
 /// megabytes.
 pub const anlz_limit = std.Io.Limit.limited(1 << 26);
 
-/// Error of `DeviceExport.open`: opening the pinned working directory,
-/// statting the root's `PIONEER` directory, or `NotAnExport` — the root
-/// carries no `PIONEER` directory (or a non-directory there), so no
-/// readable structure exists anywhere under it.
+/// Error of [DeviceExport.open](#rekordlib.device_export.DeviceExport.open):
+/// opening the pinned working directory, statting the root's `PIONEER`
+/// directory, or `NotAnExport` — the root carries no `PIONEER` directory
+/// (or a non-directory there), so no readable structure exists anywhere
+/// under it.
 pub const OpenError =
     std.Io.Dir.OpenError ||
     std.Io.Dir.StatFileError ||
     std.mem.Allocator.Error ||
     error{NotAnExport};
 
-/// Error of `DeviceExport.create`: `ExportAlreadyExists` is the
-/// exists-guard refusing a root that already carries a
-/// `PIONEER/rekordbox/export.pdb`; the rest is opening the working
-/// directory to pin it, the exists-guard's access check, and building the
-/// in-memory database and setting images.
+/// Error of [DeviceExport.create](#rekordlib.device_export.DeviceExport.create):
+/// `ExportAlreadyExists` is the exists-guard refusing a root that already
+/// carries a `PIONEER/rekordbox/export.pdb`; the rest is opening the
+/// working directory to pin it, the exists-guard's access check, and
+/// building the in-memory database and setting images.
 pub const CreateError =
     std.Io.Dir.AccessError ||
     std.Io.Dir.OpenError ||
@@ -482,8 +512,10 @@ pub const CreateError =
     bin.WriteError ||
     error{ExportAlreadyExists};
 
-/// Error of the temp-file-then-rename write `writeFileAtomic` (and every
-/// file `save` lands) performs.
+/// Error of the temp-file-then-rename write
+/// [writeFileAtomic](#rekordlib.device_export.writeFileAtomic) (and every
+/// file [DeviceExport.save](#rekordlib.device_export.DeviceExport.save)
+/// lands) performs.
 pub const AtomicWriteError =
     std.Io.Dir.CreateFileAtomicError ||
     std.Io.File.Writer.Error ||
@@ -491,9 +523,11 @@ pub const AtomicWriteError =
 
 /// Writes `bytes` to `dir`'s `path` through a temp file plus a rename, so
 /// a crash mid-write can never leave a torn file behind — the same write
-/// every `DeviceExport.save` lands through. The write half of the manual
-/// pdb path: `pdb.Database.parse` the image, edit the rows, `serialize`,
-/// then land the result with this.
+/// every [DeviceExport.save](#rekordlib.device_export.DeviceExport.save)
+/// lands through. The write half of the manual pdb path:
+/// [Database.parse](#rekordlib.pdb.Database.parse) the image, edit the
+/// rows, [Database.serialize](#rekordlib.pdb.Database.serialize), then
+/// land the result with this.
 pub fn writeFileAtomic(
     io: std.Io,
     dir: std.Io.Dir,
@@ -516,11 +550,11 @@ fn isDir(dir: std.Io.Dir, io: std.Io, path: []const u8) std.Io.Dir.StatFileError
     return stat.kind == .directory;
 }
 
-/// Error of `DeviceExport.save`: the pdb encode-and-validate pass, and
-/// the landing of every file. A root carrying no database at all never
-/// fails here — every mutating call resolves a database before queueing
-/// anything, so such a save is settings-only or a no-op and lands
-/// exactly what it has.
+/// Error of [DeviceExport.save](#rekordlib.device_export.DeviceExport.save):
+/// the pdb encode-and-validate pass, and the landing of every file. A
+/// root carrying no database at all never fails here — every mutating
+/// call resolves a database before queueing anything, so such a save is
+/// settings-only or a no-op and lands exactly what it has.
 pub const SaveError =
     OpenPdbError ||
     pdb.DatabaseEncodeError ||
@@ -535,26 +569,28 @@ pub const SaveError =
     OlMirrorError ||
     error{CwdUnavailable};
 
-/// Error of `DeviceExport.writerState`: reading or parsing
-/// `export.pdb`, or scanning it.
+/// Error of
+/// [DeviceExport.writerState](#rekordlib.device_export.DeviceExport.writerState):
+/// reading or parsing `export.pdb`, or scanning it.
 pub const WriterStateError = OpenPdbError || ScanError;
 
-/// Error of `DeviceExport.openOneLibrary`: pinning the working directory,
-/// examining or opening `exportLibrary.db` (a file over the read cap is
-/// `LibraryTooLarge`), loading its models (a drifted schema is
-/// `SchemaMismatch`, a disproportionate decode also `LibraryTooLarge`),
-/// or building its path (the process cwd was unreadable when the handle
-/// pinned it).
+/// Error of
+/// [DeviceExport.openOneLibrary](#rekordlib.device_export.DeviceExport.openOneLibrary):
+/// pinning the working directory, examining or opening `exportLibrary.db`
+/// (a file over the read cap is `LibraryTooLarge`), loading its models
+/// (a drifted schema is `SchemaMismatch`, a disproportionate decode also
+/// `LibraryTooLarge`), or building its path (the process cwd was
+/// unreadable when the handle pinned it).
 pub const OpenOLError =
     std.Io.Dir.OpenError ||
     std.Io.Dir.StatFileError ||
     onelibrary.LoadError ||
     error{ CwdUnavailable, OutOfMemory };
 
-/// Error of the OL mirroring helpers: pinning the working directory,
-/// examining or loading the existing `exportLibrary.db` (a drifted schema
-/// is `SchemaMismatch`), building its path or a device ANLZ path,
-/// allocating, or an OL-side id that exhausts its space.
+/// Error of the OneLibrary (OL) mirroring helpers: pinning the working
+/// directory, examining or loading the existing `exportLibrary.db` (a
+/// drifted schema is `SchemaMismatch`), building its path or a device
+/// ANLZ path, allocating, or an OL-side id that exhausts its space.
 pub const OlMirrorError =
     std.Io.Dir.OpenError ||
     std.Io.Dir.AccessError ||
@@ -571,11 +607,17 @@ const track_bitmask: u32 = 788_224;
 /// mirrors it as `analysedBits`. Copy exactly.
 const track_unknown5: u16 = 41;
 
-/// A track's identity in the export — the pdb Track row's id, or the
-/// content id on an OL-only export (the lockstep identity). A thin
-/// wrapper over `u32`: it names no row on its own, it just keeps a
-/// playlist id from compiling where a track id is wanted. Any integer
-/// names a track: `@enumFromInt` builds one, `int` reads it back.
+/// A track's identity in the export. If the export carries an
+/// `export.pdb`, the id is the pdb [Track](#rekordlib.pdb.Track) row's
+/// id. If the export is OL-only (no `export.pdb`), the id is the
+/// OneLibrary `content` row's id. Where both databases exist, Rekordbox
+/// keeps the two id spaces equal — the lockstep identity. The wrapper is
+/// thin: it names no row on its own, it just keeps ids from compiling
+/// against each other (a
+/// [PlaylistNodeId](#rekordlib.device_export.PlaylistNodeId) where a
+/// track id is wanted, say). Any integer names a track: `@enumFromInt`
+/// builds one, [int](#rekordlib.device_export.TrackId.int) reads it
+/// back.
 pub const TrackId = enum(u32) {
     _,
 
@@ -587,8 +629,10 @@ pub const TrackId = enum(u32) {
 
 /// A node of the playlist tree — a folder or a playlist. Folders and
 /// playlists draw from one id space (`playlist_tree_node` rows), so which
-/// one an id names stays a runtime fact (`getPlaylists`,
-/// `UnknownForeignKey`); the wrapper only keeps it apart from `TrackId`.
+/// one an id names stays a runtime fact
+/// ([DeviceExport.getPlaylists](#rekordlib.device_export.DeviceExport.getPlaylists),
+/// `UnknownForeignKey`); the wrapper only keeps it apart from
+/// [TrackId](#rekordlib.device_export.TrackId).
 pub const PlaylistNodeId = enum(u32) {
     /// The tree's root: the parent of every top-level node, not a node
     /// itself.
@@ -602,8 +646,11 @@ pub const PlaylistNodeId = enum(u32) {
 };
 
 /// A tag category or leaf tag — one id space (`exportExt.pdb`'s
-/// `TagOrCategory` rows); categories are the ones `createTagCategory`
-/// mints, leaves attach under one through `addTagsToTrack`.
+/// [TagOrCategory](#rekordlib.pdb.TagOrCategory) rows); categories are
+/// the ones
+/// [DeviceExport.createTagCategory](#rekordlib.device_export.DeviceExport.createTagCategory)
+/// mints, leaves attach under one through
+/// [DeviceExport.addTagsToTrack](#rekordlib.device_export.DeviceExport.addTagsToTrack).
 pub const TagId = enum(u32) {
     _,
 
@@ -614,15 +661,17 @@ pub const TagId = enum(u32) {
 };
 
 /// The write-side track vocabulary: plain UTF-8 string slices and
-/// scalars, no foreign-key ids (`TrackView` is its read-side mirror).
-/// Input to `DeviceExport.addTrack`, which resolves
-/// artists/albums/genres/keys/labels/artwork into deduplicated rows and
-/// handles format quirks (the 221-byte minimum row size, centi-BPM
-/// tempo); when the export carries a OneLibrary db, the same facts
-/// mirror into it. Every slice is borrowed for the call only. Experts
-/// needing fields not exposed here should parse `export.pdb` with
-/// `pdb.Database.parse`, edit the rows, and write the image back
-/// atomically with `writeFileAtomic`.
+/// scalars, no foreign-key ids ([TrackView](#rekordlib.device_export.TrackView)
+/// is its read-side mirror). Input to
+/// [DeviceExport.addTrack](#rekordlib.device_export.DeviceExport.addTrack),
+/// which resolves artists/albums/genres/keys/labels/artwork into
+/// deduplicated rows and handles format quirks (the 221-byte minimum row
+/// size, centi-BPM tempo); when the export carries a OneLibrary db, the
+/// same facts mirror into it. Every slice is borrowed for the call only.
+/// Experts needing fields not exposed here should parse `export.pdb`
+/// with [Database.parse](#rekordlib.pdb.Database.parse), edit the rows,
+/// and write the image back atomically with
+/// [writeFileAtomic](#rekordlib.device_export.writeFileAtomic).
 pub const TrackInput = struct {
     title: []const u8 = "",
     /// Performing artist name.
@@ -641,7 +690,7 @@ pub const TrackInput = struct {
     /// Free-text comment; also the auto-pad target when the row falls
     /// under the 221-byte minimum.
     comment: []const u8 = "",
-    /// ISRC, in rekordbox's mangled format.
+    /// ISRC, in Rekordbox's mangled format.
     isrc: []const u8 = "",
     /// Lyricist name. The pdb side keeps it as a plain string (no
     /// foreign key); the OL side resolves it to a real artist row under
@@ -659,11 +708,14 @@ pub const TrackInput = struct {
     /// inserted.
     file_path: []const u8 = "",
     /// File name without path. Defaults to the basename of `file_path`
-    /// when left empty — the same rule `updateTrack`'s rename applies.
+    /// when left empty — the same rule
+    /// [updateTrack](#rekordlib.device_export.DeviceExport.updateTrack)'s
+    /// rename applies.
     filename: []const u8 = "",
     /// Device path stored verbatim in the Artwork row; empty = none. The
-    /// caller owns placing the image files it names (see `artworkSpec`
-    /// for the required format).
+    /// caller owns placing the image files it names (see
+    /// [artworkSpec](#rekordlib.device_export.artworkSpec) for the
+    /// required format).
     artwork_device_path: []const u8 = "",
     /// Track "message" field shown in Rekordbox.
     message: []const u8 = "",
@@ -701,12 +753,14 @@ pub const TrackInput = struct {
     analyze_date: []const u8 = "",
     /// Pre-computed ANLZ content. Borrowed for the call only: the files
     /// are serialized right away, so the input may be freed once
-    /// `addTrack` returns. When set, the writer queues the `ANLZ0000`
-    /// files for `save` (each sibling only when its section set carries
-    /// data) and stores the device `.DAT` path in `analyze_path`. Beats
-    /// and cues are always caller-provided — the library does not do
-    /// beat detection; see `anlz.buildAnalysis` for assembling one from
-    /// performance data and waveform columns.
+    /// [addTrack](#rekordlib.device_export.DeviceExport.addTrack)
+    /// returns. When set, the writer queues the `ANLZ0000` files for
+    /// [save](#rekordlib.device_export.DeviceExport.save) (each sibling
+    /// only when its section set carries data) and stores the device
+    /// `.DAT` path in `analyze_path`. Beats and cues are always
+    /// caller-provided — the library does not do beat detection; see
+    /// [buildAnalysis](#rekordlib.anlz.buildAnalysis) for assembling one
+    /// from performance data and waveform columns.
     analysis: ?*const anlz.Analysis = null,
 
     // OneLibrary-only data: columns that exist in `exportLibrary.db`
@@ -741,19 +795,24 @@ pub const TrackInput = struct {
     information_update_count: ?i64 = null,
 };
 
-/// The outcome of `DeviceExport.addTrack`: a freshly inserted track, or
-/// an existing one returned because its `file_path` was already present.
+/// The outcome of
+/// [DeviceExport.addTrack](#rekordlib.device_export.DeviceExport.addTrack):
+/// a freshly inserted track, or an existing one returned because its
+/// `file_path` was already present.
 pub const AddTrackOutcome = struct {
-    /// The track id in the export — the pdb Track row's id, or the
-    /// content id on an OL-only export (the lockstep identity) — the
-    /// value `updateTrack`, `removeTrack`, and the track views carry.
+    /// The track's id (a [TrackId](#rekordlib.device_export.TrackId)) —
+    /// the value [updateTrack](#rekordlib.device_export.DeviceExport.updateTrack),
+    /// [removeTrack](#rekordlib.device_export.DeviceExport.removeTrack),
+    /// and the track views carry.
     id: TrackId,
     /// True if a new row was inserted; false if an existing track was
     /// returned unchanged.
     is_new: bool,
 };
 
-/// Error of `DeviceExport.addTrack`: building the writer state, encoding
+/// Error of
+/// [DeviceExport.addTrack](#rekordlib.device_export.DeviceExport.addTrack):
+/// building the writer state, encoding
 /// the track's strings (too long, or invalid UTF-8 where a format string
 /// requires it), deriving its ANLZ paths, inserting the rows, building
 /// the OneLibrary mirror's view of the export, or `DatabaseNotFound` —
@@ -782,10 +841,13 @@ pub const PlaylistError =
 /// The tag methods fail for the same reasons as the playlist ones.
 pub const TagError = PlaylistError;
 
-/// Error of the unified track reads (`tracks`, `trackByPath`): opening or
-/// parsing the export's databases, scanning them, the OL join's read of
-/// `exportLibrary.db`, or `DatabaseNotFound` — the root carries a
-/// `PIONEER` directory but neither `export.pdb` nor `exportLibrary.db`.
+/// Error of the unified track reads
+/// ([DeviceExport.tracks](#rekordlib.device_export.DeviceExport.tracks),
+/// [DeviceExport.trackByPath](#rekordlib.device_export.DeviceExport.trackByPath)):
+/// opening or parsing the export's databases, scanning them, the OL
+/// join's read of `exportLibrary.db`, or `DatabaseNotFound` — the root
+/// carries a `PIONEER` directory but neither `export.pdb` nor
+/// `exportLibrary.db`.
 pub const TrackViewError = OpenPdbError || ScanError || OpenOLError || error{DatabaseNotFound};
 
 /// Whether a track view found a OneLibrary counterpart. The pdb row is
@@ -799,21 +861,22 @@ pub const TrackSource = enum {
     pdb_and_ol,
 };
 
-/// The read-side counterpart of `TrackInput`: one pdb Track row — its
-/// foreign keys resolved to names — overlaid with the OL `content` row
-/// joined by file path, when the export carries one, so what `addTrack`
-/// writes is what a view shows. Fields only the OL side carries are
-/// empty/null under `pdb_only`; an OL-only export builds the view from
-/// the `content` row outright (`id` is the content id — Rekordbox keeps
-/// content ids in the pdb track id space; see the type doc for the
-/// field convention).
+/// The read-side counterpart of [TrackInput](#rekordlib.device_export.TrackInput):
+/// one pdb [Track](#rekordlib.pdb.Track) row — its foreign keys resolved
+/// to names — overlaid with the OL `content` row joined by file path,
+/// when the export carries one, so what
+/// [addTrack](#rekordlib.device_export.DeviceExport.addTrack) writes is
+/// what a view shows. Fields only the OL side carries are empty/null
+/// under `pdb_only`; an OL-only export builds the view from the
+/// `content` row outright. `id` is a
+/// [TrackId](#rekordlib.device_export.TrackId).
 ///
 /// A view's strings are borrowed: from an iterator, until its next
-/// `next` call (dupe what must survive); from `trackByPath`, until the
-/// record's `deinit`.
+/// `next` call (dupe what must survive); from
+/// [trackByPath](#rekordlib.device_export.DeviceExport.trackByPath),
+/// until the record's `deinit`.
 pub const TrackView = struct {
-    /// The track id — the pdb Track row's id, or the content id on an
-    /// OL-only export; the export's stable identity for the track.
+    /// The track's id (a [TrackId](#rekordlib.device_export.TrackId)).
     id: TrackId,
     title: []const u8,
     artist: []const u8,
@@ -877,11 +940,14 @@ pub const TrackView = struct {
     information_update_count: ?i64 = null,
 };
 
-/// Field patches for `updateTrack`: `null` leaves the field exactly as
-/// it is, a value replaces it. An empty string is a value — patching
-/// `artist = ""` clears the foreign key, like `addTrack` with no artist.
-/// A non-null `file_path` renames the track — `updateTrack` carries the
-/// analysis relocation the move implies (see its doc). On an OL-only
+/// Field patches for
+/// [updateTrack](#rekordlib.device_export.DeviceExport.updateTrack):
+/// `null` leaves the field exactly as it is, a value replaces it. An
+/// empty string is a value — patching `artist = ""` clears the foreign
+/// key, like [addTrack](#rekordlib.device_export.DeviceExport.addTrack)
+/// with no artist. A non-null `file_path` renames the track —
+/// [updateTrack](#rekordlib.device_export.DeviceExport.updateTrack)
+/// carries the analysis relocation the move implies. On an OL-only
 /// export (no `export.pdb`) the pdb-only fields (`message`, `mix_name`,
 /// `analyze_date`, `publish_track_information`) are ignored — there is
 /// no pdb row to patch — while everything else lands on the content row.
@@ -939,11 +1005,13 @@ pub const TrackPatch = struct {
     information_update_count: ?i64 = null,
 };
 
-/// Error of `updateTrack`: the writer state, the row replace, the
-/// dimension resolution, the OL mirror, or — when the patch renames —
-/// the path checks and the collision probe; `UnknownTrack` names an id
-/// no Track row carries, `DatabaseNotFound` a root with no database at
-/// all.
+/// Error of
+/// [updateTrack](#rekordlib.device_export.DeviceExport.updateTrack): the
+/// writer state, the row replace, the dimension resolution, the OL
+/// mirror, or — when the patch renames — the path checks and the
+/// collision probe; `UnknownTrack` names an id no
+/// [Track](#rekordlib.pdb.Track) row carries, `DatabaseNotFound` a root
+/// with no database at all.
 pub const UpdateTrackError =
     WriterStateError ||
     OlMirrorError ||
@@ -963,17 +1031,21 @@ pub const UpdateTrackError =
         DatabaseNotFound,
     };
 
-/// Options of `removeTrack`.
+/// Options of
+/// [removeTrack](#rekordlib.device_export.DeviceExport.removeTrack).
 pub const RemoveTrackOptions = struct {
     /// Delete the track's analysis directory (`PIONEER/USBANLZ/...`) at
-    /// the next save — after `export.pdb`, best effort. Off by default:
-    /// the directory is kept when another track's path hashes onto it
-    /// (a collision would lose the survivor's analysis).
+    /// the next [save](#rekordlib.device_export.DeviceExport.save) —
+    /// after `export.pdb`, best effort. Off by default: the directory is
+    /// kept when another track's path hashes onto it (a collision would
+    /// lose the survivor's analysis).
     delete_analysis_files: bool = false,
 };
 
-/// Error of `removeTrack`: the writer state, the row removals, or the OL
-/// cascade; `UnknownTrack` names an id no Track row carries,
+/// Error of
+/// [removeTrack](#rekordlib.device_export.DeviceExport.removeTrack): the
+/// writer state, the row removals, or the OL cascade; `UnknownTrack`
+/// names an id no [Track](#rekordlib.pdb.Track) row carries,
 /// `DatabaseNotFound` a root with no database at all.
 pub const RemoveTrackError =
     WriterStateError ||
@@ -983,7 +1055,8 @@ pub const RemoveTrackError =
     PathError ||
     error{ UnknownTrack, DatabaseNotFound };
 
-/// Error of the ANLZ relocation pass of `save`.
+/// Error of the ANLZ relocation pass of
+/// [DeviceExport.save](#rekordlib.device_export.DeviceExport.save).
 pub const RelocateError =
     std.Io.Dir.ReadFileAllocError ||
     std.Io.Dir.CreateDirPathError ||
@@ -992,9 +1065,13 @@ pub const RelocateError =
     anlz.WriteError ||
     PathError;
 
-/// One serialized ANLZ file waiting for the next `save`: the host path it
-/// lands at, plus its image. `addTrack` serializes eagerly so the
-/// caller's `Analysis` can go away and `save` only moves bytes.
+/// One serialized ANLZ file waiting for the next
+/// [save](#rekordlib.device_export.DeviceExport.save): the host path it
+/// lands at, plus its image.
+/// [addTrack](#rekordlib.device_export.DeviceExport.addTrack) serializes
+/// eagerly so the caller's [Analysis](#rekordlib.anlz.Analysis) can go
+/// away and [save](#rekordlib.device_export.DeviceExport.save) only
+/// moves bytes.
 const PendingAnlz = struct {
     path: []u8,
     image: []u8,
@@ -1005,12 +1082,13 @@ const PendingAnlz = struct {
     }
 };
 
-/// One queued ANLZ relocation, keyed by track id: at the next `save`,
-/// every sibling found under `from_dir` is re-serialized — its PPTH path
-/// section naming `device_path` — and written into `to_dir`; after
-/// `export.pdb` lands, `from_dir` goes away best-effort. `from_dir ==
-/// to_dir` (the two paths hash onto one directory) means only the PPTH
-/// rewrite, in place.
+/// One queued ANLZ relocation, keyed by track id: at the next
+/// [save](#rekordlib.device_export.DeviceExport.save), every sibling
+/// found under `from_dir` is re-serialized — its PPTH path section
+/// naming `device_path` — and written into `to_dir`; after `export.pdb`
+/// lands, `from_dir` goes away best-effort. `from_dir == to_dir` (the
+/// two paths hash onto one directory) means only the PPTH rewrite, in
+/// place.
 const AnlzRelocation = struct {
     from_dir: []u8,
     to_dir: []u8,
@@ -1035,85 +1113,126 @@ fn captureCwd(alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
 }
 
 /// A handle to a Rekordbox device export on disk: the setting files and
-/// the pdb database, located through `Layout`. `open` points the handle
-/// at an existing export, `create` builds a fresh one in memory. `save`
-/// is the only call that writes; `deinit` discards whatever was never
-/// saved. Files the export carries but the handle does not model are
-/// ignored by design: `djprofile.nxs` (undocumented). The OneLibrary db
-/// (`exportLibrary.db`, newer exports) is read through `openOneLibrary`
+/// the pdb database, located through [Layout](#rekordlib.device_export.Layout).
+/// [open](#rekordlib.device_export.DeviceExport.open) points the handle
+/// at an existing export;
+/// [create](#rekordlib.device_export.DeviceExport.create) builds a fresh
+/// one in memory. [save](#rekordlib.device_export.DeviceExport.save) is
+/// the only call that writes;
+/// [deinit](#rekordlib.device_export.DeviceExport.deinit) discards
+/// whatever was never saved. Files the export carries but the handle
+/// does not model are ignored by design: `djprofile.nxs`
+/// (undocumented). The OneLibrary db (`exportLibrary.db`, newer
+/// exports) is read through
+/// [openOneLibrary](#rekordlib.device_export.DeviceExport.openOneLibrary)
 /// and mirrored by the writer side of the handle.
 ///
-/// Exports come in two shapes. A full export carries `export.pdb`, its
-/// rows mirrored into `exportLibrary.db` by the mutating methods when the
-/// export carries one (`create`d and newer opened exports). An OL-only
-/// export — no `export.pdb`, as written by Rekordbox `-Donelibrary`
-/// builds — goes through `exportLibrary.db` outright: track ids are
-/// content ids, and the fields only one side stores (`message`,
-/// `mix_name`, `analyze_date`, `publish_track_information` on the pdb
-/// side) are ignored in both directions — the ignore-vice-versa
-/// convention. Methods work on either shape, failing with
-/// `DatabaseNotFound` only when the root carries neither database.
+/// Exports come in two shapes. A full export carries `export.pdb`; when
+/// it also carries an `exportLibrary.db`
+/// ([create](#rekordlib.device_export.DeviceExport.create)d and newer
+/// opened exports), the mutating methods mirror its rows into it. An
+/// OL-only export — no `export.pdb`, as written by Rekordbox
+/// `-Donelibrary` builds — goes through `exportLibrary.db` outright:
+/// track ids are [TrackId](#rekordlib.device_export.TrackId) values,
+/// and the fields only one side stores (`message`, `mix_name`,
+/// `analyze_date`, `publish_track_information` on the pdb side) are
+/// ignored in both directions — the ignore-vice-versa convention.
+/// Methods work on either shape, failing with `DatabaseNotFound` only
+/// when the root carries neither database.
 pub const DeviceExport = struct {
     layout: Layout,
     io: std.Io,
     alloc: std.mem.Allocator,
     /// Directory every path is resolved against — the process working
-    /// directory, opened as a real handle at construction (`open` and
-    /// `create` both pin it immediately) so a later cwd change cannot
-    /// reinterpret a relative root between calls. Closed by `deinit`.
+    /// directory, opened as a real handle at construction
+    /// ([open](#rekordlib.device_export.DeviceExport.open) and
+    /// [create](#rekordlib.device_export.DeviceExport.create) both pin
+    /// it immediately) so a later cwd change cannot reinterpret a
+    /// relative root between calls. Closed by
+    /// [deinit](#rekordlib.device_export.DeviceExport.deinit).
     dir: std.Io.Dir,
     /// The process cwd at the moment `dir` was pinned — the absolute
     /// prefix SQLite paths are built on (they resolve against the
     /// process cwd, not the pinned handle). Null in `-Donelibrary=off` builds
     /// (nothing needs it) or when the cwd was unreadable.
     dir_path: ?[]u8 = null,
-    /// Set by `create`: this handle builds a fresh export, so its first
-    /// `save` also writes the default directory skeleton. An `open`ed
-    /// export never creates directories.
+    /// Set by [create](#rekordlib.device_export.DeviceExport.create):
+    /// this handle builds a fresh export, so its first
+    /// [save](#rekordlib.device_export.DeviceExport.save) also writes
+    /// the default directory skeleton. An
+    /// [open](#rekordlib.device_export.DeviceExport.open)ed export never
+    /// creates directories.
     created: bool = false,
     /// The export's pdb, loaded on the first pdb-touching call — a
     /// settings-only session never parses it.
     pdb_state: PdbState = .unloaded,
-    /// Merged `*SETTING.DAT` payloads queued for the next `save`: the
-    /// four defaults on a `create`d export, or exactly the files a
-    /// `writeSettings` patch named on any export, each overlaid onto its
-    /// base (a previous patch, else the disk copy, else the default).
-    /// Null fields stay untouched on disk; the queue drops once fully
+    /// Merged `*SETTING.DAT` payloads queued for the next
+    /// [save](#rekordlib.device_export.DeviceExport.save): the four
+    /// defaults on a
+    /// [create](#rekordlib.device_export.DeviceExport.create)d export,
+    /// or exactly the files a
+    /// [writeSettings](#rekordlib.device_export.DeviceExport.writeSettings)
+    /// patch named on any export, each overlaid onto its base (a
+    /// previous patch, else the disk copy, else the default). Null
+    /// fields stay untouched on disk; the queue drops once fully
     /// drained. Plain data — nothing to free.
     pending_settings: ?Settings = null,
     /// The writer's cached scan of the export — id counters and dedup
-    /// maps — null until `writerState` builds it on first use.
+    /// maps — null until
+    /// [writerState](#rekordlib.device_export.DeviceExport.writerState)
+    /// builds it on first use.
     writer_state: ?WriterState = null,
     /// The tag database (`exportExt.pdb`), touched only by the tag
-    /// methods and `save`.
+    /// methods and [save](#rekordlib.device_export.DeviceExport.save).
     ext_pdb_state: ExtPdbState = .unloaded,
-    /// Serialized ANLZ images queued by `addTrack`, written by the next
-    /// `save` — before `export.pdb`, so a crash leaves orphan analysis
-    /// files players ignore, not rows naming missing ones.
+    /// Whether `ensureExtLoaded`'s OneLibrary bridge has completed —
+    /// false until the `recoverOlMyTags` fold succeeds over the current
+    /// tag database, so a failed fold stays retriable while the database
+    /// it half-populated stays loaded and usable.
+    ext_ol_bridged: bool = false,
+    /// Serialized ANLZ images queued by
+    /// [addTrack](#rekordlib.device_export.DeviceExport.addTrack),
+    /// written by the next
+    /// [save](#rekordlib.device_export.DeviceExport.save) — before
+    /// `export.pdb`, so a crash leaves orphan analysis files players
+    /// ignore, not rows naming missing ones.
     pending_anlz: std.ArrayList(PendingAnlz) = .empty,
-    /// The OneLibrary db read side (`openOneLibrary`), independent of the
-    /// writer side.
+    /// The OneLibrary db read side
+    /// ([openOneLibrary](#rekordlib.device_export.DeviceExport.openOneLibrary)),
+    /// independent of the writer side.
     ol_library: OlLibraryState = .unloaded,
     /// The OneLibrary db write side: rows mirrored by the mutating
-    /// methods, buffered until `save` materializes them.
+    /// methods, buffered until
+    /// [save](#rekordlib.device_export.DeviceExport.save) materializes
+    /// them.
     ol_state: OlState = .unloaded,
-    /// ANLZ relocations queued by `updateTrack`'s rename, keyed by track id and
-    /// landed by the next `save` (see `AnlzRelocation`).
+    /// ANLZ relocations queued by
+    /// [updateTrack](#rekordlib.device_export.DeviceExport.updateTrack)'s
+    /// rename, keyed by track id and landed by the next
+    /// [save](#rekordlib.device_export.DeviceExport.save) (see
+    /// `AnlzRelocation`).
     relocations: std.AutoHashMapUnmanaged(u32, AnlzRelocation) = .empty,
-    /// Analysis directories queued by `removeTrack` for deletion at the
-    /// next save, after `export.pdb` lands (best effort).
+    /// Analysis directories queued by
+    /// [removeTrack](#rekordlib.device_export.DeviceExport.removeTrack)
+    /// for deletion at the next
+    /// [save](#rekordlib.device_export.DeviceExport.save), after
+    /// `export.pdb` lands (best effort).
     pending_dir_deletes: std.ArrayListUnmanaged([]u8) = .empty,
 
     const PdbState = union(enum) {
         /// An export opened at `root`; the pdb parses on first touch.
         unloaded,
-        /// In memory — parsed from disk or built by `create`.
+        /// In memory — parsed from disk or built by
+        /// [create](#rekordlib.device_export.DeviceExport.create).
         loaded: pdb.Database,
     };
 
     /// Lifecycle of the `exportLibrary.db` models, loaded on first
-    /// `openOneLibrary` call and cached until the next `save` — which drops it,
-    /// the snapshot naming the pre-save disk — or `deinit`.
+    /// [openOneLibrary](#rekordlib.device_export.DeviceExport.openOneLibrary)
+    /// call and cached until the next
+    /// [save](#rekordlib.device_export.DeviceExport.save) — which drops
+    /// it, the snapshot naming the pre-save disk — or
+    /// [deinit](#rekordlib.device_export.DeviceExport.deinit).
     const OlLibraryState = union(enum) {
         /// Not examined yet; the first call checks the disk.
         unloaded,
@@ -1125,8 +1244,9 @@ pub const DeviceExport = struct {
 
     /// Lifecycle of the OneLibrary write side. Mirroring is a no-op in
     /// the `absent` state: an opened export without an
-    /// `exportLibrary.db` never gains one — only `create` builds a fresh
-    /// db.
+    /// `exportLibrary.db` never gains one — only
+    /// [create](#rekordlib.device_export.DeviceExport.create) builds a
+    /// fresh db.
     const OlState = union(enum) {
         /// Not examined yet; the first mirrored mutation checks the disk.
         unloaded,
@@ -1139,30 +1259,39 @@ pub const DeviceExport = struct {
 
     /// Lifecycle of the tag database. A created export starts `absent`
     /// (its first tag write starts fresh); an opened one starts
-    /// `unloaded` and examines the disk at the first tag call.
+    /// `unloaded` and examines the disk at the first tag call. The OL
+    /// bridge can also leave an opened export `loaded` straight from
+    /// `absent` — an export whose tags live only in `exportLibrary.db`
+    /// gains its ext database pre-populated with them.
     const ExtPdbState = union(enum) {
         /// Not examined yet; the first tag call checks the disk.
         unloaded,
         /// No `exportExt.pdb` under the root; the first tag write builds
-        /// a fresh database in memory.
+        /// a fresh database in memory (from the OL tree, when the export
+        /// carries one).
         absent,
         /// In memory — parsed from disk (prior tags preserved) or built
         /// fresh.
         loaded: pdb.Database,
     };
 
-    /// Points the handle at a device export on disk — minimally a root
-    /// with a `PIONEER` directory, verified here and nowhere else on the
-    /// read side: `NotAnExport` names a root without one (or a
-    /// non-directory there) at the call, not at the first I/O that needs
-    /// a database. Everything past that stays lazy — the pdbs,
+    /// Points the handle at a device export on disk. The minimum is a
+    /// root with a `PIONEER` directory, verified here and nowhere else
+    /// on the read side: `NotAnExport` names a root without one (or a
+    /// non-directory there) at the call, not at the first I/O that
+    /// needs a database. Everything past that stays lazy — the pdbs,
     /// `exportLibrary.db`, and the `*SETTING.DAT` files are first
-    /// examined by whatever call needs them. An export whose `PIONEER`
-    /// carries `exportLibrary.db` but no `export.pdb` (OL-only) reads
-    /// through the OL db in `-Donelibrary` builds; one carrying neither database
-    /// fails the read-side fallbacks with `DatabaseNotFound`.
-    /// `loadSettings` and `openOneLibrary` stay quiet on exports lacking their
-    /// files. The root path is borrowed; keep it alive until `deinit`.
+    /// examined by whatever call needs them. If an export's `PIONEER`
+    /// carries `exportLibrary.db` but no `export.pdb` (OL-only), reads
+    /// go through the OL db in `-Donelibrary` builds. If it carries
+    /// neither database, the read-side fallbacks fail with
+    /// `DatabaseNotFound`.
+    /// [loadSettings](#rekordlib.device_export.DeviceExport.loadSettings)
+    /// and
+    /// [openOneLibrary](#rekordlib.device_export.DeviceExport.openOneLibrary)
+    /// stay quiet on exports lacking their files. The root path is
+    /// borrowed; keep it alive until
+    /// [deinit](#rekordlib.device_export.DeviceExport.deinit).
     pub fn open(root_path: []const u8, io: std.Io, alloc: std.mem.Allocator) OpenError!DeviceExport {
         const layout = Layout{ .root = root_path };
         // Pin the working directory now, like `create`: open is the
@@ -1190,13 +1319,18 @@ pub const DeviceExport = struct {
 
     /// Builds a fresh export in memory: a created pdb carrying the fixed
     /// 20-table layout (the `Unknown` slots must stay in place or CDJ
-    /// players crash) with the default color, column, and menu rows, plus
-    /// the four default setting files. Nothing touches the disk until
-    /// `save`. The only skeleton-writer, and pdb-canonical: an export
-    /// opened with `open` never gains structure it did not carry — no
-    /// pdb, OL db, setting file, or directory tree appears that `create`
-    /// did not build, a `writeSettings` patch did not name, and `save`
-    /// did not land.
+    /// players crash) with the default color, column, and menu rows,
+    /// plus the four default setting files. Nothing touches the disk
+    /// until [save](#rekordlib.device_export.DeviceExport.save). The
+    /// only skeleton-writer, and pdb-canonical: an export opened with
+    /// [open](#rekordlib.device_export.DeviceExport.open) never gains
+    /// structure it did not carry — no pdb, OL db, setting file, or
+    /// directory tree appears that
+    /// [create](#rekordlib.device_export.DeviceExport.create) did not
+    /// build, a
+    /// [writeSettings](#rekordlib.device_export.DeviceExport.writeSettings)
+    /// patch did not name, and
+    /// [save](#rekordlib.device_export.DeviceExport.save) did not land.
     pub fn create(
         root_path: []const u8,
         io: std.Io,
@@ -1292,9 +1426,10 @@ pub const DeviceExport = struct {
         return e.layout.root;
     }
 
-    /// Loads the four `*SETTING.DAT` files in `dat_files` order. A
-    /// missing or invalid file leaves its field null; a file that
-    /// cannot be examined is an error.
+    /// Loads the four `*SETTING.DAT` files in
+    /// [dat_files](#rekordlib.device_export.dat_files) order. A missing
+    /// or invalid file leaves its field null; a file that cannot be
+    /// examined is an error.
     pub fn loadSettings(e: *DeviceExport) LoadSettingsError!Settings {
         const dir = e.dir;
         var settings = Settings{};
@@ -1314,21 +1449,31 @@ pub const DeviceExport = struct {
         return settings;
     }
 
-    /// Queues `*SETTING.DAT` changes for the next `save` — the write side
-    /// of `loadSettings`, with `updateTrack`'s patch shape: a null field
-    /// leaves that file untouched, and a patch names only the values that
-    /// change, overlaid onto the file's current value (a previous patch's
-    /// merge, else the disk copy when it parses, else the Rekordbox
-    /// default) — so a missing or unparseable file needs no
-    /// `loadSettings` round-trip before it can be patched, and nothing a
-    /// patch leaves null resets. `wholeSetting` covers the
-    /// load-modify-write form. Only the data section is the caller's:
-    /// brand/software/version strings and the checksum are the library's
-    /// (a `create`d export's defaults), so writes through this API keep
-    /// the header Rekordbox expects. The write lands through
-    /// `writeFileAtomic`, and a patched file an opened export does not
-    /// carry yet is created at `save` — the one explicit exception to
-    /// `open` never gaining files it did not carry.
+    /// Queues `*SETTING.DAT` changes for the next
+    /// [save](#rekordlib.device_export.DeviceExport.save) — the write
+    /// side of
+    /// [loadSettings](#rekordlib.device_export.DeviceExport.loadSettings),
+    /// with [updateTrack](#rekordlib.device_export.DeviceExport.updateTrack)'s
+    /// patch shape: a null field leaves that file untouched, and a
+    /// patch names only the values that change, overlaid onto the
+    /// file's current value (a previous patch's merge, else the disk
+    /// copy when it parses, else the Rekordbox default) — so a missing
+    /// or unparseable file needs no
+    /// [loadSettings](#rekordlib.device_export.DeviceExport.loadSettings)
+    /// round-trip before it can be patched, and nothing a patch leaves
+    /// null resets. [wholeSetting](#rekordlib.device_export.wholeSetting)
+    /// covers the load-modify-write form. Only the data section is the
+    /// caller's: brand/software/version strings and the checksum are
+    /// the library's (a
+    /// [create](#rekordlib.device_export.DeviceExport.create)d export's
+    /// defaults), so writes through this API keep the header Rekordbox
+    /// expects. The write lands through
+    /// [writeFileAtomic](#rekordlib.device_export.writeFileAtomic), and
+    /// a patched file an opened export does not carry yet is created at
+    /// [save](#rekordlib.device_export.DeviceExport.save) — the one
+    /// explicit exception to
+    /// [open](#rekordlib.device_export.DeviceExport.open) never gaining
+    /// files it did not carry.
     pub fn writeSettings(e: *DeviceExport, patch: SettingsPatch) WriteSettingsError!void {
         if (e.pending_settings == null) e.pending_settings = .{};
         const pending = &e.pending_settings.?;
@@ -1340,8 +1485,10 @@ pub const DeviceExport = struct {
     }
 
     /// Applies one file's field patch onto its pending value — the value
-    /// a previous `writeSettings` left, else the file on disk when it
-    /// parses, else the payload default.
+    /// a previous
+    /// [writeSettings](#rekordlib.device_export.DeviceExport.writeSettings)
+    /// left, else the file on disk when it parses, else the payload
+    /// default.
     fn mergeSettingPatch(
         e: *DeviceExport,
         comptime kind: SettingKind,
@@ -1359,17 +1506,22 @@ pub const DeviceExport = struct {
         return merged;
     }
 
-    /// The export's database, parsing it off disk on first call. Private:
-    /// handing the handle-owned `Database` out would let edits bypass the
-    /// writer's id counters and dedup maps (silently colliding ids on the
-    /// next mutating call). Fields the typed methods don't expose belong
-    /// on the manual path: parse, edit, `writeFileAtomic`.
+    /// The export's database, parsing it off disk on first call.
+    /// Private: handing the handle-owned
+    /// [Database](#rekordlib.pdb.Database) out would let edits bypass
+    /// the writer's id counters and dedup maps (silently colliding ids
+    /// on the next mutating call). Fields the typed methods don't
+    /// expose belong on the manual path: parse, edit,
+    /// [writeFileAtomic](#rekordlib.device_export.writeFileAtomic).
     ///
-    /// A missing pdb is `FileNotFound` — `open` verified `PIONEER` at
-    /// construction, so the caller decides what an export whose only
-    /// database is the OneLibrary db means. The `NotAnExport` branch
-    /// below only fires when the root lost or replaced its `PIONEER`
-    /// between `open` and this call.
+    /// A missing pdb is `FileNotFound` —
+    /// [open](#rekordlib.device_export.DeviceExport.open) verified
+    /// `PIONEER` at construction, so the caller decides what an export
+    /// whose only database is the OneLibrary db means. The
+    /// `NotAnExport` branch below only fires when the root lost or
+    /// replaced its `PIONEER` between
+    /// [open](#rekordlib.device_export.DeviceExport.open) and this
+    /// call.
     fn openPdb(e: *DeviceExport) OpenPdbError!*pdb.Database {
         switch (e.pdb_state) {
             .loaded => |*db| return db,
@@ -1416,8 +1568,10 @@ pub const DeviceExport = struct {
     /// pdb/OL-only duality is decided: the export's pdb when it carries
     /// one, else (in `-Donelibrary` builds) the OneLibrary store an
     /// OL-only export mutates through. `DatabaseNotFound` names a root
-    /// with no database at all. (`save` resolves by hand: its two
-    /// branches land different files, not two bodies of one vocabulary.)
+    /// with no database at all.
+    /// ([save](#rekordlib.device_export.DeviceExport.save) resolves by
+    /// hand: its two branches land different files, not two bodies of
+    /// one vocabulary.)
     fn mutationStore(e: *DeviceExport) (WriterStateError || OlMirrorError || error{DatabaseNotFound})!MutationStore {
         const db = e.openPdb() catch |err| switch (err) {
             error.FileNotFound => {
@@ -1432,7 +1586,9 @@ pub const DeviceExport = struct {
 
     /// The read-side counterpart of `mutationStore`: the export's pdb, or
     /// the OneLibrary library an OL-only export reads through (the disk
-    /// snapshot `openOneLibrary` caches, not the writer store).
+    /// snapshot
+    /// [openOneLibrary](#rekordlib.device_export.DeviceExport.openOneLibrary)
+    /// caches, not the writer store).
     fn readStore(e: *DeviceExport) (OpenPdbError || OpenOLError || error{DatabaseNotFound})!ReadStore {
         const db = e.openPdb() catch |err| switch (err) {
             error.FileNotFound => {
@@ -1445,9 +1601,11 @@ pub const DeviceExport = struct {
         return .{ .pdb = db };
     }
 
-    /// The export's playlist tree (see `getPlaylistsDb` for the shape and
-    /// ownership rules); on an OL-only export, built from the OL
-    /// `playlist` rows (see the type doc).
+    /// The export's playlist tree (see
+    /// [getPlaylistsDb](#rekordlib.device_export.getPlaylistsDb) for the
+    /// shape and ownership rules); on an OL-only export, built from the
+    /// OL `playlist` rows (see
+    /// [DeviceExport](#rekordlib.device_export.DeviceExport)).
     pub fn getPlaylists(
         e: *DeviceExport,
     ) (OpenPdbError || PlaylistTreeError || OpenOLError || error{DatabaseNotFound})!PlaylistTree {
@@ -1457,13 +1615,15 @@ pub const DeviceExport = struct {
         };
     }
 
-    /// Iterates the export's tracks as `TrackView`s — one per pdb Track
-    /// row, foreign keys resolved to names, the OL counterpart joined by
-    /// file path when the export carries one; an OL-only export iterates
-    /// its `content` rows (see the type doc). A view's strings live
-    /// until the iterator's next `next` call; dupe what must outlive it.
-    /// Mutating the export invalidates the iterator — finish iterating
-    /// first.
+    /// Iterates the export's tracks as
+    /// [TrackView](#rekordlib.device_export.TrackView)s — one per pdb
+    /// [Track](#rekordlib.pdb.Track) row, foreign keys resolved to
+    /// names, the OL counterpart joined by file path when the export
+    /// carries one; an OL-only export iterates its `content` rows (see
+    /// [TrackView](#rekordlib.device_export.TrackView)). A view's
+    /// strings live until the iterator's next `next` call; dupe what
+    /// must outlive it. Mutating the export invalidates the iterator —
+    /// finish iterating first.
     pub fn tracks(e: *DeviceExport) TrackViewError!TrackIter {
         switch (try e.readStore()) {
             .pdb => |db| {
@@ -1499,9 +1659,9 @@ pub const DeviceExport = struct {
     /// The track ids of `playlist_id`'s entries, ordered by `entry_index`
     /// — the order the player shows them in. A folder, or an id the
     /// export does not carry, yields an empty slice; the caller owns the
-    /// slice. An OL-only export reads its `playlist_content` rows instead,
-    /// ordered by their own dense 1-based `sequenceNo` (see the type
-    /// doc).
+    /// slice. An OL-only export reads its `playlist_content` rows
+    /// instead, ordered by their own dense 1-based `sequenceNo` (see
+    /// [DeviceExport](#rekordlib.device_export.DeviceExport)).
     pub fn getPlaylistTrackIds(
         e: *DeviceExport,
         alloc: std.mem.Allocator,
@@ -1558,8 +1718,9 @@ pub const DeviceExport = struct {
     /// The track view for `path` (device-root-absolute, e.g.
     /// `/Contents/Artist - Title.mp3`), or null when no track carries
     /// it; an OL-only export resolves through its `content` rows (see
-    /// the type doc). Unlike an iterator's view, the record owns its
-    /// strings — call `deinit` when done.
+    /// [TrackView](#rekordlib.device_export.TrackView)). Unlike an
+    /// iterator's view, the record owns its strings — call `deinit` when
+    /// done.
     pub fn trackByPath(e: *DeviceExport, path: []const u8) TrackViewError!?TrackRecord {
         switch (try e.readStore()) {
             .pdb => |db| {
@@ -1595,11 +1756,15 @@ pub const DeviceExport = struct {
     }
 
     /// The track view of the first track titled `title` in row order —
-    /// the order `tracks` yields — or null when none carries it. Titles
-    /// are not unique (`file_path` is the dedup key; `trackByPath`
-    /// resolves it); when several rows may share one, iterate `tracks`
-    /// to see them all. Like `trackByPath`'s, the record owns its
-    /// strings — call `deinit` when done.
+    /// the order [tracks](#rekordlib.device_export.DeviceExport.tracks)
+    /// yields — or null when none carries it. Titles are not unique
+    /// (`file_path` is the dedup key;
+    /// [trackByPath](#rekordlib.device_export.DeviceExport.trackByPath)
+    /// resolves it); when several rows may share one, iterate
+    /// [tracks](#rekordlib.device_export.DeviceExport.tracks) to see
+    /// them all. Like
+    /// [trackByPath](#rekordlib.device_export.DeviceExport.trackByPath)'s,
+    /// the record owns its strings — call `deinit` when done.
     pub fn trackByTitle(e: *DeviceExport, title: []const u8) TrackViewError!?TrackRecord {
         switch (try e.readStore()) {
             .pdb => |db| {
@@ -1640,15 +1805,19 @@ pub const DeviceExport = struct {
 
     /// The export's OneLibrary db (`exportLibrary.db`, carried by newer
     /// exports), loaded on first call and cached; null when the export
-    /// carries none. `save` drops the cache — it names the pre-save disk —
-    /// so the returned pointer is valid until the next `save` or `deinit`,
-    /// and a later call reloads from disk. The join to the pdb side is by
-    /// path:
-    /// `content.path` values are the device-root-absolute file paths the
-    /// pdb Track rows store, so `lib.contentByPath(file_path)` hands back
-    /// the OL view of a track — everything the joined `TrackView` already
-    /// decodes (subtitle, kuvo flags, update counts) plus the raw columns
-    /// no view carries (per-role artist ids, the stored `djPlayCount`,
+    /// carries none. [save](#rekordlib.device_export.DeviceExport.save)
+    /// drops the cache — it names the pre-save disk — so the returned
+    /// pointer is valid until the next
+    /// [save](#rekordlib.device_export.DeviceExport.save) or
+    /// [deinit](#rekordlib.device_export.DeviceExport.deinit), and a
+    /// later call reloads from disk. The join to the pdb side is by
+    /// path: `content.path` values are the device-root-absolute file
+    /// paths the pdb [Track](#rekordlib.pdb.Track) rows store, so
+    /// [Library.contentByPath](#rekordlib.onelibrary.Library.contentByPath)
+    /// hands back the OL view of a track — everything the joined
+    /// [TrackView](#rekordlib.device_export.TrackView) already decodes
+    /// (subtitle, kuvo flags, update counts) plus the raw columns no
+    /// view carries (per-role artist ids, the stored `djPlayCount`,
     /// `masterDbId`/`masterContentId`). Only compiled with
     /// `-Donelibrary=vendored-sqlcipher` (or `=system-sqlcipher`).
     pub fn openOneLibrary(e: *DeviceExport) OpenOLError!?*const onelibrary.Library {
@@ -1708,9 +1877,11 @@ pub const DeviceExport = struct {
     /// The OneLibrary store, building it on first use: an export that
     /// carries an `exportLibrary.db` gets a store holding its rows' dedup
     /// state (the db is loaded and closed again — pending rows are the
-    /// only mutations until `save`); an export without one never gains
-    /// one, so mirroring is a no-op there. Null in the absent case — and
-    /// always, in `-Donelibrary=off` builds, where mirroring is compiled out.
+    /// only mutations until
+    /// [save](#rekordlib.device_export.DeviceExport.save)); an export
+    /// without one never gains one, so mirroring is a no-op there. Null
+    /// in the absent case — and always, in `-Donelibrary=off` builds,
+    /// where mirroring is compiled out.
     fn olStore(e: *DeviceExport) OlMirrorError!?*OlStore {
         if (onelibrary.mode == .off) return null;
         switch (e.ol_state) {
@@ -1753,21 +1924,22 @@ pub const DeviceExport = struct {
         _ = try e.olStore();
     }
 
-    /// Mirrors a just-inserted track into the OL store: one `content` row
-    /// plus whatever dimension rows its foreign keys need, resolved
+    /// Mirrors a just-inserted track into the OL store: one `content`
+    /// row plus whatever dimension rows its foreign keys need, resolved
     /// against the store's dedup state. The OL-only columns come from
-    /// the `TrackInput` fields of the same names; their defaults keep
-    /// the fixture's conventions — unset artist roles bind NULL while
-    /// the dimension foreign keys (`album_id`, `genre_id`, `label_id`,
-    /// `key_id`, `color_id`) bind 0, `artist_id_lyricist` binds 0 with
-    /// no lyricist and a minted artist id with one,
-    /// `titleForSearch` is NULL but `subtitle`/`isrc`/
-    /// `kuvoDeliveryComment` are empty text, `dateCreated` mirrors
-    /// `date_added`, `analysedBits`/`contentLink` carry the pdb row's
-    /// constants, and no master-db ids are written (writers may leave
-    /// them out). A failure after some rows appended leaves those
-    /// pending — the same residual risk as `addTrack`'s pdb dimension
-    /// rows.
+    /// the [TrackInput](#rekordlib.device_export.TrackInput) fields of
+    /// the same names; their defaults keep the fixture's conventions —
+    /// unset artist roles bind NULL while the dimension foreign keys
+    /// (`album_id`, `genre_id`, `label_id`, `key_id`, `color_id`) bind
+    /// 0, `artist_id_lyricist` binds 0 with no lyricist and a minted
+    /// artist id with one, `titleForSearch` is NULL but `subtitle`/
+    /// `isrc`/`kuvoDeliveryComment` are empty text, `dateCreated`
+    /// mirrors `date_added`, `analysedBits`/`contentLink` carry the pdb
+    /// row's constants, and no master-db ids are written (writers may
+    /// leave them out). A failure after some rows appended leaves those
+    /// pending — the same residual risk as
+    /// [addTrack](#rekordlib.device_export.DeviceExport.addTrack)'s pdb
+    /// dimension rows.
     fn mirrorAddedTrack(
         e: *DeviceExport,
         track: TrackInput,
@@ -1895,7 +2067,7 @@ pub const DeviceExport = struct {
     /// mutates. Mutation deliberately stays with the handle: edits
     /// through a mutable pointer would desync the counters and maps
     /// from the database (colliding ids, broken dedup) with no check
-    /// at `save`.
+    /// at [save](#rekordlib.device_export.DeviceExport.save).
     pub fn writerState(e: *DeviceExport) WriterStateError!*const WriterState {
         return try e.writerStateMut();
     }
@@ -1913,27 +2085,34 @@ pub const DeviceExport = struct {
     }
 
     /// Adds a track to the export. Resolves — creating where needed —
-    /// the Artist, Album, Genre, Key, Label, and Artwork rows, then
-    /// inserts a Track row pointing at them by id. When the export
-    /// carries a OneLibrary db (`create`d exports, newer opened ones),
-    /// the same facts mirror into it: one content row per track, its
-    /// dimension rows deduped through the OL side's own view, its ids
-    /// bridged from the pdb side.
+    /// the [Artist](#rekordlib.pdb.Artist), [Album](#rekordlib.pdb.Album),
+    /// [Genre](#rekordlib.pdb.Genre), [Key](#rekordlib.pdb.Key),
+    /// [Label](#rekordlib.pdb.Label), and
+    /// [Artwork](#rekordlib.pdb.Artwork) rows, then inserts a
+    /// [Track](#rekordlib.pdb.Track) row pointing at them by id. If the
+    /// export carries a OneLibrary db
+    /// ([create](#rekordlib.device_export.DeviceExport.create)d exports,
+    /// newer opened ones), the same facts mirror into it: one content
+    /// row per track, its dimension rows deduped through the OL side's
+    /// own view, its ids bridged from the pdb side.
     ///
     /// Idempotent on a non-empty `file_path`: if a track with that path
-    /// was already added (this session, or read back by the writer-state
-    /// scan of an opened export), the existing id is returned and nothing
-    /// is inserted; `AddTrackOutcome.is_new` tells the cases apart. An
-    /// OL-only export adds through the OL db outright, dimensions
-    /// resolving through its own rows (see the type doc).
+    /// was already added — this session, or read back by the
+    /// [scanWriterState](#rekordlib.device_export.scanWriterState) scan
+    /// of an opened export — the existing id is returned and nothing is
+    /// inserted. [AddTrackOutcome](#rekordlib.device_export.AddTrackOutcome).is_new
+    /// tells the cases apart. An OL-only export adds through the OL db
+    /// outright, dimensions resolving through its own rows (see the type
+    /// doc).
     ///
     /// Caller data that can fail — string encoding, ANLZ serialization,
     /// the OL store's view of the export — fails before any id is taken
     /// or row inserted. A failure between the dimension inserts and the
-    /// Track row can leave orphaned dimension rows — unreachable from
-    /// any track, ignored by players — and a failure in the OL mirroring
-    /// after the Track insert leaves the pdb side complete with the OL
-    /// side pending until the next `save`.
+    /// Track row can leave orphaned dimension rows: unreachable from any
+    /// track, ignored by players. A failure in the OL mirroring after
+    /// the Track insert leaves the pdb side complete, with the OL side
+    /// pending until the next
+    /// [save](#rekordlib.device_export.DeviceExport.save).
     pub fn addTrack(e: *DeviceExport, track_in: TrackInput) AddTrackError!AddTrackOutcome {
         var track = track_in;
         // `filename` defaults to `file_path`'s basename — the rule
@@ -1946,7 +2125,8 @@ pub const DeviceExport = struct {
         };
     }
 
-    /// The pdb-backed `addTrack` body; see `addTrack`.
+    /// The pdb-backed body of
+    /// [addTrack](#rekordlib.device_export.DeviceExport.addTrack).
     fn addTrackPdb(
         e: *DeviceExport,
         db: *pdb.Database,
@@ -2023,15 +2203,18 @@ pub const DeviceExport = struct {
         return .{ .id = @enumFromInt(track_id), .is_new = true };
     }
 
-    /// The OL-only `addTrack` body; see `addTrack`. The mapping machinery
-    /// is reused by synthesis: dimensions pre-resolve through the store's
-    /// name-keyed maps — each new row minting its id — and the content
-    /// row lands through `mirrorAddedTrack`, fed a transient `pdb.Track`
-    /// built as a value bag. Pre-resolving makes every bridge the mirror
-    /// looks up a map hit, so the bag's own dimension ids (unable to
-    /// carry the minted artist ids at and above 2^32) are dead by
-    /// construction — only `id` (the minted content id) and `artwork_id`
-    /// (the minted image id) are read.
+    /// The OL-only body of
+    /// [addTrack](#rekordlib.device_export.DeviceExport.addTrack). The
+    /// mapping machinery is reused by synthesis: dimensions pre-resolve
+    /// through the store's name-keyed maps — each new row minting its id
+    /// — and the content row lands through
+    /// [mirrorAddedTrack](#rekordlib.device_export.DeviceExport.mirrorAddedTrack),
+    /// fed a transient [pdb.Track](#rekordlib.pdb.Track) built as a
+    /// value bag. Pre-resolving makes every bridge the mirror looks up a
+    /// map hit. The bag's own dimension ids are dead by construction —
+    /// they cannot carry the minted artist ids at and above 2^32 — so
+    /// only `id` (the minted content id) and `artwork_id` (the minted
+    /// image id) are read.
     fn addTrackOl(
         e: *DeviceExport,
         store: *OlStore,
@@ -2127,44 +2310,53 @@ pub const DeviceExport = struct {
         return .{ .id = @enumFromInt(content_id), .is_new = true };
     }
 
-    /// Updates track `id` with the non-null fields of `patch`; null
+    /// Updates track `id` with the non-null fields of `patch`. Null
     /// fields are left exactly as they are — including the row's unknown
     /// constants (`bitmask`, `unknown5`, …), which a patch never touches,
-    /// unlike a fresh `addTrack` row. Dimension fields resolve like
-    /// `addTrack`'s — a new name creates its row under a fresh id, the
-    /// old row staying behind (unreferenced, ignored by players). An
-    /// empty string is a value — `artist = ""` clears the foreign key.
+    /// unlike a fresh [addTrack](#rekordlib.device_export.DeviceExport.addTrack)
+    /// row. Dimension fields resolve like
+    /// [addTrack](#rekordlib.device_export.DeviceExport.addTrack)'s: a
+    /// new name creates its row under a fresh id; the old row stays
+    /// behind, unreferenced and ignored by players. An empty string is a
+    /// value — `artist = ""` clears the foreign key.
     ///
-    /// A non-null `file_path` renames the track to it — the
-    /// device-absolute `/Contents/...` form; a path the row already
-    /// carries is a no-op on the path side (the other fields still
-    /// patch). The rename moves everything derived from the path (see
-    /// `pathHash`): the pdb row's `file_path`, `filename` (the new
-    /// basename), and `analyze_path`; the OL row's `path`, `fileName`,
-    /// and `analysisDataFilePath`; and the analysis files themselves,
-    /// relocated at the next `save` into the directory players compute
-    /// from the new path, each sibling's PPTH section rewritten —
-    /// players recompute the location from the path hash and ignore
+    /// A non-null `file_path` renames the track to it, in the
+    /// device-absolute `/Contents/...` form. A path the row already
+    /// carries is a no-op on the path side; the other fields still
+    /// patch. The rename moves everything derived from the path (see
+    /// [pathHash](#rekordlib.device_export.pathHash)):
+    ///
+    /// - the pdb row's `file_path`, `filename` (the new basename), and
+    ///   `analyze_path`;
+    /// - the OL row's `path`, `fileName`, and `analysisDataFilePath`;
+    /// - the analysis files themselves, relocated at the next
+    ///   [save](#rekordlib.device_export.DeviceExport.save) into the
+    ///   directory players compute from the new path, each sibling's
+    ///   PPTH section rewritten.
+    ///
+    /// Players recompute the location from the path hash and ignore
     /// `analyze_path`, so relocation is not optional. Placing the audio
     /// file at the new location is the caller's; the library never
     /// touches `Contents`. The old analysis directory goes away
-    /// best-effort once the new index has landed. Renaming onto another
-    /// track's path is a `DuplicatePath`, a path without the leading
-    /// device-root slash an `InvalidPath`, and a target directory
-    /// another track's analysis already occupies an
-    /// `AnalysisPathCollision` — two paths can share one directory, per
-    /// the modulo in `pathHash`, and clobbering would destroy the other
-    /// track's analysis.
+    /// best-effort once the new index has landed.
+    ///
+    /// Renaming onto another track's path is a `DuplicatePath`. A path
+    /// without the leading device-root slash is an `InvalidPath`. A
+    /// target directory another track's analysis already occupies is an
+    /// `AnalysisPathCollision`: two paths can share one directory, per
+    /// the modulo in [pathHash](#rekordlib.device_export.pathHash), and
+    /// clobbering would destroy the other track's analysis.
     ///
     /// When the export carries a OneLibrary db and the track joined a
-    /// `content` row, the mirrored columns move with the patch and the
+    /// `content` row, the mirrored columns move with the patch, and the
     /// OL-only fields (`subtitle`, the KUVO pair, the update counts)
-    /// patch the OL row directly; a track with no OL row is patched on
+    /// patch the OL row directly. A track with no OL row is patched on
     /// the pdb side only. An OL-only export patches its content row
     /// outright, the checks mirroring the pdb path's (see the type
-    /// doc). Failure ordering follows `addTrack`'s; the row replace
-    /// inserts the new row before removing the old, so a failure cannot
-    /// lose the track.
+    /// doc). Failure ordering follows
+    /// [addTrack](#rekordlib.device_export.DeviceExport.addTrack)'s.
+    /// The row replace inserts the new row before removing the old, so
+    /// a failure cannot lose the track.
     pub fn updateTrack(e: *DeviceExport, id: TrackId, patch: TrackPatch) UpdateTrackError!void {
         // The path coordinate is device-absolute.
         if (patch.file_path) |p| {
@@ -2180,7 +2372,8 @@ pub const DeviceExport = struct {
         };
     }
 
-    /// The pdb-backed `updateTrack` body; see `updateTrack`.
+    /// The pdb-backed body of
+    /// [updateTrack](#rekordlib.device_export.DeviceExport.updateTrack).
     fn updateTrackPdb(e: *DeviceExport, id: u32, patch: TrackPatch) UpdateTrackError!void {
         const state = try e.writerStateMut();
         try e.primeOlStore();
@@ -2362,12 +2555,14 @@ pub const DeviceExport = struct {
             try e.mirrorTrackUpdate(id, p, boxed, patch, ids, rename);
     }
 
-    /// The OL-only `updateTrack` body; see `updateTrack`. The row
-    /// resolves by content id (the lockstep identity), the checks mirror
+    /// The OL-only body of
+    /// [updateTrack](#rekordlib.device_export.DeviceExport.updateTrack).
+    /// The row resolves by content id (a
+    /// [TrackId](#rekordlib.device_export.TrackId)). The checks mirror
     /// the pdb path's — the path index they run against is the OL rows
-    /// themselves — and the patch applies through
-    /// `applyTrackPatchToContentOl`, the sibling without a pdb row
-    /// behind it.
+    /// themselves. The patch applies through
+    /// [applyTrackPatchToContentOl](#rekordlib.device_export.applyTrackPatchToContentOl),
+    /// the sibling without a pdb row behind it.
     fn updateTrackOl(
         e: *DeviceExport,
         store: *OlStore,
@@ -2492,18 +2687,23 @@ pub const DeviceExport = struct {
     }
 
     /// Removes track `id` from the export: the Track row, its playlist
-    /// entries, and its tag junctions go; the OneLibrary side follows —
-    /// a pending mirror row is dropped, a disk `content` row is
-    /// cascade-deleted (with its junction rows) at the next `save`.
-    /// Every reference goes with the cascade, so the id is free again
-    /// after a reopen (the writer's scan is max-based, like the format's
-    /// own writers); within the session the counters stay past it. With
-    /// `delete_analysis_files`, the analysis directory goes too at the
-    /// next save — unless another track's path hashes onto it. Orphaned
-    /// dimension rows stay behind, like `addTrack`'s failure residue. An
-    /// OL-only export removes through its content rows, the
-    /// analysis-directory option keying on the content row's path (see
-    /// the type doc).
+    /// entries, and its tag junctions go. The OneLibrary side follows:
+    /// a pending mirror row is dropped, and a disk `content` row is
+    /// cascade-deleted — with its junction rows — at the next
+    /// [save](#rekordlib.device_export.DeviceExport.save). Every
+    /// reference goes with the cascade, so the id is free again after a
+    /// reopen (the writer's
+    /// [scanWriterState](#rekordlib.device_export.scanWriterState) scan
+    /// is max-based, like the format's own writers); within the session
+    /// the counters stay past it. With `delete_analysis_files`, the
+    /// analysis directory goes too at the next save — unless another
+    /// track's path hashes onto it. Orphaned dimension rows stay
+    /// behind, like
+    /// [addTrack](#rekordlib.device_export.DeviceExport.addTrack)'s
+    /// failure residue. An OL-only export removes through its content
+    /// rows, the analysis-directory option keying on the content row's
+    /// path (see [DeviceExport](#rekordlib.device_export.DeviceExport)
+    /// for the OL-only shape).
     pub fn removeTrack(
         e: *DeviceExport,
         id: TrackId,
@@ -2516,7 +2716,8 @@ pub const DeviceExport = struct {
         };
     }
 
-    /// The pdb-backed `removeTrack` body; see `removeTrack`.
+    /// The pdb-backed body of
+    /// [removeTrack](#rekordlib.device_export.DeviceExport.removeTrack).
     fn removeTrackPdb(
         e: *DeviceExport,
         id: u32,
@@ -2571,11 +2772,14 @@ pub const DeviceExport = struct {
         }
     }
 
-    /// The OL-only `removeTrack` body; see `removeTrack`. The row
-    /// resolves by content id and drops through the same cascade
-    /// (`dropOlContentRef`); `old_path` borrows store-arena or snapshot
-    /// memory that outlives the list removal, for the analysis-side
-    /// cleanup below.
+    /// The OL-only body of
+    /// [removeTrack](#rekordlib.device_export.DeviceExport.removeTrack).
+    /// The row resolves by content id (a
+    /// [TrackId](#rekordlib.device_export.TrackId)) and drops through
+    /// the same cascade
+    /// ([dropOlContentRef](#rekordlib.device_export.dropOlContentRef)).
+    /// `old_path` borrows store-arena or snapshot memory that outlives
+    /// the list removal, for the analysis-side cleanup below.
     fn removeTrackOl(
         e: *DeviceExport,
         store: *OlStore,
@@ -2818,7 +3022,8 @@ pub const DeviceExport = struct {
 
     /// The Track row of `id`, or null when the export carries none. The
     /// returned pointer is the row's boxed payload — arena-stable across
-    /// row-list shifts, and the identity `pdb.Database.removeRow` wants.
+    /// row-list shifts, and the identity
+    /// [pdb.Database.removeRow](#rekordlib.pdb.Database.removeRow) wants.
     fn findTrackRow(e: *DeviceExport, id: u32) WriterStateError!?*pdb.Track {
         const db = try e.openPdb();
         var it = try db.rowsOf(pdb.Track);
@@ -2840,7 +3045,8 @@ pub const DeviceExport = struct {
 
     /// Locates the OL `content` row joined to pdb track `track_id` whose
     /// pdb file path is `path`: the recorded bridge first (a rename has
-    /// already moved the path on), then by path (see `olContentRefByPath`).
+    /// already moved the path on), then by path (see
+    /// [olContentRefByPath](#rekordlib.device_export.DeviceExport.olContentRefByPath)).
     /// Every path hit records the bridge, so the next resolution survives
     /// a later path change. An export without an OL db resolves nothing.
     fn olContentRefForTrack(
@@ -2913,7 +3119,8 @@ pub const DeviceExport = struct {
         return null;
     }
 
-    /// Lands a `TrackPatch` on the OL side: the joined content row moves
+    /// Lands a [TrackPatch](#rekordlib.device_export.TrackPatch) on the
+    /// OL side: the joined content row moves
     /// only where the patch says, so a diverged db keeps its own values
     /// elsewhere — and a rename (`rename` non-null) first moves the
     /// row's `path`, `fileName`, and `analysisDataFilePath` to the new
@@ -2988,8 +3195,8 @@ pub const DeviceExport = struct {
     /// Removes every row of type `T`'s table that `matches` selects,
     /// collecting the payload pointers first — removal shifts the row
     /// list, but the boxed payloads are arena-stable (see
-    /// `pdb.Database.removeRow`). A table the database does not carry
-    /// removes nothing.
+    /// [pdb.Database.removeRow](#rekordlib.pdb.Database.removeRow)). A
+    /// table the database does not carry removes nothing.
     fn removeRowsMatching(
         e: *DeviceExport,
         db: *pdb.Database,
@@ -3125,7 +3332,8 @@ pub const DeviceExport = struct {
         try e.queueDirDeleteIfUnused(state, except_id, dir);
     }
 
-    /// `queueAnlzDirDelete` over an OL-only export's rows.
+    /// [queueAnlzDirDelete](#rekordlib.device_export.DeviceExport.queueAnlzDirDelete)
+    /// over an OL-only export's rows.
     fn queueAnlzDirDeleteOl(
         e: *DeviceExport,
         store: *OlStore,
@@ -3156,9 +3364,10 @@ pub const DeviceExport = struct {
         try e.queueDirDeleteIfNoPendingWrite(dir);
     }
 
-    /// `queueDirDeleteIfUnused` over an OL-only export's rows: the
-    /// surviving tracks are the store's pending and queued rows plus the
-    /// disk snapshot's, each skipping the id being removed.
+    /// [queueDirDeleteIfUnused](#rekordlib.device_export.DeviceExport.queueDirDeleteIfUnused)
+    /// over an OL-only export's rows: the surviving tracks are the
+    /// store's pending and queued rows plus the disk snapshot's, each
+    /// skipping the id being removed.
     fn queueDirDeleteIfUnusedOl(
         e: *DeviceExport,
         store: *OlStore,
@@ -3215,7 +3424,8 @@ pub const DeviceExport = struct {
         return std.mem.eql(u8, other, dir);
     }
 
-    /// `getOrCreateStringRow` for Artist rows.
+    /// [getOrCreateStringRow](#rekordlib.device_export.DeviceExport.getOrCreateStringRow)
+    /// for [Artist](#rekordlib.pdb.Artist) rows.
     fn getOrCreateArtist(
         state: *WriterState,
         db: *pdb.Database,
@@ -3231,17 +3441,20 @@ pub const DeviceExport = struct {
         );
     }
 
-    /// `getOrCreateStringRow` for Genre rows.
+    /// [getOrCreateStringRow](#rekordlib.device_export.DeviceExport.getOrCreateStringRow)
+    /// for [Genre](#rekordlib.pdb.Genre) rows.
     fn getOrCreateGenre(state: *WriterState, db: *pdb.Database, name: []const u8) AddTrackError!u32 {
         return getOrCreateStringRow(state, db, &state.genres_by_name, &state.next_genre_id, buildGenreRow, name);
     }
 
-    /// `getOrCreateStringRow` for Label rows.
+    /// [getOrCreateStringRow](#rekordlib.device_export.DeviceExport.getOrCreateStringRow)
+    /// for [Label](#rekordlib.pdb.Label) rows.
     fn getOrCreateLabel(state: *WriterState, db: *pdb.Database, name: []const u8) AddTrackError!u32 {
         return getOrCreateStringRow(state, db, &state.labels_by_name, &state.next_label_id, buildLabelRow, name);
     }
 
-    /// `getOrCreateStringRow` for Artwork rows.
+    /// [getOrCreateStringRow](#rekordlib.device_export.DeviceExport.getOrCreateStringRow)
+    /// for [Artwork](#rekordlib.pdb.Artwork) rows.
     fn getOrCreateArtwork(state: *WriterState, db: *pdb.Database, path: []const u8) AddTrackError!u32 {
         return getOrCreateStringRow(state, db, &state.artwork_by_path, &state.next_artwork_id, buildArtworkRow, path);
     }
@@ -3251,9 +3464,10 @@ pub const DeviceExport = struct {
     /// created row carries the name; `counter` is the table's id counter.
     /// Empty names resolve to the null id 0. The map key is duped and its
     /// capacity reserved before the insert, so the bookkeeping after it
-    /// cannot fail half-applied (the same discipline as `addTrack` and
-    /// `getOrCreateTag`: a failure can orphan a row, never leave the map
-    /// missing one).
+    /// cannot fail half-applied — the same discipline as
+    /// [addTrack](#rekordlib.device_export.DeviceExport.addTrack) and
+    /// [getOrCreateTag](#rekordlib.device_export.DeviceExport.getOrCreateTag):
+    /// a failure can orphan a row, never leave the map missing one.
     fn getOrCreateStringRow(
         state: *WriterState,
         db: *pdb.Database,
@@ -3312,9 +3526,10 @@ pub const DeviceExport = struct {
         return id;
     }
 
-    /// Resolves `name` — folded through `canonicalKeyName` — to a Key
-    /// row, inserting one when no canonical spelling matches. Empty names
-    /// resolve to the null id 0.
+    /// Resolves `name` — folded through
+    /// [canonicalKeyName](#rekordlib.device_export.canonicalKeyName) —
+    /// to a [Key](#rekordlib.pdb.Key) row, inserting one when no
+    /// canonical spelling matches. Empty names resolve to the null id 0.
     fn getOrCreateKey(state: *WriterState, db: *pdb.Database, name: []const u8) AddTrackError!u32 {
         if (name.len == 0) return 0;
         const sa = state.arena.allocator();
@@ -3359,11 +3574,14 @@ pub const DeviceExport = struct {
     }
 
     /// Creates a playlist — a leaf node holding tracks through
-    /// `addTrackToPlaylist` — under `parent` (same rule as
-    /// `createPlaylistFolder`) and returns its id. When the export
-    /// carries a OneLibrary db the node mirrors into it (`attribute` 0).
-    /// An OL-only export (no `export.pdb`, `-Donelibrary` builds) creates the
-    /// node through the OL db outright (see `createPlaylistFolder`).
+    /// [addTrackToPlaylist](#rekordlib.device_export.DeviceExport.addTrackToPlaylist)
+    /// — under `parent` (same rule as
+    /// [createPlaylistFolder](#rekordlib.device_export.DeviceExport.createPlaylistFolder))
+    /// and returns its id. When the export carries a OneLibrary db the
+    /// node mirrors into it (`attribute` 0). An OL-only export (no
+    /// `export.pdb`, `-Donelibrary` builds) creates the node through the
+    /// OL db outright (see
+    /// [createPlaylistFolder](#rekordlib.device_export.DeviceExport.createPlaylistFolder)).
     pub fn createPlaylist(
         e: *DeviceExport,
         name: []const u8,
@@ -3392,7 +3610,8 @@ pub const DeviceExport = struct {
         };
     }
 
-    /// The pdb-backed node insert; see `createPlaylistNode`.
+    /// The pdb-backed node insert; see
+    /// [createPlaylistNode](#rekordlib.device_export.DeviceExport.createPlaylistNode).
     fn createPlaylistNodePdb(
         e: *DeviceExport,
         db: *pdb.Database,
@@ -3454,7 +3673,8 @@ pub const DeviceExport = struct {
         };
     }
 
-    /// The pdb-backed `addTrackToPlaylist` body; see `addTrackToPlaylist`.
+    /// The pdb-backed body of
+    /// [addTrackToPlaylist](#rekordlib.device_export.DeviceExport.addTrackToPlaylist).
     fn addTrackToPlaylistPdb(
         e: *DeviceExport,
         db: *pdb.Database,
@@ -3494,7 +3714,8 @@ pub const DeviceExport = struct {
         }
     }
 
-    /// The OL-only `addTrackToPlaylist` body; see `addTrackToPlaylist`.
+    /// The OL-only body of
+    /// [addTrackToPlaylist](#rekordlib.device_export.DeviceExport.addTrackToPlaylist).
     /// The key checks resolve against the store's own view (a queued
     /// cascade delete counts gone, the session tombstone) and the pair
     /// pends like a mirrored one.
@@ -3518,9 +3739,13 @@ pub const DeviceExport = struct {
 
     /// Creates a top-level tag category (e.g. "My Tags") in the tag
     /// database and returns its id. Leaf tags attach under a category
-    /// through `addTagsToTrack`. The tag database (`exportExt.pdb`) loads
-    /// lazily on first use; nothing lands on disk before `save`. When
-    /// the export carries a OneLibrary db the category mirrors into its
+    /// through
+    /// [addTagsToTrack](#rekordlib.device_export.DeviceExport.addTagsToTrack).
+    /// The tag database (`exportExt.pdb`) loads lazily on first use —
+    /// recovering the ext rows it carries and the OneLibrary tree it
+    /// does not; nothing lands on disk before
+    /// [save](#rekordlib.device_export.DeviceExport.save). When the
+    /// export carries a OneLibrary db the category mirrors into its
     /// `myTag` tree under the same id.
     pub fn createTagCategory(e: *DeviceExport, name: []const u8) TagError!TagId {
         const state = try e.writerStateMut();
@@ -3549,21 +3774,28 @@ pub const DeviceExport = struct {
     }
 
     /// Associates `labels` with `track` under `category` in the tag
-    /// database. Empty labels are dropped and duplicates — within this
-    /// call or already existing under the category — collapse to one leaf
+    /// database. Empty labels are dropped. Duplicates — within this call
+    /// or already existing under the category — collapse to one leaf
     /// row. The junction rows themselves are not deduplicated: each call
     /// inserts one junction per kept label, so repeating a label in a
     /// later call stacks a duplicate junction (junction rows carry no
     /// writer state, so recovery cannot see them). `track_id` must name
-    /// an existing track and `category_id` a category this handle knows
-    /// (one returned by `createTagCategory`, or one recovered from the
-    /// opened `exportExt.pdb`), else `UnknownForeignKey`. A failure
-    /// between leaf rows leaves the earlier ones inserted — unreachable
-    /// junctions are ignored by players, not recovered automatically
-    /// (the same residual risk as `addTrack`'s dimension rows). When the
-    /// export carries a OneLibrary db, new leaf tags mirror into its
-    /// `myTag` tree under their ext ids and every junction lands as a
-    /// `myTag_content` row.
+    /// an existing track, and `category_id` a category this handle knows
+    /// — one returned by
+    /// [createTagCategory](#rekordlib.device_export.DeviceExport.createTagCategory),
+    /// or one recovered from the opened `exportExt.pdb` or the
+    /// OneLibrary db's `myTag` tree — else `UnknownForeignKey`. A
+    /// failure between leaf rows leaves the earlier ones inserted:
+    /// unreachable junctions are ignored by players, not recovered
+    /// automatically (the same residual risk as
+    /// [addTrack](#rekordlib.device_export.DeviceExport.addTrack)'s
+    /// dimension rows). When the export carries a OneLibrary db, new
+    /// leaf tags mirror into its `myTag` tree under their ext ids, and
+    /// every junction lands as a `myTag_content` row. A leaf that
+    /// already lives only there (the
+    /// [recoverOlMyTags](#rekordlib.device_export.recoverOlMyTags)
+    /// bridge) resolves to its own id — its ext row materialized at the
+    /// tag database's load — so no side gains a duplicate.
     pub fn addTagsToTrack(
         e: *DeviceExport,
         track: TrackId,
@@ -3575,8 +3807,9 @@ pub const DeviceExport = struct {
         const state = try e.writerStateMut();
         try e.primeOlStore();
         // The category check needs the tag state an opened export's
-        // `exportExt.pdb` carries, so the tag database loads (from disk
-        // only — not created) before either key is validated.
+        // `exportExt.pdb` and OneLibrary db carry, so the tag database
+        // loads — the OL tree bridging in — before either key is
+        // validated.
         try e.ensureExtLoaded();
         if (!state.track_ids.contains(track_id)) return error.UnknownForeignKey;
         if (!state.tag_categories.contains(category_id)) return error.UnknownForeignKey;
@@ -3662,10 +3895,14 @@ pub const DeviceExport = struct {
 
     /// The tag database, loading it first: parsed from disk when the root
     /// carries an `exportExt.pdb` (prior tags preserved through the
-    /// `scanExtTags` recovery), else built fresh in memory. Only the
-    /// tag-writing methods call this, so an export whose tags were never
-    /// touched never gains an `exportExt.pdb` — `save` writes the
-    /// database only once it exists here.
+    /// [scanExtTags](#rekordlib.device_export.scanExtTags) recovery, the
+    /// OL tree bridged over whatever it lacks by
+    /// [recoverOlMyTags](#rekordlib.device_export.recoverOlMyTags)),
+    /// else built fresh in memory — pre-populated from the OL tree when
+    /// the export carries one. Only the tag-writing methods call this,
+    /// so an export whose tags were never touched never gains an
+    /// `exportExt.pdb` — [save](#rekordlib.device_export.DeviceExport.save)
+    /// writes the database only once it exists here.
     fn extDb(e: *DeviceExport) TagError!*pdb.Database {
         try e.ensureExtLoaded();
         if (e.ext_pdb_state == .absent) {
@@ -3682,27 +3919,59 @@ pub const DeviceExport = struct {
 
     /// Examines `exportExt.pdb` once: present, it parses into the state
     /// and its tag rows extend the writer state; absent, the state is
-    /// only marked. A failure leaves the state `unloaded` — a retry
-    /// re-reads the file.
-    fn ensureExtLoaded(e: *DeviceExport) WriterStateError!void {
-        if (e.ext_pdb_state != .unloaded) return;
-
-        const path = try e.layout.exportExtPdb(e.alloc);
-        defer e.alloc.free(path);
-        const dir = e.dir;
-        const buf = dir.readFileAlloc(e.io, path, e.alloc, pdb_limit) catch |err| switch (err) {
-            error.FileNotFound => {
+    /// only marked. A parse failure leaves the state `unloaded` — a
+    /// retry re-reads the file. The OneLibrary bridge then runs
+    /// ([recoverOlMyTags](#rekordlib.device_export.recoverOlMyTags)):
+    /// when the export carries an OL db, its myTag rows fold into the
+    /// writer state and materialize into the tag database — building one
+    /// first when the export carries no ext pdb — so tags that live only
+    /// in the newer store validate, dedup, and mint exactly like
+    /// recovered ext ones. The bridge marks itself done only on success;
+    /// a failure retries on the next tag call (the fold is idempotent
+    /// over what already landed).
+    fn ensureExtLoaded(
+        e: *DeviceExport,
+    ) (WriterStateError || OlMirrorError || pdb.DatabaseModifyError)!void {
+        if (e.ext_pdb_state == .unloaded) {
+            const path = try e.layout.exportExtPdb(e.alloc);
+            defer e.alloc.free(path);
+            const dir = e.dir;
+            const image = dir.readFileAlloc(e.io, path, e.alloc, pdb_limit) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            if (image) |buf| {
+                defer e.alloc.free(buf);
+                var db = try pdb.Database.parse(e.alloc, buf, .ext);
+                errdefer db.deinit();
+                const state = try e.writerStateMut();
+                try scanExtTags(state.arena.allocator(), &db, state);
+                e.ext_pdb_state = .{ .loaded = db };
+            } else {
                 e.ext_pdb_state = .absent;
-                return;
-            },
-            else => return err,
+            }
+        }
+
+        if (e.ext_ol_bridged) return;
+        // No OL db (older exports, `-Donelibrary=off` builds): the ext
+        // recovery above was the whole of it.
+        const store = (try e.olStore()) orelse {
+            e.ext_ol_bridged = true;
+            return;
         };
-        defer e.alloc.free(buf);
-        var db = try pdb.Database.parse(e.alloc, buf, .ext);
-        errdefer db.deinit();
-        const state = try e.writerStateMut();
-        try scanExtTags(state.arena.allocator(), &db, state);
-        e.ext_pdb_state = .{ .loaded = db };
+        if (store.my_tag_snapshot.items.len > 0) {
+            // The bridge materializes into a tag database; an export
+            // carrying none gets the same fresh one its first tag write
+            // would build, pre-populated with the OL tree.
+            if (e.ext_pdb_state == .absent)
+                e.ext_pdb_state = .{ .loaded = try pdb.Database.create(
+                    e.alloc,
+                    .ext,
+                    &pdb.ext_table_page_types,
+                ) };
+            try recoverOlMyTags(try e.writerStateMut(), store, &e.ext_pdb_state.loaded);
+        }
+        e.ext_ol_bridged = true;
     }
 
     /// Writes the buffered export to disk — the handle's only
@@ -3712,23 +3981,40 @@ pub const DeviceExport = struct {
     /// untouched. A failure partway through the landing behaves like a
     /// crash: the write order below keeps the index files naming the
     /// previous consistent state, the handle keeps everything pending,
-    /// and a retried `save` re-lands it. Crash-safe write order: the
-    /// default directory tree, the four setting files, the queued ANLZ
-    /// files, the relocated ANLZ files `updateTrack`'s rename queued
-    /// (their old directories deleted only after the new index lands),
-    /// `exportExt.pdb` when the tag methods loaded or created one,
-    /// `exportLibrary.db` when the OneLibrary side was created or carries
-    /// pending rows, then `export.pdb` — the index everything else is
-    /// reached through — last, so a crash leaves orphan files players
-    /// ignore, not rows naming missing data. Every file lands through
-    /// `writeFileAtomic`, so readers never see a torn one.
+    /// and a retried [save](#rekordlib.device_export.DeviceExport.save)
+    /// re-lands it — the queued images are fixed bytes, so the retry
+    /// rewrites them identically.
     ///
-    /// An OL-only export saves through the same order minus the pdbs —
+    /// Write order:
+    ///
+    /// 1. The default directory tree, on a
+    ///    [create](#rekordlib.device_export.DeviceExport.create)d export
+    ///    only.
+    /// 2. The four setting files.
+    /// 3. The queued ANLZ files.
+    /// 4. The relocated ANLZ files
+    ///    [updateTrack](#rekordlib.device_export.DeviceExport.updateTrack)'s
+    ///    rename queued; their old directories are deleted only after
+    ///    the new index lands.
+    /// 5. `exportExt.pdb`, when the tag methods loaded or created one.
+    /// 6. `exportLibrary.db`, when the OneLibrary side was created or
+    ///    carries pending rows.
+    /// 7. `export.pdb` — the index everything else is reached through —
+    ///    last, so a crash leaves the old index naming a consistent
+    ///    export: orphan files players ignore, never rows naming
+    ///    missing data.
+    ///
+    /// Every file lands through
+    /// [writeFileAtomic](#rekordlib.device_export.writeFileAtomic), so
+    /// readers never see a torn one.
+    ///
+    /// An OL-only export saves through the same order minus the pdbs:
     /// queued ANLZ, relocations, then `exportLibrary.db` as the terminal
-    /// index, drained into the existing db. `save` never creates
-    /// structure the export did not carry: an opened export without a
-    /// pdb, an OL db, or a setting file never gains one — `create` is
-    /// the only skeleton-writer.
+    /// index, drained into the existing db. [save](#rekordlib.device_export.DeviceExport.save)
+    /// never creates structure the export did not carry: an opened
+    /// export without a pdb, an OL db, or a setting file never gains one
+    /// — [create](#rekordlib.device_export.DeviceExport.create) is the
+    /// only skeleton-writer.
     pub fn save(e: *DeviceExport) SaveError!void {
         if (e.openPdb()) |db| {
             return try e.savePdb(db);
@@ -3757,7 +4043,8 @@ pub const DeviceExport = struct {
         }
     }
 
-    /// The pdb-backed `save` body; see `save`.
+    /// The pdb-backed body of
+    /// [save](#rekordlib.device_export.DeviceExport.save).
     fn savePdb(e: *DeviceExport, db: *pdb.Database) SaveError!void {
         try db.validateAllTrackRows();
         const image = try db.serialize(e.alloc);
@@ -3790,17 +4077,22 @@ pub const DeviceExport = struct {
         e.cleanupAfterSave(dir);
     }
 
-    /// Lands the OneLibrary side on disk — between `exportExt.pdb` and
-    /// `export.pdb`, per the crash-safe order (a crash leaves the index
-    /// naming the previous consistent state; an OL db ahead of it is
-    /// ignored like an export without one). A created export builds a
-    /// fresh keyed db on its first `save` even with nothing pending —
-    /// newer exports carry one — overwriting a leftover file; the
-    /// property's `createdDate` lands empty (the library reads no clock
-    /// and `create` takes no date). Later saves touch the file only when
-    /// rows are pending. `close` checkpoints, so the landed file is
-    /// complete with no `-wal`/`-shm` sidecars, exactly rb's shape.
-    /// Skipped entirely in `-Donelibrary=off` builds.
+    /// Lands the OneLibrary side on disk, between `exportExt.pdb` and
+    /// `export.pdb` per the
+    /// [save](#rekordlib.device_export.DeviceExport.save) order (a crash
+    /// leaves the old index naming the previous state; an OL db ahead of
+    /// it is ignored like an export without one). A created export
+    /// builds a fresh keyed db on its first
+    /// [save](#rekordlib.device_export.DeviceExport.save) even with
+    /// nothing pending — newer exports carry one — overwriting a
+    /// leftover file. The property's `createdDate` lands empty: the
+    /// library reads no clock and
+    /// [create](#rekordlib.device_export.DeviceExport.create) takes no
+    /// date. Later saves touch the file only when rows are pending.
+    /// [onelibrary.Writer.close](#rekordlib.onelibrary.Writer.close)
+    /// checkpoints, so the landed file is complete with no
+    /// `-wal`/`-shm` sidecars, exactly Rekordbox's shape. Skipped
+    /// entirely in `-Donelibrary=off` builds.
     fn writeOl(e: *DeviceExport) SaveError!void {
         if (onelibrary.mode == .off) return;
         const store = switch (e.ol_state) {
@@ -3855,9 +4147,10 @@ pub const DeviceExport = struct {
     }
 
     /// Writes every queued ANLZ file — creating its `USBANLZ` folder —
-    /// then releases the queue; a failure leaves the not-yet-written
-    /// entries queued for the next `save` (the images are fixed bytes,
-    /// so a retry rewrites the landed ones identically).
+    /// then releases the queue. A failure leaves the not-yet-written
+    /// entries queued for the next
+    /// [save](#rekordlib.device_export.DeviceExport.save); the images
+    /// are fixed bytes, so a retry rewrites the landed ones identically.
     fn writePendingAnlz(
         e: *DeviceExport,
         dir: std.Io.Dir,
@@ -3872,13 +4165,12 @@ pub const DeviceExport = struct {
 
     /// Lands every queued relocation: each sibling found under its
     /// `from_dir` is re-serialized — its path section naming the track's
-    /// new device path — and written, atomically, into `to_dir`. A
-    /// sibling with no file on disk skips silently: the track never had
-    /// that kind of analysis. Runs before `export.pdb`, so a crash
-    /// leaves the old index naming the old directory, still populated;
-    /// the old directories go away only after the new index has landed
-    /// (`cleanupAfterSave`). A failure leaves the queue intact — the
-    /// landed siblings are fixed bytes a retry rewrites identically.
+    /// new device path — and written, atomically, into `to_dir`, in the
+    /// [save](#rekordlib.device_export.DeviceExport.save) position
+    /// before `export.pdb`. A sibling with no file on disk skips
+    /// silently: the track never had that kind of analysis. A failure
+    /// leaves the queue intact — the landed siblings are fixed bytes a
+    /// retry rewrites identically.
     fn writeRelocatedAnlz(e: *DeviceExport, dir: std.Io.Dir) RelocateError!void {
         const siblings = [_][]const u8{ "ANLZ0000.DAT", "ANLZ0000.EXT", "ANLZ0000.2EX" };
         var it = e.relocations.iterator();
@@ -3908,10 +4200,11 @@ pub const DeviceExport = struct {
     }
 
     /// Best-effort cleanup once the new `export.pdb` has landed: the
-    /// relocation source directories and the directories `removeTrack`
+    /// relocation source directories, and the directories
+    /// [removeTrack](#rekordlib.device_export.DeviceExport.removeTrack)
     /// queued. Nothing here can fail the save — a leftover directory is
     /// an orphan no player reaches. A source equal to its own or another
-    /// relocation's target stays (that target was just filled from it).
+    /// relocation's target stays; that target was just filled from it.
     /// Also drops the cached OL snapshot — it names the pre-save disk —
     /// and releases the relocation and deletion queues.
     fn cleanupAfterSave(e: *DeviceExport, dir: std.Io.Dir) void {
@@ -3948,8 +4241,10 @@ pub const DeviceExport = struct {
 
     /// Writes the default directory tree of a fresh export:
     /// `PIONEER/rekordbox`, `PIONEER/USBANLZ`, and `Contents`. Called by
-    /// every `save` of a `create`d export, before any file lands —
-    /// idempotent, so a re-save passes over existing directories.
+    /// every [save](#rekordlib.device_export.DeviceExport.save) of a
+    /// [create](#rekordlib.device_export.DeviceExport.create)d export,
+    /// before any file lands — idempotent, so a re-save passes over
+    /// existing directories.
     fn writeSkeletonDirs(
         e: *DeviceExport,
         dir: std.Io.Dir,
@@ -4005,16 +4300,17 @@ pub const PlaylistFolder = struct {
 };
 
 /// Either a playlist folder or a playlist. Nodes are owned by the
-/// `PlaylistTree` they were built into — its arena holds every name and
-/// children list — so nothing frees them individually.
+/// [PlaylistTree](#rekordlib.device_export.PlaylistTree) they were built
+/// into — its arena holds every name and children list — so nothing
+/// frees them individually.
 pub const PlaylistNode = union(enum) {
     folder: PlaylistFolder,
     playlist: Playlist,
 };
 
 /// A playlist tree, whole-owned: every node, name, and children list came
-/// from one arena, so `deinit` frees the entire tree — of any nesting
-/// depth — without walking it.
+/// from one arena, so [deinit](#rekordlib.device_export.PlaylistTree.deinit)
+/// frees the entire tree — of any nesting depth — without walking it.
 pub const PlaylistTree = struct {
     arena: *std.heap.ArenaAllocator,
     /// The top-level nodes, in row order.
@@ -4104,7 +4400,8 @@ fn buildTree(
 /// arena, so nesting of any depth builds and tears down without
 /// touching the call stack.
 ///
-/// The caller owns the tree; `deinit` frees everything:
+/// The caller owns the tree; [deinit](#rekordlib.device_export.PlaylistTree.deinit)
+/// frees everything:
 ///
 ///     const device = @import("rekordlib").device;
 ///     var tree = try export.getPlaylistsDb(alloc, &db);
@@ -4135,12 +4432,15 @@ pub fn getPlaylistsDb(
     return .{ .arena = arena, .roots = try roots.toOwnedSlice(a) };
 }
 
-/// The OL-only `getPlaylists` body (see `getPlaylistsDb` for the shape
-/// and ownership rules): the same tree over the OL `playlist` rows —
-/// `playlist_id_parent` 0 parents the top level, `attribute` 1 marks a
-/// folder, and siblings order by `sequenceNo` with NULLs last. Like the
-/// OL-only track reads, the rows are the cached disk snapshot: nodes
-/// created this session appear after the `save` that lands them.
+/// The OL-only [getPlaylists](#rekordlib.device_export.DeviceExport.getPlaylists)
+/// body (see
+/// [getPlaylistsDb](#rekordlib.device_export.getPlaylistsDb) for the
+/// shape and ownership rules): the same tree over the OL `playlist`
+/// rows — `playlist_id_parent` 0 parents the top level, `attribute` 1
+/// marks a folder, and siblings order by `sequenceNo` with NULLs last.
+/// Like the OL-only track reads, the rows are the cached disk snapshot:
+/// nodes created this session appear after the
+/// [save](#rekordlib.device_export.DeviceExport.save) that lands them.
 pub fn getPlaylistsOl(
     alloc: std.mem.Allocator,
     lib: *const onelibrary.Library,
@@ -4178,7 +4478,8 @@ fn olSiblingBefore(_: void, a: *const onelibrary.Playlist, b: *const onelibrary.
 /// OL playlist rows grouped by their parent id.
 const OlPlaylistGroups = std.AutoHashMap(i64, std.ArrayList(*const onelibrary.Playlist));
 
-/// One level of the iterative OL tree build; see `PlaylistLevel`.
+/// One level of the iterative OL tree build; see
+/// [PlaylistLevel](#rekordlib.device_export.PlaylistLevel).
 const OlPlaylistLevel = struct {
     rows: []const *const onelibrary.Playlist,
     next: usize = 0,
@@ -4187,13 +4488,13 @@ const OlPlaylistLevel = struct {
     folder: ?struct { id: u32, name: []u8 } = null,
 };
 
-/// `buildTree` over the OL rows: the same visitation order (rows in
-/// order, a folder expanded at first encounter, the visited skip) so
-/// nesting of any depth costs heap, never call-stack frames. A row
-/// whose id sits outside the u32 node-id space is skipped — it has no
-/// representation in the tree's vocabulary, and its children group
-/// under the i64 id the skipped row never expands, unreachable like a
-/// node parented to a missing id.
+/// [buildTree](#rekordlib.device_export.buildTree) over the OL rows: the
+/// same visitation order (rows in order, a folder expanded at first
+/// encounter, the visited skip) so nesting of any depth costs heap,
+/// never call-stack frames. A row whose id sits outside the u32 node-id
+/// space is skipped — it has no representation in the tree's
+/// vocabulary, and its children group under the i64 id the skipped row
+/// never expands, unreachable like a node parented to a missing id.
 fn buildTreeOl(
     a: std.mem.Allocator,
     groups: *const OlPlaylistGroups,
@@ -4242,30 +4543,41 @@ fn buildTreeOl(
 
 // --- unified track model (read views, patches, OL join) -------------------------
 
-/// Iterator over an export's tracks (see `DeviceExport.tracks`). Two
-/// arenas: one holds the dimension maps for the iterator's life, the
-/// other the current view's decoded strings, reset at every `next` — a
-/// view borrows from it until the next call.
+/// Iterator over an export's tracks (see
+/// [DeviceExport.tracks](#rekordlib.device_export.DeviceExport.tracks)).
+/// Two arenas: one holds the dimension maps for the iterator's life;
+/// the other holds the current view's decoded strings, reset at every
+/// [next](#rekordlib.device_export.TrackIter.next) — a view borrows
+/// from it until the next call.
 pub const TrackIter = struct {
     e: *DeviceExport,
-    /// Holds the dimension maps; freed by `deinit`. Unused (and empty) on
-    /// the OL-only path, whose names resolve through the borrowed library.
+    /// Holds the dimension maps; freed by
+    /// [deinit](#rekordlib.device_export.TrackIter.deinit). Unused (and
+    /// empty) on the OL-only path, whose names resolve through the
+    /// borrowed library.
     dim_arena: std.heap.ArenaAllocator,
-    /// Holds the current view's decoded strings; reset by every `next`.
+    /// Holds the current view's decoded strings; reset by every
+    /// [next](#rekordlib.device_export.TrackIter.next).
     view_arena: std.heap.ArenaAllocator,
     /// Only the pdb path fills these.
     dims: TrackDimensions,
     rows: Rows,
 
-    /// The row source: the pdb's Track table, or — on an OL-only export —
-    /// the `openOneLibrary` cache's `contents` in load order.
+    /// The row source: the pdb's [Track](#rekordlib.pdb.Track) table, or
+    /// — on an OL-only export — the
+    /// [openOneLibrary](#rekordlib.device_export.DeviceExport.openOneLibrary)
+    /// cache's `contents` in load order.
     const Rows = union(enum) {
         pdb: pdb.RowIter(pdb.Track),
-        /// The library is borrowed from the handle's `openOneLibrary` cache; only
-        /// `save` and `deinit` drop it, and both invalidate the iterator
-        /// outright (like every mutation). `deletes` borrows the store's
-        /// cascade-delete queue the same way — rows queued there are
-        /// skipped, the session's view of a removal before its save.
+        /// The library is borrowed from the handle's
+        /// [openOneLibrary](#rekordlib.device_export.DeviceExport.openOneLibrary)
+        /// cache; only
+        /// [save](#rekordlib.device_export.DeviceExport.save) and
+        /// [deinit](#rekordlib.device_export.TrackIter.deinit) drop it,
+        /// and both invalidate the iterator outright (like every
+        /// mutation). `deletes` borrows the store's cascade-delete queue
+        /// the same way — rows queued there are skipped, the session's
+        /// view of a removal before its save.
         ol: struct {
             lib: *const onelibrary.Library,
             deletes: []const i64 = &.{},
@@ -4303,8 +4615,8 @@ pub const TrackIter = struct {
 };
 
 /// Whether `id` appears in a borrowed cascade-delete queue (the store's
-/// `contentDeleteQueued` over a slice, for the read side that holds no
-/// store pointer).
+/// [contentDeleteQueued](#rekordlib.device_export.OlStore.contentDeleteQueued)
+/// over a slice, for the read side that holds no store pointer).
 fn olIdQueued(deletes: []const i64, id: i64) bool {
     for (deletes) |queued| {
         if (queued == id) return true;
@@ -4312,8 +4624,11 @@ fn olIdQueued(deletes: []const i64, id: i64) bool {
     return false;
 }
 
-/// A `TrackView` that owns its strings, from `DeviceExport.trackByPath`.
-/// `deinit` frees the view's every slice.
+/// A [TrackView](#rekordlib.device_export.TrackView) that owns its
+/// strings, from
+/// [DeviceExport.trackByPath](#rekordlib.device_export.DeviceExport.trackByPath).
+/// [deinit](#rekordlib.device_export.TrackRecord.deinit) frees the
+/// view's every slice.
 pub const TrackRecord = struct {
     arena: *std.heap.ArenaAllocator,
     view: TrackView,
@@ -4327,9 +4642,12 @@ pub const TrackRecord = struct {
 
 /// Where a joined OL content row lives, when one joined at all.
 const OlContentRef = union(enum) {
-    /// A row pending its first insert — an `OlStore.contents` index.
+    /// A row pending its first insert — an
+    /// [OlStore](#rekordlib.device_export.OlStore) `contents` index.
     pending: usize,
-    /// A queued whole-row update — an `OlStore.content_updates` index.
+    /// A queued whole-row update — an
+    /// [OlStore](#rekordlib.device_export.OlStore) `content_updates`
+    /// index.
     queued_update: usize,
     /// A row already on disk, borrowed from the cached library.
     disk: *const onelibrary.Content,
@@ -4494,9 +4812,10 @@ fn fillTrackView(
 /// OL-only export path, where the content row is the whole track. Names
 /// resolve through the library's id-keyed rows; the pdb-side vocabulary
 /// (`message`, `mix_name`, `analyze_date`, `publish_track_information`)
-/// stays empty — the ignore-vice-versa convention. Strings are duped into
-/// `a` (the iterator's view arena, or a record's), so the lifetime
-/// contract matches the pdb path's.
+/// stays empty — the ignore-vice-versa convention of
+/// [DeviceExport](#rekordlib.device_export.DeviceExport)'s two export
+/// shapes. Strings are duped into `a` (the iterator's view arena, or a
+/// record's), so the lifetime contract matches the pdb path's.
 fn fillTrackViewOl(
     lib: *const onelibrary.Library,
     a: std.mem.Allocator,
@@ -4568,7 +4887,8 @@ fn olDupeOrEmpty(a: std.mem.Allocator, s: ?[]const u8) std.mem.Allocator.Error![
 }
 
 /// An OL integer column as `T`, degrading NULL (or a value `T` cannot
-/// hold) to 0 — the `TrackInput` default for scalars.
+/// hold) to 0 — the [TrackInput](#rekordlib.device_export.TrackInput)
+/// default for scalars.
 fn olScalar(comptime T: type, v: ?i64) T {
     return std.math.cast(T, v orelse 0) orelse 0;
 }
@@ -4617,8 +4937,9 @@ fn olJoinForView(e: *DeviceExport, path: []const u8) TrackViewError!?*const onel
     return lib.contentByPath(path);
 }
 
-/// The resolved dimension ids a `TrackPatch` asked for — seeded from the
-/// old row, so an unpatched dimension keeps its id untouched.
+/// The resolved dimension ids a [TrackPatch](#rekordlib.device_export.TrackPatch)
+/// asked for — seeded from the old row, so an unpatched dimension keeps
+/// its id untouched.
 const PatchDimensionIds = struct {
     artist: u32 = 0,
     album: u32 = 0,
@@ -4631,8 +4952,9 @@ const PatchDimensionIds = struct {
     artwork: u32 = 0,
 };
 
-/// The string fields of a `TrackPatch`, encoded up front so a bad one
-/// fails the call before anything is mutated.
+/// The string fields of a [TrackPatch](#rekordlib.device_export.TrackPatch),
+/// encoded up front so a bad one fails the call before anything is
+/// mutated.
 const PatchedTrackStrings = struct {
     title: ?pdb.DeviceSQLString = null,
     comment: ?pdb.DeviceSQLString = null,
@@ -4674,7 +4996,8 @@ fn encodePatchedStrings(
     return ps;
 }
 
-/// Applies a `TrackPatch` to one OL content row in place: pdb-mirrored
+/// Applies a [TrackPatch](#rekordlib.device_export.TrackPatch) to one
+/// OL content row in place: pdb-mirrored
 /// columns move only where the patch says — a diverged db keeps its own
 /// values elsewhere — and the OL-only columns patch directly. Dimension
 /// patches resolve through the mirror's own dedup state, bridging the
@@ -4748,8 +5071,10 @@ fn moveContentRow(
     if (has_analysis) c.analysisDataFilePath = try anlzDevicePath(a, new_path);
 }
 
-/// `moveContentRow` over a pending-or-queued row, keeping the store's
-/// path index in step with the rename (see `reindexContentPath`).
+/// [moveContentRow](#rekordlib.device_export.moveContentRow) over a
+/// pending-or-queued row, keeping the store's path index in step with
+/// the rename (see
+/// [reindexContentPath](#rekordlib.device_export.reindexContentPath)).
 fn renameListedContent(
     store: *OlStore,
     row: *onelibrary.Content,
@@ -4762,14 +5087,16 @@ fn renameListedContent(
     try reindexContentPath(store, row.content_id, prev, row.path);
 }
 
-/// Applies a `TrackPatch` to one OL content row on an OL-only export —
-/// the sibling of `applyTrackPatchToContent` with no pdb row behind it:
-/// scalars come from the patch itself (the pdb variant reads them off
-/// the already-patched row), dimensions resolve through the store's
-/// minting get-or-creates, the lyricist keys the row the pdb side keeps
-/// as a plain string, and the pdb-only fields (`message`, `mix_name`,
-/// `analyze_date`, `publish_track_information`) are ignored — there is
-/// no pdb row to patch.
+/// Applies a [TrackPatch](#rekordlib.device_export.TrackPatch) to one
+/// OL content row on an OL-only export — the sibling of
+/// [applyTrackPatchToContent](#rekordlib.device_export.applyTrackPatchToContent)
+/// with no pdb row behind it: scalars come from the patch itself (the
+/// pdb variant reads them off the already-patched row), dimensions
+/// resolve through the store's minting get-or-creates, the lyricist
+/// keys the row the pdb side keeps as a plain string, and the pdb-only
+/// fields (`message`, `mix_name`, `analyze_date`,
+/// `publish_track_information`) are ignored — there is no pdb row to
+/// patch.
 fn applyTrackPatchToContentOl(
     store: *OlStore,
     c: *onelibrary.Content,
@@ -4885,28 +5212,48 @@ fn trackTagNamesTrack(ctx: TrackIdMatch, junction: *const pdb.TrackTag) bool {
 
 // --- OneLibrary mirror (O4) -----------------------------------------------------
 
-/// A playlist membership waiting for `save`, inserted through
-/// `Writer.addAllToPlaylist` — the pair carries no `sequenceNo` because
-/// the Writer derives it at insert time (dense, 1-based, continuing past
-/// rows already on disk).
+/// A playlist membership waiting for
+/// [save](#rekordlib.device_export.DeviceExport.save), inserted through
+/// [Writer.addAllToPlaylist](#rekordlib.onelibrary.Writer.addAllToPlaylist)
+/// — the pair carries no `sequenceNo` because the Writer derives it at
+/// insert time (dense, 1-based, continuing past rows already on disk).
 const OlPlaylistPair = struct {
     playlist_id: i64,
     content_id: i64,
 };
 
-/// The writer's OneLibrary side: rows mirrored from the mutating methods,
-/// buffered in memory until `save` materializes them — nothing
-/// SQLite-shaped happens before `save`, so a discarded handle leaves no
-/// `exportLibrary.db` behind. Every value the store allocates comes from
-/// its arena and is reclaimed whole by `deinit`.
+/// One `myTag` row as [scanOlStore](#rekordlib.device_export.scanOlStore)
+/// snapshotted it — the tag recovery's OL-side input. `id` and
+/// `parent_id` are the row's own values narrowed to the u32 tag-id
+/// space (rows beyond it are never snapshotted — a u32 mint can never
+/// collide with them); the NULL columns carry the conventions the fold
+/// applies (`sequence_no` 0, `name` null, `is_category` reading
+/// `attribute`'s 1).
+const OlMyTag = struct {
+    id: u32,
+    parent_id: u32,
+    sequence_no: i64,
+    name: ?[]const u8,
+    is_category: bool,
+};
+
+/// The writer's OneLibrary side: rows mirrored from the mutating
+/// methods, buffered in memory until
+/// [save](#rekordlib.device_export.DeviceExport.save) materializes
+/// them — nothing SQLite-shaped happens before
+/// [save](#rekordlib.device_export.DeviceExport.save), so a discarded
+/// handle leaves no `exportLibrary.db` behind. Every value the store
+/// allocates comes from its arena and is reclaimed whole by
+/// [deinit](#rekordlib.device_export.OlStore.deinit).
 const OlStore = struct {
     arena: std.heap.ArenaAllocator,
-    /// True until this handle's first `save` lands the db: a created
-    /// export builds a fresh `exportLibrary.db` on its first save even
-    /// with nothing pending (newer exports carry one), overwriting a
-    /// leftover file — the same stance as the ext pdb. An opened export
-    /// never sets this: it only ever appends, and only when the export
-    /// already carries the db.
+    /// True until this handle's first
+    /// [save](#rekordlib.device_export.DeviceExport.save) lands the db:
+    /// a created export builds a fresh `exportLibrary.db` on its first
+    /// save even with nothing pending (newer exports carry one),
+    /// overwriting a leftover file — the same stance as the ext pdb. An
+    /// opened export never sets this: it only ever appends, and only
+    /// when the export already carries the db.
     fresh: bool = false,
 
     /// Rows pending their first insert, in mirroring order.
@@ -4924,11 +5271,15 @@ const OlStore = struct {
     /// junction carries nothing the insert derives.
     my_tag_pairs: std.ArrayListUnmanaged(onelibrary.MyTagContent) = .empty,
     /// Complete replacement rows for `content` rows already on disk,
-    /// patched by `updateTrack` and rewritten by the next
-    /// `save` (see `onelibrary.Writer.updateAllContents`). At most one per
-    /// content id.
+    /// patched by [updateTrack](#rekordlib.device_export.DeviceExport.updateTrack)
+    /// and rewritten by the next
+    /// [save](#rekordlib.device_export.DeviceExport.save) (see
+    /// [onelibrary.Writer.updateAllContents](#rekordlib.onelibrary.Writer.updateAllContents)).
+    /// At most one per content id.
     content_updates: std.ArrayListUnmanaged(onelibrary.Content) = .empty,
-    /// Content ids `removeTrack` cascade-deletes at the next `save`.
+    /// Content ids [removeTrack](#rekordlib.device_export.DeviceExport.removeTrack)
+    /// cascade-deletes at the next
+    /// [save](#rekordlib.device_export.DeviceExport.save).
     content_deletes: std.ArrayListUnmanaged(i64) = .empty,
     /// pdb track id -> OL content id, recorded wherever the two sides
     /// are first seen joined (by path), so a later resolution — after a
@@ -4941,15 +5292,20 @@ const OlStore = struct {
     /// library's `content_by_path` stance); and the cascade-delete queue
     /// as a set, the list itself staying the drain order. Disk rows
     /// resolve through the cached library, not these. Every mutation of
-    /// the three lists maintains them: `pushContent`,
-    /// `queueContentUpdate`, `queueContentDelete`,
-    /// `renameListedContent`, `removeListedContent`, and the content
-    /// drains in `writeOl`.
+    /// the three lists maintains them:
+    /// [pushContent](#rekordlib.device_export.pushContent),
+    /// [queueContentUpdate](#rekordlib.device_export.queueContentUpdate),
+    /// [queueContentDelete](#rekordlib.device_export.queueContentDelete),
+    /// [renameListedContent](#rekordlib.device_export.renameListedContent),
+    /// [removeListedContent](#rekordlib.device_export.removeListedContent),
+    /// and the content drains in
+    /// [writeOl](#rekordlib.device_export.DeviceExport.writeOl).
     content_ref_by_id: std.AutoHashMapUnmanaged(i64, OlContentRef) = .empty,
     content_id_by_path: std.StringHashMapUnmanaged(i64) = .empty,
     content_delete_set: std.AutoHashMapUnmanaged(i64, void) = .empty,
 
-    /// Dedup state over the existing db (filled by `scanOlStore`) and the
+    /// Dedup state over the existing db (filled by
+    /// [scanOlStore](#rekordlib.device_export.scanOlStore)) and the
     /// pending rows; values are OL ids. Name lookups make a reopened db
     /// resolve to its own ids — in lockstep dbs those are exactly the
     /// bridged pdb ids.
@@ -4973,22 +5329,29 @@ const OlStore = struct {
     playlist_child_counts: std.AutoHashMapUnmanaged(i64, IdMint(i64)) = .empty,
     /// Bridged ext tag ids whose `myTag` row exists or pends.
     my_tag_ids: std.AutoHashMapUnmanaged(i64, void) = .empty,
+    /// The OL `myTag` rows as the scan saw them —
+    /// [recoverOlMyTags](#rekordlib.device_export.recoverOlMyTags)'
+    /// input, snapshotted only for rows the ext paradigm can represent.
+    /// Names are duped into the store's arena; the library the scan read
+    /// is freed after it.
+    my_tag_snapshot: std.ArrayListUnmanaged(OlMyTag) = .empty,
 
     /// Next id for a minted artist row — the lyricist resolution, the
     /// one mirrored row with no pdb id to bridge. Seeded at
-    /// `first_minted_artist_id` and raised past every artist id an
-    /// existing db carries.
+    /// [first_minted_artist_id](#rekordlib.device_export.first_minted_artist_id)
+    /// and raised past every artist id an existing db carries.
     next_minted_artist_id: IdMint(i64) = .{ .next = first_minted_artist_id },
 
     /// Id mints for the OL-only writer (an export with no `export.pdb`,
     /// where there is no pdb id to bridge a new row through): content,
     /// playlist, and image ids stay in the pdb's u32 space — Rekordbox
     /// keeps them in lockstep with the pdb track, node, and artwork ids,
-    /// and the ids `addTrack` returns are u32 — so a db whose rows there
-    /// exhaust that space fails the scan. The free dimension tables mint
-    /// in the OL side's own i64 space, continuing past the db's own ids;
-    /// artists reuse `next_minted_artist_id`, whose 2^32 floor keeps a
-    /// minted id clear of every bridged one.
+    /// and the ids [addTrack](#rekordlib.device_export.DeviceExport.addTrack)
+    /// returns are u32 — so a db whose rows there exhaust that space
+    /// fails the scan. The free dimension tables mint in the OL side's
+    /// own i64 space, continuing past the db's own ids; artists reuse
+    /// `next_minted_artist_id`, whose 2^32 floor keeps a minted id clear
+    /// of every bridged one.
     next_content_id: IdMint(u32) = .{},
     next_playlist_id: IdMint(u32) = .{},
     next_image_id: IdMint(u32) = .{},
@@ -5015,8 +5378,10 @@ const OlStore = struct {
 
     /// Whether `content_id` is queued for the cascade delete: the row is
     /// gone from the session's point of view — the cached disk snapshot
-    /// still names it until `save` lands the delete, so every resolution
-    /// treats a queued id as absent (the pdb side's `track_ids` verdict).
+    /// still names it until
+    /// [save](#rekordlib.device_export.DeviceExport.save) lands the
+    /// delete, so every resolution treats a queued id as absent (the
+    /// pdb side's `track_ids` verdict).
     fn contentDeleteQueued(store: *const OlStore, content_id: i64) bool {
         return store.content_delete_set.contains(content_id);
     }
@@ -5026,34 +5391,42 @@ const OlStore = struct {
     }
 };
 
-/// Drains `list` through one `Writer.insertAll` batch — one prepared
-/// statement and one commit for the whole table instead of a
-/// prepare/finalize/commit triple per row — clearing it only after the
-/// batch commits. A failure rolls the whole batch back and leaves every
-/// row pending for the next `save`, so a retry never duplicates a landed
-/// one (nothing landed): the pending lists keep naming exactly the rows
-/// the db lacks, all-or-nothing per table rather than per row.
+/// Drains `list` through one
+/// [Writer.insertAll](#rekordlib.onelibrary.Writer.insertAll) batch —
+/// one prepared statement and one commit for the whole table instead
+/// of a prepare/finalize/commit triple per row — clearing it only
+/// after the batch commits. A failure rolls the whole batch back and
+/// leaves every row pending for the next
+/// [save](#rekordlib.device_export.DeviceExport.save), so a retry never
+/// duplicates a landed one (nothing landed): the pending lists keep
+/// naming exactly the rows the db lacks, all-or-nothing per table
+/// rather than per row.
 fn olDrain(w: onelibrary.Writer, list: anytype) onelibrary.SqlError!void {
     try w.insertAll(list.items);
     list.clearRetainingCapacity();
 }
 
-/// Drains `list` through one `Writer.addAllToPlaylist` batch: the dense
-/// 1-based `sequenceNo`s are derived inside the transaction, continuing
-/// past rows already on disk. The same clear-only-after-commit contract
-/// as `olDrain`.
+/// Drains `list` through one
+/// [Writer.addAllToPlaylist](#rekordlib.onelibrary.Writer.addAllToPlaylist)
+/// batch: the dense 1-based `sequenceNo`s are derived inside the
+/// transaction, continuing past rows already on disk. The same
+/// clear-only-after-commit contract as
+/// [olDrain](#rekordlib.device_export.olDrain).
 fn olDrainPlaylistPairs(w: onelibrary.Writer, list: anytype) onelibrary.SqlError!void {
     try w.addAllToPlaylist(list.items);
     list.clearRetainingCapacity();
 }
 
-/// Drains pending content inserts through one `Writer.insertAll` batch —
-/// the same clear-only-after-commit contract as `olDrain` — and re-points
-/// the content indexes at the queued updates alone: the lists and the
+/// Drains pending content inserts through one
+/// [Writer.insertAll](#rekordlib.onelibrary.Writer.insertAll) batch —
+/// the same clear-only-after-commit contract as
+/// [olDrain](#rekordlib.device_export.olDrain) — and re-points the
+/// content indexes at the queued updates alone: the lists and the
 /// indexes must stay in step, or a later lookup reads a slot that no
-/// longer exists. Runs before the updates drain (the insert-first order
-/// `writeOl` already keeps); an id is never both pending and queued
-/// (updates replace disk rows), so the rebuild covers every listed row.
+/// longer exists. Runs before the updates drain (the insert-first
+/// order [writeOl](#rekordlib.device_export.DeviceExport.writeOl)
+/// already keeps); an id is never both pending and queued (updates
+/// replace disk rows), so the rebuild covers every listed row.
 fn olDrainContents(w: onelibrary.Writer, store: *OlStore) onelibrary.SqlError!void {
     try w.insertAll(store.contents.items);
     store.contents.clearRetainingCapacity();
@@ -5074,9 +5447,10 @@ fn olDrainContents(w: onelibrary.Writer, store: *OlStore) onelibrary.SqlError!vo
 }
 
 /// Drains queued whole-row content updates through one
-/// `Writer.updateAllContents` batch — the same clear-only-after-commit
-/// contract as `olDrain` — with their index entries (nothing pending
-/// remains: the contents drain runs first).
+/// [Writer.updateAllContents](#rekordlib.onelibrary.Writer.updateAllContents)
+/// batch — the same clear-only-after-commit contract as
+/// [olDrain](#rekordlib.device_export.olDrain) — with their index
+/// entries (nothing pending remains: the contents drain runs first).
 fn olDrainUpdates(w: onelibrary.Writer, store: *OlStore) onelibrary.SqlError!void {
     try w.updateAllContents(store.content_updates.items);
     store.content_updates.clearRetainingCapacity();
@@ -5085,8 +5459,9 @@ fn olDrainUpdates(w: onelibrary.Writer, store: *OlStore) onelibrary.SqlError!voi
 }
 
 /// Drains queued content cascade-deletes through one
-/// `Writer.deleteContentCascadeAll` batch — the same
-/// clear-only-after-commit contract as `olDrain` — with the delete set.
+/// [Writer.deleteContentCascadeAll](#rekordlib.onelibrary.Writer.deleteContentCascadeAll)
+/// batch — the same clear-only-after-commit contract as
+/// [olDrain](#rekordlib.device_export.olDrain) — with the delete set.
 fn olDrainContentDeletes(w: onelibrary.Writer, store: *OlStore) onelibrary.SqlError!void {
     try w.deleteContentCascadeAll(store.content_deletes.items);
     store.content_deletes.clearRetainingCapacity();
@@ -5192,9 +5567,10 @@ fn queueContentUpdate(store: *OlStore, row: onelibrary.Content) std.mem.Allocato
     indexContentPath(store, row);
 }
 
-/// Queues `content_id` for the cascade delete at the next `save`;
-/// double-queuing is a no-op. The set entry is reserved before the list
-/// append so the two cannot disagree.
+/// Queues `content_id` for the cascade delete at the next
+/// [save](#rekordlib.device_export.DeviceExport.save); double-queuing
+/// is a no-op. The set entry is reserved before the list append so the
+/// two cannot disagree.
 fn queueContentDelete(store: *OlStore, content_id: i64) std.mem.Allocator.Error!void {
     if (store.content_delete_set.contains(content_id)) return;
     const a = store.arena.allocator();
@@ -5268,7 +5644,8 @@ fn dupeContent(a: std.mem.Allocator, src: *const onelibrary.Content) std.mem.All
     return c;
 }
 
-/// The dedup key of a mirrored album, like `AlbumKey` but over the OL id
+/// The dedup key of a mirrored album, like
+/// [AlbumKey](#rekordlib.device_export.AlbumKey) but over the OL id
 /// space.
 pub const OlAlbumKey = struct {
     artist_id: i64,
@@ -5301,7 +5678,7 @@ pub const OlAlbumsByArtistAndName = std.HashMapUnmanaged(
 /// written in lockstep resolves to the bridged pdb id) and never
 /// duplicate a row the db already carries. A NULL album artist keys as 0,
 /// the pdb-side null convention. An id that exhausts its space fails the
-/// scan (see `IdMint`).
+/// scan (see [IdMint](#rekordlib.device_export.IdMint)).
 fn scanOlStore(
     lib: *const onelibrary.Library,
     store: *OlStore,
@@ -5363,22 +5740,39 @@ fn scanOlStore(
         // A NULL sequenceNo occupies nothing: the high water stays at 0.
         try gop.value_ptr.raisePast(row.sequenceNo orelse -1);
     }
-    for (lib.my_tags) |row| try store.my_tag_ids.put(a, row.myTag_id, {});
+    for (lib.my_tags) |row| {
+        try store.my_tag_ids.put(a, row.myTag_id, {});
+        // The recovery snapshot: only rows the ext paradigm can
+        // represent — u32 id and parent (a NULL parent is the root, the
+        // 0 convention) — with the name duped into the store's arena.
+        const id = std.math.cast(u32, row.myTag_id) orelse continue;
+        const parent = std.math.cast(u32, row.myTag_id_parent orelse 0) orelse continue;
+        try store.my_tag_snapshot.append(a, .{
+            .id = id,
+            .parent_id = parent,
+            .sequence_no = row.sequenceNo orelse 0,
+            .name = if (row.name) |n| try a.dupe(u8, n) else null,
+            .is_category = (row.attribute orelse 0) == 1,
+        });
+    }
 }
 
-/// One mirrored `artist` row; see `olNamedRow`.
+/// One mirrored `artist` row; see
+/// [olNamedRow](#rekordlib.device_export.olNamedRow).
 fn olArtistRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!onelibrary.Artist {
     _ = a;
     return .{ .artist_id = id, .name = name, .nameForSearch = null };
 }
 
-/// One mirrored `genre` row; see `olNamedRow`.
+/// One mirrored `genre` row; see
+/// [olNamedRow](#rekordlib.device_export.olNamedRow).
 fn olGenreRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!onelibrary.Genre {
     _ = a;
     return .{ .genre_id = id, .name = name };
 }
 
-/// One mirrored `label` row; see `olNamedRow`.
+/// One mirrored `label` row; see
+/// [olNamedRow](#rekordlib.device_export.olNamedRow).
 fn olLabelRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator.Error!onelibrary.Label {
     _ = a;
     return .{ .label_id = id, .name = name };
@@ -5387,11 +5781,12 @@ fn olLabelRow(a: std.mem.Allocator, name: []const u8, id: i64) std.mem.Allocator
 /// Resolves `name` through `map` to a mirrored row: an existing entry
 /// (the db's own id) is returned as-is; a miss appends a pending row
 /// built by `build_row` under the bridged `pdb_id` — the fixture shows
-/// rb keeps the pdb and OL id spaces aligned (artist 1 ↔ artist 1), so a
-/// lockstep db never sees a collision. The map key is duped and its
-/// capacity reserved before the append, so the bookkeeping after it
-/// cannot fail half-applied (the `getOrCreateStringRow` discipline).
-/// Empty names resolve to null: no row, no foreign key.
+/// Rekordbox keeps the pdb and OL id spaces aligned (artist 1 ↔ artist
+/// 1), so a lockstep db never sees a collision. The map key is duped
+/// and its capacity reserved before the append, so the bookkeeping
+/// after it cannot fail half-applied (the
+/// [getOrCreateStringRow](#rekordlib.device_export.DeviceExport.getOrCreateStringRow)
+/// discipline). Empty names resolve to null: no row, no foreign key.
 fn olNamedRow(
     store: *OlStore,
     map: *std.StringHashMapUnmanaged(i64),
@@ -5411,8 +5806,9 @@ fn olNamedRow(
     return pdb_id;
 }
 
-/// `olNamedRow` with the new row's id minted from `counter` instead of
-/// bridged from the pdb side — the OL-only writer's dimension resolution.
+/// [olNamedRow](#rekordlib.device_export.olNamedRow) with the new row's
+/// id minted from `counter` instead of bridged from the pdb side — the
+/// OL-only writer's dimension resolution.
 fn olMintedRow(
     store: *OlStore,
     map: *std.StringHashMapUnmanaged(i64),
@@ -5436,10 +5832,12 @@ const first_minted_artist_id: i64 = 0x1_0000_0000;
 /// Resolves the lyricist name to a mirrored artist row. Unlike the
 /// other artist roles there is no pdb id to bridge — the pdb keeps the
 /// lyricist as a plain string — so a new name is minted an id from
-/// `first_minted_artist_id` upward; an existing name (bridged or
-/// previously minted) resolves to its own id, exactly like the other
-/// roles. The `olNamedRow` bookkeeping discipline applies: the map key
-/// is duped and capacity reserved before the append.
+/// [first_minted_artist_id](#rekordlib.device_export.first_minted_artist_id)
+/// upward; an existing name (bridged or previously minted) resolves to
+/// its own id, exactly like the other roles. The
+/// [olNamedRow](#rekordlib.device_export.olNamedRow) bookkeeping
+/// discipline applies: the map key is duped and capacity reserved
+/// before the append.
 fn olLyricistId(
     store: *OlStore,
     name: []const u8,
@@ -5456,9 +5854,10 @@ fn olLyricistId(
     return id;
 }
 
-/// Resolves `name` — folded through `canonicalKeyName` — to a mirrored
-/// `key` row; the stored spelling is the canonical one, exactly like the
-/// pdb Key row this mirrors.
+/// Resolves `name` — folded through
+/// [canonicalKeyName](#rekordlib.device_export.canonicalKeyName) — to
+/// a mirrored `key` row; the stored spelling is the canonical one,
+/// exactly like the pdb Key row this mirrors.
 fn olKeyId(
     store: *OlStore,
     name: []const u8,
@@ -5477,8 +5876,8 @@ fn olKeyId(
     return pdb_id;
 }
 
-/// `olKeyId` with the new row's id minted — the OL-only resolution (no
-/// pdb key id to bridge).
+/// [olKeyId](#rekordlib.device_export.olKeyId) with the new row's id
+/// minted — the OL-only resolution (no pdb key id to bridge).
 fn olMintedKeyId(
     store: *OlStore,
     name: []const u8,
@@ -5523,7 +5922,8 @@ fn olAlbumId(
     return pdb_id;
 }
 
-/// `olAlbumId` with the new row's id minted — the OL-only resolution.
+/// [olAlbumId](#rekordlib.device_export.olAlbumId) with the new row's
+/// id minted — the OL-only resolution.
 fn olMintedAlbumId(
     store: *OlStore,
     name: []const u8,
@@ -5537,11 +5937,12 @@ fn olMintedAlbumId(
     return try olAlbumId(store, name, try store.next_album_id.mint(), ol_artist_id);
 }
 
-/// Resolves an artwork row to its mirrored `image` row: the bridge is the
-/// artwork id itself, and the stored path is the OneLibrary `b{id}.jpg`
-/// variant derived from it — not the caller's `a*` path, which the spec
-/// (`artworkSpec`) tells the caller to place alongside. No artwork (id
-/// 0) mirrors nothing.
+/// Resolves an artwork row to its mirrored `image` row: the bridge is
+/// the artwork id itself, and the stored path is the OneLibrary
+/// `b{id}.jpg` variant derived from it — not the caller's `a*` path,
+/// which the spec ([artworkSpec](#rekordlib.device_export.artworkSpec))
+/// tells the caller to place alongside. No artwork (id 0) mirrors
+/// nothing.
 fn olImageId(store: *OlStore, pdb_artwork_id: u32) std.mem.Allocator.Error!?i64 {
     if (pdb_artwork_id == 0) return null;
     const id: i64 = pdb_artwork_id;
@@ -5602,12 +6003,13 @@ fn mirrorPlaylistRow(
     gop.value_ptr.* = sequence_mint;
 }
 
-/// The OL-only node mint (`createPlaylist`'s fallback body): the id
-/// comes from `next_playlist_id` — the lockstep u32 space, so the
-/// returned id is the API's u32 — and the row lands through
-/// `mirrorPlaylistRow`, the same shape a bridged node writes. The
-/// parent check runs against the store's folder map before the mint, so
-/// a rejected call burns nothing.
+/// The OL-only node mint ([createPlaylist](#rekordlib.device_export.DeviceExport.createPlaylist)'s
+/// fallback body): the id comes from `next_playlist_id` — the lockstep
+/// u32 space, so the returned id is the API's u32 — and the row lands
+/// through [mirrorPlaylistRow](#rekordlib.device_export.mirrorPlaylistRow),
+/// the same shape a bridged node writes. The parent check runs against
+/// the store's folder map before the mint, so a rejected call burns
+/// nothing.
 fn createPlaylistNodeOl(
     store: *OlStore,
     name: []const u8,
@@ -5655,8 +6057,9 @@ fn mirrorMyTagRow(
 
 // --- writer state ---------------------------------------------------------------
 
-/// Fold tokens for `canonicalKeyName`, longest first so `major` folds as
-/// one token instead of matching `maj` and leaking the rest.
+/// Fold tokens for [canonicalKeyName](#rekordlib.device_export.canonicalKeyName),
+/// longest first so `major` folds as one token instead of matching
+/// `maj` and leaking the rest.
 const key_name_folds = [_]struct { token: []const u8, emit: []const u8 }{
     .{ .token = "major", .emit = "maj" },
     .{ .token = "minor", .emit = "min" },
@@ -5724,7 +6127,8 @@ pub const AlbumKey = struct {
     name: []const u8,
 };
 
-/// Content hash over `AlbumKey` — never the slice pointer.
+/// Content hash over [AlbumKey](#rekordlib.device_export.AlbumKey) —
+/// never the slice pointer.
 const AlbumKeyContext = struct {
     pub fn hash(_: AlbumKeyContext, key: AlbumKey) u64 {
         var h = std.hash.Wyhash.init(0);
@@ -5808,14 +6212,20 @@ pub fn IdMint(comptime Int: type) type {
     };
 }
 
-/// The writer's cached view of an export: one `IdMint` counter per table
-/// it appends to, plus the dedup maps that let later inserts reuse an
+/// The writer's cached view of an export: one
+/// [IdMint](#rekordlib.device_export.IdMint) counter per table it
+/// appends to, plus the dedup maps that let later inserts reuse an
 /// existing row instead of duplicating it. Everything the state
-/// allocates — map entries and string keys alike — comes from its arena
-/// and is reclaimed whole by `deinit`; a key that duplicates an existing
-/// one simply stays in the arena until then. Rebuilt from a plain
-/// database by `scanWriterState` and extended over an ext database's tag
-/// rows by `scanExtTags`.
+/// allocates — map entries and string keys alike — comes from its
+/// arena and is reclaimed whole by
+/// [deinit](#rekordlib.device_export.WriterState.deinit); a key that
+/// duplicates an existing one simply stays in the arena until then.
+/// Rebuilt from a plain database by
+/// [scanWriterState](#rekordlib.device_export.scanWriterState) and
+/// extended over an ext database's tag rows by
+/// [scanExtTags](#rekordlib.device_export.scanExtTags) and the
+/// OneLibrary myTag tree by
+/// [recoverOlMyTags](#rekordlib.device_export.recoverOlMyTags).
 pub const WriterState = struct {
     arena: std.heap.ArenaAllocator,
     /// Next free id per table. Id 0 is the null foreign key, so the
@@ -5847,19 +6257,27 @@ pub const WriterState = struct {
     /// row count, so a reopened export with sparse indices doesn't
     /// collide.
     playlist_entry_counts: std.AutoHashMapUnmanaged(u32, IdMint(u32)) = .empty,
-    /// Track ids by device file path (non-empty paths only; `addTrack`
+    /// Track ids by device file path (non-empty paths only;
+    /// [addTrack](#rekordlib.device_export.DeviceExport.addTrack)
     /// dedups on this key).
     tracks_by_path: std.StringHashMapUnmanaged(u32) = .empty,
     artists_by_name: std.StringHashMapUnmanaged(u32) = .empty,
     albums_by_artist_and_name: AlbumsByArtistAndName = .empty,
     genres_by_name: std.StringHashMapUnmanaged(u32) = .empty,
-    /// Key names indexed under their canonical form (`canonicalKeyName`)
+    /// Key names indexed under their canonical form
+    /// ([canonicalKeyName](#rekordlib.device_export.canonicalKeyName))
     /// so later lookups collide across spellings.
     keys_by_canonical: std.StringHashMapUnmanaged(u32) = .empty,
     labels_by_name: std.StringHashMapUnmanaged(u32) = .empty,
     artwork_by_path: std.StringHashMapUnmanaged(u32) = .empty,
     /// Tag category ids, for leaf FK validation.
     tag_categories: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Every tag id the tag database carries — ext rows the scan counted
+    /// and OL rows the bridge materialized
+    /// ([recoverOlMyTags](#rekordlib.device_export.recoverOlMyTags)) —
+    /// the bridge's lockstep check for which OL myTag rows still need an
+    /// ext row.
+    tag_ids: std.AutoHashMapUnmanaged(u32, void) = .empty,
     /// `(category, label) -> tag id` leaf dedup.
     tags_by_key: TagsByKey = .empty,
     /// `category -> next leaf position` (dense from 0 within a
@@ -5874,9 +6292,11 @@ pub const WriterState = struct {
 /// Error of the writer-state scans: walking a table's page chain hit
 /// structural corruption (a missing, raw, mis-typed, or looping page),
 /// an allocation failed, or a row carried an id that exhausts its space
-/// (see `IdMint`). A table the database doesn't carry is not an error —
-/// `rowsOfOrEmpty` resolves tables up front and scans them as empty;
-/// `NoTable` is only in the set because the row iterators share one.
+/// (see [IdMint](#rekordlib.device_export.IdMint)). A table the
+/// database doesn't carry is not an error —
+/// [rowsOfOrEmpty](#rekordlib.device_export.rowsOfOrEmpty) resolves
+/// tables up front and scans them as empty; `NoTable` is only in the
+/// set because the row iterators share one.
 pub const ScanError = error{
     OutOfMemory,
     NoTable,
@@ -5887,9 +6307,9 @@ pub const ScanError = error{
     IdSpaceExhausted,
 };
 
-/// `Database.rowsOf`, treating a table the database doesn't carry as
-/// empty (standard exports carry all 20 tables; this keeps the scan
-/// total over hand-built databases).
+/// [Database.rowsOf](#rekordlib.pdb.Database.rowsOf), treating a table
+/// the database doesn't carry as empty (standard exports carry all 20
+/// tables; this keeps the scan total over hand-built databases).
 fn rowsOfOrEmpty(
     db: *const pdb.Database,
     comptime T: type,
@@ -5929,7 +6349,8 @@ fn putIfAbsent(
 }
 
 /// Builds an Artist row in `a` — the caller's id, the name encoded.
-/// Nothing is inserted; see `getOrCreateStringRow`.
+/// Nothing is inserted; see
+/// [getOrCreateStringRow](#rekordlib.device_export.DeviceExport.getOrCreateStringRow).
 fn buildArtistRow(
     a: std.mem.Allocator,
     id: u32,
@@ -5942,7 +6363,8 @@ fn buildArtistRow(
     return .{ .artist = boxed };
 }
 
-/// Builds a Genre row in `a`; see `buildArtistRow`.
+/// Builds a Genre row in `a`; see
+/// [buildArtistRow](#rekordlib.device_export.buildArtistRow).
 fn buildGenreRow(
     a: std.mem.Allocator,
     id: u32,
@@ -5953,7 +6375,8 @@ fn buildGenreRow(
     return .{ .genre = boxed };
 }
 
-/// Builds a Label row in `a`; see `buildArtistRow`.
+/// Builds a Label row in `a`; see
+/// [buildArtistRow](#rekordlib.device_export.buildArtistRow).
 fn buildLabelRow(
     a: std.mem.Allocator,
     id: u32,
@@ -5964,7 +6387,8 @@ fn buildLabelRow(
     return .{ .label = boxed };
 }
 
-/// Builds an Artwork row in `a`; see `buildArtistRow`.
+/// Builds an Artwork row in `a`; see
+/// [buildArtistRow](#rekordlib.device_export.buildArtistRow).
 fn buildArtworkRow(
     a: std.mem.Allocator,
     id: u32,
@@ -5975,7 +6399,8 @@ fn buildArtworkRow(
     return .{ .artwork = boxed };
 }
 
-/// The writer-chosen fields of a Tag row; see `buildTagRow`.
+/// The writer-chosen fields of a Tag row; see
+/// [buildTagRow](#rekordlib.device_export.buildTagRow).
 const TagRowInput = struct {
     parent_id: u32,
     position: u32,
@@ -6014,8 +6439,9 @@ fn buildTagRow(
 }
 
 /// Walks every row of `db`'s table for row type `T` in row order,
-/// handing each to `visit(ctx, row)`; a table the database doesn't carry
-/// walks nothing (see `rowsOfOrEmpty`).
+/// handing each to `visit(ctx, row)`; a table the database doesn't
+/// carry walks nothing (see
+/// [rowsOfOrEmpty](#rekordlib.device_export.rowsOfOrEmpty)).
 fn forEachRow(
     db: *const pdb.Database,
     comptime T: type,
@@ -6050,8 +6476,10 @@ fn visitTrack(ctx: anytype, track: *const pdb.Track) ScanError!void {
 /// genres, labels, artwork): the id counter past the highest row id, and
 /// every row's id into `map` under its decoded key — an invalid encoding
 /// skips the map entry but still advances the counter. `T` is the row
-/// type; `field_path` names the `DeviceSQLString` within the row payload,
-/// through nested structs (`.{"name"}`, `.{"offsets", "inner", "name"}`).
+/// type; `field_path` names the
+/// [DeviceSQLString](#rekordlib.pdb.DeviceSQLString) within the row
+/// payload, through nested structs (`.{"name"}`, `.{"offsets", "inner",
+/// "name"}`).
 fn scanStringKeyed(
     alloc: std.mem.Allocator,
     db: *const pdb.Database,
@@ -6069,8 +6497,9 @@ fn scanStringKeyed(
     }
 }
 
-/// The `DeviceSQLString` at `field_path` within `row`, through nested
-/// structs (see `scanStringKeyed`).
+/// The [DeviceSQLString](#rekordlib.pdb.DeviceSQLString) at
+/// `field_path` within `row`, through nested structs (see
+/// [scanStringKeyed](#rekordlib.device_export.scanStringKeyed)).
 fn stringField(value: anytype, comptime field_path: []const []const u8) pdb.DeviceSQLString {
     if (field_path.len == 1) return @field(value, field_path[0]);
     return stringField(@field(value, field_path[0]), field_path[1..]);
@@ -6099,7 +6528,8 @@ fn visitAlbum(ctx: anytype, album: *const pdb.Album) ScanError!void {
     }
 }
 
-/// Scans `keys`: names folded through `canonicalKeyName` into
+/// Scans `keys`: names folded through
+/// [canonicalKeyName](#rekordlib.device_export.canonicalKeyName) into
 /// `keys_by_canonical`, so later lookups collide across spellings, and
 /// the id counter past the highest key id.
 fn scanKeys(
@@ -6149,10 +6579,11 @@ fn visitPlaylistEntry(ctx: anytype, entry: *const pdb.PlaylistEntry) ScanError!v
     try gop.value_ptr.raisePast(entry.entry_index);
 }
 
-/// Scans a plain database into a fresh `WriterState`: one pass per
-/// table, rebuilding the id counters (max id + 1) and the dedup maps the
-/// writer consults before inserting. First row wins on duplicate map
-/// keys, except `playlist_nodes`, where the last row wins. Rows are
+/// Scans a plain database into a fresh
+/// [WriterState](#rekordlib.device_export.WriterState): one pass per
+/// table, rebuilding the id counters (max id + 1) and the dedup maps
+/// the writer consults before inserting. First row wins on duplicate
+/// map keys, except `playlist_nodes`, where the last row wins. Rows are
 /// walked through the page chain, so deleted-row remnants in page heaps
 /// are invisible, exactly as to readers.
 pub fn scanWriterState(
@@ -6176,14 +6607,14 @@ pub fn scanWriterState(
     return state;
 }
 
-/// Extends a `WriterState` with the tag state recovered from an ext
-/// database, so later tag calls append instead of colliding or
-/// truncating: counters past every Tag row's id and `index_shift`, the
-/// category set, and the leaf dedup map. TrackTag junction rows carry no
-/// state the writer tracks — their ids reference tag rows already
-/// counted here — so they are not scanned. On error the state keeps
-/// whatever was merged so far; callers treat a failed scan as fatal for
-/// the session.
+/// Extends a [WriterState](#rekordlib.device_export.WriterState) with
+/// the tag state recovered from an ext database, so later tag calls
+/// append instead of colliding or truncating: counters past every Tag
+/// row's id and `index_shift`, the category set, and the leaf dedup
+/// map. TrackTag junction rows carry no state the writer tracks —
+/// their ids reference tag rows already counted here — so they are not
+/// scanned. On error the state keeps whatever was merged so far;
+/// callers treat a failed scan as fatal for the session.
 pub fn scanExtTags(
     alloc: std.mem.Allocator,
     ext_db: *const pdb.Database,
@@ -6193,6 +6624,7 @@ pub fn scanExtTags(
 }
 
 fn visitTag(ctx: anytype, tag: *const pdb.TagOrCategory) ScanError!void {
+    try ctx.state.tag_ids.put(ctx.alloc, tag.id, {});
     try ctx.state.next_tag_id.raisePast(tag.id);
     try ctx.state.next_tag_row_index.raisePast(@as(u32, tag.index_shift) / 0x20);
     if (tag.raw_is_category != 0) {
@@ -6210,5 +6642,97 @@ fn visitTag(ctx: anytype, tag: *const pdb.TagOrCategory) ScanError!void {
         const gop = try ctx.state.tag_leaf_counts.getOrPut(ctx.alloc, tag.parent_id);
         if (!gop.found_existing) gop.value_ptr.* = .{ .next = 0 };
         try gop.value_ptr.raisePast(tag.position);
+    }
+}
+
+/// Bridges the OneLibrary `myTag` tree into the tag writer state and
+/// the ext database — the recovery
+/// [scanExtTags](#rekordlib.device_export.scanExtTags) cannot do when
+/// the export's tags live only in the newer store (no `exportExt.pdb`,
+/// or one the OL side has moved past): every OL row whose id the ext
+/// database does not carry is materialized as an ext Tag row under its
+/// own id — the lockstep convention; ext tag ids and OL myTag ids are
+/// one space — and folded into the state, so categories validate,
+/// labels dedup, and new ids mint past the OL tree exactly as if an
+/// ext pdb had carried it.
+///
+/// The ext scan wins on divergence: an id it already counted is skipped
+/// whole, and so is a leaf whose `(category, label)` already resolves —
+/// the OL id only reserves its slot (`next_tag_id` still moves past it,
+/// so a mint can never collide with a row the OL mirror would skip). A
+/// name that fails to encode leaves the tag OL-only: the state still
+/// folds, the ext row does not land. The walk is idempotent — every
+/// step guards or maxes against what earlier steps left — so a failure
+/// retries cleanly on the next tag call.
+fn recoverOlMyTags(
+    state: *WriterState,
+    store: *const OlStore,
+    db: *pdb.Database,
+) (ScanError || pdb.DatabaseModifyError)!void {
+    const sa = state.arena.allocator();
+    for (store.my_tag_snapshot.items) |snap| {
+        if (state.tag_ids.contains(snap.id)) continue;
+        try state.next_tag_id.raisePast(snap.id);
+        // A leaf whose key already resolves names the ext row a junction
+        // would use; the OL duplicate stays unbridged.
+        if (!snap.is_category and state.tags_by_key.contains(.{
+            .category_id = snap.parent_id,
+            .label = snap.name orelse "",
+        })) continue;
+
+        // An out-of-range sequenceNo only misses the position high-water
+        // (a collision there reorders siblings, nothing more).
+        const position: ?u32 = std.math.cast(u32, @max(snap.sequence_no, 0));
+
+        // Reserve every map write before the insert so the bookkeeping
+        // after it cannot fail half-applied (the `getOrCreateTag`
+        // discipline); a reservation an unencodable name leaves unused is
+        // harmless.
+        try state.tag_ids.ensureUnusedCapacity(sa, 1);
+        var owned_label: ?[]u8 = null;
+        var leaf_mint: IdMint(u32) = undefined;
+        if (snap.is_category) {
+            try state.tag_categories.ensureUnusedCapacity(sa, 1);
+            if (position) |p| try state.next_category_position.raisePast(p);
+        } else {
+            owned_label = try sa.dupe(u8, snap.name orelse "");
+            try state.tags_by_key.ensureUnusedCapacity(sa, 1);
+            try state.tag_leaf_counts.ensureUnusedCapacity(sa, 1);
+            leaf_mint = state.tag_leaf_counts.get(snap.parent_id) orelse .{ .next = 0 };
+            if (position) |p| try leaf_mint.raisePast(p);
+        }
+
+        // A burned row index on an unencodable name is the `IdMint`
+        // contract: a later failure may burn an id, never mint a
+        // duplicate.
+        const row_index = try state.next_tag_row_index.mint();
+        const boxed = buildTagRow(db.arena.allocator(), .{
+            .parent_id = snap.parent_id,
+            .position = position orelse 0,
+            .id = snap.id,
+            .is_category = snap.is_category,
+            .row_index = row_index,
+        }, snap.name orelse "") catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // The OL name cannot live in an ext string; the tag stays
+            // OL-only with its state folded.
+            error.TooLong, error.InvalidEncoding => null,
+        };
+        if (boxed) |tag| {
+            var row = pdb.Row{ .tag = tag };
+            _ = try db.addRow(&row);
+            state.tag_ids.putAssumeCapacity(snap.id, {});
+        }
+
+        if (snap.is_category) {
+            state.tag_categories.putAssumeCapacity(snap.id, {});
+        } else {
+            state.tags_by_key.putAssumeCapacity(
+                .{ .category_id = snap.parent_id, .label = owned_label.? },
+                snap.id,
+            );
+            const gop = state.tag_leaf_counts.getOrPutAssumeCapacity(snap.parent_id);
+            gop.value_ptr.* = leaf_mint;
+        }
     }
 }

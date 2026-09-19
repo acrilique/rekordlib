@@ -540,7 +540,7 @@ test "playlist trees match the fixtures" {
 // --- OneLibrary reader hook -------------------------------------------------------
 
 test "OL reader hook loads with_anlz and joins tracks by path" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -565,7 +565,7 @@ test "OL reader hook loads with_anlz and joins tracks by path" {
 }
 
 test "OL reader hook is null without an exportLibrary.db" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -627,7 +627,7 @@ fn tmpOlDbPath(tmp: *testing.TmpDir, alloc: std.mem.Allocator) ![:0]u8 {
 }
 
 test "create saves an OL db with defaults and zero contents" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -710,7 +710,7 @@ test "off builds write no exportLibrary.db" {
 }
 
 test "addTrack mirrors a content row and its dimensions" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -832,7 +832,7 @@ test "addTrack mirrors a content row and its dimensions" {
 }
 
 test "addTrack authors OL-only columns and mints a lyricist artist" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -900,7 +900,7 @@ test "addTrack authors OL-only columns and mints a lyricist artist" {
 }
 
 test "a lyricist sharing the track artist resolves, never mints" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -933,7 +933,7 @@ test "a lyricist sharing the track artist resolves, never mints" {
 }
 
 test "a failed OL batch rolls back whole and stays pending" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -987,7 +987,7 @@ test "a failed OL batch rolls back whole and stays pending" {
 }
 
 test "a save blocked at the first OL batch recovers whole on retry" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -1045,7 +1045,7 @@ test "a save blocked at the first OL batch recovers whole on retry" {
 }
 
 test "addTrack mirrors the analysis path when analysis pends" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -1080,7 +1080,7 @@ test "addTrack mirrors the analysis path when analysis pends" {
 }
 
 test "mirroring dedups against an existing OL db" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -2001,6 +2001,7 @@ test "ext tag scan recovers the with_anlz fixture" {
     try testing.expectEqual(@as(u32, 28), state.next_tag_row_index.next);
     try testing.expectEqual(@as(u32, 4), state.next_category_position.next);
     try testing.expectEqual(@as(usize, 4), state.tag_categories.count());
+    try testing.expectEqual(@as(usize, 28), state.tag_ids.count());
     for ([_]u32{ 1, 2, 3, 4 }) |id| try testing.expect(state.tag_categories.contains(id));
     try testing.expectEqual(@as(u32, 4275955888), state.tags_by_key.get(.{
         .category_id = 1,
@@ -2891,6 +2892,128 @@ test "open preserves existing tags" {
     for (shifts[1..], 0..) |value, i| try testing.expect(value != shifts[i]);
 }
 
+test "tag calls bridge a myTag tree with no exportExt.pdb" {
+    if (onelibrary.mode == .off) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    // The with_anlz export without its exportExt.pdb: the same databases
+    // and tracks, the 28-row tag tree only on the OL side.
+    for ([_][]const u8{ "export.pdb", "exportLibrary.db" }) |file| {
+        const sub = try std.fmt.allocPrint(alloc, "PIONEER/rekordbox/{s}", .{file});
+        defer alloc.free(sub);
+        try copyFixtureFile(&tmp, io, alloc, "with_anlz", sub);
+    }
+
+    var ex = try device_export.DeviceExport.open(tmp_path, io, alloc);
+    defer ex.deinit();
+
+    var rec = (try ex.trackByPath(with_anlz_tracks[0].audio_path)).?;
+    defer rec.deinit();
+    const track = rec.view.id;
+
+    // Category 1 ("Genre") exists only in the OL tree; the FK check and
+    // the "Acid House" leaf's dedup both resolve through the bridge —
+    // no duplicate leaf, the junction carries the OL row's own id.
+    try ex.addTagsToTrack(track, @enumFromInt(1), &.{"Acid House"});
+    // A label the tree lacks mints past every OL id (the fixture's max
+    // is Acid House's 4275955888) and mirrors back into the OL side.
+    try ex.addTagsToTrack(track, @enumFromInt(1), &.{"Fresh"});
+    try ex.save();
+
+    // The tag database materialized the whole OL tree plus the new leaf.
+    var ext = try openSavedExtDb(&tmp, io, alloc);
+    defer ext.deinit();
+    var rows = try collectExtRows(alloc, &ext);
+    defer rows.deinit(alloc);
+    try testing.expectEqual(@as(usize, 29), rows.tags.items.len);
+    try testing.expectEqual(@as(usize, 2), rows.track_tags.items.len);
+
+    var acid_house_id: ?u32 = null;
+    var fresh_id: ?u32 = null;
+    for (rows.tags.items) |tag| {
+        if (tag.raw_is_category != 0) continue;
+        const name = try tag.offsets.inner.name.utf8(alloc);
+        defer alloc.free(name);
+        if (std.mem.eql(u8, name, "Acid House")) acid_house_id = tag.id;
+        if (std.mem.eql(u8, name, "Fresh")) fresh_id = tag.id;
+    }
+    try testing.expectEqual(@as(u32, 4275955888), acid_house_id.?);
+    try testing.expectEqual(@as(u32, 4275955889), fresh_id.?);
+    for (rows.track_tags.items) |tt| {
+        try testing.expectEqual(track.int(), tt.track_id);
+        try testing.expect(tt.tag_id == acid_house_id.? or tt.tag_id == fresh_id.?);
+    }
+
+    // The OL side gained only the new leaf and the two junctions — the
+    // 28 bridged rows are the ones already on disk.
+    const db_path = try tmpOlDbPath(&tmp, alloc);
+    defer alloc.free(db_path);
+    var db = try onelibrary.Db.open(io, db_path);
+    defer db.close();
+    var lib = try onelibrary.Library.load(alloc, db);
+    defer lib.deinit();
+    try testing.expectEqual(@as(usize, 29), lib.my_tags.len);
+    try testing.expectEqual(@as(usize, 2), lib.my_tag_contents.len);
+    try testing.expectEqual(@as(?i64, 1), lib.byId(onelibrary.MyTag, 4275955889).?.myTag_id_parent);
+}
+
+test "a lockstep myTag tree bridges without duplicating" {
+    if (onelibrary.mode == .off) return;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer alloc.free(tmp_path);
+
+    // The full with_anlz export: the ext pdb and the OL db carry the
+    // same 28 tags under the same ids (the lockstep the bridge assumes).
+    for ([_][]const u8{ "export.pdb", "exportLibrary.db", "exportExt.pdb" }) |file| {
+        const sub = try std.fmt.allocPrint(alloc, "PIONEER/rekordbox/{s}", .{file});
+        defer alloc.free(sub);
+        try copyFixtureFile(&tmp, io, alloc, "with_anlz", sub);
+    }
+
+    var ex = try device_export.DeviceExport.open(tmp_path, io, alloc);
+    defer ex.deinit();
+
+    var rec = (try ex.trackByPath(with_anlz_tracks[0].audio_path)).?;
+    defer rec.deinit();
+    const track = rec.view.id;
+
+    // "Techno" already lives under category 1 on both sides; the
+    // junction must reuse its id (3139558292), not mint a leaf.
+    try ex.addTagsToTrack(track, @enumFromInt(1), &.{"Techno"});
+    try ex.save();
+
+    var ext = try openSavedExtDb(&tmp, io, alloc);
+    defer ext.deinit();
+    var rows = try collectExtRows(alloc, &ext);
+    defer rows.deinit(alloc);
+    try testing.expectEqual(@as(usize, 28), rows.tags.items.len);
+    try testing.expectEqual(@as(usize, 1), rows.track_tags.items.len);
+    try testing.expectEqual(track.int(), rows.track_tags.items[0].track_id);
+    try testing.expectEqual(@as(u32, 3139558292), rows.track_tags.items[0].tag_id);
+
+    const db_path = try tmpOlDbPath(&tmp, alloc);
+    defer alloc.free(db_path);
+    var db = try onelibrary.Db.open(io, db_path);
+    defer db.close();
+    var lib = try onelibrary.Library.load(alloc, db);
+    defer lib.deinit();
+    try testing.expectEqual(@as(usize, 28), lib.my_tags.len);
+    try testing.expectEqual(@as(usize, 1), lib.my_tag_contents.len);
+    try testing.expectEqual(@as(i64, 3139558292), lib.my_tag_contents[0].myTag_id.?);
+    try testing.expectEqual(@as(i64, track.int()), lib.my_tag_contents[0].content_id.?);
+}
+
 test "a relative root stays pinned to the working directory of first use" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
 
@@ -2946,7 +3069,7 @@ test "a relative root stays pinned to the working directory of first use" {
 }
 
 test "playlist operations mirror into the OL db" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -3006,7 +3129,7 @@ test "playlist operations mirror into the OL db" {
 }
 
 test "tag operations mirror into the OL db" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -3072,7 +3195,7 @@ test "tag operations mirror into the OL db" {
 }
 
 test "playlist and tag mirroring continues an existing OL db" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -3335,7 +3458,7 @@ test "a PIONEER-only root carries no database" {
 }
 
 test "OL-only roots read tracks through the OL db" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -3436,7 +3559,7 @@ test "off builds read OL-only roots as FileNotFound" {
 }
 
 test "OL-only roots add tracks through the OL db" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -3521,7 +3644,7 @@ test "OL-only roots add tracks through the OL db" {
 }
 
 test "OL-only add then remove before save lands nothing" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -3547,7 +3670,7 @@ test "OL-only add then remove before save lands nothing" {
 }
 
 test "OL-only roots update, rename, and remove tracks" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 
@@ -3631,7 +3754,7 @@ test "OL-only roots update, rename, and remove tracks" {
 }
 
 test "OL-only roots round-trip playlists" {
-    if (onelibrary.mode != .@"vendored-sqlcipher") return;
+    if (onelibrary.mode == .off) return;
     const alloc = testing.allocator;
     const io = testing.io;
 

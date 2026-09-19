@@ -1,3 +1,15 @@
+//! Read, write, and create Rekordbox device-export files.
+//!
+//! * `anlz`: ANLZ analysis files.
+//! * `bin`: binary reading and writing helpers.
+//! * `budget`: memory caps for decodes.
+//! * `device_export`: device-export layout and entry point.
+//! * `onelibrary`: OneLibrary database files.
+//! * `pdb`: `*.pdb` database files.
+//! * `setting`: Rekordbox settings files.
+//! * `util`: wire types shared across formats.
+//! * `xor`: repeating-key XOR obfuscation.
+
 pub const anlz = @import("anlz.zig");
 pub const bin = @import("bin.zig");
 pub const budget = @import("budget.zig");
